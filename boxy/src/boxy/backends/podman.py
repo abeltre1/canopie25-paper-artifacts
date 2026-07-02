@@ -41,6 +41,7 @@ class PodmanBackend(RuntimeBackend):
     ) -> list[str]:
         entrypoint, inner_args = inner_cmd[0], inner_cmd[1:]
         cmd = [self.name, self.run_verb, "--rm", f"--name={box.name}", "--network=host", "--ipc=host"]
+        cmd += [f"--label=boxy.box={box.name}"]  # lets `boxy list` find boxy-launched containers
         cmd += [f"--entrypoint={entrypoint}"]
         if box.workdir:
             cmd += [f"--workdir={box.workdir}"]

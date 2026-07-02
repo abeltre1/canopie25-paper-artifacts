@@ -116,3 +116,31 @@ def vllm_image_for(accelerator: str) -> str:
         "rocm": "rocm/vllm:latest",
         "intel": "intel/vllm:latest",
     }.get(accelerator, "vllm/vllm-openai:latest")
+
+
+def _ramalama_vllm_image(accelerator: str) -> str | None:
+    """Ask RamaLama's vLLM plugin for its accelerator->image mapping (deeper
+    leverage than the static map); returns None when unavailable."""
+    try:
+        from ramalama.config import DefaultConfig
+        from ramalama.plugins.loader import get_runtime
+
+        gpu_type = {"cuda": "CUDA", "rocm": "HIP", "intel": "INTEL"}.get(accelerator)
+        if gpu_type is None:
+            return None
+        return get_runtime("vllm").get_container_image(DefaultConfig(), gpu_type)
+    except Exception:
+        return None
+
+
+def default_image(engine: str, accelerator: str) -> str:
+    """Default container image when a box omits `image`, per engine+accelerator.
+
+    vLLM defaults come from RamaLama's own plugin mapping when importable
+    (falling back to the static map); llama.cpp uses the upstream server image.
+    """
+    if engine == "llama.cpp":
+        if accelerator == "cuda":
+            return "ghcr.io/ggml-org/llama.cpp:server-cuda"
+        return "ghcr.io/ggml-org/llama.cpp:server"
+    return _ramalama_vllm_image(accelerator) or vllm_image_for(accelerator)

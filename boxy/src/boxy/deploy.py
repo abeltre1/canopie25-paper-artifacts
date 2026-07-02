@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
 
 from boxy import engines, envs, ramalama_shim
@@ -94,9 +94,13 @@ def _plan(
     dryrun: bool,
 ) -> Deployment:
     accelerator = location.resolve_accelerator()
+    if not box.image:
+        # RamaLama-informed default image for the box's engine + this
+        # location's accelerator (SPEC §3c: leverage, don't reinvent).
+        box = replace(box, image=ramalama_shim.default_image(box.engine, accelerator))
     backend = get_backend(location.resolve_runtime())
     scheduler = get_scheduler(location.scheduler)
-    env = envs.build_env(box.env, accelerator, location.offline)
+    env = envs.build_env(box.env, accelerator, location.offline, engine=box.engine)
     mounts = resolve_mounts(box, location) + extra_mounts
     cmd = backend.build_command(box, location, inner_cmd, env, mounts, accelerator)
     cmd = scheduler.with_modules(cmd, location)

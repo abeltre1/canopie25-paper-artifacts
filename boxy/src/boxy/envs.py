@@ -1,6 +1,6 @@
 """Environment-variable sets for boxes, from the paper's prototype (common_boxy.sh).
 
-Merge order (later wins): base -> offline -> accelerator quirks -> box.env.
+Merge order (later wins): base -> engine hygiene -> offline -> box.env.
 The user's box definition always has the last word.
 """
 
@@ -21,6 +21,10 @@ OFFLINE_ENV: dict[str, str] = {
 # Reproducibility / resource hygiene defaults from the prototype.
 BASE_ENV: dict[str, str] = {
     "OMP_NUM_THREADS": "1",
+}
+
+# vLLM engine hygiene (prototype ENV_VARS) — only injected for vllm boxes.
+VLLM_ENV: dict[str, str] = {
     "VLLM_DISABLE_COMPILE_CACHE": "1",
     "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
 }
@@ -32,11 +36,13 @@ ROCM_VLLM_ENV: dict[str, str] = {
 }
 
 
-def build_env(box_env: dict[str, str], accelerator: str, offline: bool) -> dict[str, str]:
+def build_env(box_env: dict[str, str], accelerator: str, offline: bool, engine: str = "vllm") -> dict[str, str]:
     env: dict[str, str] = dict(BASE_ENV)
+    if engine == "vllm":
+        env.update(VLLM_ENV)
+        if accelerator == "rocm":
+            env.update(ROCM_VLLM_ENV)
     if offline:
         env.update(OFFLINE_ENV)
-    if accelerator == "rocm":
-        env.update(ROCM_VLLM_ENV)
     env.update(box_env)  # box always wins
     return env

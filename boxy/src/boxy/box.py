@@ -26,7 +26,7 @@ ENGINES = ("vllm", "llama.cpp")
 @dataclass
 class Box:
     name: str
-    image: str
+    image: str = ""  # "" => default image for engine+accelerator (RamaLama-informed map)
     engine: str = "vllm"  # inference engine inside the box: vllm | llama.cpp
     entrypoint: str = ""
     model: str = ""
@@ -59,4 +59,7 @@ class Box:
         unknown = set(section) - known
         if unknown:
             raise ValueError(f"{path}: unknown [box] keys: {sorted(unknown)}")
-        return cls(volumes=volumes, env=env, **section)
+        try:
+            return cls(volumes=volumes, env=env, **section)
+        except TypeError as e:
+            raise ValueError(f"{path}: invalid [box] section: {e}") from None

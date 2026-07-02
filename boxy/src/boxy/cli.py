@@ -63,7 +63,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     from boxy import deploy
 
     box, location = _load(args)
-    deployment = deploy.plan_run(box, location, args.args, dryrun=args.dryrun)
+    # argparse.REMAINDER keeps the literal "--" separator; it must not reach
+    # the container command.
+    user_args = args.args[1:] if args.args[:1] == ["--"] else args.args
+    deployment = deploy.plan_run(box, location, user_args, dryrun=args.dryrun)
     return _emit(deployment, args.dryrun)
 
 
@@ -110,6 +113,12 @@ def cmd_generate(args: argparse.Namespace) -> int:
         print(f"boxy generate: unknown format {args.format!r} (available: sky)", file=sys.stderr)
         return 1
     box, location = _load(args)
+    if location.scheduler != "none":
+        print(
+            f"warning: location {location.name!r} uses scheduler={location.scheduler!r}; the SkyPilot "
+            "path targets cloud/K8s — boxy serves Slurm/Flux natively (use `boxy serve`)",
+            file=sys.stderr,
+        )
     yaml_text = sky_export.to_sky_task(box, location, port=args.port, serve=args.serve)
     if args.output:
         with open(args.output, "w") as f:
@@ -118,6 +127,42 @@ def cmd_generate(args: argparse.Namespace) -> int:
     else:
         print(yaml_text, end="")
     return 0
+
+
+def _container_runtime(location: Location | None) -> str:
+    if location is not None and location.runtime:
+        if location.runtime == "apptainer":
+            raise RuntimeError(
+                "apptainer runs are foreground in the MVP: Ctrl-C the process, "
+                "or cancel the job (scancel / flux cancel)"
+            )
+        return location.runtime
+    for candidate in ("podman", "docker"):
+        if shutil.which(candidate):
+            return candidate
+    raise RuntimeError("no container runtime found on host (looked for podman, docker)")
+
+
+def _run_or_print(cmd: list[str], dryrun: bool) -> int:
+    print(f"### Running Command:\n    {shlex.join(cmd)}")
+    if dryrun:
+        return 0
+    import subprocess
+
+    return subprocess.run(cmd).returncode
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    box = Box.from_toml(args.box)
+    location = Location.from_toml(args.location) if args.location else None
+    runtime = _container_runtime(location)
+    return _run_or_print([runtime, "stop", box.name], args.dryrun)
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    location = Location.from_toml(args.location) if args.location else None
+    runtime = _container_runtime(location)
+    return _run_or_print([runtime, "ps", "--filter", "label=boxy.box"], args.dryrun)
 
 
 def _stub(name: str):
@@ -164,6 +209,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--serve", action="store_true", help="add a SkyServe service block (sky serve up)")
     p.add_argument("-o", "--output", default=None, help="write YAML to file instead of stdout")
     p.set_defaults(func=cmd_generate)
+
+    p = sub.add_parser("stop", help="stop a running boxy container (by box name)")
+    p.add_argument("--box", required=True)
+    p.add_argument("--location", default=None)
+    p.add_argument("--dryrun", action="store_true")
+    p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser("list", help="list running boxy-launched containers")
+    p.add_argument("--location", default=None)
+    p.add_argument("--dryrun", action="store_true")
+    p.set_defaults(func=cmd_list)
 
     for name, help_text in (
         ("alloc", "request nodes via the location's scheduler"),

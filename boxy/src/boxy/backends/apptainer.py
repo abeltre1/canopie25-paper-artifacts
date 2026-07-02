@@ -49,8 +49,11 @@ class ApptainerBackend(RuntimeBackend):
         cmd += BASE_ARGS
         if box.workdir:
             cmd += ["--cwd", box.workdir]
-        for source, target, _options in mounts:
-            cmd += ["--bind", f"{source}:{target}"]
+        for source, target, options in mounts:
+            spec = f"{source}:{target}"
+            if "ro" in options.split(","):
+                spec += ":ro"
+            cmd += ["--bind", spec]
         # vllm needs a writable HF cache under /root (prototype rule).
         cmd += ["--env", "HF_HOME=/root/.cache/huggingface"]
         cmd += self.gpu_args(accelerator)
