@@ -15,9 +15,19 @@ tuning applied automatically.
 ## Install
 
 ```bash
+# pip
 pip install ./boxy                 # core (stdlib only)
 pip install './boxy[ramalama]'     # + RamaLama: GPU autodetect, model pulls
+
+# uv
+uv venv .boxy && source .boxy/bin/activate
+uv pip install -e './boxy[ramalama,test]'
 ```
+
+**uv note:** uv-managed standalone Pythons don't inherit the system CA store,
+so HTTPS (model pulls) fails with `CERTIFICATE_VERIFY_FAILED` until you set
+`SSL_CERT_FILE` (see RUNBOOK §2.1 / troubleshooting). `boxy pull` prints the
+remedy if you hit it.
 
 ## Quickstart (mirrors the paper's pipeline)
 

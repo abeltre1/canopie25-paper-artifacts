@@ -36,11 +36,20 @@ capability moves to **E**.
 
 ```bash
 git clone -b claude/boxy-cli-hpc-spec-ojevsl <repo-url> && cd */boxy
+
+# with pip:
 python3 -m venv .boxy && source .boxy/bin/activate
 pip install -e '.[ramalama,test]'
+# or with uv:
+uv venv .boxy && source .boxy/bin/activate
+uv pip install -e '.[ramalama,test]'
+
 pytest -q            # EXPECT: 113 passed (live Docker test skips if no Docker)
 boxy info            # EXPECT: version, ramalama available, your runtimes/schedulers
 ```
+
+**uv users:** uv's standalone Pythons ship without system CA wiring — step 2.1
+(SSL_CERT_FILE) is *required* for you, not optional.
 
 ## 2. Laptop end-to-end (macOS/Linux, CPU — ~10 min)
 
