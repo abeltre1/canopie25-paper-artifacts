@@ -3,7 +3,7 @@
 **A unified, site-portable, offline-first CLI for deploying and serving
 containerized GenAI/LLM services on HPC systems.**
 
-Status: Draft design specification (v0.1)
+Status: Draft design specification (v0.2 — Phase 1 implemented in `boxy/`)
 Audience: maintainers scoping the implementation of `boxy`
 Baseline repo: `abeltre1/canopie25-paper-artifacts` (this repo)
 
@@ -197,6 +197,66 @@ multi-runtime, **CUDA + ROCm** stance a durable differentiator.
 
 ---
 
+## 3c. Engineering Reuse Map (verified at source level)
+
+What `boxy` concretely *gets* from each project, and where the seams are.
+
+### RamaLama — reuse as a pinned library behind one seam
+
+RamaLama v0.23.0: MIT, on PyPI, runtime deps are only
+`argcomplete + pyyaml + jinja2` (good for air-gap). **The seam:** everything up
+to `assemble_command(args)` → `VllmPlugin._cmd_serve(args) -> list[str]` (the
+*inner* engine argv) is backend-agnostic and reusable; everything after
+(`execute_command` → `Engine` → `podman run`, transports/base.py:394/674) is
+podman/docker-coupled and is exactly what `boxy` replaces with
+Apptainer/srun/flux.
+
+```
+        REUSE (backend-agnostic)                 │  REPLACE (podman/docker)
+Config → get_accel → New/pull → accel_image →    │
+  inner engine argv  ◀ SEAM                      │  execute_command → Engine → podman run
+```
+
+| RamaLama asset | Location | How boxy uses it | Friction |
+| --- | --- | --- | --- |
+| `get_accel()` | common.py:576 | GPU autodetect for `location.accelerator` (probes nvidia-smi/ROCm; mutates `os.environ` — by design) | clean |
+| `get_accel_env_vars()` / `set_accel_env_vars()` | common.py:637/591 | accelerator visibility env for pass-through | clean |
+| `get_gpu_devices()` | common.py:616 | device nodes (`/dev/kfd`, `/dev/dri`) for binds | clean |
+| `Config()` / `DefaultConfig()` | config.py:213/343 | programmatic config; **must set engine/container/image explicitly** (defaults probe the host) | clean |
+| `transport_factory.New()` + `ensure_model_exists()` | transport_factory.py:180, base.py:585 | `boxy pull` for `hf://`, `ollama://`, `oci://`, … | needs-shim |
+| `GlobalModelStore(base_path)` | global_store.py:22 | local store on scratch/shared FS | clean |
+| `VllmPlugin.get_container_image()` | plugins/…/vllm.py:94 | GPU→image selection | clean |
+| `Engine`/`BaseEngine` command assembly | engine.py | **not reused** — constructor eagerly emits podman argv (fork-worthy); patterns only | — |
+
+Contract notes: args are duck-typed via `getattr` against the Protocols in
+`arg_types.py` (`StoreArgType`: `store/engine/container`; pull also reads
+`MODEL, pull, quiet, verify, dryrun`) — a `SimpleNamespace` works, no argparse.
+There is **no public API promise** (plugin group is literally
+`ramalama.runtimes.v1alpha`), and `_cmd_serve` is impure (resolves models via
+the store). Mitigations `boxy` implements: pin `ramalama==0.23.*`; confine every
+import to one module (`boxy/ramalama_shim.py`, lazy imports, graceful
+degradation when ramalama is absent); build the vLLM serve argv in `boxy`
+itself for path-based (shared-FS) models.
+
+### SkyPilot — call for cloud, copy patterns for HPC, never vendor wholesale
+
+SkyPilot is Apache-2.0 but architecturally client–server: every command talks
+to an **API server** (auto-started locally), which is the opposite of an
+air-gapped, serverless HPC CLI. Its Slurm backend (v0.12+, ~Mar 2026) SSHes to
+a login node (SSH-style `~/.slurm/config`), generates **sbatch**, and runs
+containers **only via Pyxis/Enroot** (`srun --container-image=…
+--container-name=…:create/exec`, readiness via a `.sky_sbatch_ready` sentinel
+file). **SkyServe serving is not supported on Slurm.**
+
+| boxy need | SkyPilot asset | Mode |
+| --- | --- | --- |
+| Cloud provisioning + cloud serving | `sky.launch()` / `sky serve up` (`sky/client/sdk.py`) | **CALL** — Phase 5: transpile box+cloud-location → sky task YAML (`image_id`, `run`, `accelerators`, `service.readiness_probe`) and delegate; inherit 20+ clouds and SkyServe for free |
+| Slurm sbatch + container job plumbing | `sky/provision/slurm/instance.py` | **COPY PATTERN** (Apache-2.0 permits lifting with attribution) — informs boxy's future Enroot/Pyxis backend and detached `sbatch` serving |
+| Serving with a stable route | `sky/serve/` (readiness-probe-gated replica pool, least-load router, replica=one job, re-launch on failure) | **COPY PATTERN** — reimplement against Slurm/Flux jobs for HPC serving (Phase 3+) |
+| Whole framework | client–server core, cloud catalogs, optimizer | **DO NOT VENDOR** — drags in the API server and cloud assumptions |
+
+---
+
 ## 4. Core Concepts: `box` and `location`
 
 `boxy` separates *what* you deploy from *where* you deploy it. Both are declared
@@ -367,16 +427,20 @@ scheduler abstractions can be contributed as plugins — A does not preclude B.)
 ## 6b. Gap Analysis — What `boxy` Uniquely Fills
 
 Every individual capability below exists somewhere. **The union does not ship in
-any single tool** (see §3b):
+any single tool** (see §3b; the SkyPilot facts below are verified from its
+source and docs, the RamaLama facts from its v0.23.0 source — see §3c):
 
 1. **Serve — not just run — on Slurm/Flux**, with a stable OpenAI-compatible
-   route. SkyPilot serves everywhere *except* Slurm; RamaLama serves but has no
-   scheduler.
+   route. SkyPilot serves everywhere *except* Slurm (its docs list SkyServe as
+   unsupported there; on Slurm it only runs batch jobs via SSH+sbatch+Pyxis);
+   RamaLama serves but has no scheduler concept at all.
 2. **Apptainer/SIF as a first-class serving runtime.** The orchestrators skip it
    (SkyPilot → Enroot; Run:ai/KServe → Docker/K8s). `boxy` also abstracts the
    Apptainer-vs-root breakage the paper documents.
 3. **Offline / air-gapped by design.** NIM struggles here; SkyPilot/dstack/Modal
-   are cloud-control-plane oriented. `boxy` reuses RamaLama transports + local
+   are cloud-control-plane oriented (SkyPilot's client–server model requires an
+   API server even locally, and its cloud paths assume reachable catalogs).
+   `boxy` is serverless and stdlib-bootstrappable: RamaLama transports + local
    shared-FS/S3 staging, fully disconnected.
 4. **Site portability via a `location` object.** One box retargeted across
    scheduler (Slurm/Flux) × runtime (Apptainer/Podman/Enroot) × accelerator
@@ -409,6 +473,40 @@ any single tool** (see §3b):
 
 ---
 
+## 6c. Standalone vs Leverage — the Decision
+
+The question: should `boxy` lean on RamaLama and SkyPilot, or be a fully
+standalone tool that absorbs all that functionality into one CLI?
+
+**Decision: `boxy` is a standalone single CLI — one tool, one UX — that
+leverages both projects *behind seams*, absorbing neither.**
+
+- **RamaLama → library behind one file.** Pinned dependency, every import
+  confined to `boxy/ramalama_shim.py` with lazy loading and graceful
+  degradation (no ramalama ⇒ no autodetect/no transport pulls, everything else
+  works). If its unstable internals ever break the pin, the worst case is
+  vendoring ~300 lines of accelerator probes under MIT attribution.
+- **SkyPilot → optional cloud backend behind a subprocess/SDK boundary.**
+  Never a hard dependency (its API-server model must not infect the air-gapped
+  path). Phase 5 adds a `cloud` location kind that transpiles to a sky task
+  YAML and calls `sky launch` / `sky serve up`.
+- **Why not fully standalone (absorb everything)?** Neither project's gaps can
+  be configured away — RamaLama has no HPC layer, SkyPilot can't serve on
+  Slurm or run air-gapped — so `boxy` must own the HPC layer *either way*.
+  Rewriting RamaLama's transports/GPU probes or SkyPilot's cloud provisioning
+  on top of that buys no capability, only a permanent maintenance bill for
+  code that upstream already maintains.
+- **Why not merge into either project?** Upstreaming HPC into RamaLama couples
+  boxy to a general-purpose tool's release process (§6, option B); building on
+  SkyPilot inherits a control-plane architecture that contradicts the offline
+  requirement. The single-CLI user experience is preserved regardless: users
+  see only `boxy`.
+
+To the user, `boxy` **is** the single CLI that powers all of it; RamaLama and
+SkyPilot are implementation details it can swap out.
+
+---
+
 ## 7. Requirements
 
 ### Functional
@@ -434,37 +532,49 @@ any single tool** (see §3b):
 
 ## 8. Phased Roadmap
 
-- **Phase 1 — Core.** `box`/`location` model + `boxy serve`/`run`/`info` on a
-  single node; Podman + Apptainer backends; CUDA + ROCm. (Formalizes the
-  prototype.)
-- **Phase 2 — Models & offline.** `boxy pull`/`stage`/`build`; full air-gap;
-  shared-FS + S3 staging; OCI→SIF auto-build.
-- **Phase 3 — Scale.** `boxy alloc`; Slurm + Flux scheduler adapters; multi-node
-  tensor-parallel serving (Ray-on-Slurm pattern); Enroot/Pyxis + `scrun`
+- **Phase 1 — Core. ✅ implemented in this repo (`boxy/`).** `box`/`location`
+  TOML model + `boxy serve`/`run`/`info`/`build`/`pull`; Podman + Apptainer +
+  Docker backends; CUDA + ROCm; srun/`flux run` wrapping; module-load
+  preamble; offline env injection; OCI→SIF auto-build; RamaLama seam
+  (`ramalama_shim.py`) with graceful degradation. 30 golden-argv tests
+  reproduce the prototype's known-good commands for HOPS and Eldorado.
+- **Phase 2 — Models & offline.** `boxy stage` (shared-FS + site-local S3
+  sync); store-pulled models end-to-end on air-gapped sites; SIF caching
+  policy.
+- **Phase 3 — Scale & serve.** `boxy alloc`; detached `sbatch`/`flux batch`
+  serving with readiness sentinel (SkyPilot Slurm pattern); multi-node
+  tensor-parallel (Ray-on-Slurm pattern); HPC serve route (readiness-gated
+  replica pool + login-node router, SkyServe pattern); Enroot/Pyxis + `scrun`
   backends.
 - **Phase 4 — Benchmark.** `boxy bench` ShareGPT sweeps + plot export
   (reproduce `plots/`).
+- **Phase 5 — Cloud delegation.** `cloud` location kind transpiling to
+  SkyPilot task YAML (`sky launch` / `sky serve up`) as an optional extra.
 
 ---
 
 ## 9. Open Questions / Decisions
 
-- **Implementation language.** Python (maximal RamaLama reuse) vs Rust (the
-  paper's aspiration). Python is the low-friction path given §3.2.
-- **Where the code lands.** This repo (baseline, has the paper + prototype, but
-  no Python package skeleton) vs a new package vs contributed into RamaLama.
-- **Config format finalization.** Confirm TOML schemas for `box`/`location`.
-- **Fast-moving competitive facts to re-confirm before citing as absolute**
-  (phrased "as of mid-2026" with sources in this spec, not asserted as
-  permanent):
-  - (a) SkyPilot's SkyServe still not supporting serving on Slurm.
-  - (b) That no shipped tool serves LLMs on Flux.
+- ~~**Implementation language.**~~ **Decided: Python** (maximal RamaLama reuse;
+  see §6c). Phase 1 is implemented in `boxy/` in this repo.
+- ~~**Where the code lands.**~~ **Decided for now: this repo** (`boxy/`
+  subdirectory next to the paper and prototype); can graduate to its own repo
+  when it outgrows the artifacts.
+- **Config format finalization.** TOML schemas for `box`/`location` are
+  implemented as in §4; extend as Phase 2+ adds fields (staging S3 auth,
+  partitions/QOS, readiness probes).
+- **Fast-moving competitive facts** (verified against SkyPilot source/docs as
+  of mid-2026; re-confirm periodically):
+  - (a) SkyPilot's SkyServe does not support serving on Slurm (docs list it as
+    unsupported; Slurm mode is SSH+sbatch+Pyxis batch jobs only).
+  - (b) No shipped tool serves LLMs on Flux.
 
 ### Sources
 
 - SkyPilot: `github.com/skypilot-org/skypilot`; `docs.skypilot.co`;
-  `blog.skypilot.co/slurm-vs-k8s`
-- RamaLama: `github.com/containers/ramalama`
+  `blog.skypilot.co/slurm-vs-k8s`; `sky/provision/slurm/instance.py`;
+  `sky/client/sdk.py`
+- RamaLama: `github.com/containers/ramalama` (v0.23.0 source)
 - Pyxis/Enroot: `github.com/NVIDIA/pyxis`; AMD Enroot/Pyxis toolkit docs
 - Slurm OCI/scrun: `slurm.schedmd.com/containers.html`, `/scrun.html`
 - This repo's paper: arXiv 2509.20603 / `doi.org/10.1145/3731599.3767356`
