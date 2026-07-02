@@ -60,8 +60,14 @@ def build_llamacpp_serve_cmd(
     port: int | None = None,
     extra_args: list[str] | None = None,
 ) -> list[str]:
-    """llama.cpp OpenAI-compatible server argv (`llama-server -m <model> ...`)."""
-    entrypoint = box.entrypoint or "llama-server"
+    """llama.cpp OpenAI-compatible server argv (`llama-server -m <model> ...`).
+
+    An empty first element means "defer to the image's own ENTRYPOINT": the
+    upstream ghcr.io/ggml-org/llama.cpp:server image keeps its binary at
+    /app/llama-server, NOT on $PATH, so overriding the entrypoint by bare
+    name fails under crun. (Field finding: Mac run-through, 2026-07.)
+    """
+    entrypoint = box.entrypoint  # "" => image ENTRYPOINT + args
     cmd = [entrypoint, "-m", model_path]
     cmd += list(extra_args or [])
     resolved_port = port or (box.ports[0] if box.ports else 8080)

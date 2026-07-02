@@ -80,6 +80,32 @@ def test_finding5_example_boxes_workdir_rule_holds():
             assert box.workdir in targets, f"{path.name}: workdir {box.workdir} has no volume"
 
 
+def test_finding7_llamacpp_defers_to_image_entrypoint(hops):
+    from boxy.backends import get_backend
+
+    box = Box(name="q", engine="llama.cpp", model="m.gguf", ports=[8090])
+    d = deploy.plan_serve(box, hops, dryrun=True)  # hops runtime=podman
+    joined = " ".join(d.command)
+    assert "--entrypoint" not in joined            # image ENTRYPOINT wins
+    image_idx = d.command.index(d.box.image)
+    assert d.command[image_idx + 1] == "-m"        # args follow image directly
+    # explicit entrypoint still honored
+    box2 = Box(name="q2", engine="llama.cpp", entrypoint="/app/llama-server", model="m.gguf")
+    d2 = deploy.plan_serve(box2, hops, dryrun=True)
+    assert "--entrypoint=/app/llama-server" in d2.command
+    # apptainer: deferred entrypoint switches exec -> run (SIF runscript)
+    cmd = get_backend("apptainer").build_command(box, hops, ["", "-m", "m.gguf"], {}, [], "cuda")
+    assert cmd[:2] == ["apptainer", "run"]
+    assert "" not in cmd
+
+
+def test_finding8_prompts_hard_silenced_at_seam():
+    ramalama_shim.detect_accel()
+    import ramalama.common as rc
+
+    assert rc.confirm_no_gpu("any-machine", "applehv") is True  # patched, no input()
+
+
 def test_finding6_latest_vllm_and_mac_example():
     hf_box = Box.from_toml(EXAMPLES / "boxes" / "vllm-hf.toml")
     assert hf_box.image == "vllm/vllm-openai:v0.24.0"   # registry-verified latest

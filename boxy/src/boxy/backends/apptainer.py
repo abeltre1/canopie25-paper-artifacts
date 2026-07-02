@@ -45,7 +45,10 @@ class ApptainerBackend(RuntimeBackend):
         mounts: list[tuple[str, str, str]],
         accelerator: str,
     ) -> list[str]:
-        cmd = [self.name, "exec"]
+        # Empty entrypoint => `apptainer run` (executes the SIF runscript,
+        # i.e. the original image ENTRYPOINT) instead of `exec <command>`.
+        defer_to_image = inner_cmd and inner_cmd[0] == ""
+        cmd = [self.name, "run" if defer_to_image else "exec"]
         cmd += BASE_ARGS
         if box.workdir:
             cmd += ["--cwd", box.workdir]
@@ -60,5 +63,5 @@ class ApptainerBackend(RuntimeBackend):
         for key, value in env.items():
             cmd += ["--env", f"{key}={value}"]
         cmd += [self.sif_name(box, accelerator)]
-        cmd += inner_cmd
+        cmd += inner_cmd[1:] if defer_to_image else inner_cmd
         return cmd

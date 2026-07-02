@@ -1,7 +1,8 @@
 # vLLM box whose model is pulled by transport URI (requires boxy[ramalama]).
 # On connected systems: boxy pull --box vllm-hf.toml
-# NOTE: this image is linux/amd64 + CUDA — serve it on a GPU cluster, not a
-# laptop. For laptop testing use qwen-gguf.toml (llama.cpp, multi-arch).
+# NOTE: this image is linux/amd64 + CUDA and ~20 GB — pull/serve it on a GPU
+# cluster, not a laptop. For laptop testing use qwen-gguf.toml (llama.cpp,
+# multi-arch, small). A laptop `boxy pull` of the MODEL is fine (~1 GB).
 # No `workdir`: the pulled model is bind-mounted at an absolute /mnt/models
 # path, and Podman refuses workdirs that don't exist in the image.
 [box]

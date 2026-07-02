@@ -29,6 +29,21 @@ os.environ.setdefault("RAMALAMA_USER__NO_MISSING_GPU_PROMPT", "true")
 DEFAULT_STORE = os.path.expanduser(os.environ.get("BOXY_STORE", "~/.local/share/boxy/store"))
 
 
+def _silence_prompts() -> None:
+    """Hard guarantee that RamaLama never blocks boxy on an interactive prompt.
+
+    The env-var route (above) depends on RamaLama's config layering; field
+    testing showed the macOS applehv prompt can still fire. Patching
+    confirm_no_gpu at the seam is unconditional. (Field finding #8, 2026-07.)
+    """
+    try:
+        import ramalama.common as _rc
+
+        _rc.confirm_no_gpu = lambda name, provider: True
+    except Exception:
+        pass
+
+
 def ramalama_available() -> bool:
     try:
         import ramalama.common  # noqa: F401
@@ -46,6 +61,7 @@ def detect_accel() -> str:
     Returns "none" when ramalama is unavailable or no accelerator is found.
     """
     try:
+        _silence_prompts()
         from ramalama.common import get_accel
     except Exception:
         return "none"
@@ -101,6 +117,7 @@ def pull_model(model_uri: str, dryrun: bool = False, quiet: bool = False) -> str
     Raises RuntimeError with guidance if ramalama is not installed.
     """
     try:
+        _silence_prompts()
         from ramalama.transports.transport_factory import New
     except Exception as e:
         raise RuntimeError(

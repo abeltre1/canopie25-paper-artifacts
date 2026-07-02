@@ -32,8 +32,9 @@ def cloud_gpu() -> Location:
 
 def test_llamacpp_serve_cmd_space_style(llamacpp_box, cloud_gpu):
     cmd = engines.build_serve_cmd(llamacpp_box, cloud_gpu, "tiny.gguf")
-    # llama-server style: -m <model>, two-token flags (no '=')
-    assert cmd[:3] == ["llama-server", "-m", "tiny.gguf"]
+    # No explicit entrypoint => defer to the image ENTRYPOINT ("" sentinel):
+    # the upstream llama.cpp image keeps its binary off $PATH (field finding).
+    assert cmd[:3] == ["", "-m", "tiny.gguf"]
     i = cmd.index("--port")
     assert cmd[i + 1] == "8090"
     assert not any(a.startswith("--port=") for a in cmd)

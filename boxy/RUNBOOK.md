@@ -15,7 +15,7 @@ Be precise about what "tested" means. Three tiers:
 
 | Capability | Status | Where executed |
 | --- | --- | --- |
-| Unit/regression suite (113 tests, 96% cov) | **E** | CI sandbox |
+| Unit/regression suite (115 tests, 96% cov) | **E** | CI sandbox |
 | serve→inference→list→stop, llama.cpp on **Docker** | **E** | CI sandbox (air-gapped) |
 | `bench` sweep against a live endpoint | **E** | CI sandbox |
 | `pull` hf:// full repo through RamaLama | **E** | User's Mac (after SSL fix) |
@@ -44,7 +44,7 @@ pip install -e '.[ramalama,test]'
 uv venv .boxy && source .boxy/bin/activate
 uv pip install -e '.[ramalama,test]'
 
-pytest -q            # EXPECT: 113 passed (live Docker test skips if no Docker)
+pytest -q            # EXPECT: 115 passed (live Docker test skips if no Docker)
 boxy info            # EXPECT: version, ramalama available, your runtimes/schedulers
 ```
 
@@ -70,7 +70,8 @@ boxy pull --box examples/boxes/qwen-gguf.toml
 
 # 2.3 Serve it (llama.cpp engine; default image auto-resolves, multi-arch, CPU-OK)
 boxy serve --box examples/boxes/qwen-gguf.toml --location examples/locations/local.toml
-# EXPECT: the container line, then llama.cpp startup logs.
+# EXPECT: the container line (args follow the image directly — boxy defers to
+# the image's own ENTRYPOINT), then llama.cpp startup logs.
 
 # 2.4 In another terminal: query, bench, lifecycle
 curl -s http://127.0.0.1:8090/v1/models                       # EXPECT: qwen model id
@@ -82,10 +83,10 @@ boxy list                                                     # EXPECT: qwen-ggu
 boxy stop --box examples/boxes/qwen-gguf.toml                 # EXPECT: container gone
 ```
 
-**Do NOT serve `vllm-hf.toml` on a laptop** — `vllm/vllm-openai` is a
-linux/amd64 CUDA image (podman will print exactly that warning). It's for
-step 3. `boxy pull --box examples/boxes/vllm-hf.toml` on the laptop IS a
-valid test of the full-repo pull path.
+**Do NOT pull/serve the vLLM boxes on a laptop** — `vllm/vllm-openai` is a
+linux/amd64 CUDA image and ~20 GB (it can fill the podman VM disk). They're
+for step 3. A laptop `boxy pull --box examples/boxes/vllm-hf.toml` of the
+MODEL (~1 GB) is fine and valid.
 
 ## 3. Slurm + Podman + CUDA cluster (HOPS-class)
 
@@ -155,10 +156,12 @@ boxy launch --box ... --location ... --serve --down     # teardown
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `SSL: CERTIFICATE_VERIFY_FAILED` on pull | Python without CA bundle (uv/standalone) or TLS-intercepting proxy | `pip install certifi; export SSL_CERT_FILE=$(python3 -m certifi)` — or your site CA bundle. boxy now prints this remedy itself. |
-| Interactive *"proceed without GPU?"* prompt (macOS podman) | RamaLama's applehv check | Fixed — boxy suppresses it automatically. Re-enable: `export RAMALAMA_USER__NO_MISSING_GPU_PROMPT=false` |
+| Interactive *"proceed without GPU?"* prompt (macOS podman) | RamaLama's applehv check | Fixed — boxy patches the prompt away at the seam (hard guarantee, no env var needed). |
 | `huggingface cli download not available` | RamaLama 0.23's repo-pull fallback is unimplemented; the *direct* download failed first | boxy now shows the root-cause error + remedy instead of this dead-end message |
 | `workdir "..." does not exist on container` (Podman) | box sets a workdir no volume provides | Fixed in examples; boxy now warns before launch on any box with this pattern |
+| `executable file `llama-server` not found in $PATH` | upstream llama.cpp image keeps its binary at /app/llama-server, off $PATH | Fixed — boxes without an explicit entrypoint defer to the image's own ENTRYPOINT (podman/docker pass args only; apptainer uses `run`) |
 | `image platform (linux/amd64) does not match ... (linux/arm64)` | vLLM images are amd64/CUDA | Expected on Apple Silicon — use `qwen-gguf.toml` locally; vLLM boxes belong on the cluster |
+| `no space left on device` pulling vLLM image (podman machine) | vLLM images are ~20 GB; the podman VM disk is small | `podman system prune -a`; do vLLM pulls on the cluster, or grow the VM: `podman machine stop && podman machine set --disk-size 200` |
 | `no container runtime found on host` | login node without podman/docker/apptainer | set `[location].runtime` explicitly / load the site's container module |
 | Rootless podman fails inside `salloc`/`flux alloc` | stale XDG session vars | boxy unsets `XDG_SESSION_ID`/`XDG_RUNTIME_DIR` automatically at launch |
 | Port already in use | previous serve still running | `boxy list` then `boxy stop --box <box>` |

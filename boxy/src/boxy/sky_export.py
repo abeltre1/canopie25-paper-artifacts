@@ -39,8 +39,13 @@ def to_sky_task(
         model_note = "# model is fetched by the engine at task start (cloud VM needs network)"
     else:
         model_path = box.model
-    run_cmd = shlex.join(engines.build_serve_cmd(box, location, model_path, port=resolved_port,
-                                                 extra_args=extra_args))
+    serve_cmd = engines.build_serve_cmd(box, location, model_path, port=resolved_port,
+                                        extra_args=extra_args)
+    if serve_cmd and serve_cmd[0] == "":
+        # Sky's `run:` executes in a shell, not via the image ENTRYPOINT, so
+        # the deferred-entrypoint sentinel needs a concrete binary here.
+        serve_cmd[0] = "/app/llama-server"  # upstream ghcr llama.cpp image layout
+    run_cmd = shlex.join(serve_cmd)
     env = envs.build_env(box.env, location.accelerator or "none", location.offline, engine=box.engine)
 
     lines: list[str] = [
