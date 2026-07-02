@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boxy-hpc"
+version = "0.1.0"
+description = "Unified, site-portable, offline-first CLI for containerized GenAI serving on HPC"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Angel M. Beltre" }]
+keywords = ["hpc", "genai", "vllm", "apptainer", "podman", "slurm", "flux"]
+
+# RamaLama is an optional (but recommended) library dependency: boxy degrades
+# gracefully without it (no accelerator autodetect, no transport pulls).
+# Pinned to a minor series because its internals carry no API promise.
+[project.optional-dependencies]
+ramalama = ["ramalama==0.23.*"]
+test = ["pytest"]
+
+[project.scripts]
+boxy = "boxy.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

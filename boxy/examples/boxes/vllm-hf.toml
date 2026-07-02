@@ -1,0 +1,13 @@
+# vLLM box whose model is pulled by transport URI (requires boxy[ramalama]).
+# On connected systems: boxy pull --box vllm-hf.toml
+# On air-gapped systems: prefer a path-based model (see vllm.toml).
+[box]
+name = "vllm-hf"
+image = "vllm/vllm-openai:v0.9.1"
+entrypoint = "vllm"
+model = "hf://Qwen/Qwen2.5-0.5B-Instruct"
+workdir = "/vllm-workspace/models"
+ports = [8000]
+
+[box.args]
+seed = 12345

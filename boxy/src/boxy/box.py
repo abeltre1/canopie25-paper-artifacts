@@ -1,0 +1,54 @@
+"""The `box` abstraction: the containerized application/service (the *what*).
+
+A box is runtime- and accelerator-agnostic: it never names Podman, Apptainer,
+CUDA, or ROCm. Those come from the `location` (see location.py).
+"""
+
+from __future__ import annotations
+
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+TRANSPORT_SCHEMES = ("hf://", "huggingface://", "ollama://", "oci://", "ms://", "modelscope://", "rlcr://")
+
+
+@dataclass
+class Volume:
+    source: str
+    target: str
+    options: str = ""
+
+
+@dataclass
+class Box:
+    name: str
+    image: str
+    entrypoint: str = ""
+    model: str = ""
+    workdir: str = ""
+    ports: list[int] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    volumes: list[Volume] = field(default_factory=list)
+    # Engine args appended last, without overriding user-supplied args
+    # (the prototype's "tack on last" rule from common_boxy.sh).
+    args: dict[str, object] = field(default_factory=dict)
+
+    @property
+    def model_is_transport_uri(self) -> bool:
+        return self.model.startswith(TRANSPORT_SCHEMES)
+
+    @classmethod
+    def from_toml(cls, path: str | Path) -> "Box":
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        section = data.get("box")
+        if section is None:
+            raise ValueError(f"{path}: missing [box] section")
+        volumes = [Volume(**v) for v in section.pop("volumes", [])]
+        env = {k: str(v) for k, v in section.pop("env", {}).items()}
+        known = {f.name for f in cls.__dataclass_fields__.values()} - {"volumes", "env"}
+        unknown = set(section) - known
+        if unknown:
+            raise ValueError(f"{path}: unknown [box] keys: {sorted(unknown)}")
+        return cls(volumes=volumes, env=env, **section)
