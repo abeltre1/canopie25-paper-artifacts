@@ -42,7 +42,15 @@ boxy run --box examples/boxes/vllm.toml --location examples/locations/hops.toml 
 
 # Pull a model by transport URI (via RamaLama: hf://, ollama://, oci://):
 boxy pull --box examples/boxes/vllm-hf.toml
+
+# Lifecycle: list boxy-launched containers, stop one by box name:
+boxy list
+boxy stop --box examples/boxes/vllm.toml
 ```
+
+Boxes may omit `image`: boxy picks a default per engine + accelerator
+(vLLM defaults come from RamaLama's own plugin mapping; llama.cpp uses the
+upstream `ghcr.io/ggml-org/llama.cpp:server` image).
 
 Drop `--dryrun` to execute. The Eldorado dry-run reproduces the prototype's
 known-good command:
@@ -97,11 +105,13 @@ sky serve up task.yaml      # managed serving (SkyServe replicas + readiness pro
 ## Tests
 
 ```bash
-pytest          # 37 golden-argv tests vs the prototype's known-good commands
+pytest          # 46 tests: golden-argv vs the prototype + one regression
+                # test per gap found in the feature-by-feature audit
 ```
 
 ## Not in the MVP (see SPEC.md §8)
 
 `boxy alloc` (interactive allocation), `boxy stage` (S3/shared-FS sync),
-`boxy bench` (ShareGPT sweeps), Enroot/Pyxis + Slurm `scrun` backends,
-sbatch/detached serving, and the SkyPilot cloud delegation.
+`boxy bench` (ShareGPT sweeps), Enroot/Pyxis + Slurm `scrun` backends, and
+sbatch/detached serving. The SkyPilot cloud path ships as `boxy generate sky`
+(direct `sky launch` invocation comes later).

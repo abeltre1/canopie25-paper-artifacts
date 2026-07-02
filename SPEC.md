@@ -225,7 +225,7 @@ Config → get_accel → New/pull → accel_image →    │
 | `Config()` / `DefaultConfig()` | config.py:213/343 | programmatic config; **must set engine/container/image explicitly** (defaults probe the host) | clean |
 | `transport_factory.New()` + `ensure_model_exists()` | transport_factory.py:180, base.py:585 | `boxy pull` for `hf://`, `ollama://`, `oci://`, … | needs-shim |
 | `GlobalModelStore(base_path)` | global_store.py:22 | local store on scratch/shared FS | clean |
-| `VllmPlugin.get_container_image()` | plugins/…/vllm.py:94 | GPU→image selection | clean |
+| `VllmPlugin.get_container_image()` | plugins/…/vllm.py:94 | GPU→image selection; powers boxy's default images | clean |
 | `Engine`/`BaseEngine` command assembly | engine.py | **not reused** — constructor eagerly emits podman argv (fork-worthy); patterns only | — |
 
 Contract notes: args are duck-typed via `getattr` against the Protocols in
@@ -250,10 +250,49 @@ file). **SkyServe serving is not supported on Slurm.**
 
 | boxy need | SkyPilot asset | Mode |
 | --- | --- | --- |
-| Cloud provisioning + cloud serving | `sky.launch()` / `sky serve up` (`sky/client/sdk.py`) | **CALL** — Phase 5: transpile box+cloud-location → sky task YAML (`image_id`, `run`, `accelerators`, `service.readiness_probe`) and delegate; inherit 20+ clouds and SkyServe for free |
+| Cloud provisioning + cloud serving | `sky.launch()` / `sky serve up` (`sky/client/sdk.py`) | **CALL** — `boxy generate sky` ships today; direct invocation later. Inherit 20+ clouds and SkyServe for free |
 | Slurm sbatch + container job plumbing | `sky/provision/slurm/instance.py` | **COPY PATTERN** (Apache-2.0 permits lifting with attribution) — informs boxy's future Enroot/Pyxis backend and detached `sbatch` serving |
 | Serving with a stable route | `sky/serve/` (readiness-probe-gated replica pool, least-load router, replica=one job, re-launch on failure) | **COPY PATTERN** — reimplement against Slurm/Flux jobs for HPC serving (Phase 3+) |
 | Whole framework | client–server core, cloud catalogs, optimizer | **DO NOT VENDOR** — drags in the API server and cloud assumptions |
+
+---
+
+## 3d. What Each Tool Gives You — boxy vs SkyPilot vs RamaLama
+
+The three tools are complements, not substitutes. boxy *uses* the other two
+where they are strongest and owns only what neither can do.
+
+| Capability | **boxy** | **SkyPilot** | **RamaLama** |
+| --- | --- | --- | --- |
+| Serve an LLM on Slurm/Flux | ✅ native (srun/`flux run`; sbatch Phase 3) | ❌ Slurm = batch jobs only; SkyServe unsupported there | ❌ no scheduler concept |
+| Apptainer/SIF runtime | ✅ first-class + auto OCI→SIF | ❌ (Enroot/Pyxis only on Slurm) | ❌ (Podman/Docker only) |
+| Podman / Docker | ✅ builders + `boxy.box` labels | Docker on cloud/K8s | ✅ core strength |
+| Enroot / Pyxis | planned (Phase 3, copying SkyPilot's builder) | ✅ its Slurm container path | ❌ |
+| Cloud provisioning (20+ clouds, spot, optimizer) | ➡️ delegated: `boxy generate sky` | ✅ core strength | ❌ |
+| Managed cloud serving (replicas, LB, autoscale) | ➡️ delegated: `sky serve up` on boxy-generated YAML | ✅ SkyServe (cloud/K8s only) | ❌ |
+| Model transports (hf/ollama/oci/modelscope) + store | ✅ **via RamaLama as a library** | ❌ (file_mounts / buckets / in-task downloads) | ✅ core strength |
+| GPU autodetect (CUDA/ROCm/Intel/…) | ✅ **via RamaLama `get_accel()`** | cloud-catalog driven | ✅ core strength |
+| Default image per engine+accelerator | ✅ via RamaLama's vLLM plugin mapping | `image_id` manual | ✅ core strength |
+| Air-gapped / no control plane | ✅ by design (serverless, offline env, local staging) | ❌ API server + catalogs | partial (local once pulled) |
+| One definition → many sites | ✅ `box` + `location` | task YAML (cloud-centric resources) | ❌ single-host |
+| Multi-node tensor-parallel serving on HPC | Phase 3 (Ray-on-Slurm pattern) | ❌ on Slurm | ❌ |
+| Local dev serving UX (`run`/`serve` on a laptop) | ✅ (scheduler=none) | not its job | ✅ core strength |
+| Benchmarking workflow | Phase 4 (paper's ShareGPT sweep) | ❌ | ✅ (`ramalama bench`, llama.cpp) |
+
+**Division of labor in one line:** RamaLama supplies the *model layer*
+(transports, store, GPU detect, image maps) as a pinned library; SkyPilot
+supplies the *cloud layer* behind `boxy generate sky`; boxy owns the *HPC
+layer* (Apptainer/Podman × Slurm/Flux × CUDA/ROCm, offline) and the single
+`box`/`location` UX over all three.
+
+**Do we still want RamaLama? Yes — as a library, not as the tool.** boxy now
+leverages four of its subsystems through one seam file (`ramalama_shim.py`):
+accelerator autodetect (`get_accel`), accelerator env/device maps, model
+transports + store (`boxy pull`), and the vLLM plugin's accelerator→image
+mapping (default images when a box omits `image`). Adopting the *entire* tool
+would mean inheriting its podman-hardcoded execution path and CLI/daemon —
+the exact single-host coupling boxy exists to escape — so full adoption is
+explicitly rejected (§6, option B analysis).
 
 ---
 
@@ -271,7 +310,7 @@ A generalization of the vLLM block in `common_boxy.sh`.
 # boxes/vllm-llama4-scout.toml
 [box]
 name          = "vllm-llama4-scout"
-image         = "vllm/vllm-openai:v0.9.1"   # OCI ref; SIF derived per-runtime
+image         = "vllm/vllm-openai:v0.9.1"   # optional; default per engine+accelerator
 entrypoint    = "vllm"
 model         = "hf://meta-llama/Llama-4-Scout-17B-16E-Instruct"
 workdir       = "/vllm-workspace/models"
@@ -374,9 +413,10 @@ takes `--box` and `--location` (or uses the active defaults).
 | `boxy build` | Build/convert image for the location's runtime (OCI→SIF for Apptainer, etc.). | `accel_image()` | SIF build (auto from OCI) |
 | `boxy serve` | Launch the box as a service (vLLM/llama.cpp) via the selected runtime + scheduler; expose OpenAI-compatible endpoint. | RamaLama runtime plugins | runtime backend + scheduler submit + routing |
 | `boxy run` | Interactive / one-shot inference against a box. | RamaLama `run` | scheduler-aware launch |
+| `boxy generate sky` | Transpile box+location to a SkyPilot task YAML (cloud path). | SkyPilot (delegated) | transpiler |
 | `boxy bench` | Throughput/latency sweep (ShareGPT, batch 1–1024); emit plot-ready data. | (wrap a proven offline benchmarker, e.g. GuideLLM) | batch sweep + result export |
-| `boxy list` | List boxes, locations, and running services. | RamaLama `list` | scheduler job state |
-| `boxy stop` | Stop a running service / cancel its job. | RamaLama `stop` | `scancel` / `flux cancel` |
+| `boxy list` | List running boxy-launched containers (label `boxy.box`). | — | scheduler job state (later) |
+| `boxy stop` | Stop a running service / cancel its job. | — | `scancel` / `flux cancel` (later) |
 | `boxy info` | Show detected accelerator, available runtimes, scheduler, site config. | `get_accel()`, `get_default_engine()` | scheduler/runtime probe |
 
 A typical HPC session:
@@ -488,8 +528,8 @@ leverages both projects *behind seams*, absorbing neither.**
   vendoring ~300 lines of accelerator probes under MIT attribution.
 - **SkyPilot → optional cloud backend behind a subprocess/SDK boundary.**
   Never a hard dependency (its API-server model must not infect the air-gapped
-  path). Phase 5 adds a `cloud` location kind that transpiles to a sky task
-  YAML and calls `sky launch` / `sky serve up`.
+  path). `boxy generate sky` ships today; direct `sky launch`/`sky serve up`
+  invocation is the remaining Phase 5 work.
 - **Why not fully standalone (absorb everything)?** Neither project's gaps can
   be configured away — RamaLama has no HPC layer, SkyPilot can't serve on
   Slurm or run air-gapped — so `boxy` must own the HPC layer *either way*.
@@ -533,11 +573,14 @@ SkyPilot are implementation details it can swap out.
 ## 8. Phased Roadmap
 
 - **Phase 1 — Core. ✅ implemented in this repo (`boxy/`).** `box`/`location`
-  TOML model + `boxy serve`/`run`/`info`/`build`/`pull`; Podman + Apptainer +
-  Docker backends; CUDA + ROCm; srun/`flux run` wrapping; module-load
-  preamble; offline env injection; OCI→SIF auto-build; RamaLama seam
-  (`ramalama_shim.py`) with graceful degradation. 30 golden-argv tests
-  reproduce the prototype's known-good commands for HOPS and Eldorado.
+  TOML model + `boxy serve`/`run`/`info`/`build`/`pull`/`stop`/`list`/
+  `generate sky`; Podman + Apptainer + Docker backends; vLLM + llama.cpp
+  engines; CUDA + ROCm; srun/`flux run` wrapping; module-load preamble;
+  offline env injection; OCI→SIF auto-build; RamaLama-informed default
+  images; RamaLama seam (`ramalama_shim.py`) with graceful degradation.
+  46 tests: golden-argv vs the prototype's known-good commands plus one
+  regression test per gap found in the feature-by-feature audit. Verified
+  live end-to-end (see `boxy/DEMO.md`).
 - **Phase 2 — Models & offline.** `boxy stage` (shared-FS + site-local S3
   sync); store-pulled models end-to-end on air-gapped sites; SIF caching
   policy.
@@ -548,8 +591,10 @@ SkyPilot are implementation details it can swap out.
   backends.
 - **Phase 4 — Benchmark.** `boxy bench` ShareGPT sweeps + plot export
   (reproduce `plots/`).
-- **Phase 5 — Cloud delegation.** `cloud` location kind transpiling to
-  SkyPilot task YAML (`sky launch` / `sky serve up`) as an optional extra.
+- **Phase 5 — Cloud delegation. ◐ started.** `boxy generate sky` ships
+  (box+location → SkyPilot task YAML, validated by SkyPilot 0.12.3's own
+  parser; hf:// models map to bare repo ids fetched in-task). Remaining:
+  boxy invoking `sky launch`/`sky serve up` directly as an optional extra.
 
 ---
 
