@@ -75,10 +75,29 @@ flux run -N2 --gpus-per-node=4 bash -lc 'module load rocm/6.4.0 && exec \
   lives in `src/boxy/ramalama_shim.py`; without it boxy still works with
   explicit locations and path-based models.
 
+## Seen in action
+
+[`DEMO.md`](DEMO.md) records a real end-to-end run: `boxy serve` launching a
+live llama.cpp OpenAI endpoint in a container (in a fully air-gapped sandbox)
+and answering `/v1/chat/completions`, plus the cloud-path YAML being accepted
+by SkyPilot 0.12.3 itself.
+
+## Cloud path (SkyPilot delegation)
+
+For cloud sites, boxy doesn't reimplement provisioning — it transpiles the
+same box+location into a SkyPilot task:
+
+```bash
+boxy generate sky --box examples/boxes/vllm.toml \
+     --location examples/locations/cloud-gpu.toml --serve -o task.yaml
+sky launch task.yaml        # batch, or:
+sky serve up task.yaml      # managed serving (SkyServe replicas + readiness probe)
+```
+
 ## Tests
 
 ```bash
-pytest          # 30 golden-argv tests vs the prototype's known-good commands
+pytest          # 37 golden-argv tests vs the prototype's known-good commands
 ```
 
 ## Not in the MVP (see SPEC.md §8)

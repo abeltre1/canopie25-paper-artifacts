@@ -103,6 +103,23 @@ def cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_generate(args: argparse.Namespace) -> int:
+    from boxy import sky_export
+
+    if args.format != "sky":
+        print(f"boxy generate: unknown format {args.format!r} (available: sky)", file=sys.stderr)
+        return 1
+    box, location = _load(args)
+    yaml_text = sky_export.to_sky_task(box, location, port=args.port, serve=args.serve)
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(yaml_text)
+        print(f"wrote {args.output}  (launch: sky {'serve up' if args.serve else 'launch'} {args.output})")
+    else:
+        print(yaml_text, end="")
+    return 0
+
+
 def _stub(name: str):
     def handler(args: argparse.Namespace) -> int:
         print(f"boxy {name}: {NOT_IN_MVP}", file=sys.stderr)
@@ -138,6 +155,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("build", help="build/convert the image for the location's runtime (OCI->SIF)")
     _add_common(p)
     p.set_defaults(func=cmd_build)
+
+    p = sub.add_parser("generate", help="transpile box+location to another orchestrator (cloud path)")
+    p.add_argument("format", choices=["sky"], help="output format (sky = SkyPilot task YAML)")
+    p.add_argument("--box", required=True)
+    p.add_argument("--location", required=True)
+    p.add_argument("--port", type=int, default=None)
+    p.add_argument("--serve", action="store_true", help="add a SkyServe service block (sky serve up)")
+    p.add_argument("-o", "--output", default=None, help="write YAML to file instead of stdout")
+    p.set_defaults(func=cmd_generate)
 
     for name, help_text in (
         ("alloc", "request nodes via the location's scheduler"),

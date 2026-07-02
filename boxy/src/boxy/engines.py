@@ -16,10 +16,13 @@ def _flag(key: str) -> str:
     return "--" + key.replace("_", "-")
 
 
-def _tack_on_last(cmd: list[str], extra: dict[str, object]) -> list[str]:
+def _tack_on_last(cmd: list[str], extra: dict[str, object], style: str = "eq") -> list[str]:
     """Append args unless the user already set them (prototype rule from
     common_boxy.sh: 'If user has already set any of these args, don't tack
-    them on (don't override the user).')."""
+    them on (don't override the user).').
+
+    style="eq" emits --key=value (vLLM style); style="space" emits
+    --key value as two tokens (llama.cpp's llama-server style)."""
     present = {a.split("=", 1)[0] for a in cmd if a.startswith("--")}
     for key, value in extra.items():
         flag = _flag(str(key))
@@ -28,8 +31,43 @@ def _tack_on_last(cmd: list[str], extra: dict[str, object]) -> list[str]:
         if isinstance(value, bool):
             if value:
                 cmd.append(flag)
+        elif style == "space":
+            cmd += [flag, str(value)]
         else:
             cmd.append(f"{flag}={value}")
+    return cmd
+
+
+def build_serve_cmd(
+    box: Box,
+    location: Location,
+    model_path: str,
+    host: str = "0.0.0.0",
+    port: int | None = None,
+    extra_args: list[str] | None = None,
+) -> list[str]:
+    """Dispatch to the box's inference engine (box.engine)."""
+    if box.engine == "llama.cpp":
+        return build_llamacpp_serve_cmd(box, location, model_path, host, port, extra_args)
+    return build_vllm_serve_cmd(box, location, model_path, host, port, extra_args)
+
+
+def build_llamacpp_serve_cmd(
+    box: Box,
+    location: Location,
+    model_path: str,
+    host: str = "0.0.0.0",
+    port: int | None = None,
+    extra_args: list[str] | None = None,
+) -> list[str]:
+    """llama.cpp OpenAI-compatible server argv (`llama-server -m <model> ...`)."""
+    entrypoint = box.entrypoint or "llama-server"
+    cmd = [entrypoint, "-m", model_path]
+    cmd += list(extra_args or [])
+    resolved_port = port or (box.ports[0] if box.ports else 8080)
+    cmd = _tack_on_last(cmd, {"host": host, "port": resolved_port}, style="space")
+    cmd = _tack_on_last(cmd, box.args, style="space")
+    cmd = _tack_on_last(cmd, location.tuning, style="space")
     return cmd
 
 

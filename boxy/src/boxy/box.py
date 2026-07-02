@@ -20,10 +20,14 @@ class Volume:
     options: str = ""
 
 
+ENGINES = ("vllm", "llama.cpp")
+
+
 @dataclass
 class Box:
     name: str
     image: str
+    engine: str = "vllm"  # inference engine inside the box: vllm | llama.cpp
     entrypoint: str = ""
     model: str = ""
     workdir: str = ""
@@ -33,6 +37,10 @@ class Box:
     # Engine args appended last, without overriding user-supplied args
     # (the prototype's "tack on last" rule from common_boxy.sh).
     args: dict[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.engine not in ENGINES:
+            raise ValueError(f"box {self.name}: unknown engine {self.engine!r} (expected {ENGINES})")
 
     @property
     def model_is_transport_uri(self) -> bool:

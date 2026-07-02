@@ -35,7 +35,13 @@ class Deployment:
 
 
 def _expand(value: str, location: Location) -> str:
-    return value.replace("${MODELS_DIR}", location.staging.models_dir)
+    value = value.replace("${MODELS_DIR}", location.staging.models_dir)
+    # Docker rejects relative bind-mount sources (and older Podman does too):
+    # absolutize against the CWD, mirroring how the prototype was always run
+    # from the workflow directory.
+    if value.startswith("."):
+        value = os.path.abspath(value)
+    return value
 
 
 def resolve_mounts(box: Box, location: Location) -> list[tuple[str, str, str]]:
@@ -71,7 +77,7 @@ def plan_serve(
     dryrun: bool = False,
 ) -> Deployment:
     model_path, extra_mounts = resolve_model(box, location, dryrun)
-    inner = engines.build_vllm_serve_cmd(box, location, model_path, port=port, extra_args=extra_args)
+    inner = engines.build_serve_cmd(box, location, model_path, port=port, extra_args=extra_args)
     return _plan(box, location, inner, extra_mounts, dryrun)
 
 
