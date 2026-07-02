@@ -165,6 +165,57 @@ def cmd_list(args: argparse.Namespace) -> int:
     return _run_or_print([runtime, "ps", "--filter", "label=boxy.box"], args.dryrun)
 
 
+def cmd_bench(args: argparse.Namespace) -> int:
+    from boxy import bench
+
+    box = Box.from_toml(args.box)
+    url = args.url or f"http://127.0.0.1:{box.ports[0] if box.ports else 8000}"
+    batch_sizes = [int(b) for b in args.batch_sizes.split(",")] if args.batch_sizes else bench.DEFAULT_BATCH_SIZES
+    if args.dryrun:
+        print(f"### Bench plan: url={url} batch_sizes={batch_sizes} max_tokens={args.max_tokens} "
+              f"dataset={args.dataset or 'synthetic'}")
+        return 0
+    report = bench.run_bench(url, batch_sizes, max_tokens=args.max_tokens, dataset=args.dataset)
+    if args.json:
+        print(report.to_json())
+    else:
+        print(f"# model={report.model} url={report.url} max_tokens={report.max_tokens}")
+        print(f"{'batch':>6} {'ok':>4} {'err':>4} {'req/s':>8} {'tok/s':>9} {'p50 ms':>9} {'p95 ms':>9}")
+        for r in report.results:
+            print(f"{r.batch_size:>6} {r.ok:>4} {r.errors:>4} {r.requests_per_s:>8.2f} "
+                  f"{r.tokens_per_s:>9.1f} {r.latency_p50_ms:>9.1f} {r.latency_p95_ms:>9.1f}")
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(report.to_csv())
+        print(f"wrote {args.output}")
+    return 0
+
+
+def cmd_launch(args: argparse.Namespace) -> int:
+    from boxy import cloud
+
+    box, location = _load(args)
+    if location.scheduler != "none":
+        print(
+            f"warning: location {location.name!r} uses scheduler={location.scheduler!r}; "
+            "`boxy launch` delegates to SkyPilot (cloud) — use `boxy serve` for Slurm/Flux",
+            file=sys.stderr,
+        )
+    if args.down:
+        cmd = cloud.launch_command(box, "", serve=args.serve, down=True)
+    else:
+        yaml_path = cloud.write_task_yaml(box, location, args.port, args.serve, output=args.output)
+        print(f"### Task YAML: {yaml_path}")
+        cmd = cloud.launch_command(box, yaml_path, serve=args.serve)
+    print(f"### Running Command:\n    {shlex.join(cmd)}")
+    if args.dryrun:
+        return 0
+    cloud.ensure_sky()
+    import subprocess
+
+    return subprocess.run(cmd).returncode
+
+
 def _stub(name: str):
     def handler(args: argparse.Namespace) -> int:
         print(f"boxy {name}: {NOT_IN_MVP}", file=sys.stderr)
@@ -210,6 +261,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", default=None, help="write YAML to file instead of stdout")
     p.set_defaults(func=cmd_generate)
 
+    p = sub.add_parser("bench", help="throughput/latency sweep against a served box (paper's step 5)")
+    p.add_argument("--box", required=True)
+    p.add_argument("--url", default=None, help="endpoint (default: http://127.0.0.1:<box port>)")
+    p.add_argument("--batch-sizes", default=None, help="comma list, default 1,2,4,...,1024")
+    p.add_argument("--max-tokens", type=int, default=32)
+    p.add_argument("--dataset", default=None, help="JSON list of prompts or ShareGPT JSON")
+    p.add_argument("-o", "--output", default=None, help="write plot-ready CSV here")
+    p.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    p.add_argument("--dryrun", action="store_true")
+    p.set_defaults(func=cmd_bench)
+
+    p = sub.add_parser("launch", help="launch the box on cloud via SkyPilot (delegated)")
+    p.add_argument("--box", required=True)
+    p.add_argument("--location", required=True)
+    p.add_argument("--port", type=int, default=None)
+    p.add_argument("--serve", action="store_true", help="managed serving via SkyServe (sky serve up)")
+    p.add_argument("--down", action="store_true", help="tear down instead of launching")
+    p.add_argument("-o", "--output", default=None, help="also keep the task YAML at this path")
+    p.add_argument("--dryrun", action="store_true")
+    p.set_defaults(func=cmd_launch)
+
     p = sub.add_parser("stop", help="stop a running boxy container (by box name)")
     p.add_argument("--box", required=True)
     p.add_argument("--location", default=None)
@@ -224,7 +296,6 @@ def build_parser() -> argparse.ArgumentParser:
     for name, help_text in (
         ("alloc", "request nodes via the location's scheduler"),
         ("stage", "stage models to shared FS / site-local S3"),
-        ("bench", "throughput/latency sweep"),
     ):
         p = sub.add_parser(name, help=f"{help_text} (post-MVP)")
         p.set_defaults(func=_stub(name))

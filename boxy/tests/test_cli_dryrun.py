@@ -101,5 +101,5 @@ def test_cli_pull_path_model_noop(capsys):
 
 
 def test_cli_stub_commands(capsys):
-    assert main(["bench"]) == 2
+    assert main(["stage"]) == 2
     assert "not implemented in the MVP" in capsys.readouterr().err

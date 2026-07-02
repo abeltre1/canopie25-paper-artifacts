@@ -17,6 +17,7 @@ keywords = ["hpc", "genai", "vllm", "apptainer", "podman", "slurm", "flux"]
 # Pinned to a minor series because its internals carry no API promise.
 [project.optional-dependencies]
 ramalama = ["ramalama==0.23.*"]
+cloud = ["skypilot>=0.12"]
 test = ["pytest"]
 
 [project.scripts]

@@ -46,6 +46,13 @@ boxy pull --box examples/boxes/vllm-hf.toml
 # Lifecycle: list boxy-launched containers, stop one by box name:
 boxy list
 boxy stop --box examples/boxes/vllm.toml
+
+# Benchmark a served box (paper's step 5): batch sweep, plot-ready CSV:
+boxy bench --box examples/boxes/vllm.toml --batch-sizes 1,2,4,8 -o results.csv
+
+# Cloud: launch the same box via SkyPilot (delegated; pip install 'boxy-hpc[cloud]'):
+boxy launch --box examples/boxes/vllm.toml --location examples/locations/cloud-gpu.toml --serve
+boxy launch --box examples/boxes/vllm.toml --location examples/locations/cloud-gpu.toml --serve --down
 ```
 
 Boxes may omit `image`: boxy picks a default per engine + accelerator
@@ -87,31 +94,29 @@ flux run -N2 --gpus-per-node=4 bash -lc 'module load rocm/6.4.0 && exec \
 
 [`DEMO.md`](DEMO.md) records a real end-to-end run: `boxy serve` launching a
 live llama.cpp OpenAI endpoint in a container (in a fully air-gapped sandbox)
-and answering `/v1/chat/completions`, plus the cloud-path YAML being accepted
-by SkyPilot 0.12.3 itself.
+and answering `/v1/chat/completions`, a live `boxy bench` sweep against it,
+plus the cloud-path YAML being accepted by SkyPilot 0.12.3 itself.
 
 ## Cloud path (SkyPilot delegation)
 
 For cloud sites, boxy doesn't reimplement provisioning — it transpiles the
-same box+location into a SkyPilot task:
+same box+location into a SkyPilot task and can launch it directly:
 
 ```bash
 boxy generate sky --box examples/boxes/vllm.toml \
      --location examples/locations/cloud-gpu.toml --serve -o task.yaml
-sky launch task.yaml        # batch, or:
-sky serve up task.yaml      # managed serving (SkyServe replicas + readiness probe)
+boxy launch --box examples/boxes/vllm.toml \
+     --location examples/locations/cloud-gpu.toml --serve   # sky serve up, delegated
 ```
 
 ## Tests
 
 ```bash
-pytest          # 46 tests: golden-argv vs the prototype + one regression
-                # test per gap found in the feature-by-feature audit
+pytest          # 55 tests: golden-argv vs the prototype, one regression test
+                # per audit gap, and bench tests against a real HTTP server
 ```
 
-## Not in the MVP (see SPEC.md §8)
+## Not yet implemented (see SPEC.md §8)
 
 `boxy alloc` (interactive allocation), `boxy stage` (S3/shared-FS sync),
-`boxy bench` (ShareGPT sweeps), Enroot/Pyxis + Slurm `scrun` backends, and
-sbatch/detached serving. The SkyPilot cloud path ships as `boxy generate sky`
-(direct `sky launch` invocation comes later).
+Enroot/Pyxis + Slurm `scrun` backends, and sbatch/detached serving.

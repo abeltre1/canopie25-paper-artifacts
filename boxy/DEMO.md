@@ -102,9 +102,33 @@ VALID: SkyPilot 0.12.3 accepted the task
 ```
 
 Launch it with `sky launch task.yaml` (batch) or `sky serve up task.yaml`
-(managed serving) on any machine with cloud credentials.
+(managed serving) on any machine with cloud credentials — or let boxy do it:
+`boxy launch --box … --location cloud-gpu.toml --serve`.
 
 We also confirmed, in SkyPilot 0.12.3's shipped source, that its Slurm
 support (`sky/provision/slurm/`) is Pyxis/Enroot-based and that serving is a
 cloud-side feature — reinforcing the division of labor in SPEC §6c: SkyPilot
 for cloud, boxy for HPC.
+
+## Phase 4 benchmarked live too
+
+`boxy bench` (self-contained stdlib load generator — works air-gapped) ran a
+real batch sweep against the boxy-served llama.cpp endpoint above:
+
+```console
+$ boxy bench --box examples/boxes/llamacpp-demo.toml --batch-sizes 1,2,4,8 \
+             --max-tokens 16 -o results.csv
+# model=tiny-llama-demo.gguf url=http://127.0.0.1:8090 max_tokens=16
+ batch   ok  err    req/s     tok/s    p50 ms    p95 ms
+     1    1    0     4.07      65.1     240.6     240.6
+     2    2    0    15.68     250.8     121.9     121.9
+     4    4    0    33.88     542.1      82.8     113.5
+     8    8    0    38.76     620.2     127.4     197.2
+wrote results.csv
+```
+
+Real requests, real token accounting from the engine's usage fields, and the
+throughput-vs-batch-size curve has exactly the shape of the paper's plots.
+The CSV columns are plot-ready (batch_size, req/s, tok/s, p50/p95 latency).
+On a cluster, point it at the paper's ShareGPT dataset with
+`--dataset ShareGPT_V3_unfiltered_cleaned_split.json --batch-sizes 1,...,1024`.
