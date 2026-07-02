@@ -109,11 +109,24 @@ boxy launch --box examples/boxes/vllm.toml \
      --location examples/locations/cloud-gpu.toml --serve   # sky serve up, delegated
 ```
 
+## Going to production
+
+**[`RUNBOOK.md`](RUNBOOK.md)** is the step-by-step path from fresh checkout to
+serving on your cluster — laptop first, then Slurm+CUDA, then Flux+ROCm — with
+expected output at each step, a test-provenance table (what has been *executed*
+vs. verified-by-construction), and a troubleshooting table covering every
+failure observed in real-user testing (SSL/CA bundles, macOS podman prompts,
+amd64-on-ARM, Podman workdir strictness).
+
 ## Tests
 
 ```bash
-pytest          # 55 tests: golden-argv vs the prototype, one regression test
-                # per audit gap, and bench tests against a real HTTP server
+pytest          # 113 tests, 96% line coverage (+ subprocess-covered paths):
+                # golden-argv vs the prototype, one regression test per audit
+                # gap, bench vs a real HTTP server, a degraded-mode suite run
+                # WITHOUT ramalama on the path, a live Docker cycle
+                # (serve -> inference -> list -> stop), and one regression
+                # test per field finding from real-user runs
 ```
 
 ## Not yet implemented (see SPEC.md §8)

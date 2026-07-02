@@ -32,6 +32,8 @@ def _load(args: argparse.Namespace) -> tuple[Box, Location]:
 def _emit(deployment, dryrun: bool) -> int:
     from boxy import deploy
 
+    for warning in deployment.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
     for prep in deployment.prepare_commands:
         print(f"### Prepare: {shlex.join(prep)}")
     print(f"### Running Command:\n    {shlex.join(deployment.command)}")
