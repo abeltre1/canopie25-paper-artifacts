@@ -2,7 +2,7 @@
 # Pair it with a location: boxy serve --box vllm.toml --location eldorado.toml
 [box]
 name = "vllm"
-image = "vllm/vllm-openai:v0.9.1"
+image = "vllm/vllm-openai:v0.24.0"  # latest (registry-verified); the paper used v0.9.1
 entrypoint = "vllm"
 # Relative path => resolved against workdir (the mounted ${MODELS_DIR});
 # also accepts hf://org/name to pull via RamaLama transports.

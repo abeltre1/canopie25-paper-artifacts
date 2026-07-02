@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 
 from boxy import engines, envs, ramalama_shim
@@ -32,6 +32,7 @@ class Deployment:
     command: list[str]
     prepare_commands: list[list[str]]
     env_unset: list[str]
+    warnings: list[str] = field(default_factory=list)
 
 
 def _expand(value: str, location: Location) -> str:
@@ -102,6 +103,16 @@ def _plan(
     scheduler = get_scheduler(location.scheduler)
     env = envs.build_env(box.env, accelerator, location.offline, engine=box.engine)
     mounts = resolve_mounts(box, location) + extra_mounts
+    warnings: list[str] = []
+    # Podman (unlike Docker) refuses to start when the workdir doesn't exist
+    # in the image; a workdir no volume provides is usually a box bug.
+    # (Field finding: Mac run-through, 2026-07.)
+    if box.workdir and not any(target == box.workdir for _, target, _ in mounts):
+        warnings.append(
+            f"box {box.name!r}: workdir {box.workdir!r} is not the target of any volume; "
+            "the image must already contain this directory or Podman will refuse to start "
+            "(drop `workdir` or add a [[box.volumes]] entry targeting it)"
+        )
     cmd = backend.build_command(box, location, inner_cmd, env, mounts, accelerator)
     cmd = scheduler.with_modules(cmd, location)
     cmd = scheduler.wrap(cmd, location)
@@ -115,6 +126,7 @@ def _plan(
         command=cmd,
         prepare_commands=prepare,
         env_unset=scheduler.host_env_fixups(),
+        warnings=warnings,
     )
 
 

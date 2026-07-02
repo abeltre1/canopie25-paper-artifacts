@@ -1,0 +1,9 @@
+# Laptop-friendly box (macOS/Linux, CPU, no GPU needed): llama.cpp engine,
+# multi-arch default image, single-file GGUF pull that needs no HF CLI.
+#   boxy pull  --box qwen-gguf.toml
+#   boxy serve --box qwen-gguf.toml --location ../locations/local.toml
+[box]
+name = "qwen-gguf"
+engine = "llama.cpp"
+model = "hf://Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+ports = [8090]

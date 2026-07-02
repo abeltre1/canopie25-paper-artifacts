@@ -20,6 +20,12 @@ from types import SimpleNamespace
 # keep boxy's output clean unless the user opts into verbosity.
 logging.getLogger("ramalama").setLevel(os.environ.get("BOXY_RAMALAMA_LOGLEVEL", "WARNING"))
 
+# ramalama's config prompts interactively on macOS when the podman machine has
+# no GPU (applehv). boxy must never block on a prompt — a pull doesn't need a
+# GPU. Users can still opt back in by exporting the variable themselves.
+# (Field finding: Mac run-through, 2026-07.)
+os.environ.setdefault("RAMALAMA_USER__NO_MISSING_GPU_PROMPT", "true")
+
 DEFAULT_STORE = os.path.expanduser(os.environ.get("BOXY_STORE", "~/.local/share/boxy/store"))
 
 
@@ -104,9 +110,43 @@ def pull_model(model_uri: str, dryrun: bool = False, quiet: bool = False) -> str
         ) from e
     args = _store_args(model_uri, dryrun=dryrun, quiet=quiet)
     transport = New(model_uri, args)
-    transport.ensure_model_exists(args)
+    try:
+        transport.ensure_model_exists(args)
+    except Exception as e:
+        raise RuntimeError(_pull_failure_message(model_uri, e)) from e
     # use_container=False, should_generate=False => host blob/snapshot path.
     return transport._get_entry_model_path(False, False, dryrun)
+
+
+def _pull_failure_message(model_uri: str, error: Exception) -> str:
+    """Actionable message with the ROOT cause. RamaLama's repo-pull fallback
+    masks the original URL error behind 'cli download not available'
+    (NotImplementedError in its v0.23 HF transport), so surface the chain.
+    (Field findings: Mac run-through, 2026-07.)"""
+    chain: list[str] = []
+    seen = 0
+    cursor: BaseException | None = error
+    while cursor is not None and seen < 6:
+        chain.append(str(cursor))
+        cursor = cursor.__cause__ or cursor.__context__
+        seen += 1
+    combined = " | ".join(chain)
+    msg = f"failed to pull {model_uri}: {chain[0]}"
+    if len(chain) > 1:
+        msg += f"\n  root cause: {chain[-1]}"
+    if "CERTIFICATE_VERIFY_FAILED" in combined:
+        msg += (
+            "\n  remedy: your Python has no usable CA bundle (common with uv/standalone builds"
+            " and TLS-intercepting proxies). Run:\n"
+            "    pip install certifi && export SSL_CERT_FILE=$(python3 -m certifi)\n"
+            "  or point SSL_CERT_FILE at your site's CA bundle."
+        )
+    if "cli download not available" in combined:
+        msg += (
+            "\n  note: RamaLama 0.23's HuggingFace full-repo CLI fallback is unimplemented;"
+            " the direct download above is the path that must succeed."
+        )
+    return msg
 
 
 def vllm_image_for(accelerator: str) -> str:
