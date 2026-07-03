@@ -16,7 +16,7 @@ load = ["rocm/6.4.0"]
 [location.staging]
 models_dir = "./models"
 
-[location.tuning]
+[location.tuning.vllm]
 # MI300a HBM is shared with the host CPU: leave memory for the OS
 # (paper finding; default 0.9 OOMs the node).
 gpu_memory_utilization = 0.7

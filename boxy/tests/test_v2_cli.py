@@ -42,7 +42,7 @@ def test_serve_model_dryrun_prints_decisions_and_command(gguf, capsys):
 
 
 def test_serve_without_model_or_box_is_usage_error(capsys):
-    assert main(["serve", "--dryrun"]) == 1
+    assert main(["serve", "--dryrun"]) == 2  # usage errors exit 2 (finding 51)
     assert "usage: boxy serve MODEL" in capsys.readouterr().err
 
 
@@ -221,7 +221,7 @@ def test_stop_by_positional_name(capsys):
 
 
 def test_stop_without_name_or_box_is_usage_error(capsys):
-    assert main(["stop", "--runtime", "docker"]) == 1
+    assert main(["stop", "--runtime", "docker"]) == 2  # usage errors exit 2 (finding 51)
     assert "boxy stop NAME" in capsys.readouterr().err
 
 

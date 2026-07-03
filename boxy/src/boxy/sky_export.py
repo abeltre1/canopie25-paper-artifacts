@@ -32,19 +32,34 @@ def to_sky_task(
     accelerator_type = getattr(location.resources, "accelerator_type", "")
     resolved_port = port or (box.ports[0] if box.ports else 8000)
     model_note = ""
+    hf_flags: list[str] | None = None
     if box.model_is_transport_uri:
         # On the cloud path the engine downloads the model itself at task
         # start: hf://Org/Name becomes the bare repo id vLLM/HF understand.
         model_path = box.model.split("://", 1)[1]
         model_note = "# model is fetched by the engine at task start (cloud VM needs network)"
+        if box.engine == "llama.cpp":
+            # llama-server can't fetch a repo via -m; it has dedicated HF
+            # download flags (sweep finding 43)
+            parts = model_path.split("/")
+            repo, filename = "/".join(parts[:2]), "/".join(parts[2:])
+            hf_flags = ["--hf-repo", repo] + (["--hf-file", filename] if filename else [])
     else:
         model_path = box.model
     serve_cmd = engines.build_serve_cmd(box, location, model_path, port=resolved_port,
                                         extra_args=extra_args)
+    if hf_flags is not None:
+        # replace '-m <repo-path>' with the HF download flags
+        m_index = serve_cmd.index("-m")
+        serve_cmd[m_index:m_index + 2] = hf_flags
     if serve_cmd and serve_cmd[0] == "":
         # Sky's `run:` executes in a shell, not via the image ENTRYPOINT, so
         # the deferred-entrypoint sentinel needs a concrete binary here.
-        serve_cmd[0] = "/app/llama-server"  # upstream ghcr llama.cpp image layout
+        # Layout differs per image family (sweep finding 42).
+        from boxy import ramalama_shim
+
+        serve_cmd[0] = (ramalama_shim.default_entrypoint(box.engine, box.image)
+                        or "/app/llama-server")  # ghcr llama.cpp keeps it off $PATH
     run_cmd = shlex.join(serve_cmd)
     env = envs.build_env(box.env, location.accelerator or "none", location.offline, engine=box.engine)
 

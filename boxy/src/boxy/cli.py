@@ -26,6 +26,10 @@ from boxy.schedulers import SCHEDULERS
 NOT_IN_MVP = "not implemented in the MVP — see SPEC.md §8 (roadmap) for the phase that adds it"
 
 
+class UsageError(ValueError):
+    """CLI misuse — exits 2 like argparse's own usage errors (finding 51)."""
+
+
 def _add_common(parser: argparse.ArgumentParser, location_required: bool = True) -> None:
     parser.add_argument("--box", required=True, help="path to a box TOML definition")
     parser.add_argument("--location", required=location_required, help="path to a location TOML definition")
@@ -105,55 +109,126 @@ def _probe_registries() -> int:
 
 def _resolve_or_load(args: argparse.Namespace):
     """v2 front door: positional MODEL with full auto-resolution; --box/--location
-    profiles still honored. MODEL and --box are alternatives: when --box is
-    given, positionals are extra engine args (the profile names the model)."""
+    profiles still honored. Explicit flags ALWAYS win over profile values, and
+    a profile's pinned scheduler/accelerator/runtime inform resolution (they
+    behave like flags — a slurm profile must not trip the login-node guard).
+    (Sweep findings 11/12/13/39/46.)"""
+    from dataclasses import replace as dc_replace
+
     from boxy import resolve
 
     if args.box and args.model:
-        # profile mode: the MODEL slot swallowed the first extra engine arg
-        args.args = [args.model] + list(args.args)
-        args.model = None
+        raise UsageError(
+            "MODEL and --box are mutually exclusive (the profile names its model); "
+            "extra engine args go after `--`"
+        )
     if not args.model and not args.box:
-        raise ValueError(
+        raise UsageError(
             f"usage: boxy {args.subcommand} MODEL   "
             f"(or: boxy {args.subcommand} --box box.toml [--location loc.toml])"
         )
+
+    profile = Location.from_toml(args.location) if args.location else None
+
     if args.box:
         box = Box.from_toml(args.box)
-        if args.location:
-            return box, Location.from_toml(args.location), []
-        location, decisions = resolve.auto_location(
-            runtime=args.runtime,
-            scheduler=args.scheduler,
-            accelerator=args.accelerator,
-            gpus=args.gpus,
-            nodes=args.nodes,
-            here=args.here,
-        )
+        decisions: list[str] = []
+        # explicit flags overlay the box profile
+        for field_name, value in (("name", args.name), ("image", args.image), ("engine", args.engine)):
+            if value:
+                box = dc_replace(box, **{field_name: value})
+                decisions.append(f"{field_name}: {value} (flag overrides profile)")
+        if profile is not None:
+            location = profile
+        else:
+            location, loc_decisions = resolve.auto_location(
+                runtime=args.runtime,
+                scheduler=args.scheduler,
+                accelerator=args.accelerator,
+                gpus=args.gpus or 0,
+                nodes=args.nodes or 1,
+                here=args.here,
+            )
+            decisions += loc_decisions
+        location = _overlay_location_flags(location, args, decisions)
         return box, location, decisions
+
+    # model mode: profile values act as defaults, explicit flags win
     r = resolve.resolve(
         args.model,
         engine=args.engine,
-        runtime=args.runtime,
-        scheduler=args.scheduler,
+        runtime=args.runtime or (profile.runtime or None if profile else None),
+        scheduler=args.scheduler or (profile.scheduler if profile and profile.scheduler != "none" else None),
         image=args.image,
         port=args.port,
-        gpus=args.gpus,
-        nodes=args.nodes,
+        gpus=args.gpus or 0,
+        nodes=args.nodes or 1,
         name=args.name,
-        accelerator=args.accelerator,
+        accelerator=args.accelerator or (profile.accelerator or None if profile else None),
         here=args.here,
         require_exists=not args.dryrun,
     )
-    if args.location:  # location profile + bare model is a valid mix (cluster profiles)
-        location = Location.from_toml(args.location)
+    if profile is not None:
+        # keep the profile's site details (modules/tuning/offline/staging/
+        # scheduler_args) but overlay explicit flags, and fill fields the
+        # profile leaves to autodetection from this resolution
+        location = _overlay_location_flags(profile, args, r.decisions)
+        fill = {}
+        if not location.runtime:
+            fill["runtime"] = r.location.runtime
+        if not location.accelerator:
+            fill["accelerator"] = r.location.accelerator
+        if fill:
+            location = dc_replace(location, **fill)
         return r.box, location, r.decisions
     return r.box, r.location, r.decisions
 
 
+def _overlay_location_flags(location: Location, args: argparse.Namespace,
+                            decisions: list[str]) -> Location:
+    """Explicit --runtime/--accelerator/--scheduler/--gpus/--nodes override a
+    loaded location profile (finding 12/40: they were silently ignored)."""
+    from dataclasses import replace as dc_replace
+
+    from boxy.location import Resources
+
+    updates = {}
+    for field_name, value in (("runtime", args.runtime), ("accelerator", args.accelerator),
+                              ("scheduler", args.scheduler)):
+        if value and getattr(location, field_name) != value:
+            updates[field_name] = value
+            decisions.append(f"{field_name}: {value} (flag overrides profile)")
+    resources = location.resources
+    if args.gpus is not None and args.gpus != resources.gpus_per_node:
+        resources = Resources(nodes=resources.nodes, gpus_per_node=args.gpus,
+                              accelerator_type=resources.accelerator_type)
+        decisions.append(f"gpus-per-node: {args.gpus} (flag overrides profile)")
+    if args.nodes is not None and args.nodes != resources.nodes:
+        resources = Resources(nodes=args.nodes, gpus_per_node=resources.gpus_per_node,
+                              accelerator_type=resources.accelerator_type)
+        decisions.append(f"nodes: {args.nodes} (flag overrides profile)")
+    if resources is not location.resources:
+        updates["resources"] = resources
+    return dc_replace(location, **updates) if updates else location
+
+
+def _toml_value(value) -> str:
+    """TOML-safe scalar: json.dumps escapes quotes/backslashes for strings
+    and matches TOML syntax for ints/floats/bools (finding 5/15)."""
+    import json
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(str(value))
+
+
 def _save_profile(prefix: str, box, location) -> None:
-    """Snapshot the resolved configuration to TOML profiles (reproducibility,
-    air-gapped sites, code review of what will run)."""
+    """Snapshot the resolved configuration to TOML profiles. Full fidelity:
+    env/volumes/args and modules/tuning/staging are serialized too — a
+    'reproducibility snapshot' that reloads into a different deployment is
+    worse than none (findings 0/9/48)."""
     header = (
         "# written by `boxy --save-profile`: values autodetected on the node where\n"
         "# it ran — review accelerator/runtime before reusing on a different node.\n"
@@ -162,18 +237,49 @@ def _save_profile(prefix: str, box, location) -> None:
     for key in ("name", "image", "engine", "entrypoint", "model", "workdir"):
         value = getattr(box, key)
         if value:
-            box_lines.append(f'{key} = "{value}"')
+            box_lines.append(f"{key} = {_toml_value(value)}")
     if box.ports:
-        box_lines.append(f"ports = {box.ports}")
+        box_lines.append(f"ports = {[int(p) for p in box.ports]}")
+    if box.env:
+        box_lines.append("[box.env]")
+        box_lines += [f"{k} = {_toml_value(v)}" for k, v in box.env.items()]
+    if box.args:
+        box_lines.append("[box.args]")
+        box_lines += [f"{k} = {_toml_value(v)}" for k, v in box.args.items()]
+    for volume in box.volumes:
+        box_lines.append("[[box.volumes]]")
+        box_lines.append(f"source = {_toml_value(volume.source)}")
+        box_lines.append(f"target = {_toml_value(volume.target)}")
+        if volume.options:
+            box_lines.append(f"options = {_toml_value(volume.options)}")
+
     loc_lines = [header + "[location]"]
     for key in ("name", "scheduler", "accelerator", "runtime", "registry"):
         value = getattr(location, key)
         if value:
-            loc_lines.append(f'{key} = "{value}"')
+            loc_lines.append(f"{key} = {_toml_value(value)}")
     if location.offline:
         loc_lines.append("offline = true")
+    if location.modules:
+        loc_lines.append(f"modules = {[str(m) for m in location.modules]!r}".replace("'", '"'))
+    if location.scheduler_args:
+        loc_lines.append(f"scheduler_args = {[str(a) for a in location.scheduler_args]!r}".replace("'", '"'))
     loc_lines += ["[location.resources]", f"nodes = {location.resources.nodes}",
                   f"gpus_per_node = {location.resources.gpus_per_node}"]
+    if location.staging.models_dir != "./models" or location.staging.s3_endpoint:
+        loc_lines.append("[location.staging]")
+        loc_lines.append(f"models_dir = {_toml_value(location.staging.models_dir)}")
+        if location.staging.s3_endpoint:
+            loc_lines.append(f"s3_endpoint = {_toml_value(location.staging.s3_endpoint)}")
+    if location.tuning:
+        flat = {k: v for k, v in location.tuning.items() if not isinstance(v, dict)}
+        nested = {k: v for k, v in location.tuning.items() if isinstance(v, dict)}
+        if flat:
+            loc_lines.append("[location.tuning]")
+            loc_lines += [f"{k} = {_toml_value(v)}" for k, v in flat.items()]
+        for engine_name, table in nested.items():
+            loc_lines.append(f'[location.tuning.{_toml_value(engine_name)}]')
+            loc_lines += [f"{k} = {_toml_value(v)}" for k, v in table.items()]
     with open(f"{prefix}.box.toml", "w") as f:
         f.write("\n".join(box_lines) + "\n")
     with open(f"{prefix}.location.toml", "w") as f:
@@ -327,6 +433,10 @@ def _inner_serve_command(args, model: str, name: str) -> str:
     base = [boxy_bin] if boxy_bin else [sys.executable, "-m", "boxy.cli"]
     inner = base + ["serve", model, "--foreground", "--here",
                     "--name", name, "--endpoint-file", str(jobs.endpoint_path(name))]
+    if args.location:
+        # the profile's runtime/offline/tuning/staging must reach the compute
+        # node too, not just its batch directives (finding 38); shared FS
+        inner += ["--location", os.path.abspath(args.location)]
     for flag, value in (("--engine", args.engine), ("--image", args.image),
                         ("--runtime", args.runtime), ("--accelerator", args.accelerator)):
         if value:
@@ -352,9 +462,26 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
     for line in decisions:
         print(f"  auto: {line}")
 
-    location = profile or Location(
-        name="auto", scheduler=scheduler_name,
-        resources=Resources(nodes=args.nodes, gpus_per_node=args.gpus))
+    if profile is not None:
+        location = profile
+        resources = location.resources
+        # explicit flags win over the profile's job geometry (finding 40)
+        if args.gpus is not None and args.gpus != resources.gpus_per_node:
+            resources = Resources(nodes=resources.nodes, gpus_per_node=args.gpus,
+                                  accelerator_type=resources.accelerator_type)
+        if args.nodes is not None and args.nodes != resources.nodes:
+            resources = Resources(nodes=args.nodes, gpus_per_node=resources.gpus_per_node,
+                                  accelerator_type=resources.accelerator_type)
+        if resources is not location.resources:
+            from dataclasses import replace as dc_replace
+
+            location = dc_replace(location, resources=resources)
+            print(f"  auto: job geometry: {resources.nodes} node(s) x "
+                  f"{resources.gpus_per_node} GPU(s) (flags override profile)")
+    else:
+        location = Location(
+            name="auto", scheduler=scheduler_name,
+            resources=Resources(nodes=args.nodes or 1, gpus_per_node=args.gpus or 0))
     scheduler = get_scheduler(scheduler_name)
     site_args = list(location.scheduler_args)
     for kind, value in (("partition", args.partition), ("account", args.account), ("time", args.time)):
@@ -484,7 +611,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if getattr(args, "save_profile", None):
         _save_profile(args.save_profile, deployment.box, deployment.location)
 
-    port = args.port or (deployment.box.ports[0] if deployment.box.ports else 8000)
+    port = deployment.port  # parsed from the ACTUAL command (findings 2/10/25/47/55)
     url = f"http://127.0.0.1:{port}"
     runtime_bin = deployment.command[0]
     cname = deployment.box.name
@@ -537,6 +664,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
         return deploy.execute(deployment)
 
     rc = deploy.execute(deployment)  # returns immediately (-d)
+    if rc == 0 and args.ready_timeout <= 0:
+        # 'launch, don't wait' spelling (finding 27)
+        print(f"### Launched (not waiting; --ready-timeout {args.ready_timeout:g})")
+        print(f"###   endpoint once loaded: {url}/v1     stop: boxy stop {cname}")
+        return 0
     if rc != 0:
         if "-p" in deployment.command:
             # macOS podman-machine: gvproxy refuses a port forward another
@@ -593,7 +725,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
             return 1
         model = box.model
     if not model:
-        raise ValueError("usage: boxy pull MODEL   (or: boxy pull --box box.toml)")
+        raise UsageError("usage: boxy pull MODEL   (or: boxy pull --box box.toml)")
     if not model.startswith(TRANSPORT_SCHEMES):
         print(f"model is a path ({model}); nothing to pull (shared-FS flow)")
         return 0
@@ -632,6 +764,9 @@ def cmd_generate(args: argparse.Namespace) -> int:
         print(f"boxy generate: unknown format {args.format!r} (available: sky)", file=sys.stderr)
         return 1
     box, location = _load(args)
+    from boxy.deploy import _apply_defaults
+
+    box = _apply_defaults(box, location.resolve_accelerator())  # finding 41: empty image_id
     if location.scheduler != "none":
         print(
             f"warning: location {location.name!r} uses scheduler={location.scheduler!r}; the SkyPilot "
@@ -649,6 +784,8 @@ def cmd_generate(args: argparse.Namespace) -> int:
 
 
 def _container_runtime(location: Location | None) -> str:
+    from boxy import resolve
+
     if location is not None and location.runtime:
         if location.runtime == "apptainer":
             raise RuntimeError(
@@ -656,6 +793,11 @@ def _container_runtime(location: Location | None) -> str:
                 "or cancel the job (scancel / flux cancel)"
             )
         return location.runtime
+    # viability, not PATH presence: serve picks the WORKING runtime, so the
+    # `boxy stop` printed in its banner must pick the same one (finding 24)
+    for candidate in ("podman", "docker"):
+        if shutil.which(candidate) and resolve._runtime_works(candidate):
+            return candidate
     for candidate in ("podman", "docker"):
         if shutil.which(candidate):
             return candidate
@@ -680,7 +822,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     elif args.box:
         target = Box.from_toml(args.box).name
     else:
-        raise ValueError("usage: boxy stop NAME   (names are printed at serve time and by `boxy list`)")
+        raise UsageError("usage: boxy stop NAME   (names are printed at serve time and by `boxy list`)")
 
     record = jobs.read_record(target)
     if record:
@@ -694,6 +836,11 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
     location = Location.from_toml(args.location) if args.location else None
     runtime = args.runtime or _container_runtime(location)
+    if not args.dryrun and _container_exists(runtime, target) and _container_label(runtime, target) != target:
+        raise RuntimeError(
+            f"container {target!r} was not created by boxy (no boxy.box label) — refusing to "
+            f"stop it; use `{runtime} stop {target}` directly if you own it"
+        )
     rc = _run_or_print([runtime, "stop", target], args.dryrun)
     if rc == 0 and not args.dryrun:
         # detached serves drop --rm so crash logs survive; clean up here
@@ -728,14 +875,25 @@ def cmd_list(args: argparse.Namespace) -> int:
 def cmd_bench(args: argparse.Namespace) -> int:
     from boxy import bench
 
+    from boxy import engines
+
     box = Box.from_toml(args.box)
-    url = args.url or f"http://127.0.0.1:{box.ports[0] if box.ports else 8000}"
+    default = box.ports[0] if box.ports else engines.default_port(box.engine)
+    url = args.url or f"http://127.0.0.1:{default}"
     batch_sizes = [int(b) for b in args.batch_sizes.split(",")] if args.batch_sizes else bench.DEFAULT_BATCH_SIZES
     if args.dryrun:
         print(f"### Bench plan: url={url} batch_sizes={batch_sizes} max_tokens={args.max_tokens} "
               f"dataset={args.dataset or 'synthetic'}")
         return 0
-    report = bench.run_bench(url, batch_sizes, max_tokens=args.max_tokens, dataset=args.dataset)
+    import urllib.error
+
+    try:
+        report = bench.run_bench(url, batch_sizes, max_tokens=args.max_tokens, dataset=args.dataset)
+    except (urllib.error.URLError, OSError, ConnectionError) as e:
+        raise RuntimeError(
+            f"cannot reach {url} ({getattr(e, 'reason', e)}) — is the box serving? "
+            f"(boxy list; or point --url at the endpoint from the READY banner)"
+        ) from e
     if args.json:
         print(report.to_json())
     else:
@@ -761,6 +919,9 @@ def cmd_launch(args: argparse.Namespace) -> int:
             "`boxy launch` delegates to SkyPilot (cloud) — use `boxy serve` for Slurm/Flux",
             file=sys.stderr,
         )
+    from boxy.deploy import _apply_defaults
+
+    box = _apply_defaults(box, location.resolve_accelerator())
     if args.down:
         cmd = cloud.launch_command(box, "", serve=args.serve, down=True)
     else:
@@ -812,8 +973,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="pin the accelerator (needed when submitting GPU jobs from GPU-less login nodes)")
     p.add_argument("--image", default=None, help="container image (default: per engine+accelerator)")
     p.add_argument("--port", type=int, default=None, help="serving port (default: engine default, next free)")
-    p.add_argument("--gpus", type=int, default=0, help="GPUs per node for the --scheduler job request")
-    p.add_argument("--nodes", type=int, default=1, help="node count for the --scheduler job request")
+    p.add_argument("--gpus", type=int, default=None, help="GPUs per node for the --scheduler job request")
+    p.add_argument("--nodes", type=int, default=None, help="node count for the --scheduler job request")
     p.add_argument("--name", default=None, help="container name (default: derived from the model)")
     p.add_argument("--partition", default=None,
                    help="partition/queue for --scheduler jobs (Slurm --partition, Flux --queue)")
@@ -945,6 +1106,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(f"'boxy {args.subcommand}' takes no engine args after --")
             args.args = list(args.args or []) + extra
         return args.func(args)
+    except UsageError as e:
+        print(f"boxy: error: {e}", file=sys.stderr)
+        return 2
     except (ValueError, RuntimeError, FileNotFoundError) as e:
         print(f"boxy: error: {e}", file=sys.stderr)
         return 1

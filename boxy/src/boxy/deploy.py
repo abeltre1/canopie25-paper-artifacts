@@ -33,14 +33,19 @@ class Deployment:
     prepare_commands: list[list[str]]
     env_unset: list[str]
     warnings: list[str] = field(default_factory=list)
+    # THE serving port: parsed from the actual inner command (user --port after
+    # `--` wins there), so banners/probes/publishing never disagree with the
+    # server. 0 for run-mode deployments with no port. (Sweep findings 2/10/25.)
+    port: int = 0
 
 
 def _expand(value: str, location: Location) -> str:
     value = value.replace("${MODELS_DIR}", location.staging.models_dir)
-    # Docker rejects relative bind-mount sources (and older Podman does too):
-    # absolutize against the CWD, mirroring how the prototype was always run
-    # from the workflow directory.
-    if value.startswith("."):
+    # Docker rejects relative bind-mount sources, and a bare relative source
+    # ('models') silently becomes an empty NAMED volume (sweep finding 60):
+    # absolutize every non-absolute source against the CWD, mirroring how
+    # the prototype was always run from the workflow directory.
+    if not os.path.isabs(value):
         value = os.path.abspath(value)
     return value
 
@@ -73,14 +78,17 @@ def resolve_model(box: Box, location: Location, dryrun: bool) -> tuple[str, list
 def _apply_defaults(box: Box, accelerator: str) -> Box:
     """RamaLama-informed default image for the box's engine + this location's
     accelerator (SPEC §3c: leverage, don't reinvent). Runs BEFORE the inner
-    command is built: some default images need an explicit entrypoint."""
+    command is built: some default images need an explicit entrypoint.
+
+    The entrypoint default applies to USER-PINNED images too (sweep finding
+    53: a pinned quay.io/ramalama/* image has no ENTRYPOINT, so deferral
+    launches nothing)."""
     if not box.image:
-        image = ramalama_shim.default_image(box.engine, accelerator)
-        box = replace(box, image=image)
-        if not box.entrypoint:
-            entrypoint = ramalama_shim.default_entrypoint(box.engine, image)
-            if entrypoint:
-                box = replace(box, entrypoint=entrypoint)
+        box = replace(box, image=ramalama_shim.default_image(box.engine, accelerator))
+    if not box.entrypoint:
+        entrypoint = ramalama_shim.default_entrypoint(box.engine, box.image)
+        if entrypoint:
+            box = replace(box, entrypoint=entrypoint)
     return box
 
 
@@ -95,7 +103,9 @@ def plan_serve(
     box = _apply_defaults(box, accelerator)
     model_path, extra_mounts = resolve_model(box, location, dryrun)
     inner = engines.build_serve_cmd(box, location, model_path, port=port, extra_args=extra_args)
-    return _plan(box, location, inner, extra_mounts, dryrun, accelerator)
+    deployment = _plan(box, location, inner, extra_mounts, dryrun, accelerator)
+    deployment.port = engines.serving_port(inner, box)
+    return deployment
 
 
 def plan_run(box: Box, location: Location, user_args: list[str], dryrun: bool = False) -> Deployment:
@@ -132,6 +142,13 @@ def _plan(
     # with a scheduler wrap the path may exist on the compute node instead.
     # (Field finding #10: Mac run-through, 2026-07.)
     for source, _target, _options in mounts:
+        if source == "/path/to/model":
+            continue  # ramalama's --dryrun placeholder for a not-yet-pulled model
+        if ":" in source:
+            warnings.append(
+                f"volume source {source!r} contains ':' — the --volume/--bind syntax cannot "
+                "escape it; rename the path"
+            )
         if os.path.isabs(source) and not os.path.exists(source):
             warnings.append(
                 f"volume source {source!r} does not exist on this host — podman/docker will fail "
@@ -141,7 +158,8 @@ def _plan(
     cmd = backend.build_command(box, location, inner_cmd, env, mounts, accelerator)
     cmd = scheduler.with_modules(cmd, location)
     cmd = scheduler.wrap(cmd, location)
-    prepare = backend.prepare(box, location, dryrun) if backend.image_format == "sif" else []
+    prepare = (backend.prepare(box, location, dryrun, accelerator=accelerator)
+               if backend.image_format == "sif" else [])
     return Deployment(
         box=box,
         location=location,

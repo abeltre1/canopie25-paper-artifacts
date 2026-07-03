@@ -21,17 +21,19 @@ ROCM_ARGS = [
 
 
 def _serve_ports(box: Box, inner_cmd: list[str]) -> list[int]:
-    """Ports to publish: the box's declared ports plus any --port in the
-    engine args (covers `boxy serve --port N` overrides)."""
-    ports = set(box.ports)
+    """Ports to publish. A --port in the engine args is the port the server
+    will ACTUALLY bind, so it replaces (not augments) the box's declared
+    ports — publishing the stale declared port binds the host port the user
+    was avoiding (finding 58)."""
+    from_cmd: set[int] = set()
     for i, arg in enumerate(inner_cmd):
         if arg == "--port" and i + 1 < len(inner_cmd) and inner_cmd[i + 1].isdigit():
-            ports.add(int(inner_cmd[i + 1]))
+            from_cmd.add(int(inner_cmd[i + 1]))
         elif arg.startswith("--port="):
             value = arg.split("=", 1)[1]
             if value.isdigit():
-                ports.add(int(value))
-    return sorted(ports)
+                from_cmd.add(int(value))
+    return sorted(from_cmd) if from_cmd else sorted(set(box.ports))
 
 
 class PodmanBackend(RuntimeBackend):

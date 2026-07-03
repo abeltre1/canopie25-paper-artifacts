@@ -18,8 +18,12 @@ class RuntimeBackend(ABC):
     def available(self) -> bool:
         return shutil.which(self.name) is not None
 
-    def prepare(self, box: Box, location: Location, dryrun: bool = False) -> list[list[str]]:
-        """Commands to run before launch (e.g. OCI->SIF build). Default: none."""
+    def prepare(self, box: Box, location: Location, dryrun: bool = False,
+                accelerator: str | None = None) -> list[list[str]]:
+        """Commands to run before launch (e.g. OCI->SIF build). `accelerator`
+        is the RESOLVED accelerator - the same one build_command receives, so
+        artifacts named per-accelerator (SIFs) match between build and run.
+        Default: none."""
         return []
 
     @abstractmethod

@@ -23,10 +23,15 @@ class ApptainerBackend(RuntimeBackend):
         # Prototype: SHORT_NAME="vllm-${TARGET}" -> vllm-cuda.sif
         return f"{box.name}-{accelerator}.sif"
 
-    def prepare(self, box: Box, location: Location, dryrun: bool = False) -> list[list[str]]:
-        """Auto-build the SIF from the OCI image if it doesn't exist."""
-        accelerator = location.accelerator or "none"
-        sif = self.sif_name(box, accelerator)
+    def prepare(self, box: Box, location: Location, dryrun: bool = False,
+                accelerator: str | None = None) -> list[list[str]]:
+        """Auto-build the SIF from the OCI image if it doesn't exist.
+
+        Uses the RESOLVED accelerator (sweep findings 3/37/54: naming the SIF
+        from the raw location field built '<name>-none.sif' on autodetect
+        locations while the run command exec'd '<name>-<detected>.sif')."""
+        resolved = accelerator if accelerator is not None else location.resolve_accelerator()
+        sif = self.sif_name(box, resolved)
         return [[self.name, "build", "--force", sif, f"docker://{self.image_ref(box, location)}"]]
 
     def gpu_args(self, accelerator: str) -> list[str]:

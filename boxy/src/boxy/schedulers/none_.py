@@ -15,6 +15,6 @@ class NoScheduler(Scheduler):
         # Even with no launcher prefix we may be *inside* an interactive
         # allocation; rootless podman needs the XDG session vars cleared there
         # (prototype: check_podman in common_boxy.sh).
-        if os.environ.get("SLURM_JOB_ID") or os.environ.get("FLUX_ENCLOSING_ID"):
+        if os.environ.get("SLURM_JOB_ID") or os.environ.get("FLUX_ENCLOSING_ID") or os.environ.get("FLUX_JOB_ID"):
             return ["XDG_SESSION_ID", "XDG_RUNTIME_DIR"]
         return []

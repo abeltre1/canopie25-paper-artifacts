@@ -87,7 +87,7 @@ serve is foreground: stop with Ctrl-C or `scancel`/`flux cancel`.
 ```
 ### Prepare: apptainer build --force qwen-gguf-rocm.sif docker://quay.io/ramalama/rocm:latest
 ### Running Command:
-    flux run -N2 --gpus-per-node=4 bash -lc 'module load rocm/6.4.0 && exec apptainer exec --fakeroot --writable-tmpfs --cleanenv --no-home --bind /path/to/model:/mnt/models/model:ro --env HF_HOME=/root/.cache/huggingface --rocm --env OMP_NUM_THREADS=1 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env HF_HUB_DISABLE_TELEMETRY=1 --env VLLM_NO_USAGE_STATS=1 --env DO_NOT_TRACK=1 --env HF_HUB_ENABLE_HF_TRANSFER=0 qwen-gguf-rocm.sif llama-server -m /mnt/models/model --host 0.0.0.0 --port 8090 --gpu-memory-utilization 0.7'
+    flux run -N2 --gpus-per-node=4 bash -lc 'module load rocm/6.4.0 && exec apptainer exec --fakeroot --writable-tmpfs --cleanenv --no-home --bind /path/to/model:/mnt/models/model:ro --env HF_HOME=/root/.cache/huggingface --rocm --env OMP_NUM_THREADS=1 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env HF_HUB_DISABLE_TELEMETRY=1 --env VLLM_NO_USAGE_STATS=1 --env DO_NOT_TRACK=1 --env HF_HUB_ENABLE_HF_TRANSFER=0 qwen-gguf-rocm.sif llama-server -m /mnt/models/model --host 0.0.0.0 --port 8090'
 ```
 
 ### llama.cpp + docker + flux  (`flux-docker-rocm.toml`)
@@ -104,14 +104,14 @@ serve is foreground: stop with Ctrl-C or `scancel`/`flux cancel`.
 
 ```
 ### Running Command:
-    podman run --rm --name=vllm --network=host --ipc=host --label=boxy.box=vllm --entrypoint=vllm --workdir=/vllm-workspace/models --volume=$PWD/models:/vllm-workspace/models --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 vllm/vllm-openai:v0.24.0 serve Llama-4-Scout-17B-16E-Instruct --host=0.0.0.0 --port=8000 --tensor-parallel-size=4 --seed=12345
+    podman run --rm --name=vllm --network=host --ipc=host --label=boxy.box=vllm --entrypoint=vllm --workdir=/vllm-workspace/models --volume=$PWD/models:/vllm-workspace/models --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 vllm/vllm-openai:v0.24.0 serve Llama-4-Scout-17B-16E-Instruct --tensor-parallel-size=4 --seed=12345 --host=0.0.0.0 --port=8000
 ```
 
 ### vllm + docker + none  (`local-docker.toml`)
 
 ```
 ### Running Command:
-    docker run --rm --name=vllm --network=host --ipc=host --label=boxy.box=vllm --entrypoint=vllm --workdir=/vllm-workspace/models --volume=$PWD/models:/vllm-workspace/models --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env HF_HUB_DISABLE_TELEMETRY=1 --env VLLM_NO_USAGE_STATS=1 --env DO_NOT_TRACK=1 --env HF_HUB_ENABLE_HF_TRANSFER=0 vllm/vllm-openai:v0.24.0 serve Llama-4-Scout-17B-16E-Instruct --host=0.0.0.0 --port=8000 --tensor-parallel-size=4 --seed=12345
+    docker run --rm --name=vllm --network=host --ipc=host --label=boxy.box=vllm --entrypoint=vllm --workdir=/vllm-workspace/models --volume=$PWD/models:/vllm-workspace/models --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env HF_HUB_DISABLE_TELEMETRY=1 --env VLLM_NO_USAGE_STATS=1 --env DO_NOT_TRACK=1 --env HF_HUB_ENABLE_HF_TRANSFER=0 vllm/vllm-openai:v0.24.0 serve Llama-4-Scout-17B-16E-Instruct --tensor-parallel-size=4 --seed=12345 --host=0.0.0.0 --port=8000
 ```
 
 ### vllm + apptainer + none  (`local-apptainer.toml`)
@@ -119,14 +119,14 @@ serve is foreground: stop with Ctrl-C or `scancel`/`flux cancel`.
 ```
 ### Prepare: apptainer build --force vllm-none.sif docker://vllm/vllm-openai:v0.24.0
 ### Running Command:
-    apptainer exec --fakeroot --writable-tmpfs --cleanenv --no-home --cwd /vllm-workspace/models --bind $PWD/models:/vllm-workspace/models --env HF_HOME=/root/.cache/huggingface --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 vllm-none.sif vllm serve Llama-4-Scout-17B-16E-Instruct --host=0.0.0.0 --port=8000 --tensor-parallel-size=4 --seed=12345
+    apptainer exec --fakeroot --writable-tmpfs --cleanenv --no-home --cwd /vllm-workspace/models --bind $PWD/models:/vllm-workspace/models --env HF_HOME=/root/.cache/huggingface --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 vllm-none.sif vllm serve Llama-4-Scout-17B-16E-Instruct --tensor-parallel-size=4 --seed=12345 --host=0.0.0.0 --port=8000
 ```
 
 ### vllm + podman + slurm  (`hops.toml`)
 
 ```
 ### Running Command:
-    srun --nodes=2 --gpus-per-node=4 podman run --rm --name=vllm --network=host --ipc=host --label=boxy.box=vllm --entrypoint=vllm --workdir=/vllm-workspace/models --volume=$PWD/models:/vllm-workspace/models --device nvidia.com/gpu=all --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env HF_HUB_DISABLE_TELEMETRY=1 --env VLLM_NO_USAGE_STATS=1 --env DO_NOT_TRACK=1 --env HF_HUB_ENABLE_HF_TRANSFER=0 vllm/vllm-openai:v0.24.0 serve Llama-4-Scout-17B-16E-Instruct --host=0.0.0.0 --port=8000 --tensor-parallel-size=4 --seed=12345
+    srun --nodes=2 --gpus-per-node=4 podman run --rm --name=vllm --network=host --ipc=host --label=boxy.box=vllm --entrypoint=vllm --workdir=/vllm-workspace/models --volume=$PWD/models:/vllm-workspace/models --device nvidia.com/gpu=all --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env HF_HUB_DISABLE_TELEMETRY=1 --env VLLM_NO_USAGE_STATS=1 --env DO_NOT_TRACK=1 --env HF_HUB_ENABLE_HF_TRANSFER=0 vllm/vllm-openai:v0.24.0 serve Llama-4-Scout-17B-16E-Instruct --tensor-parallel-size=4 --seed=12345 --host=0.0.0.0 --port=8000
 ```
 
 ### vllm + apptainer + slurm  (`slurm-apptainer-cuda.toml`)
@@ -134,21 +134,21 @@ serve is foreground: stop with Ctrl-C or `scancel`/`flux cancel`.
 ```
 ### Prepare: apptainer build --force vllm-cuda.sif docker://vllm/vllm-openai:v0.24.0
 ### Running Command:
-    srun --nodes=1 --gpus-per-node=4 apptainer exec --fakeroot --writable-tmpfs --cleanenv --no-home --cwd /vllm-workspace/models --bind $PWD/models:/vllm-workspace/models --env HF_HOME=/root/.cache/huggingface --nv --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env HF_HUB_DISABLE_TELEMETRY=1 --env VLLM_NO_USAGE_STATS=1 --env DO_NOT_TRACK=1 --env HF_HUB_ENABLE_HF_TRANSFER=0 vllm-cuda.sif vllm serve Llama-4-Scout-17B-16E-Instruct --host=0.0.0.0 --port=8000 --tensor-parallel-size=4 --seed=12345
+    srun --nodes=1 --gpus-per-node=4 apptainer exec --fakeroot --writable-tmpfs --cleanenv --no-home --cwd /vllm-workspace/models --bind $PWD/models:/vllm-workspace/models --env HF_HOME=/root/.cache/huggingface --nv --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env HF_HUB_DISABLE_TELEMETRY=1 --env VLLM_NO_USAGE_STATS=1 --env DO_NOT_TRACK=1 --env HF_HUB_ENABLE_HF_TRANSFER=0 vllm-cuda.sif vllm serve Llama-4-Scout-17B-16E-Instruct --tensor-parallel-size=4 --seed=12345 --host=0.0.0.0 --port=8000
 ```
 
 ### vllm + docker + slurm  (`slurm-docker-cuda.toml`)
 
 ```
 ### Running Command:
-    srun --nodes=1 --gpus-per-node=4 docker run --rm --name=vllm --network=host --ipc=host --label=boxy.box=vllm --entrypoint=vllm --workdir=/vllm-workspace/models --volume=$PWD/models:/vllm-workspace/models --gpus all --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env HF_HUB_DISABLE_TELEMETRY=1 --env VLLM_NO_USAGE_STATS=1 --env DO_NOT_TRACK=1 --env HF_HUB_ENABLE_HF_TRANSFER=0 vllm/vllm-openai:v0.24.0 serve Llama-4-Scout-17B-16E-Instruct --host=0.0.0.0 --port=8000 --tensor-parallel-size=4 --seed=12345
+    srun --nodes=1 --gpus-per-node=4 docker run --rm --name=vllm --network=host --ipc=host --label=boxy.box=vllm --entrypoint=vllm --workdir=/vllm-workspace/models --volume=$PWD/models:/vllm-workspace/models --gpus all --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env HF_HUB_DISABLE_TELEMETRY=1 --env VLLM_NO_USAGE_STATS=1 --env DO_NOT_TRACK=1 --env HF_HUB_ENABLE_HF_TRANSFER=0 vllm/vllm-openai:v0.24.0 serve Llama-4-Scout-17B-16E-Instruct --tensor-parallel-size=4 --seed=12345 --host=0.0.0.0 --port=8000
 ```
 
 ### vllm + podman + flux  (`flux-podman-rocm.toml`)
 
 ```
 ### Running Command:
-    flux run -N1 --gpus-per-node=4 podman run --rm --name=vllm --network=host --ipc=host --label=boxy.box=vllm --entrypoint=vllm --workdir=/vllm-workspace/models --volume=$PWD/models:/vllm-workspace/models --group-add=video --cap-add=SYS_PTRACE --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 --env VLLM_USE_V1=1 --env VLLM_USE_TRITON_FLASH_ATTN=0 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env HF_HUB_DISABLE_TELEMETRY=1 --env VLLM_NO_USAGE_STATS=1 --env DO_NOT_TRACK=1 --env HF_HUB_ENABLE_HF_TRANSFER=0 vllm/vllm-openai:v0.24.0 serve Llama-4-Scout-17B-16E-Instruct --host=0.0.0.0 --port=8000 --tensor-parallel-size=4 --seed=12345
+    flux run -N1 --gpus-per-node=4 podman run --rm --name=vllm --network=host --ipc=host --label=boxy.box=vllm --entrypoint=vllm --workdir=/vllm-workspace/models --volume=$PWD/models:/vllm-workspace/models --group-add=video --cap-add=SYS_PTRACE --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 --env VLLM_USE_V1=1 --env VLLM_USE_TRITON_FLASH_ATTN=0 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env HF_HUB_DISABLE_TELEMETRY=1 --env VLLM_NO_USAGE_STATS=1 --env DO_NOT_TRACK=1 --env HF_HUB_ENABLE_HF_TRANSFER=0 vllm/vllm-openai:v0.24.0 serve Llama-4-Scout-17B-16E-Instruct --tensor-parallel-size=4 --seed=12345 --host=0.0.0.0 --port=8000
 ```
 
 ### vllm + apptainer + flux  (`eldorado.toml`)
@@ -156,12 +156,12 @@ serve is foreground: stop with Ctrl-C or `scancel`/`flux cancel`.
 ```
 ### Prepare: apptainer build --force vllm-rocm.sif docker://vllm/vllm-openai:v0.24.0
 ### Running Command:
-    flux run -N2 --gpus-per-node=4 bash -lc 'module load rocm/6.4.0 && exec apptainer exec --fakeroot --writable-tmpfs --cleanenv --no-home --cwd /vllm-workspace/models --bind $PWD/models:/vllm-workspace/models --env HF_HOME=/root/.cache/huggingface --rocm --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 --env VLLM_USE_V1=1 --env VLLM_USE_TRITON_FLASH_ATTN=0 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env HF_HUB_DISABLE_TELEMETRY=1 --env VLLM_NO_USAGE_STATS=1 --env DO_NOT_TRACK=1 --env HF_HUB_ENABLE_HF_TRANSFER=0 vllm-rocm.sif vllm serve Llama-4-Scout-17B-16E-Instruct --host=0.0.0.0 --port=8000 --tensor-parallel-size=4 --seed=12345 --gpu-memory-utilization=0.7'
+    flux run -N2 --gpus-per-node=4 bash -lc 'module load rocm/6.4.0 && exec apptainer exec --fakeroot --writable-tmpfs --cleanenv --no-home --cwd /vllm-workspace/models --bind $PWD/models:/vllm-workspace/models --env HF_HOME=/root/.cache/huggingface --rocm --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 --env VLLM_USE_V1=1 --env VLLM_USE_TRITON_FLASH_ATTN=0 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env HF_HUB_DISABLE_TELEMETRY=1 --env VLLM_NO_USAGE_STATS=1 --env DO_NOT_TRACK=1 --env HF_HUB_ENABLE_HF_TRANSFER=0 vllm-rocm.sif vllm serve Llama-4-Scout-17B-16E-Instruct --tensor-parallel-size=4 --seed=12345 --gpu-memory-utilization=0.7 --host=0.0.0.0 --port=8000'
 ```
 
 ### vllm + docker + flux  (`flux-docker-rocm.toml`)
 
 ```
 ### Running Command:
-    flux run -N1 --gpus-per-node=4 docker run --rm --name=vllm --network=host --ipc=host --label=boxy.box=vllm --entrypoint=vllm --workdir=/vllm-workspace/models --volume=$PWD/models:/vllm-workspace/models --group-add=video --cap-add=SYS_PTRACE --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 --env VLLM_USE_V1=1 --env VLLM_USE_TRITON_FLASH_ATTN=0 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env HF_HUB_DISABLE_TELEMETRY=1 --env VLLM_NO_USAGE_STATS=1 --env DO_NOT_TRACK=1 --env HF_HUB_ENABLE_HF_TRANSFER=0 vllm/vllm-openai:v0.24.0 serve Llama-4-Scout-17B-16E-Instruct --host=0.0.0.0 --port=8000 --tensor-parallel-size=4 --seed=12345
+    flux run -N1 --gpus-per-node=4 docker run --rm --name=vllm --network=host --ipc=host --label=boxy.box=vllm --entrypoint=vllm --workdir=/vllm-workspace/models --volume=$PWD/models:/vllm-workspace/models --group-add=video --cap-add=SYS_PTRACE --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined --env OMP_NUM_THREADS=1 --env VLLM_DISABLE_COMPILE_CACHE=1 --env VLLM_ENABLE_V1_MULTIPROCESSING=0 --env VLLM_USE_V1=1 --env VLLM_USE_TRITON_FLASH_ATTN=0 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env HF_DATASETS_OFFLINE=1 --env HF_HUB_DISABLE_TELEMETRY=1 --env VLLM_NO_USAGE_STATS=1 --env DO_NOT_TRACK=1 --env HF_HUB_ENABLE_HF_TRANSFER=0 vllm/vllm-openai:v0.24.0 serve Llama-4-Scout-17B-16E-Instruct --tensor-parallel-size=4 --seed=12345 --host=0.0.0.0 --port=8000
 ```

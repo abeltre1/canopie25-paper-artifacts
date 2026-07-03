@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
@@ -27,10 +28,13 @@ def wait_ready(
         try:
             with urllib.request.urlopen(f"{url}/v1/models", timeout=2) as resp:
                 data = json.load(resp)
-            models = data.get("data") or []
-            if models:
-                return models[0].get("id", "unknown")
-        except (urllib.error.URLError, OSError, json.JSONDecodeError):
+            # a non-OpenAI responder on this port (JSON array, HTML, junk)
+            # is 'not ready yet', never a crash (sweep finding 26)
+            if isinstance(data, dict):
+                models = data.get("data") or []
+                if models and isinstance(models[0], dict):
+                    return models[0].get("id", "unknown")
+        except (urllib.error.URLError, OSError, json.JSONDecodeError, http.client.HTTPException):
             pass
         if still_alive is not None and not still_alive():
             raise RuntimeError("server exited during startup")

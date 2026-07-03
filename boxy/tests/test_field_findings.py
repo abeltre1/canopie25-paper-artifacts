@@ -327,7 +327,10 @@ def test_finding11_macos_publishes_ports_instead_of_host_network(monkeypatch, ho
     assert "--network=host" not in cmd
     assert "-p" in cmd
     published = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-p"]
-    assert "8090:8090" in published and "8001:8001" in published  # box port + CLI override
+    # a --port in the command REPLACES the declared box port: publishing the
+    # stale 8090 would bind the very host port the user was avoiding
+    # (sweep finding 58)
+    assert published == ["8001:8001"]
 
     monkeypatch.setattr(sys, "platform", "linux")
     cmd = get_backend("podman").build_command(box, hops, inner, {}, [], "none")

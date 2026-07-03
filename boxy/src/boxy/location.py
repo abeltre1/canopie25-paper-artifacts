@@ -80,18 +80,36 @@ class Location:
 
     @classmethod
     def from_toml(cls, path: str | Path) -> "Location":
-        with open(path, "rb") as f:
-            data = tomllib.load(f)
+        try:
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            raise ValueError(f"{path}: {e}") from None
         section = data.get("location")
         if section is None:
             raise ValueError(f"{path}: missing [location] section")
-        resources = Resources(**section.pop("resources", {}))
-        staging = Staging(**section.pop("staging", {}))
+        try:
+            resources = Resources(**section.pop("resources", {}))
+            staging = Staging(**section.pop("staging", {}))
+        except TypeError as e:
+            raise ValueError(f"{path}: invalid [location.resources]/[location.staging]: {e}") from None
         modules = section.pop("modules", {})
-        module_list = modules.get("load", []) if isinstance(modules, dict) else list(modules)
+        if isinstance(modules, str):
+            # modules = "rocm/6.4.0" iterated as characters: 'module load r &&
+            # module load o && ...' (finding 8)
+            module_list = [modules]
+        elif isinstance(modules, dict):
+            module_list = modules.get("load", [])
+        elif isinstance(modules, list):
+            module_list = list(modules)
+        else:
+            raise ValueError(f"{path}: modules must be a list of module names")
         tuning = section.pop("tuning", {})
         known = {f.name for f in cls.__dataclass_fields__.values()} - {"resources", "staging", "modules", "tuning"}
         unknown = set(section) - known
         if unknown:
             raise ValueError(f"{path}: unknown [location] keys: {sorted(unknown)}")
-        return cls(resources=resources, staging=staging, modules=module_list, tuning=tuning, **section)
+        try:
+            return cls(resources=resources, staging=staging, modules=module_list, tuning=tuning, **section)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"{path}: invalid [location] section: {e}") from None

@@ -18,7 +18,10 @@ from types import SimpleNamespace
 
 # ramalama configures an INFO-level logger on import (proxy discovery etc.);
 # keep boxy's output clean unless the user opts into verbosity.
-logging.getLogger("ramalama").setLevel(os.environ.get("BOXY_RAMALAMA_LOGLEVEL", "WARNING"))
+_loglevel = os.environ.get("BOXY_RAMALAMA_LOGLEVEL", "WARNING").upper()
+if _loglevel not in ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"):
+    _loglevel = "WARNING"  # a verbosity knob must never crash boxy (finding 32)
+logging.getLogger("ramalama").setLevel(_loglevel)
 
 # ramalama's config prompts interactively on macOS when the podman machine has
 # no GPU (applehv). boxy must never block on a prompt — a pull doesn't need a
@@ -82,7 +85,16 @@ def detect_accel() -> str:
                 file=sys.stderr,
             )
         return "none"
-    accel = str(get_accel())
+    try:
+        accel = str(get_accel())
+    except Exception as e:
+        # malformed sysfs/KFD entries crash ramalama's probes on odd kernels;
+        # autodetect must degrade, not traceback (finding 33)
+        import sys
+
+        print(f"warning: GPU autodetect failed ({e.__class__.__name__}: {e}); "
+              f"assuming none — pass --accelerator to override", file=sys.stderr)
+        return "none"
     # ramalama returns e.g. "cuda", "hip", "intel", "cann", ... or "none"
     accel = accel.split(":")[0] if accel else "none"
     return _ACCEL_NORMALIZE.get(accel, accel)
@@ -154,7 +166,13 @@ def ensure_trust_bundle() -> str | None:
             file=sys.stderr,
         )
         return None
+    if os.path.isdir(site):
+        print(f"warning: SSL_CERT_FILE={site} is a DIRECTORY — you probably meant SSL_CERT_DIR. "
+              f"Point SSL_CERT_FILE at a PEM file.", file=sys.stderr)
+        return None
     if site.endswith("ca-merged.crt"):  # already ours
+        print("note: SSL_CERT_FILE points at boxy's own merged bundle — point it at your SITE CA "
+              "instead so CA rotations and certifi updates are picked up.", file=sys.stderr)
         return site
     try:
         import certifi
@@ -162,14 +180,20 @@ def ensure_trust_bundle() -> str | None:
         public = certifi.where()
     except Exception:
         return None
-    merged = os.path.join(DEFAULT_STORE, "ca-merged.crt")
-    os.makedirs(DEFAULT_STORE, exist_ok=True)
-    with open(public, "rb") as f:
-        bundle = f.read()
-    with open(site, "rb") as f:
-        bundle += b"\n" + f.read()
-    with open(merged, "wb") as f:
-        f.write(bundle)
+    try:
+        merged = os.path.join(DEFAULT_STORE, "ca-merged.crt")
+        os.makedirs(DEFAULT_STORE, exist_ok=True)
+        with open(public, "rb") as f:
+            bundle = f.read()
+        with open(site, "rb") as f:
+            bundle += b"\n" + f.read()
+        with open(merged, "wb") as f:
+            f.write(bundle)
+    except OSError as e:
+        # diagnosing TLS must never introduce its own crash (finding 31)
+        print(f"warning: could not build the merged CA bundle ({e}); "
+              f"continuing with SSL_CERT_FILE as-is", file=sys.stderr)
+        return None
     os.environ["SSL_CERT_FILE"] = merged
     print(
         f"tls: merged your SSL_CERT_FILE ({site}) with certifi's public CAs -> {merged}\n"
@@ -210,6 +234,13 @@ def pull_model(model_uri: str, dryrun: bool = False, quiet: bool = False) -> str
             "(pip install 'boxy-hpc[ramalama]'); for air-gapped sites set "
             "box.model to a path on the shared filesystem instead"
         ) from e
+    if model_uri.startswith(("oci://", "docker://")):
+        raise RuntimeError(
+            f"{model_uri.split('://')[0]}:// models need a container engine to pull, which "
+            "boxy's store-only pull path doesn't drive yet (SPEC roadmap). Use hf:// or "
+            "ollama:// for the model weights, or pull the OCI artifact with podman/docker "
+            "directly and serve the extracted GGUF by path."
+        )
     ensure_trust_bundle()
     args = _store_args(model_uri, dryrun=dryrun, quiet=quiet)
     transport = New(model_uri, args)
@@ -410,10 +441,17 @@ def _ramalama_vllm_image(accelerator: str) -> str | None:
         from ramalama.config import DefaultConfig
         from ramalama.plugins.loader import get_runtime
 
-        gpu_type = {"cuda": "CUDA", "rocm": "HIP", "intel": "INTEL"}.get(accelerator)
+        # the plugin map is keyed by env-var names; "CUDA"/"HIP" silently fell
+        # through to the CUDA-only default image on ROCm/Intel (finding 28)
+        gpu_type = {"cuda": "CUDA_VISIBLE_DEVICES", "rocm": "HIP_VISIBLE_DEVICES",
+                    "intel": "INTEL_VISIBLE_DEVICES"}.get(accelerator)
         if gpu_type is None:
             return None
-        return get_runtime("vllm").get_container_image(DefaultConfig(), gpu_type)
+        image = get_runtime("vllm").get_container_image(DefaultConfig(), gpu_type)
+        # never accept a CUDA image for a non-CUDA accelerator (fallthrough guard)
+        if accelerator != "cuda" and image and "vllm-openai:" in image:
+            return None
+        return image
     except Exception:
         return None
 
@@ -473,6 +511,8 @@ def default_image(engine: str, accelerator: str) -> str:
         if accelerator == "cuda":
             return "ghcr.io/ggml-org/llama.cpp:server-cuda"
         if accelerator in _LLAMACPP_ACCEL_IMAGES:
-            return _ramalama_llamacpp_image(accelerator) or _LLAMACPP_ACCEL_IMAGES[accelerator]
+            # static map is authoritative: RamaLama's 'auto' backend resolves
+            # HIP/INTEL to the generic vulkan image on Linux (finding 29)
+            return _LLAMACPP_ACCEL_IMAGES[accelerator]
         return "ghcr.io/ggml-org/llama.cpp:server"
     return _ramalama_vllm_image(accelerator) or vllm_image_for(accelerator)

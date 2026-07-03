@@ -46,24 +46,34 @@ def _slug(model: str) -> str:
 
 def looks_like_gguf(model: str) -> bool:
     # ollama registries serve GGUF blobs; treat the transport as GGUF.
-    return ".gguf" in model.lower() or model.startswith("ollama://")
+    # Extension of the FINAL path component only: '/data/models.gguf/x' is a
+    # directory name, not a GGUF file (sweep finding 20).
+    if model.lower().startswith("ollama://"):
+        return True
+    base = model.rstrip("/").rsplit("/", 1)[-1].lower()
+    return base.endswith(".gguf")
 
 
 def infer_engine(model: str, accelerator: str, gpus: int = 0) -> tuple[str, str]:
     """(engine, reason). GGUF/ollama -> llama.cpp. Otherwise vLLM, which needs a GPU
     (detected here, or requested via --gpus for a scheduler submission)."""
-    if model.startswith("ollama://"):
+    if model.lower().startswith("ollama://"):
         return "llama.cpp", "ollama models are GGUF"
     if looks_like_gguf(model):
         return "llama.cpp", "model is GGUF"
     if accelerator in VLLM_ACCELS:
         return "vllm", f"safetensors/HF repo + {accelerator} GPU"
-    if gpus > 0:
+    if gpus > 0 and accelerator in VLLM_ACCELS + ("none",):
+        # 'none' = submitting from a GPU-less node; a non-vLLM accelerator
+        # (vulkan/asahi/...) must not sail into the CUDA-only vLLM image
+        # (sweep finding 21).
         return "vllm", f"safetensors/HF repo + --gpus {gpus} requested for the job"
     base = model.rstrip("/").rsplit("/", 1)[-1]
+    accel_note = ("no GPU was detected on this host" if accelerator == "none"
+                  else f"this host's accelerator is {accelerator!r}, which vLLM's images do not "
+                       f"support (supported: {', '.join(VLLM_ACCELS)})")
     raise RuntimeError(
-        f"model {model!r} is a safetensors/HF repo: that needs vLLM and a GPU, and none was "
-        f"detected on this host.\n"
+        f"model {model!r} is a safetensors/HF repo: that needs vLLM, and {accel_note}.\n"
         f"  CPU serving here:  use a GGUF build with llama.cpp — search huggingface.co for\n"
         f"      '{base} GGUF' (publishers like TheBloke, bartowski, QuantFactory), then:\n"
         f"      boxy serve hf://<owner>/<repo>/<file>.gguf\n"
@@ -240,17 +250,33 @@ def _classify_model(model: str, require_exists: bool) -> tuple[str, str]:
     """Syntax decides: a transport scheme means remote; anything else is a local
     path, full stop. Bare names are never guessed into registries — same
     command, same meaning, on every machine. Returns (resolved, decision)."""
-    if model.startswith(TRANSPORT_SCHEMES):
-        return model, f"model: {model} (transport URI — pulled via RamaLama)"
+    if model.lower().startswith("file://"):
+        # RamaLama supports file:, but boxy's shared-FS flow IS a path —
+        # strip the scheme instead of mangling it into a cwd-joined mount
+        # (sweep finding 35).
+        model = model[len("file://"):]
+    scheme_split = model.split("://", 1)
+    if len(scheme_split) == 2 and scheme_split[0].lower() + "://" in TRANSPORT_SCHEMES:
+        scheme, rest = scheme_split[0].lower(), scheme_split[1]
+        if not rest.strip("/"):
+            raise RuntimeError(
+                f"malformed model URI {model!r}: nothing after the scheme "
+                f"(an unset shell variable? e.g. hf://$ORG/$FILE)"
+            )
+        return f"{scheme}://{rest}", f"model: {scheme}://{rest} (transport URI — pulled via RamaLama)"
+    if len(scheme_split) == 2:
+        raise RuntimeError(
+            f"unsupported model scheme {scheme_split[0]!r}:// — supported: "
+            f"{', '.join(s[:-3] for s in TRANSPORT_SCHEMES)} (or a local path)"
+        )
     resolved = os.path.abspath(model)
     if not os.path.exists(resolved):
+        base = model.rsplit("/", 1)[-1]
+        hint = (f"no such model file: {model!r}. MODEL is a local path or a transport URI — "
+                f"did you mean ollama://{base} or hf://<org>/{base}?")
         if require_exists:
-            base = model.rsplit("/", 1)[-1]
-            raise RuntimeError(
-                f"no such model file: {model!r}. MODEL is a local path or a transport URI — "
-                f"did you mean ollama://{base} or hf://<org>/{base}?"
-            )
-        return resolved, f"model: {resolved} (local path; not present — dryrun)"
+            raise RuntimeError(hint)
+        return resolved, f"model: {resolved} (local path; NOT PRESENT — dryrun only. {hint})"
     return resolved, f"model: {resolved} (local file)"
 
 
@@ -298,8 +324,14 @@ def resolve(
     decisions += loc_decisions
 
     if engine is None:
-        engine, why = infer_engine(model, location.accelerator, gpus=gpus)
-        decisions.append(f"engine: {engine} ({why})")
+        if not resolved_model.startswith(TRANSPORT_SCHEMES) and not os.path.exists(resolved_model):
+            # dryrun with a missing path: don't assert facts about a file that
+            # doesn't exist (finding 22) — plan as llama.cpp and say so
+            engine = "llama.cpp"
+            decisions.append("engine: llama.cpp (assumed — model file not present)")
+        else:
+            engine, why = infer_engine(model, location.accelerator, gpus=gpus)
+            decisions.append(f"engine: {engine} ({why})")
     else:
         decisions.append(f"engine: {engine} (--engine)")
 

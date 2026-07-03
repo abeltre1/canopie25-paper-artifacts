@@ -25,7 +25,7 @@ def test_location_from_toml():
     assert loc.accelerator == "rocm"
     assert loc.runtime == "apptainer"
     assert loc.modules == ["rocm/6.4.0"]
-    assert loc.tuning["gpu_memory_utilization"] == 0.7
+    assert loc.tuning["vllm"]["gpu_memory_utilization"] == 0.7  # engine-scoped (finding 4/36)
     assert loc.resources.nodes == 2
 
 

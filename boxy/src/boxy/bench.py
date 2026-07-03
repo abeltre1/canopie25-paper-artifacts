@@ -34,6 +34,18 @@ SYNTHETIC_PROMPTS = [
 ]
 
 
+def percentile_ms(latencies: list[float], p: float) -> float:
+    """Nearest-rank percentile in ms. ceil(p*n)-1: int(p*n) sat one rank high,
+    so p50 of two samples reported the MAX (sweep finding 49)."""
+    import math
+
+    if not latencies:
+        return 0.0
+    ordered = sorted(latencies)
+    rank = min(len(ordered) - 1, max(0, math.ceil(p * len(ordered)) - 1))
+    return ordered[rank] * 1000
+
+
 @dataclass
 class BenchResult:
     batch_size: int
@@ -75,6 +87,8 @@ def load_prompts(path: str | None) -> list[str]:
         return list(SYNTHETIC_PROMPTS)
     with open(path) as f:
         data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError(f"{path}: no prompts found (expected JSON list of strings or ShareGPT JSON)")
     if data and isinstance(data[0], str):
         return data
     # ShareGPT format: [{"conversations": [{"from": "human", "value": ...}, ...]}, ...]
@@ -132,7 +146,7 @@ def run_level(url: str, model: str, prompts: list[str], batch_size: int, max_tok
     completion_tokens = sum(u.get("completion_tokens", 0) for u in usages)
 
     def pct(p: float) -> float:
-        return latencies[min(len(latencies) - 1, int(p * len(latencies)))] * 1000
+        return percentile_ms(latencies, p)
 
     return BenchResult(
         batch_size=batch_size,
