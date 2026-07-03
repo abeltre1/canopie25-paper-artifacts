@@ -39,6 +39,53 @@ def test_finding2_ssl_failure_message_has_remedy():
     assert "SSL_CERT_FILE" in msg and "root cause" in msg and "CERTIFICATE_VERIFY_FAILED" in msg
 
 
+def test_finding12_chainless_retry_error_still_surfaces_ssl_remedy():
+    """ramalama's downloader logs the SSL error per retry, then raises a FRESH
+    ConnectionError with no chain ('Download failed after multiple attempts').
+    boxy must still name the root cause and the remedy, from the log tap.
+    (Field finding: ollama:// pull on Mac, 2026-07.)"""
+    logged = [
+        "❌ Network Error: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+        "unable to get local issuer certificate (_ssl.c:1028)"
+    ] * 4
+    err = ConnectionError("\nDownload failed after multiple attempts.\nPossible causes:\n- Internet ...")
+    msg = ramalama_shim._pull_failure_message("ollama://granite3-moe", err, logged=logged)
+    assert "root cause" in msg and "CERTIFICATE_VERIFY_FAILED" in msg
+    assert "SSL_CERT_FILE" in msg and "persist" in msg  # sticky remedy, not a one-shell export
+
+
+def test_finding12b_log_tap_captures_ramalama_errors(monkeypatch):
+    """End-to-end through pull_model: a transport that logs then raises
+    chain-less must still produce the SSL remedy."""
+    import logging
+
+    class FakeTransport:
+        def ensure_model_exists(self, args):
+            logging.getLogger("ramalama").error(
+                "❌ Network Error: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"
+            )
+            raise ConnectionError("\nDownload failed after multiple attempts.\n")
+
+        def _get_entry_model_path(self, *a):
+            raise AssertionError("unreachable")
+
+    import ramalama.transports.transport_factory as tf
+
+    monkeypatch.setattr(tf, "New", lambda uri, args: FakeTransport())
+    with pytest.raises(RuntimeError) as e:
+        ramalama_shim.pull_model("ollama://granite3-moe")
+    assert "SSL_CERT_FILE" in str(e.value) and "CERTIFICATE_VERIFY_FAILED" in str(e.value)
+
+
+def test_finding12c_info_reports_tls_state(monkeypatch, capsys):
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    assert main(["info"]) == 0
+    assert "tls: system default CA store" in capsys.readouterr().out
+    monkeypatch.setenv("SSL_CERT_FILE", "/nonexistent/ca.crt")
+    assert main(["info"]) == 0
+    assert "MISSING FILE" in capsys.readouterr().out
+
+
 def test_finding3_cli_fallback_message_names_real_cause():
     try:
         try:

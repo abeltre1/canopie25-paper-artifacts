@@ -56,6 +56,13 @@ def cmd_info(args: argparse.Namespace) -> int:
     print(f"container runtimes: {', '.join(runtimes) or 'none found'}")
     launchers = [name for name, probe in (("slurm", "srun"), ("flux", "flux")) if shutil.which(probe)]
     print(f"schedulers: {', '.join(launchers) or 'none found'}")
+    ssl_cert = os.environ.get("SSL_CERT_FILE")
+    if ssl_cert:
+        status = "" if os.path.exists(ssl_cert) else "  (MISSING FILE!)"
+        print(f"tls: SSL_CERT_FILE={ssl_cert}{status}")
+    else:
+        print("tls: system default CA store (if pulls fail with CERTIFICATE_VERIFY_FAILED, "
+              "set SSL_CERT_FILE — and persist it in your shell profile)")
     return 0
 
 

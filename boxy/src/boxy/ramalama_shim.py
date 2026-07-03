@@ -128,6 +128,21 @@ def _store_args(model: str, dryrun: bool = False, quiet: bool = False) -> Simple
     )
 
 
+class _LogTap(logging.Handler):
+    """Capture RamaLama's WARNING+ log records during a pull. Its downloader
+    logs the real error (e.g. the SSL failure) on every retry but then raises
+    a FRESH ConnectionError('Download failed after multiple attempts') with no
+    exception chain — without the tap, boxy's remedies never see the root
+    cause on the ollama path. (Field finding: Mac run-through #2, 2026-07.)"""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(record.getMessage())
+
+
 def pull_model(model_uri: str, dryrun: bool = False, quiet: bool = False) -> str:
     """Pull a model via RamaLama transports (hf://, ollama://, oci://, ...).
 
@@ -145,19 +160,26 @@ def pull_model(model_uri: str, dryrun: bool = False, quiet: bool = False) -> str
         ) from e
     args = _store_args(model_uri, dryrun=dryrun, quiet=quiet)
     transport = New(model_uri, args)
+    tap = _LogTap()
+    ramalama_logger = logging.getLogger("ramalama")
+    ramalama_logger.addHandler(tap)
     try:
         transport.ensure_model_exists(args)
     except Exception as e:
-        raise RuntimeError(_pull_failure_message(model_uri, e)) from e
+        raise RuntimeError(_pull_failure_message(model_uri, e, logged=tap.lines)) from e
+    finally:
+        ramalama_logger.removeHandler(tap)
     # use_container=False, should_generate=False => host blob/snapshot path.
     return transport._get_entry_model_path(False, False, dryrun)
 
 
-def _pull_failure_message(model_uri: str, error: Exception) -> str:
+def _pull_failure_message(model_uri: str, error: Exception, logged: list[str] | None = None) -> str:
     """Actionable message with the ROOT cause. RamaLama's repo-pull fallback
     masks the original URL error behind 'cli download not available'
-    (NotImplementedError in its v0.23 HF transport), so surface the chain.
-    (Field findings: Mac run-through, 2026-07.)"""
+    (NotImplementedError in its v0.23 HF transport), and its retrying
+    downloader masks it behind a chain-less ConnectionError — so scan both
+    the exception chain and the captured log lines.
+    (Field findings: Mac run-throughs, 2026-07.)"""
     chain: list[str] = []
     seen = 0
     cursor: BaseException | None = error
@@ -165,16 +187,22 @@ def _pull_failure_message(model_uri: str, error: Exception) -> str:
         chain.append(str(cursor))
         cursor = cursor.__cause__ or cursor.__context__
         seen += 1
-    combined = " | ".join(chain)
-    msg = f"failed to pull {model_uri}: {chain[0]}"
+    distinct_logged = list(dict.fromkeys(logged or []))
+    combined = " | ".join(chain + distinct_logged)
+    msg = f"failed to pull {model_uri}: {chain[0].strip()}"
     if len(chain) > 1:
         msg += f"\n  root cause: {chain[-1]}"
+    elif distinct_logged:
+        msg += f"\n  root cause: {distinct_logged[0]}"
     if "CERTIFICATE_VERIFY_FAILED" in combined:
         msg += (
             "\n  remedy: your Python has no usable CA bundle (common with uv/standalone builds"
             " and TLS-intercepting proxies). Run:\n"
             "    pip install certifi && export SSL_CERT_FILE=$(python3 -m certifi)\n"
             "  or point SSL_CERT_FILE at your site's CA bundle."
+            "\n  NOTE: an `export` only lives in that one shell — if this worked before, persist it:\n"
+            "    echo 'export SSL_CERT_FILE=<path-to-ca.crt>' >> ~/.zshrc   # or ~/.bashrc,"
+            " or your venv's bin/activate"
         )
     if "cli download not available" in combined:
         msg += (
