@@ -66,8 +66,13 @@ def cmd_info(args: argparse.Namespace) -> int:
         status = "" if os.path.exists(ssl_cert) else "  (MISSING FILE!)"
         print(f"tls: SSL_CERT_FILE={ssl_cert}{status}")
     else:
-        print("tls: system default CA store (if pulls fail with CERTIFICATE_VERIFY_FAILED, "
-              "set SSL_CERT_FILE — and persist it in your shell profile)")
+        os_bundle = ramalama_shim.discover_os_ca_bundle()
+        if os_bundle:
+            print(f"tls: system default CA store; boxy auto-merges the OS trust store "
+                  f"({os_bundle}) with certifi on pull (disable: BOXY_NO_CA_MERGE=1)")
+        else:
+            print("tls: system default CA store; no OS CA bundle found — if pulls fail with "
+                  "CERTIFICATE_VERIFY_FAILED, set SSL_CERT_FILE to your site CA and persist it")
     from boxy import policy
 
     allowed = policy.allowed_transports()
@@ -453,7 +458,7 @@ def _reclaim_or_report(runtime: str, name: str, url: str) -> tuple[int | None, s
               f"  stop:   boxy stop {name}", file=sys.stderr)
         return 1, name
     print("boxy: found an exited container from a previous attempt; its last log lines:", file=sys.stderr)
-    _dump_logs(runtime, name)
+    _print_diagnosis(_dump_logs(runtime, name))
     subprocess.run([runtime, "rm", name], capture_output=True)
     print(f"boxy: removed {name}; relaunching ...", file=sys.stderr)
     return None, name
@@ -465,12 +470,27 @@ def _container_running(runtime: str, name: str) -> bool:
     return result.returncode == 0 and "true" in result.stdout
 
 
-def _dump_logs(runtime: str, name: str, tail: int = 50) -> None:
+def _dump_logs(runtime: str, name: str, tail: int = 50) -> str:
+    """Print the container's last log lines to stderr and return the captured
+    text so the caller can run it through the startup diagnostics."""
     result = subprocess.run([runtime, "logs", "--tail", str(tail), name],
                             capture_output=True, text=True)
+    captured = []
     for stream in (result.stdout, result.stderr):
         if stream.strip():
             print(stream.rstrip(), file=sys.stderr)
+            captured.append(stream)
+    return "\n".join(captured)
+
+
+def _print_diagnosis(log_text: str) -> None:
+    """Scan dumped engine logs for a known failure signature and, if found,
+    print a plain-language fix instead of leaving the user with a raw trace."""
+    from boxy import diagnostics
+
+    hint = diagnostics.diagnose(log_text)
+    if hint:
+        print(hint, file=sys.stderr)
 
 
 def _job_state(scheduler, job_id: str) -> str:
@@ -492,15 +512,19 @@ def _job_state(scheduler, job_id: str) -> str:
     return scheduler.interpret_state(result.stdout)
 
 
-def _dump_file_tail(path, tail: int = 30) -> None:
+def _dump_file_tail(path, tail: int = 30) -> str:
+    """Print the tail of a job log file and return the captured text for
+    diagnosis."""
     try:
         lines = open(path, errors="replace").read().splitlines()[-tail:]
         if not lines:
             print(f"    (log at {path} is empty)", file=sys.stderr)
         for line in lines:
             print(f"    {line}", file=sys.stderr)
+        return "\n".join(lines)
     except OSError:
         print(f"    (no log at {path} yet)", file=sys.stderr)
+        return ""
 
 
 def _inner_serve_command(args, model: str, name: str) -> str:
@@ -579,25 +603,45 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
         print("note: --save-profile is not yet supported for batch submissions "
               "(the box resolves on the compute node)", file=sys.stderr)
 
-    # deterministic name = singleton lock, batch edition
+    # deterministic name = singleton lock, batch edition. Probe the existing
+    # record with ITS OWN scheduler, never the one requested now: a slurm job id
+    # is meaningless to `flux jobs` (and vice versa), so querying the wrong
+    # scheduler always returns UNKNOWN and wedges resubmission. Field report:
+    # `boxy serve ... --scheduler flux` reported "slurm job 1786916 unreachable"
+    # because a stale slurm record was probed with the flux state command.
     record = jobs.read_record(name)
     if record:
-        state = _job_state(scheduler, record["job"])
+        rec_sched_name = record.get("scheduler") or scheduler_name
+        try:
+            rec_scheduler = get_scheduler(rec_sched_name)
+        except ValueError:
+            rec_scheduler = scheduler
+        state = _job_state(rec_scheduler, record["job"])
+        mismatch = rec_sched_name != scheduler_name
         if state != "DONE":
             endpoint = jobs.read_endpoint(name)
             if endpoint and state in ("PENDING", "RUNNING"):
                 model_id = readiness.wait_ready(endpoint["url"], timeout_s=2, interval_s=0.5)
                 if model_id:
                     print(f"### ALREADY SERVING  {endpoint['url']}/v1   "
-                          f"(model: {model_id}, {record['scheduler']} job {record['job']})")
+                          f"(model: {model_id}, {rec_sched_name} job {record['job']})")
                     print(f"###   stop: boxy stop {name}")
                     return 0
             if state == "UNKNOWN":
-                print(f"boxy: cannot determine the state of {record['scheduler']} job "
-                      f"{record['job']} ({name}) — scheduler unreachable? Not resubmitting. "
-                      f"Retry when it answers, or boxy stop {name}.", file=sys.stderr)
+                hint = (f" That job was submitted under '{rec_sched_name}' but you asked for "
+                        f"'{scheduler_name}'; if the old scheduler isn't available here, clear it "
+                        f"with boxy stop {name} and rerun."
+                        if mismatch else
+                        f" Retry when it answers, or boxy stop {name}.")
+                print(f"boxy: cannot determine the state of {rec_sched_name} job "
+                      f"{record['job']} ({name}) — scheduler unreachable? Not resubmitting.{hint}",
+                      file=sys.stderr)
+            elif mismatch:
+                print(f"boxy: {name} is already submitted as a {rec_sched_name} job "
+                      f"({record['job']}, {state}), but you requested {scheduler_name}. "
+                      f"Stop it first: boxy stop {name}.", file=sys.stderr)
             else:
-                print(f"boxy: {name} is already submitted as {record['scheduler']} job {record['job']} "
+                print(f"boxy: {name} is already submitted as {rec_sched_name} job {record['job']} "
                       f"({state}) — watch: boxy list; stop: boxy stop {name}", file=sys.stderr)
             return 1
         if not args.dryrun:
@@ -670,7 +714,8 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
             if state == "DONE":
                 print(f"boxy: job {job_id} ended before the server became ready; last log lines:",
                       file=sys.stderr)
-                _dump_file_tail(jobs.log_path(name))
+                log_text = _dump_file_tail(jobs.log_path(name))
+                _print_diagnosis(log_text)
                 jobs.remove(name)
                 return 1
             time.sleep(2)
@@ -815,7 +860,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         )
     except RuntimeError:
         print(f"boxy: server exited during startup; last log lines from {cname}:", file=sys.stderr)
-        _dump_logs(runtime_bin, cname)
+        log_text = _dump_logs(runtime_bin, cname)
+        _print_diagnosis(log_text)
         subprocess.run([runtime_bin, "rm", "-f", cname], capture_output=True)
         return 1
     if model_id is None:

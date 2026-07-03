@@ -36,12 +36,25 @@ class FluxScheduler(Scheduler):
 
     # ---- batch submission ----
 
-    directive_prefix = "#FLUX:"
+    # Flux's directive sentinel is the literal `flux:`; the leading `#` is just
+    # the script's comment syntax (RFC 36). It is CASE-SENSITIVE lowercase —
+    # `#FLUX:` is an ordinary comment flux silently ignores, so directives
+    # written that way never take effect (the job lands with default resources
+    # and default queue). Field report: `--scheduler flux --gpus 4` produced a
+    # job with no GPUs because every directive was dropped.
+    directive_prefix = "# flux:"
 
     def resource_directives(self, location: Location) -> list[str]:
-        lines = [f"#FLUX: -N{location.resources.nodes}"]
-        if location.resources.gpus_per_node:
-            lines.append(f"#FLUX: --gpus-per-node={location.resources.gpus_per_node}")
+        # `flux batch` does not launch tasks, so it speaks SLOTS, not the
+        # per-node GPU spelling that `flux run`/`flux alloc` accept. GPUs are
+        # requested with -g/--gpus-per-slot; map "nodes x gpus_per_node" onto
+        # one slot per node (-N nodes, -n nodes) each carrying the GPUs
+        # (-g gpus_per_node). `--gpus-per-node` is NOT a flux-batch option.
+        r = location.resources
+        lines = [f"# flux: -N{r.nodes}"]
+        if r.gpus_per_node:
+            lines.append(f"# flux: -n{r.nodes}")
+            lines.append(f"# flux: -g{r.gpus_per_node}")
         return lines
 
     def site_directive(self, kind: str, value: str) -> str:

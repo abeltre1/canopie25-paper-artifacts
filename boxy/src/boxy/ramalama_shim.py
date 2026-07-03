@@ -140,25 +140,105 @@ def _store_args(model: str, dryrun: bool = False, quiet: bool = False) -> Simple
     )
 
 
+# OS trust stores, in the order distros ship them. A TLS-inspecting proxy's
+# root CA is installed HERE (so curl/yum/git work) but is NOT in certifi's
+# bundle, which requests/huggingface_hub use — that split is why pulls fail
+# with "unable to get local issuer certificate" on an otherwise-working login
+# node. We discover the OS bundle and merge it with certifi.
+_OS_CA_BUNDLES = (
+    "/etc/pki/tls/certs/ca-bundle.crt",                    # RHEL / CentOS / Fedora
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",  # RHEL (extracted)
+    "/etc/ssl/certs/ca-certificates.crt",                 # Debian / Ubuntu / SLES
+    "/etc/ssl/ca-bundle.pem",                             # openSUSE
+    "/etc/ssl/cert.pem",                                  # Alpine / BSD / macOS
+)
+
+
+def discover_os_ca_bundle() -> str | None:
+    """Return the first existing, non-empty OS CA bundle — the trust store the
+    system's own tools use. Checked in distro order, then OpenSSL's compiled-in
+    default as a fallback."""
+    candidates = list(_OS_CA_BUNDLES)
+    try:
+        import ssl
+
+        default = ssl.get_default_verify_paths().cafile
+        if default:
+            candidates.append(default)
+    except Exception:
+        pass
+    for path in candidates:
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def _merge_with_certifi(primary: str, note: str) -> str | None:
+    """Write certifi's public CAs + `primary` into boxy's ca-merged.crt and point
+    this process at it. Superset of both stores — never drops a trust anchor.
+    `note` is the one-line explanation printed to stderr. Returns the merged
+    path, or None if certifi is unavailable or the write fails."""
+    import sys
+
+    try:
+        import certifi
+
+        public = certifi.where()
+    except Exception:
+        return None
+    try:
+        merged = os.path.join(DEFAULT_STORE, "ca-merged.crt")
+        os.makedirs(DEFAULT_STORE, exist_ok=True)
+        with open(public, "rb") as f:
+            bundle = f.read()
+        with open(primary, "rb") as f:
+            bundle += b"\n" + f.read()
+        with open(merged, "wb") as f:
+            f.write(bundle)
+    except OSError as e:
+        # diagnosing TLS must never introduce its own crash (finding 31)
+        print(f"warning: could not build the merged CA bundle ({e})", file=sys.stderr)
+        return None
+    os.environ["SSL_CERT_FILE"] = merged
+    print(f"{note} -> {merged}  (disable: BOXY_NO_CA_MERGE=1)", file=sys.stderr)
+    return merged
+
+
 def ensure_trust_bundle() -> str | None:
-    """Repair the TLS trust store for pulls. Two verified OpenSSL behaviors
-    bite HPC users (field finding #13, Mac run-through #3, 2026-07):
+    """Repair the TLS trust store for pulls. Verified OpenSSL behaviors that
+    bite HPC users (field findings #13, Mac run-through #3, eldorado 2026-07):
 
       * SSL_CERT_FILE REPLACES the trust store — a file holding only the
         site/proxy CA breaks every registry that is NOT intercepted with that
         CA (hf:// works, ollama:// fails, same shell);
-      * a missing SSL_CERT_FILE path is SILENTLY ignored — everything fails.
+      * a missing SSL_CERT_FILE path is SILENTLY ignored — everything fails;
+      * certifi (used by requests/huggingface_hub) does NOT include a site's
+        TLS-inspecting-proxy CA even when the OS trust store does, so pulls
+        fail with "unable to get local issuer certificate" on a login node
+        where curl works fine.
 
-    When SSL_CERT_FILE is set and certifi is importable, merge public CAs +
-    the site CA into one bundle in boxy's store and point this process at it
-    (env changes are picked up by later urlopen calls — verified). The site
-    CA is preserved, so intercepted hosts still verify. Opt out with
-    BOXY_NO_CA_MERGE=1. Returns the merged path, or None if nothing done."""
+    Two paths, both merging with certifi so public + site roots coexist:
+      1. SSL_CERT_FILE set  -> merge that site CA with certifi.
+      2. SSL_CERT_FILE unset -> auto-discover the OS trust store and merge it,
+         so boxy trusts exactly what the system's own tools trust.
+    Opt out with BOXY_NO_CA_MERGE=1. Returns the merged path, or None."""
     import sys
 
-    site = os.environ.get("SSL_CERT_FILE")
-    if not site or os.environ.get("BOXY_NO_CA_MERGE"):
+    if os.environ.get("BOXY_NO_CA_MERGE"):
         return None
+    site = os.environ.get("SSL_CERT_FILE")
+    if not site:
+        os_bundle = discover_os_ca_bundle()
+        if not os_bundle:
+            return None
+        return _merge_with_certifi(
+            os_bundle,
+            f"tls: no SSL_CERT_FILE set — merged the OS trust store ({os_bundle}) with certifi's "
+            f"public CAs so pulls trust the same roots as the system",
+        )
     if not os.path.exists(site):
         print(
             f"warning: SSL_CERT_FILE={site} does not exist — OpenSSL silently ignores missing "
@@ -177,38 +257,10 @@ def ensure_trust_bundle() -> str | None:
         print(f"warning: SSL_CERT_FILE={site} is not a regular file — skipping the CA merge.",
               file=sys.stderr)
         return None
-    if site.endswith("ca-merged.crt"):  # already ours
-        print("note: SSL_CERT_FILE points at boxy's own merged bundle — point it at your SITE CA "
-              "instead so CA rotations and certifi updates are picked up.", file=sys.stderr)
+    if site.endswith("ca-merged.crt"):  # already ours (idempotent within a process)
         return site
-    try:
-        import certifi
-
-        public = certifi.where()
-    except Exception:
-        return None
-    try:
-        merged = os.path.join(DEFAULT_STORE, "ca-merged.crt")
-        os.makedirs(DEFAULT_STORE, exist_ok=True)
-        with open(public, "rb") as f:
-            bundle = f.read()
-        with open(site, "rb") as f:
-            bundle += b"\n" + f.read()
-        with open(merged, "wb") as f:
-            f.write(bundle)
-    except OSError as e:
-        # diagnosing TLS must never introduce its own crash (finding 31)
-        print(f"warning: could not build the merged CA bundle ({e}); "
-              f"continuing with SSL_CERT_FILE as-is", file=sys.stderr)
-        return None
-    os.environ["SSL_CERT_FILE"] = merged
-    print(
-        f"tls: merged your SSL_CERT_FILE ({site}) with certifi's public CAs -> {merged}\n"
-        f"     (site CA kept; needed because SSL_CERT_FILE replaces the trust store. "
-        f"Disable: BOXY_NO_CA_MERGE=1)",
-        file=sys.stderr,
-    )
-    return merged
+    return _merge_with_certifi(
+        site, f"tls: merged your SSL_CERT_FILE ({site}) with certifi's public CAs (site CA kept)")
 
 
 class _LogTap(logging.Handler):

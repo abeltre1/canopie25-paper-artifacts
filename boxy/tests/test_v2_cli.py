@@ -92,10 +92,12 @@ def test_serve_flux_submission_uses_flux_spellings(gguf, capsys, monkeypatch, tm
                "--partition", "pbatch", "--account", "guests", "--time", "4h", "--dryrun"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "#FLUX: --gpus-per-node=4" in out
-    assert "#FLUX: --queue=pbatch" in out       # partition -> queue
-    assert "#FLUX: --bank=guests" in out        # account -> bank
-    assert "#FLUX: -t 4h" in out                # time -> -t
+    # flux batch: lowercase `# flux:` sentinel; GPUs via -n/-g slots, not --gpus-per-node
+    assert "# flux: -g4" in out and "# flux: -n" in out
+    assert "#FLUX:" not in out                   # the uppercase spelling is silently ignored by flux
+    assert "# flux: --queue=pbatch" in out       # partition -> queue
+    assert "# flux: --bank=guests" in out        # account -> bank
+    assert "# flux: -t 4h" in out                # time -> -t
     assert "flux batch" in out
 
 

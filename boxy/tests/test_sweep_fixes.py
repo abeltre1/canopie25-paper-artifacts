@@ -198,7 +198,8 @@ def test_submission_flags_override_profile_geometry(gguf, tmp_path, monkeypatch,
     rc = main(["serve", str(gguf), "--location", str(profile), "--gpus", "8", "--nodes", "1", "--dryrun"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "#FLUX: -N1" in out and "#FLUX: --gpus-per-node=8" in out  # finding 40
+    # flux batch: lowercase sentinel + slot-based GPU spelling (not --gpus-per-node)
+    assert "# flux: -N1" in out and "# flux: -n1" in out and "# flux: -g8" in out  # finding 40
     assert "--location" in out  # profile forwarded to the compute node (finding 38)
 
 

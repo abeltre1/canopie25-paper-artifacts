@@ -93,10 +93,49 @@ def test_finding13b_trust_bundle_edge_cases(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("SSL_CERT_FILE", str(site))
     monkeypatch.setenv("BOXY_NO_CA_MERGE", "1")
     assert ramalama_shim.ensure_trust_bundle() is None
-    # unset -> nothing to do
+    # unset + no discoverable OS bundle -> nothing to do
     monkeypatch.delenv("BOXY_NO_CA_MERGE")
     monkeypatch.delenv("SSL_CERT_FILE")
+    monkeypatch.setattr(ramalama_shim, "discover_os_ca_bundle", lambda: None)
     assert ramalama_shim.ensure_trust_bundle() is None
+
+
+def test_finding13d_unset_ssl_cert_file_auto_merges_os_trust_store(monkeypatch, tmp_path, capsys):
+    """eldorado 2026-07: certifi lacks the site proxy CA that the OS trust store
+    has, so pulls fail with 'unable to get local issuer certificate' even though
+    curl works. With SSL_CERT_FILE unset, boxy discovers the OS bundle and merges
+    it with certifi automatically — no manual export required."""
+    os_bundle = tmp_path / "os-ca-bundle.crt"
+    os_bundle.write_text("-----BEGIN CERTIFICATE-----\nOSPROXYCA\n-----END CERTIFICATE-----\n")
+    public = tmp_path / "certifi.pem"
+    public.write_text("-----BEGIN CERTIFICATE-----\nPUBLIC\n-----END CERTIFICATE-----\n")
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("BOXY_NO_CA_MERGE", raising=False)
+    monkeypatch.setattr(ramalama_shim, "DEFAULT_STORE", str(tmp_path / "store"))
+    monkeypatch.setattr(ramalama_shim, "discover_os_ca_bundle", lambda: str(os_bundle))
+    import certifi
+
+    monkeypatch.setattr(certifi, "where", lambda: str(public))
+    merged = ramalama_shim.ensure_trust_bundle()
+    assert merged and os.environ["SSL_CERT_FILE"] == merged
+    text = Path(merged).read_text()
+    assert "OSPROXYCA" in text and "PUBLIC" in text   # both roots present
+    err = capsys.readouterr().err
+    assert "OS trust store" in err
+    # opt-out still wins over auto-discovery
+    monkeypatch.delenv("SSL_CERT_FILE")
+    monkeypatch.setenv("BOXY_NO_CA_MERGE", "1")
+    assert ramalama_shim.ensure_trust_bundle() is None
+
+
+def test_finding13e_discover_os_ca_bundle_picks_first_nonempty(monkeypatch, tmp_path):
+    good = tmp_path / "real.crt"
+    good.write_text("CA")
+    empty = tmp_path / "empty.crt"
+    empty.write_text("")
+    monkeypatch.setattr(ramalama_shim, "_OS_CA_BUNDLES",
+                        (str(tmp_path / "missing.crt"), str(empty), str(good)))
+    assert ramalama_shim.discover_os_ca_bundle() == str(good)
 
 
 def test_finding13c_info_net_probes_registries(monkeypatch, capsys):
