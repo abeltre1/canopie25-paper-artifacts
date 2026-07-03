@@ -16,8 +16,13 @@ class FluxScheduler(Scheduler):
         prefix = [self.launcher, "run", f"-N{location.resources.nodes}"]
         if location.resources.gpus_per_node:
             prefix.append(f"--gpus-per-node={location.resources.gpus_per_node}")
-        for arg in location.scheduler_args:  # site flags apply to flux run too
-            prefix += shlex.split(arg)
+        for arg in location.scheduler_args:
+            # split only the single-char "-X value" spelling; everything else
+            # is ONE token (shlex.split choked on values with apostrophes)
+            if arg.startswith("-") and not arg.startswith("--") and " " in arg:
+                prefix += arg.split(" ", 1)
+            else:
+                prefix.append(arg)
         return prefix
 
     def host_env_fixups(self) -> list[str]:

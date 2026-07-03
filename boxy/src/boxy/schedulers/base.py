@@ -62,6 +62,11 @@ class Scheduler(ABC):
         lines.append(f"{self.directive_prefix} --job-name={name}")
         lines += self.resource_directives(location)
         for arg in site_args:
+            # sbatch's directive parser splits on whitespace unless quoted:
+            # --comment=hello world  ->  'Invalid directive: world' (r2 audit)
+            if "=" in arg and any(c.isspace() for c in arg.split("=", 1)[1]):
+                flag, value = arg.split("=", 1)
+                arg = f'{flag}="{value.replace(chr(34), chr(92) + chr(34))}"'
             lines.append(f"{self.directive_prefix} {arg}")
         lines.append(f"{self.directive_prefix} --output={log_file}")
         lines.append("")

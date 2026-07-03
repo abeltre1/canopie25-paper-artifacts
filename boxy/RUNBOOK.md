@@ -15,7 +15,9 @@ Be precise about what "tested" means. Three tiers:
 
 | Capability | Status | Where executed |
 | --- | --- | --- |
-| Unit/regression suite (188 tests) | **E** | CI sandbox |
+| Unit/regression suite (291 tests) | **E** | CI sandbox |
+| Two adversarial audit rounds (7+4 agents, 80+ findings fixed w/ regression tests) | **E** | CI sandbox |
+| Scheduler-outage resilience (controller down != job done; no reap/duplicate/mis-stop) | **E** | CI sandbox vs real Slurm |
 | serve→inference→list→stop, llama.cpp on **Docker** | **E** | CI sandbox (air-gapped) |
 | **v2** `boxy serve MODEL` → auto-decisions → detach → `### READY` → curl → `boxy stop NAME` | **E** | CI sandbox (air-gapped) |
 | **v2** crash fast-fail (bad engine flag → log dump → cleanup, rc 1) | **E** | CI sandbox |

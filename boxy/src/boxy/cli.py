@@ -153,20 +153,43 @@ def _resolve_or_load(args: argparse.Namespace):
         location = _overlay_location_flags(location, args, decisions)
         return box, location, decisions
 
-    # model mode: profile values act as defaults, explicit flags win
+    # model mode: profile values act as defaults, explicit flags win.
+    # A --port inside the engine extras counts as explicit too (r2 audit:
+    # the decision line advertised the scanned default while extras won).
+    from boxy.engines import parse_port_flag
+
+    extras_port = parse_port_flag(list(args.args or []))
+    if extras_port is not None and args.port is not None and extras_port != args.port:
+        print(f"warning: both --port {args.port} and an engine-level --port {extras_port} were "
+              f"given; the engine flag wins (serving on {extras_port})", file=sys.stderr)
+    # a slurm/flux profile's job geometry counts for engine inference too
+    # (r2 audit: profile gpus_per_node=2 still produced a 'no GPU' refusal)
+    profile_gpus = (profile.resources.gpus_per_node
+                    if profile and profile.scheduler in ("slurm", "flux") else 0)
+    profile_nodes = (profile.resources.nodes
+                     if profile and profile.scheduler in ("slurm", "flux") else 1)
+    sources = {}
+    if profile is not None:
+        if not args.runtime and profile.runtime:
+            sources["runtime"] = "location profile"
+        if not args.scheduler:
+            sources["scheduler"] = "location profile"
+        if not args.accelerator and profile.accelerator:
+            sources["accelerator"] = "location profile"
     r = resolve.resolve(
         args.model,
         engine=args.engine,
         runtime=args.runtime or (profile.runtime or None if profile else None),
-        scheduler=args.scheduler or (profile.scheduler if profile and profile.scheduler != "none" else None),
+        scheduler=args.scheduler or (profile.scheduler if profile else None),
         image=args.image,
-        port=args.port,
-        gpus=args.gpus or 0,
-        nodes=args.nodes or 1,
+        port=extras_port if extras_port is not None else args.port,
+        gpus=args.gpus or profile_gpus or 0,
+        nodes=args.nodes or profile_nodes or 1,
         name=args.name,
         accelerator=args.accelerator or (profile.accelerator or None if profile else None),
         here=args.here,
         require_exists=not args.dryrun,
+        sources=sources,
     )
     if profile is not None:
         # keep the profile's site details (modules/tuning/offline/staging/
@@ -197,7 +220,8 @@ def _overlay_location_flags(location: Location, args: argparse.Namespace,
                               ("scheduler", args.scheduler)):
         if value and getattr(location, field_name) != value:
             updates[field_name] = value
-            decisions.append(f"{field_name}: {value} (flag overrides profile)")
+            if not any(d.startswith(f"{field_name}: {value}") for d in decisions):
+                decisions.append(f"{field_name}: {value} (flag overrides profile)")
     resources = location.resources
     if args.gpus is not None and args.gpus != resources.gpus_per_node:
         resources = Resources(nodes=resources.nodes, gpus_per_node=args.gpus,
@@ -242,10 +266,10 @@ def _save_profile(prefix: str, box, location) -> None:
         box_lines.append(f"ports = {[int(p) for p in box.ports]}")
     if box.env:
         box_lines.append("[box.env]")
-        box_lines += [f"{k} = {_toml_value(v)}" for k, v in box.env.items()]
+        box_lines += [f"{_toml_value(k)} = {_toml_value(v)}" for k, v in box.env.items()]
     if box.args:
         box_lines.append("[box.args]")
-        box_lines += [f"{k} = {_toml_value(v)}" for k, v in box.args.items()]
+        box_lines += [f"{_toml_value(k)} = {_toml_value(v)}" for k, v in box.args.items()]
     for volume in box.volumes:
         box_lines.append("[[box.volumes]]")
         box_lines.append(f"source = {_toml_value(volume.source)}")
@@ -261,9 +285,10 @@ def _save_profile(prefix: str, box, location) -> None:
     if location.offline:
         loc_lines.append("offline = true")
     if location.modules:
-        loc_lines.append(f"modules = {[str(m) for m in location.modules]!r}".replace("'", '"'))
+        loc_lines.append("modules = [" + ", ".join(_toml_value(m) for m in location.modules) + "]")
     if location.scheduler_args:
-        loc_lines.append(f"scheduler_args = {[str(a) for a in location.scheduler_args]!r}".replace("'", '"'))
+        loc_lines.append("scheduler_args = ["
+                         + ", ".join(_toml_value(a) for a in location.scheduler_args) + "]")
     loc_lines += ["[location.resources]", f"nodes = {location.resources.nodes}",
                   f"gpus_per_node = {location.resources.gpus_per_node}"]
     if location.staging.models_dir != "./models" or location.staging.s3_endpoint:
@@ -276,10 +301,10 @@ def _save_profile(prefix: str, box, location) -> None:
         nested = {k: v for k, v in location.tuning.items() if isinstance(v, dict)}
         if flat:
             loc_lines.append("[location.tuning]")
-            loc_lines += [f"{k} = {_toml_value(v)}" for k, v in flat.items()]
+            loc_lines += [f"{_toml_value(k)} = {_toml_value(v)}" for k, v in flat.items()]
         for engine_name, table in nested.items():
             loc_lines.append(f'[location.tuning.{_toml_value(engine_name)}]')
-            loc_lines += [f"{k} = {_toml_value(v)}" for k, v in table.items()]
+            loc_lines += [f"{_toml_value(k)} = {_toml_value(v)}" for k, v in table.items()]
     with open(f"{prefix}.box.toml", "w") as f:
         f.write("\n".join(box_lines) + "\n")
     with open(f"{prefix}.location.toml", "w") as f:
@@ -331,12 +356,9 @@ def _container_port(runtime: str, name: str) -> int | None:
         cmd = json.loads(result.stdout) or []
     except ValueError:
         return None
-    for i, arg in enumerate(cmd):
-        if arg == "--port" and i + 1 < len(cmd) and str(cmd[i + 1]).isdigit():
-            return int(cmd[i + 1])
-        if isinstance(arg, str) and arg.startswith("--port=") and arg.split("=", 1)[1].isdigit():
-            return int(arg.split("=", 1)[1])
-    return None
+    from boxy.engines import parse_port_flag
+
+    return parse_port_flag(cmd)
 
 
 def _reclaim_or_report(runtime: str, name: str, url: str) -> tuple[int | None, str]:
@@ -404,19 +426,29 @@ def _dump_logs(runtime: str, name: str, tail: int = 50) -> None:
 
 
 def _job_state(scheduler, job_id: str) -> str:
+    """PENDING | RUNNING | DONE | UNKNOWN. A scheduler that cannot be REACHED
+    (controller down, squeue missing) must be UNKNOWN, never DONE: squeue's
+    connect-failure signature (rc!=0, empty stdout) is identical to
+    'job left the queue', and misreading it reaped live jobs, resubmitted
+    duplicates, and cancelled the wrong job (r2 audit, reproduced live)."""
     try:
         result = subprocess.run(scheduler.state_command(job_id), capture_output=True,
                                 text=True, timeout=20)
     except Exception:
         return "UNKNOWN"
     if result.returncode != 0:
-        return "DONE" if not result.stdout.strip() else "UNKNOWN"
+        err = ((result.stderr or "") + (result.stdout or "")).lower()
+        if "invalid job" in err or "unknown job" in err:
+            return "DONE"  # the scheduler answered: no such job
+        return "UNKNOWN"   # the scheduler did NOT answer — assume nothing
     return scheduler.interpret_state(result.stdout)
 
 
 def _dump_file_tail(path, tail: int = 30) -> None:
     try:
         lines = open(path, errors="replace").read().splitlines()[-tail:]
+        if not lines:
+            print(f"    (log at {path} is empty)", file=sys.stderr)
         for line in lines:
             print(f"    {line}", file=sys.stderr)
     except OSError:
@@ -503,19 +535,25 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
     record = jobs.read_record(name)
     if record:
         state = _job_state(scheduler, record["job"])
-        if state in ("PENDING", "RUNNING"):
+        if state != "DONE":
             endpoint = jobs.read_endpoint(name)
-            if endpoint:
+            if endpoint and state in ("PENDING", "RUNNING"):
                 model_id = readiness.wait_ready(endpoint["url"], timeout_s=2, interval_s=0.5)
                 if model_id:
                     print(f"### ALREADY SERVING  {endpoint['url']}/v1   "
                           f"(model: {model_id}, {record['scheduler']} job {record['job']})")
                     print(f"###   stop: boxy stop {name}")
                     return 0
-            print(f"boxy: {name} is already submitted as {record['scheduler']} job {record['job']} "
-                  f"({state}) — watch: boxy list; stop: boxy stop {name}", file=sys.stderr)
+            if state == "UNKNOWN":
+                print(f"boxy: cannot determine the state of {record['scheduler']} job "
+                      f"{record['job']} ({name}) — scheduler unreachable? Not resubmitting. "
+                      f"Retry when it answers, or boxy stop {name}.", file=sys.stderr)
+            else:
+                print(f"boxy: {name} is already submitted as {record['scheduler']} job {record['job']} "
+                      f"({state}) — watch: boxy list; stop: boxy stop {name}", file=sys.stderr)
             return 1
-        jobs.remove(name)  # stale record from a finished job
+        if not args.dryrun:
+            jobs.remove(name)  # stale record from a finished job (S6: dryrun must not mutate)
 
     inner = _inner_serve_command(args, model, name)
     script_text = scheduler.batch_script(inner, location, name, str(jobs.log_path(name)), site_args)
@@ -541,12 +579,27 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
           "(Ctrl-C detaches; the job keeps running)")
 
     last_state, ready_deadline = None, None
+    last_note = time.time()
+    unknown_streak = 0
     try:
         while True:
             state = _job_state(scheduler, job_id)
+            unknown_streak = unknown_streak + 1 if state == "UNKNOWN" else 0
+            if unknown_streak >= 10:
+                # scheduler unreachable / unmapped state: never spin silently
+                # forever (r2 audit) — detach and leave the job alone
+                print(f"boxy: cannot determine job {job_id}'s state (scheduler unreachable?) — "
+                      f"detaching; the job (if alive) keeps running.\n"
+                      f"  status: boxy list    log: {jobs.log_path(name)}\n"
+                      f"  stop:   boxy stop {name}", file=sys.stderr)
+                return 1
             if state != last_state:
                 print(f"###   job {job_id}: {state}")
                 last_state = state
+                last_note = time.time()
+            elif time.time() - last_note > 30:
+                print(f"###   still waiting (job {job_id}: {state}); log: {jobs.log_path(name)}")
+                last_note = time.time()
             endpoint = jobs.read_endpoint(name)
             if endpoint:
                 url = endpoint["url"]
@@ -600,16 +653,44 @@ def cmd_serve(args: argparse.Namespace) -> int:
     for line in decisions:
         print(f"  auto: {line}")
     dynamic = getattr(args, "dynamic_flags", [])
-    if dynamic and location.scheduler in ("slurm", "flux"):
-        # attached srun/flux-run mode: pass-through flags apply to the launcher
+    site_flags = [("partition", getattr(args, "partition", None)),
+                  ("account", getattr(args, "account", None)),
+                  ("time", getattr(args, "time", None))]
+    raw_args = list(getattr(args, "scheduler_args", None) or [])
+    if location.scheduler in ("slurm", "flux"):
+        # attached srun/flux-run mode consumes the SAME scheduler flags as
+        # batch mode (r2 audit: --partition/--account/--time/--scheduler-arg
+        # silently vanished here — a mis-billed job on a real site)
         from boxy.schedulers import get_scheduler
 
         sched_obj = get_scheduler(location.scheduler)
+        for kind, value in site_flags:
+            if value:
+                location.scheduler_args.append(sched_obj.site_directive(kind, value))
+        location.scheduler_args.extend(raw_args)
         location.scheduler_args.extend(
             sched_obj.dynamic_directive(k, v) for s, k, v in dynamic if s == location.scheduler)
+        ignored = [f"--{s}-{k}" for s, k, v in dynamic if s != location.scheduler]
+        if ignored:
+            print(f"warning: ignoring {' '.join(ignored)} (active scheduler is {location.scheduler})",
+                  file=sys.stderr)
+    else:
+        ignored = [f"--{kind}" for kind, value in site_flags if value] + raw_args
+        ignored += [f"--{s}-{k}" for s, k, v in dynamic]
+        if ignored:
+            print(f"warning: ignoring {' '.join(ignored)} — no scheduler in play "
+                  f"(scheduler is 'none'; add --scheduler slurm|flux)", file=sys.stderr)
     deployment = deploy.plan_serve(box, location, port=args.port, extra_args=args.args, dryrun=args.dryrun)
     if getattr(args, "save_profile", None):
-        _save_profile(args.save_profile, deployment.box, deployment.location)
+        from dataclasses import replace as dc_replace
+
+        snap_box = deployment.box
+        if deployment.port and snap_box.ports != [deployment.port]:
+            snap_box = dc_replace(snap_box, ports=[deployment.port])  # r2: box-mode --port was lost
+        if args.args:
+            print("note: engine extras after `--` are not captured by --save-profile; "
+                  "add them to [box.args] in the snapshot for full reproducibility", file=sys.stderr)
+        _save_profile(args.save_profile, snap_box, deployment.location)
 
     port = deployment.port  # parsed from the ACTUAL command (findings 2/10/25/47/55)
     url = f"http://127.0.0.1:{port}"
@@ -647,13 +728,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if getattr(args, "endpoint_file", None):
         # batch-job rendezvous: publish host+port over the shared FS so the
         # submitting boxy (on the login node) can find and readiness-gate us
-        import json
+        from boxy import jobs
 
-        with open(args.endpoint_file, "w") as f:
-            json.dump({"name": cname, "host": socket.gethostname(), "port": port,
-                       "url": f"http://{socket.gethostname()}:{port}",
-                       "job": os.environ.get("SLURM_JOB_ID") or os.environ.get("FLUX_JOB_ID", "")}, f)
-            f.write("\n")
+        jobs.write_endpoint_file(
+            args.endpoint_file, name=cname, port=port,
+            job_id=os.environ.get("SLURM_JOB_ID") or os.environ.get("FLUX_JOB_ID", ""))
 
     if not detach:
         if deployment.location.scheduler == "none":
@@ -860,7 +939,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             endpoint = jobs.read_endpoint(record["name"])
             url = f"{endpoint['url']}/v1" if endpoint else "-"
             print(f"  {record['name']}  {record['scheduler']} job {record['job']}  {state}  {url}")
-            if state == "DONE":
+            if state == "DONE" and not args.dryrun:
                 jobs.remove(record["name"])  # reap finished jobs from the list
     location = Location.from_toml(args.location) if args.location else None
     try:
@@ -878,9 +957,18 @@ def cmd_bench(args: argparse.Namespace) -> int:
     from boxy import engines
 
     box = Box.from_toml(args.box)
-    default = box.ports[0] if box.ports else engines.default_port(box.engine)
+    # the port precedence bench sees must match what serve binds (r2 audit):
+    # [box.args] port > ports[0] > engine default
+    args_port = box.args.get("port")
+    default = (int(args_port) if isinstance(args_port, int) and not isinstance(args_port, bool)
+               else box.ports[0] if box.ports else engines.default_port(box.engine))
     url = args.url or f"http://127.0.0.1:{default}"
-    batch_sizes = [int(b) for b in args.batch_sizes.split(",")] if args.batch_sizes else bench.DEFAULT_BATCH_SIZES
+    try:
+        batch_sizes = ([int(b) for b in args.batch_sizes.split(",")]
+                       if args.batch_sizes else bench.DEFAULT_BATCH_SIZES)
+    except ValueError:
+        raise UsageError(f"--batch-sizes must be a comma-separated list of integers, "
+                         f"got {args.batch_sizes!r}") from None
     if args.dryrun:
         print(f"### Bench plan: url={url} batch_sizes={batch_sizes} max_tokens={args.max_tokens} "
               f"dataset={args.dataset or 'synthetic'}")

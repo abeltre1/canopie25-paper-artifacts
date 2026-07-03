@@ -62,17 +62,25 @@ def read_record(name: str) -> dict | None:
         return None
 
 
-def write_endpoint(name: str, port: int, job_id: str = "") -> Path:
+def write_endpoint_file(path: str | Path, name: str, port: int, job_id: str = "") -> Path:
+    """Atomic (tmp + rename): the login-side poller must never see a torn
+    write over NFS-ish filesystems (r2 audit)."""
     host = socket.gethostname()
-    path = endpoint_path(name)
-    path.write_text(json.dumps({
+    path = Path(path)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({
         "name": name,
         "host": host,
         "port": port,
         "url": f"http://{host}:{port}",
         "job": job_id,
     }) + "\n")
+    os.replace(tmp, path)
     return path
+
+
+def write_endpoint(name: str, port: int, job_id: str = "") -> Path:
+    return write_endpoint_file(endpoint_path(name), name, port, job_id)
 
 
 def read_endpoint(name: str) -> dict | None:
@@ -80,9 +88,14 @@ def read_endpoint(name: str) -> dict | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text())
+        data = json.loads(path.read_text())
     except ValueError:
         return None  # partially written; caller retries
+    # junk-typed JSON (or a partial dict) must never KeyError three commands
+    # downstream (r2 audit) — treat as not-yet-published
+    if isinstance(data, dict) and all(k in data for k in ("url", "host", "port")):
+        return data
+    return None
 
 
 def remove(name: str) -> None:
@@ -99,7 +112,10 @@ def list_records() -> list[dict]:
         if path.name.endswith(".endpoint.json"):
             continue
         try:
-            records.append(json.loads(path.read_text()))
+            record = json.loads(path.read_text())
         except ValueError:
             continue
+        # shape-guard: a stale/hand-edited record must not take out `boxy list`
+        if isinstance(record, dict) and all(k in record for k in ("name", "scheduler", "job")):
+            records.append(record)
     return records

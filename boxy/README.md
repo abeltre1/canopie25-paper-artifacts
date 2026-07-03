@@ -207,7 +207,7 @@ amd64-on-ARM, Podman workdir strictness).
 ## Tests
 
 ```bash
-pytest          # 188 tests: golden-argv vs the prototype, one regression test
+pytest          # 291 tests: golden-argv vs the prototype, one regression test
                 # per audit gap and per field finding, the v2 resolution rules
                 # (login-node guard, hip->rocm, port scan, runtime probes),
                 # bench vs a real HTTP server, a degraded-mode suite run

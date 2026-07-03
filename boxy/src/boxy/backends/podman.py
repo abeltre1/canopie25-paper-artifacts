@@ -25,15 +25,10 @@ def _serve_ports(box: Box, inner_cmd: list[str]) -> list[int]:
     will ACTUALLY bind, so it replaces (not augments) the box's declared
     ports — publishing the stale declared port binds the host port the user
     was avoiding (finding 58)."""
-    from_cmd: set[int] = set()
-    for i, arg in enumerate(inner_cmd):
-        if arg == "--port" and i + 1 < len(inner_cmd) and inner_cmd[i + 1].isdigit():
-            from_cmd.add(int(inner_cmd[i + 1]))
-        elif arg.startswith("--port="):
-            value = arg.split("=", 1)[1]
-            if value.isdigit():
-                from_cmd.add(int(value))
-    return sorted(from_cmd) if from_cmd else sorted(set(box.ports))
+    from boxy.engines import parse_port_flag
+
+    from_cmd = parse_port_flag(inner_cmd)  # LAST occurrence = the bound port
+    return [from_cmd] if from_cmd is not None else sorted(set(box.ports))
 
 
 class PodmanBackend(RuntimeBackend):

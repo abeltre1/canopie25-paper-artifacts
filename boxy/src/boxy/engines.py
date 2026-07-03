@@ -48,15 +48,18 @@ def _tack_on_last(cmd: list[str], extra: dict[str, object], style: str = "eq") -
 
 
 def tuning_for_engine(location: Location, engine: str) -> dict[str, object]:
-    """Site tuning scoped to the engine that understands it. Nested tables
+    """Site tuning scoped to the engine that understands it. Flat keys are
+    vLLM-only (the paper's prototype tuned vLLM on MI300a — llama-server
+    exits 2 on unknown flags, burning the allocation); nested tables
     ([location.tuning.vllm] / [location.tuning."llama.cpp"]) select per
-    engine; flat keys are vLLM-only (the paper's prototype tuned vLLM on
-    MI300a — llama-server exits 2 on unknown flags, burning the allocation)."""
+    engine and MERGE with the flat keys for vLLM (r2 audit: adding a
+    llama.cpp table must not silently drop the flat vLLM tuning)."""
     tuning = location.tuning or {}
     nested = {k: v for k, v in tuning.items() if isinstance(v, dict)}
-    if nested:
-        return dict(nested.get(engine, {}))
-    return dict(tuning) if engine == "vllm" else {}
+    flat = {k: v for k, v in tuning.items() if not isinstance(v, dict)}
+    if engine == "vllm":
+        return {**flat, **nested.get("vllm", {})}
+    return dict(nested.get(engine, {}))
 
 
 def build_serve_cmd(
@@ -94,8 +97,13 @@ def build_llamacpp_serve_cmd(
     # user-supplied sources first (box.args, site tuning), THEN the defaults:
     # _tack_on_last skips flags already present, so this order is what makes
     # "user args always win" true for host/port too. (Sweep finding 59.)
-    cmd = _tack_on_last(cmd, box.args, style="space")
-    cmd = _tack_on_last(cmd, tuning_for_engine(location, "llama.cpp"), style="space")
+    # An EXPLICIT --port flag outranks a profile's [box.args] port (r2 audit).
+    box_args, tuning = dict(box.args), tuning_for_engine(location, "llama.cpp")
+    if port is not None:
+        box_args.pop("port", None)
+        tuning.pop("port", None)
+    cmd = _tack_on_last(cmd, box_args, style="space")
+    cmd = _tack_on_last(cmd, tuning, style="space")
     resolved_port = port or (box.ports[0] if box.ports else default_port("llama.cpp"))
     cmd = _tack_on_last(cmd, {"host": host, "port": resolved_port}, style="space")
     return cmd
@@ -114,23 +122,37 @@ def build_vllm_serve_cmd(
     entrypoint = box.entrypoint or "vllm"
     cmd = [entrypoint, "serve", model_path]
     cmd += list(extra_args or [])
-    cmd = _tack_on_last(cmd, box.args)
-    cmd = _tack_on_last(cmd, tuning_for_engine(location, "vllm"))
+    box_args, tuning = dict(box.args), tuning_for_engine(location, "vllm")
+    if port is not None:  # explicit --port outranks a profile's [box.args] port
+        box_args.pop("port", None)
+        tuning.pop("port", None)
+    cmd = _tack_on_last(cmd, box_args)
+    cmd = _tack_on_last(cmd, tuning)
     resolved_port = port or (box.ports[0] if box.ports else default_port("vllm"))
     cmd = _tack_on_last(cmd, {"host": host, "port": resolved_port})
     return cmd
 
 
+def parse_port_flag(argv: list) -> int | None:
+    """LAST --port/--port= in an argv (argparse engines honor the last
+    occurrence — probing the first missed a live server; r2 audit)."""
+    found = None
+    for i, arg in enumerate(argv):
+        if arg == "--port" and i + 1 < len(argv) and str(argv[i + 1]).isdigit():
+            found = int(argv[i + 1])
+        elif isinstance(arg, str) and arg.startswith("--port=") and arg.split("=", 1)[1].isdigit():
+            found = int(arg.split("=", 1)[1])
+    return found
+
+
 def serving_port(inner_cmd: list[str], box: Box) -> int:
-    """The port the built command will actually serve on: an explicit --port
-    in the argv wins (user extra args are honored by _tack_on_last), else the
+    """The port the built command will actually serve on: the LAST --port in
+    the argv wins (user extra args are honored by _tack_on_last), else the
     box's declared port, else the engine default. This is THE port for
     banners, readiness probes, and publishing. (Sweep findings 2/10/25/47/55.)"""
-    for i, arg in enumerate(inner_cmd):
-        if arg == "--port" and i + 1 < len(inner_cmd) and str(inner_cmd[i + 1]).isdigit():
-            return int(inner_cmd[i + 1])
-        if isinstance(arg, str) and arg.startswith("--port=") and arg.split("=", 1)[1].isdigit():
-            return int(arg.split("=", 1)[1])
+    from_cmd = parse_port_flag(inner_cmd)
+    if from_cmd is not None:
+        return from_cmd
     if box.ports:
         return box.ports[0]
     return default_port(box.engine)

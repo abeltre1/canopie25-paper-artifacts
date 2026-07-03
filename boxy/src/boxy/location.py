@@ -105,6 +105,9 @@ class Location:
         else:
             raise ValueError(f"{path}: modules must be a list of module names")
         tuning = section.pop("tuning", {})
+        if not isinstance(tuning, dict):
+            raise ValueError(f"{path}: [location.tuning] must be a table of engine flags "
+                             f"(optionally nested per engine: [location.tuning.vllm])")
         known = {f.name for f in cls.__dataclass_fields__.values()} - {"resources", "staging", "modules", "tuning"}
         unknown = set(section) - known
         if unknown:

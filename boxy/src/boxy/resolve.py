@@ -195,16 +195,20 @@ def auto_location(
     gpus: int = 0,
     nodes: int = 1,
     here: bool = False,
+    sources: dict | None = None,
 ) -> tuple[Location, list[str]]:
     """Resolve the *where* (used for bare-MODEL serves and for --box without
-    --location). Explicit flags win; everything else is detected and explained."""
+    --location). Explicit flags win; everything else is detected and explained.
+    `sources` labels where a pinned value came from ("--flag" vs "location
+    profile") so decision lines never claim false provenance (r2 audit)."""
     decisions: list[str] = []
+    sources = sources or {}
 
     if scheduler is None:
         scheduler, why = detect_scheduler_context(here=here)
         decisions.append(f"scheduler: {scheduler} ({why})")
     else:
-        decisions.append(f"scheduler: {scheduler} (--scheduler)")
+        decisions.append(f"scheduler: {scheduler} ({sources.get('scheduler', '--scheduler')})")
 
     if scheduler == "none" and (gpus > 0 or nodes > 1):
         raise RuntimeError(
@@ -213,7 +217,7 @@ def auto_location(
         )
 
     if accelerator is not None:
-        decisions.append(f"accelerator: {accelerator} (--accelerator)")
+        decisions.append(f"accelerator: {accelerator} ({sources.get('accelerator', '--accelerator')})")
     else:
         accelerator = ramalama_shim.detect_accel()
         if scheduler in ("slurm", "flux"):
@@ -234,7 +238,7 @@ def auto_location(
         runtime, why = detect_runtime()
         decisions.append(f"runtime: {runtime} ({why})")
     else:
-        decisions.append(f"runtime: {runtime} (--runtime)")
+        decisions.append(f"runtime: {runtime} ({sources.get('runtime', '--runtime')})")
 
     location = Location(
         name="auto",
@@ -313,13 +317,15 @@ def resolve(
     accelerator: str | None = None,
     here: bool = False,
     require_exists: bool = True,
+    sources: dict | None = None,
 ) -> Resolution:
     decisions: list[str] = []
     resolved_model, model_decision = _classify_model(model, require_exists)
     decisions.append(model_decision)
 
     location, loc_decisions = auto_location(
-        runtime=runtime, scheduler=scheduler, accelerator=accelerator, gpus=gpus, nodes=nodes, here=here
+        runtime=runtime, scheduler=scheduler, accelerator=accelerator, gpus=gpus, nodes=nodes,
+        here=here, sources=sources
     )
     decisions += loc_decisions
 

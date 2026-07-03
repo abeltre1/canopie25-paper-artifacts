@@ -170,6 +170,13 @@ def ensure_trust_bundle() -> str | None:
         print(f"warning: SSL_CERT_FILE={site} is a DIRECTORY — you probably meant SSL_CERT_DIR. "
               f"Point SSL_CERT_FILE at a PEM file.", file=sys.stderr)
         return None
+    import stat
+
+    if not stat.S_ISREG(os.stat(site).st_mode):
+        # a FIFO with no writer blocks open() FOREVER (r2 audit)
+        print(f"warning: SSL_CERT_FILE={site} is not a regular file — skipping the CA merge.",
+              file=sys.stderr)
+        return None
     if site.endswith("ca-merged.crt"):  # already ours
         print("note: SSL_CERT_FILE points at boxy's own merged bundle — point it at your SITE CA "
               "instead so CA rotations and certifi updates are picked up.", file=sys.stderr)

@@ -433,3 +433,206 @@ def test_relative_volume_sources_absolutized_and_colon_warned(tmp_path):
     volume_args = [a for a in d.command if a.startswith("--volume=")]
     assert not any(a.startswith("--volume=models:") for a in volume_args)  # absolutized
     assert any("contains ':'" in w for w in d.warnings)
+
+
+# ---- round 2: robustness auditor ----
+
+def test_r2_tuning_array_is_clean_error(tmp_path):
+    loc = tmp_path / "l.toml"
+    loc.write_text('[location]\nname="l"\nruntime="docker"\ntuning = ["x=1"]\n')
+    with pytest.raises(ValueError, match="l.toml.*tuning"):
+        Location.from_toml(loc)
+
+
+def test_r2_bool_and_out_of_range_ports_rejected():
+    with pytest.raises(ValueError, match="1-65535"):
+        Box(name="b", image="i", engine="llama.cpp", ports=[True])
+    with pytest.raises(ValueError, match="1-65535"):
+        Box(name="b", image="i", engine="llama.cpp", ports=[-1])
+
+
+def test_r2_fifo_ssl_cert_file_does_not_hang(tmp_path, monkeypatch, capsys):
+    import os as _os
+
+    fifo = tmp_path / "ca.fifo"
+    _os.mkfifo(fifo)
+    monkeypatch.setenv("SSL_CERT_FILE", str(fifo))
+    monkeypatch.delenv("BOXY_NO_CA_MERGE", raising=False)
+    assert ramalama_shim.ensure_trust_bundle() is None  # was: blocks forever
+    assert "not a regular file" in capsys.readouterr().err
+
+
+def test_r2_malformed_job_record_skipped(tmp_path, monkeypatch, capsys):
+    from boxy import jobs
+
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
+    (tmp_path / "y.json").write_text('{"name":"y"}')          # missing keys
+    (tmp_path / "z.json").write_text('{"name":"z","scheduler":"slurm","job":"1"}')
+    assert [r["name"] for r in jobs.list_records()] == ["z"]  # was: KeyError in boxy list
+
+
+def test_r2_bench_batch_sizes_misuse_exits_2(capsys):
+    rc = main(["bench", "--box", str(EXAMPLES / "boxes" / "qwen-gguf.toml"),
+               "--batch-sizes", "abc", "--dryrun"])
+    assert rc == 2
+    assert "--batch-sizes" in capsys.readouterr().err
+
+
+# ---- round 2: port/engine auditor ----
+
+def test_r2_duplicate_port_last_wins_everywhere(gguf):
+    """argparse engines honor the LAST --port; probing the first missed a
+    live server (reproduced with a 30s timeout against a READY endpoint)."""
+    box = Box(name="d", image="i:1", engine="llama.cpp", model=str(gguf))
+    loc = Location(name="l", runtime="docker", accelerator="none")
+    d = deploy.plan_serve(box, loc, extra_args=["--port", "19301", "--port", "19302"], dryrun=True)
+    assert d.port == 19302
+    assert engines.parse_port_flag(["--port", "1", "--port=2"]) == 2
+
+
+def test_r2_explicit_port_flag_beats_box_args_port(gguf):
+    box = Box(name="b", image="i:1", engine="llama.cpp", model=str(gguf),
+              ports=[8091], args={"port": 9999})
+    loc = Location(name="l", runtime="docker", accelerator="none")
+    d = deploy.plan_serve(box, loc, port=8888, dryrun=True)
+    assert d.port == 8888
+    assert "9999" not in d.command
+
+
+def test_r2_bench_default_honors_box_args_port(tmp_path, capsys):
+    box = tmp_path / "b.toml"
+    box.write_text('[box]\nname="b"\nimage="i:1"\nengine="llama.cpp"\nmodel="m.gguf"\n'
+                   "ports = [8091]\n[box.args]\nport = 9999\n")
+    rc = main(["bench", "--box", str(box), "--dryrun"])
+    assert rc == 0
+    assert "url=http://127.0.0.1:9999" in capsys.readouterr().out
+
+
+def test_r2_mixed_flat_and_nested_tuning_keeps_vllm_keys():
+    loc = Location(name="l", runtime="docker", accelerator="none",
+                   tuning={"gpu_memory_utilization": 0.7, "llama.cpp": {"ctx_size": 2048}})
+    assert engines.tuning_for_engine(loc, "vllm") == {"gpu_memory_utilization": 0.7}
+    assert engines.tuning_for_engine(loc, "llama.cpp") == {"ctx_size": 2048}
+
+
+def test_r2_extras_port_reflected_in_decisions(gguf, capsys):
+    rc = main(["serve", str(gguf), "--runtime", "docker", "--image", "i:1",
+               "--here", "--dryrun", "--", "--port", "19305"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "port: 19305" in out            # decision line matches reality
+    assert "llama.cpp default" not in out  # no phantom scanned default
+
+
+# ---- round 2: layering auditor ----
+
+def _slurm_profile(tmp_path, **extra):
+    lines = ['[location]', 'name = "site"', 'scheduler = "slurm"', 'runtime = "podman"',
+             'accelerator = "cuda"',
+             'scheduler_args = ["--partition=site-default", "--license=tscratch:1"]',
+             '[location.resources]', 'nodes = 1', 'gpus_per_node = 2']
+    profile = tmp_path / "site.toml"
+    profile.write_text("\n".join(lines) + "\n")
+    return profile
+
+
+def test_r2_attached_mode_consumes_scheduler_flags(gguf, tmp_path, monkeypatch, capsys):
+    """r2-L1 (high): --partition/--account/--time/--scheduler-arg silently
+    vanished in attached (srun) mode — a mis-billed job on a real site."""
+    monkeypatch.setattr("boxy.resolve.shutil.which", lambda name: f"/usr/bin/{name}")
+    profile = _slurm_profile(tmp_path)
+    rc = main(["serve", str(gguf), "--location", str(profile), "--foreground",
+               "--partition", "cli-part", "--time", "4:00:00",
+               "--scheduler-arg=--qos=high", "--slurm-mem=64G", "--dryrun"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "--partition=cli-part" in out and "--time=4:00:00" in out
+    assert "--qos=high" in out and "--mem=64G" in out
+    assert "--license=tscratch:1" in out  # profile args survive too
+
+
+def test_r2_scheduler_flags_warn_when_no_scheduler(gguf, capsys):
+    rc = main(["serve", str(gguf), "--runtime", "docker", "--image", "i:1",
+               "--partition", "foo", "--slurm-mem=64G", "--dryrun"])
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "ignoring" in err and "--partition" in err and "--slurm-mem" in err
+
+
+def test_r2_scheduler_none_profile_skips_guard_in_model_mode(gguf, monkeypatch, capsys):
+    """r2-L2: a profile pinning scheduler='none' behaves like the flag."""
+    monkeypatch.setattr("boxy.resolve.shutil.which", lambda name: f"/usr/bin/{name}")
+    rc = main(["serve", str(gguf), "--location", str(EXAMPLES / "locations" / "local-docker.toml"),
+               "--image", "i:1", "--dryrun"])
+    out = capsys.readouterr()
+    assert rc == 0, out.err  # was: login-node guard refusal
+    assert "docker run" in out.out
+
+
+def test_r2_save_profile_list_escaping(tmp_path, gguf, capsys):
+    """r2-L3: an apostrophe in scheduler_args wrote unloadable TOML."""
+    profile = tmp_path / "l.toml"
+    profile.write_text('[location]\nname = "l"\nscheduler = "slurm"\nruntime = "podman"\n'
+                       'accelerator = "cuda"\nscheduler_args = ["--comment=bob\'s run"]\n')
+    prefix = tmp_path / "snap"
+    rc = main(["serve", str(gguf), "--location", str(profile), "--foreground",
+               "--dryrun", "--save-profile", str(prefix)])
+    assert rc == 0
+    loc = Location.from_toml(f"{prefix}.location.toml")   # was: Unclosed array
+    assert loc.scheduler_args[0] == "--comment=bob's run"
+
+
+def test_r2_save_profile_captures_box_mode_port(tmp_path, capsys):
+    prefix = tmp_path / "snap"
+    rc = main(["serve", "--box", str(EXAMPLES / "boxes" / "llamacpp-demo.toml"),
+               "--location", str(EXAMPLES / "locations" / "local-docker.toml"),
+               "--port", "9000", "--dryrun", "--save-profile", str(prefix)])
+    assert rc == 0
+    assert Box.from_toml(f"{prefix}.box.toml").ports == [9000]  # was: [8090]
+
+
+def test_r2_save_profile_quotes_dotted_env_keys(tmp_path, gguf, capsys):
+    box = tmp_path / "b.toml"
+    box.write_text('[box]\nname = "b"\nimage = "i:1"\nengine = "llama.cpp"\nmodel = "m.gguf"\n'
+                   '[box.env]\n"MY.DOTTED" = "v1"\n')
+    prefix = tmp_path / "snap"
+    rc = main(["serve", "--box", str(box),
+               "--location", str(EXAMPLES / "locations" / "local-docker.toml"),
+               "--dryrun", "--save-profile", str(prefix)])
+    assert rc == 0
+    reloaded = Box.from_toml(f"{prefix}.box.toml")
+    assert reloaded.env == {"MY.DOTTED": "v1"}   # was: {"MY": "{'DOTTED': 'v1'}"}
+
+
+def test_r2_profile_gpus_feed_engine_inference(tmp_path, monkeypatch, capsys):
+    """r2-L6: slurm profile with gpus_per_node=2 must not yield 'no GPU'."""
+    monkeypatch.setattr("boxy.resolve.shutil.which", lambda name: f"/usr/bin/{name}")
+    profile = tmp_path / "l.toml"
+    profile.write_text('[location]\nname = "l"\nscheduler = "slurm"\nruntime = "podman"\n'
+                       "[location.resources]\ngpus_per_node = 2\n")
+    safetensors = tmp_path / "model-dir"
+    safetensors.mkdir()
+    rc = main(["serve", str(safetensors), "--location", str(profile), "--foreground",
+               "--accelerator", "cuda", "--dryrun"])
+    out = capsys.readouterr()
+    assert rc == 0, out.err
+    assert "engine: vllm" in out.out
+
+
+def test_r2_extras_port_beats_port_flag_with_warning(gguf, capsys):
+    rc = main(["serve", str(gguf), "--runtime", "docker", "--image", "i:1", "--here",
+               "--port", "9000", "--dryrun", "--", "--port", "9100"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "port: 9100" in captured.out          # decision matches the argv winner
+    assert "engine flag wins" in captured.err
+    assert "--port 9000" not in captured.out
+
+
+def test_r2_decision_lines_name_profile_provenance(gguf, capsys):
+    rc = main(["serve", str(gguf), "--location", str(EXAMPLES / "locations" / "hops.toml"),
+               "--foreground", "--dryrun"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "scheduler: slurm (location profile)" in out   # was: "(--scheduler)"
+    assert "accelerator: cuda (location profile)" in out

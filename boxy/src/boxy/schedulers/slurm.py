@@ -16,8 +16,13 @@ class SlurmScheduler(Scheduler):
         prefix = [self.launcher, f"--nodes={location.resources.nodes}"]
         if location.resources.gpus_per_node:
             prefix.append(f"--gpus-per-node={location.resources.gpus_per_node}")
-        for arg in location.scheduler_args:  # site flags apply to srun too
-            prefix += shlex.split(arg)
+        for arg in location.scheduler_args:
+            # split only the single-char "-X value" spelling; everything else
+            # is ONE token (shlex.split choked on values with apostrophes)
+            if arg.startswith("-") and not arg.startswith("--") and " " in arg:
+                prefix += arg.split(" ", 1)
+            else:
+                prefix.append(arg)
         return prefix
 
     def host_env_fixups(self) -> list[str]:
@@ -63,8 +68,8 @@ class SlurmScheduler(Scheduler):
         state = stdout.strip().upper()
         if not state:
             return "DONE"  # left the queue
-        if state in ("PENDING", "CONFIGURING"):
-            return "PENDING"
+        if state in ("PENDING", "CONFIGURING", "SUSPENDED", "REQUEUED", "RESIZING"):
+            return "PENDING"  # alive but not serving yet (r2: these spun as UNKNOWN)
         if state in ("RUNNING", "COMPLETING"):
             return "RUNNING"
         if state in ("COMPLETED", "CANCELLED", "FAILED", "TIMEOUT", "PREEMPTED", "NODE_FAIL", "OUT_OF_MEMORY"):

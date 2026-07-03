@@ -42,8 +42,12 @@ class Box:
         if self.engine not in ENGINES:
             raise ValueError(f"box {self.name}: unknown engine {self.engine!r} (expected {ENGINES})")
         # ports = "8090" (a string) would serve on port 8 via ports[0] (finding 1)
-        if not isinstance(self.ports, list) or not all(isinstance(p, int) for p in self.ports):
-            raise ValueError(f"box {self.name}: ports must be a list of integers, e.g. ports = [8090]")
+        if (not isinstance(self.ports, list)
+                or not all(isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= 65535
+                           for p in self.ports)):
+            # bool IS an int in Python: ports=[true] emitted a dangling --port (r2)
+            raise ValueError(f"box {self.name}: ports must be a list of integers in 1-65535, "
+                             f"e.g. ports = [8090]")
         if not isinstance(self.args, dict):
             raise ValueError(f"box {self.name}: [box.args] must be a table of engine flags")
 

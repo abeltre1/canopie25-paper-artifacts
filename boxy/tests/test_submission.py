@@ -207,3 +207,91 @@ def test_endpoint_file_written_by_serving_side(gguf, jobs_dir, monkeypatch, tmp_
     assert rc == 0
     data = json.loads(endpoint_file.read_text())
     assert data["port"] == 9391 and data["url"].endswith(":9391")
+
+
+# ---- round 2: submission auditor ----
+
+def test_r2_unreachable_scheduler_is_unknown_not_done(monkeypatch):
+    """r2-S1 (major, reproduced live): squeue's connect-failure signature
+    (rc!=0, empty stdout) was read as DONE — live jobs got reaped, duplicated,
+    and boxy stop cancelled the wrong job."""
+    import boxy.cli as cli
+    from boxy.schedulers import get_scheduler
+
+    def fake_run(cmd, **kw):
+        return type("R", (), {"returncode": 1, "stdout": "",
+                              "stderr": "slurm_load_jobs error: Unable to contact slurm controller"})()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    assert cli._job_state(get_scheduler("slurm"), "11") == "UNKNOWN"
+
+    def fake_run2(cmd, **kw):
+        return type("R", (), {"returncode": 1, "stdout": "",
+                              "stderr": "slurm_load_jobs error: Invalid job id specified"})()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run2)
+    assert cli._job_state(get_scheduler("slurm"), "11") == "DONE"
+
+
+def test_r2_unknown_state_never_resubmits(gguf, jobs_dir, monkeypatch, capsys):
+    import boxy.cli as cli
+
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "11"})
+    monkeypatch.setattr(cli, "_job_state", lambda s, j: "UNKNOWN")
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--name", "boxy-m"])
+    err = capsys.readouterr()
+    assert rc == 1
+    assert "Not resubmitting" in err.err
+    assert jobs.read_record("boxy-m") is not None        # record NOT reaped
+    assert "sbatch" not in err.out                       # no duplicate job
+
+
+def test_r2_wait_loop_bails_after_unknown_streak(gguf, jobs_dir, monkeypatch, capsys):
+    """r2-S2 (major, reproduced): the wait loop spun forever, silently."""
+    _FakeSlurm(monkeypatch, states=["SUSPENDEDX\n"])  # unmapped -> UNKNOWN forever
+    monkeypatch.setattr("boxy.readiness.wait_ready", lambda url, **kw: None)
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--name", "boxy-m"])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "cannot determine job" in err and "boxy stop boxy-m" in err
+
+
+def test_r2_suspended_is_alive_not_unknown():
+    from boxy.schedulers import get_scheduler
+
+    slurm = get_scheduler("slurm")
+    for state in ("SUSPENDED", "REQUEUED", "RESIZING"):
+        assert slurm.interpret_state(state) == "PENDING"
+
+
+def test_r2_junk_endpoint_json_is_not_published(jobs_dir):
+    jobs.endpoint_path("boxy-m").parent.mkdir(parents=True, exist_ok=True)
+    jobs.endpoint_path("boxy-m").write_text('{"name": "boxy-m", "host": "vm", "port": 1}')  # no url
+    assert jobs.read_endpoint("boxy-m") is None          # was: KeyError downstream
+    jobs.endpoint_path("boxy-m").write_text('"just a string"')
+    assert jobs.read_endpoint("boxy-m") is None
+    jobs.write_endpoint("boxy-m", 8090, job_id="1")      # the real writer round-trips
+    assert jobs.read_endpoint("boxy-m")["url"].endswith(":8090")
+
+
+def test_r2_directive_values_with_spaces_are_quoted(gguf, jobs_dir, capsys):
+    rc = main(["serve", str(gguf), "--scheduler", "slurm",
+               "--scheduler-arg=--comment=hello world", "--dryrun"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert '#SBATCH --comment="hello world"' in out      # was: 'Invalid directive: world'
+
+
+def test_r2_dryrun_does_not_reap_job_state(gguf, jobs_dir, monkeypatch, capsys):
+    """r2-S6: --dryrun deleted stale records and endpoint files."""
+    import boxy.cli as cli
+
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "24"})
+    jobs.write_endpoint("boxy-m", 8090)
+    monkeypatch.setattr(cli, "_job_state", lambda s, j: "DONE")
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--name", "boxy-m", "--dryrun"])
+    assert rc == 0
+    assert jobs.read_record("boxy-m") is not None        # untouched by dryrun
+    rc = main(["list", "--dryrun", "--runtime", "docker"])
+    assert jobs.read_record("boxy-m") is not None
