@@ -93,6 +93,41 @@ def choose_backend(runtime: str | None = None) -> str:
     return "none"
 
 
+def _ini_parses(path: str) -> bool:
+    """True if the file parses as INI the way botocore reads it. botocore's
+    raw_config_parse uses configparser.RawConfigParser, so this matches exactly."""
+    import configparser
+
+    try:
+        configparser.RawConfigParser().read(path)
+        return True
+    except configparser.Error:
+        return False
+
+
+def _isolate_from_broken_aws_files(unsigned: bool) -> None:
+    """boto3 and the aws CLI parse ~/.aws/{credentials,config} at startup and
+    crash on a malformed file — even when credentials come from the environment
+    (field: ConfigParseError on a site ~/.aws/credentials). When those files
+    aren't needed (anonymous access, or explicit AWS_ACCESS_KEY_ID/SECRET in the
+    env, and no AWS_PROFILE), point the loaders at an empty file so a broken one
+    can't break the run. Only redirects a file that actually fails to parse."""
+    env = os.environ
+    if env.get("AWS_PROFILE"):
+        return  # a named profile genuinely needs the files
+    self_sufficient = unsigned or (env.get("AWS_ACCESS_KEY_ID") and env.get("AWS_SECRET_ACCESS_KEY"))
+    if not self_sufficient:
+        return
+    for name, default in (("AWS_SHARED_CREDENTIALS_FILE", "~/.aws/credentials"),
+                          ("AWS_CONFIG_FILE", "~/.aws/config")):
+        path = os.path.expanduser(env.get(name, default))
+        if os.path.isfile(path) and not _ini_parses(path):
+            env[name] = os.devnull
+            print(f"warning: {path} won't parse as an AWS config file — ignoring it and using "
+                  f"{'anonymous access' if unsigned else 'environment credentials'} "
+                  f"(fix the file, or point {name} elsewhere, to silence this)", file=sys.stderr)
+
+
 def no_sign_requested(explicit: bool | None = None) -> bool:
     """Anonymous (unsigned) access for a public bucket: explicit flag wins, else
     S3_NO_SIGN_REQUEST / BOXY_S3_NO_SIGN in the environment."""
@@ -123,6 +158,7 @@ def stage_model(uri: str, models_dir: str, endpoint: str | None = None, dryrun: 
     # user already decided (matches AWS_EC2_METADATA_DISABLED in the K8s config).
     if endpoint and "AWS_EC2_METADATA_DISABLED" not in os.environ:
         os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
+    _isolate_from_broken_aws_files(unsigned)
     chosen = (backend or "").lower()
     if chosen in ("", "auto"):
         chosen = choose_backend(runtime)
@@ -167,14 +203,24 @@ def _boto3_available() -> bool:
 
 def _stage_boto3(bucket: str, key: str, dest: Path, endpoint: str | None, unsigned: bool = False) -> None:
     import boto3
+    import botocore.exceptions
 
+    cfg = None
     if unsigned:
         from botocore import UNSIGNED
         from botocore.client import Config
 
-        client = boto3.client("s3", endpoint_url=endpoint, config=Config(signature_version=UNSIGNED))
-    else:
-        client = boto3.client("s3", endpoint_url=endpoint)
+        cfg = Config(signature_version=UNSIGNED)
+    try:
+        client = boto3.client("s3", endpoint_url=endpoint, config=cfg)
+    except botocore.exceptions.ConfigParseError as e:
+        # reached only when the broken file couldn't be auto-bypassed (no env
+        # creds to fall back on) — give the fix instead of a boto3 stack trace.
+        raise RuntimeError(
+            f"{e}. Fix that AWS config file, or provide AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY "
+            f"in the environment (boxy then ignores the file), or pass --no-sign-request for a "
+            f"public bucket."
+        ) from e
     paginator = client.get_paginator("list_objects_v2")
     prefix = key if key.endswith("/") or not key else key + "/"
     found = False

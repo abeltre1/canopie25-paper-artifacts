@@ -70,10 +70,11 @@ class _FakeS3Client:
 def _install_fake_boto3(monkeypatch, objects, capture=None):
     fake = types.ModuleType("boto3")
 
-    def client(_name, endpoint_url=None):
+    def client(_name, endpoint_url=None, config=None):
         c = _FakeS3Client(objects)
         if capture is not None:
             capture["endpoint_url"] = endpoint_url
+            capture["config"] = config
         return c
 
     fake.client = client
@@ -115,6 +116,45 @@ def test_serve_s3_stages_then_serves_by_path(monkeypatch, tmp_path, capsys):
     assert rc == 0, out
     assert "S3 bucket — staged to the shared filesystem" in out
     assert str(tmp_path / "staged" / "Llama") in out           # served the staged dir
+
+
+def test_broken_aws_credentials_file_is_bypassed_with_env_creds(monkeypatch, tmp_path):
+    """Field: a malformed ~/.aws/credentials crashes boto3 at startup even with
+    env creds. boxy redirects the loader to an empty file and carries on."""
+    bad = tmp_path / "credentials"
+    bad.write_text("not valid ini !!!\n[oops\n")
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(bad))
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "k")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "s")
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    s3._isolate_from_broken_aws_files(unsigned=False)
+    import os as _os
+    assert _os.environ["AWS_SHARED_CREDENTIALS_FILE"] == _os.devnull
+
+
+def test_broken_file_kept_when_profile_or_no_creds(monkeypatch, tmp_path):
+    bad = tmp_path / "credentials"
+    bad.write_text("[oops\n")
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(bad))
+    # no env creds, not unsigned -> we can't bypass (the file is the only auth)
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    s3._isolate_from_broken_aws_files(unsigned=False)
+    assert monkeypatch is monkeypatch and __import__("os").environ["AWS_SHARED_CREDENTIALS_FILE"] == str(bad)
+    # but unsigned is self-sufficient -> bypassed
+    s3._isolate_from_broken_aws_files(unsigned=True)
+    assert __import__("os").environ["AWS_SHARED_CREDENTIALS_FILE"] == __import__("os").devnull
+
+
+def test_valid_aws_file_left_untouched(monkeypatch, tmp_path):
+    good = tmp_path / "credentials"
+    good.write_text("[default]\naws_access_key_id = AKIA\naws_secret_access_key = xxx\n")
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(good))
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "k")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "s")
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    s3._isolate_from_broken_aws_files(unsigned=False)
+    assert __import__("os").environ["AWS_SHARED_CREDENTIALS_FILE"] == str(good)  # untouched
 
 
 def test_box_model_is_s3():
