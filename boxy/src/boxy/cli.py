@@ -1019,8 +1019,9 @@ def cmd_stage(args: argparse.Namespace) -> int:
         return 2
     runtime = getattr(args, "runtime", None) or next(
         (r for r in ("podman", "docker", "apptainer") if shutil.which(r)), "podman")
+    no_sign = True if getattr(args, "no_sign_request", False) else None  # None => env decides
     path = s3.stage_model(model, models_dir, endpoint=endpoint, dryrun=getattr(args, "dryrun", False),
-                          runtime=runtime, backend=getattr(args, "s3_backend", "") or "")
+                          runtime=runtime, backend=getattr(args, "s3_backend", "") or "", no_sign=no_sign)
     print(f"model staged at: {path}\n  serve it:  boxy serve {path} [--scheduler slurm|flux --gpus N]")
     return 0
 
@@ -1380,6 +1381,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "default auto (boto3 -> aws -> container)")
     p.add_argument("--runtime", choices=["podman", "docker", "apptainer"], default=None,
                    help="container engine for --s3-backend=container")
+    p.add_argument("--no-sign-request", action="store_true",
+                   help="anonymous access for a public bucket (no credentials; "
+                        "also via S3_NO_SIGN_REQUEST=1)")
     p.add_argument("--dryrun", action="store_true")
     p.set_defaults(func=cmd_stage)
 

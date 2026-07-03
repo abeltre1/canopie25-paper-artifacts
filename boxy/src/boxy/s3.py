@@ -93,14 +93,24 @@ def choose_backend(runtime: str | None = None) -> str:
     return "none"
 
 
+def no_sign_requested(explicit: bool | None = None) -> bool:
+    """Anonymous (unsigned) access for a public bucket: explicit flag wins, else
+    S3_NO_SIGN_REQUEST / BOXY_S3_NO_SIGN in the environment."""
+    if explicit is not None:
+        return explicit
+    v = (os.environ.get("S3_NO_SIGN_REQUEST") or os.environ.get("BOXY_S3_NO_SIGN") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 def stage_model(uri: str, models_dir: str, endpoint: str | None = None, dryrun: bool = False,
-                runtime: str = "podman", backend: str = "") -> str:
+                runtime: str = "podman", backend: str = "", no_sign: bool | None = None) -> str:
     """Download every object under the S3 prefix into a local directory and
     return that directory's path (boxy then serves it as a shared-FS model).
     Idempotent: unchanged objects are skipped.
 
     `runtime` is boxy's container engine, used by the 'container' backend.
-    `backend` overrides selection ('' = auto / BOXY_S3_BACKEND)."""
+    `backend` overrides selection ('' = auto / BOXY_S3_BACKEND).
+    `no_sign` forces anonymous access for a public bucket (no credentials)."""
     bucket, key = parse_s3_uri(uri)
     if not bucket:
         raise RuntimeError(
@@ -108,6 +118,7 @@ def stage_model(uri: str, models_dir: str, endpoint: str | None = None, dryrun: 
             "(and S3_PATH) in the environment (the same secret keys your K8s deployment uses)."
         )
     endpoint = endpoint_url(endpoint)
+    unsigned = no_sign_requested(no_sign)
     # A custom endpoint means non-AWS: disable the EC2 metadata probe unless the
     # user already decided (matches AWS_EC2_METADATA_DISABLED in the K8s config).
     if endpoint and "AWS_EC2_METADATA_DISABLED" not in os.environ:
@@ -117,23 +128,25 @@ def stage_model(uri: str, models_dir: str, endpoint: str | None = None, dryrun: 
         chosen = choose_backend(runtime)
     dest = _dest_for(key, models_dir)
     where = endpoint or "AWS S3"
+    tag = f"{chosen}, unsigned" if unsigned else chosen
     if dryrun:
-        print(f"### Stage: s3://{bucket}/{key}  ({where}, via {chosen})  ->  {dest}")
+        print(f"### Stage: s3://{bucket}/{key}  ({where}, via {tag})  ->  {dest}")
         return str(dest)
-    if not credentials_present():
+    if not unsigned and not credentials_present():
         raise RuntimeError(
             "no S3 credentials found: export AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY "
-            "(or AWS_PROFILE, or ~/.aws/credentials). boxy reads the same variables your "
-            "K8s secret provides."
+            "(or AWS_PROFILE, or ~/.aws/credentials) — or, for a public bucket, pass "
+            "--no-sign-request (or set S3_NO_SIGN_REQUEST=1). boxy reads the same variables "
+            "your K8s secret provides."
         )
     dest.mkdir(parents=True, exist_ok=True)
-    print(f"### Staging s3://{bucket}/{key} from {where} -> {dest}  (via {chosen})", file=sys.stderr)
+    print(f"### Staging s3://{bucket}/{key} from {where} -> {dest}  (via {tag})", file=sys.stderr)
     if chosen == "boto3":
-        _stage_boto3(bucket, key, dest, endpoint)
+        _stage_boto3(bucket, key, dest, endpoint, unsigned)
     elif chosen == "awscli":
-        _stage_awscli(bucket, key, dest, endpoint)
+        _stage_awscli(bucket, key, dest, endpoint, unsigned)
     elif chosen == "container":
-        _stage_container(bucket, key, dest, endpoint, runtime)
+        _stage_container(bucket, key, dest, endpoint, runtime, unsigned)
     else:
         raise RuntimeError(
             "no S3 staging backend available: install boto3 (pip install boto3), or the aws CLI, "
@@ -152,10 +165,16 @@ def _boto3_available() -> bool:
         return False
 
 
-def _stage_boto3(bucket: str, key: str, dest: Path, endpoint: str | None) -> None:
+def _stage_boto3(bucket: str, key: str, dest: Path, endpoint: str | None, unsigned: bool = False) -> None:
     import boto3
 
-    client = boto3.client("s3", endpoint_url=endpoint)
+    if unsigned:
+        from botocore import UNSIGNED
+        from botocore.client import Config
+
+        client = boto3.client("s3", endpoint_url=endpoint, config=Config(signature_version=UNSIGNED))
+    else:
+        client = boto3.client("s3", endpoint_url=endpoint)
     paginator = client.get_paginator("list_objects_v2")
     prefix = key if key.endswith("/") or not key else key + "/"
     found = False
@@ -176,22 +195,26 @@ def _stage_boto3(bucket: str, key: str, dest: Path, endpoint: str | None) -> Non
         raise RuntimeError(f"nothing found under s3://{bucket}/{key} — check the bucket/prefix")
 
 
-def _aws_sync_args(bucket: str, key: str, endpoint: str | None, dest_in_container: str) -> list[str]:
+def _aws_sync_args(bucket: str, key: str, endpoint: str | None, dest_in_container: str,
+                   unsigned: bool = False) -> list[str]:
     args = []
     if endpoint:
         args += ["--endpoint-url", endpoint]
     args += ["s3", "sync", f"s3://{bucket}/{key.rstrip('/')}/", dest_in_container]
+    if unsigned:
+        args.append("--no-sign-request")
     return args
 
 
-def _stage_awscli(bucket: str, key: str, dest: Path, endpoint: str | None) -> None:
-    cmd = ["aws"] + _aws_sync_args(bucket, key, endpoint, f"{dest}/")
+def _stage_awscli(bucket: str, key: str, dest: Path, endpoint: str | None, unsigned: bool = False) -> None:
+    cmd = ["aws"] + _aws_sync_args(bucket, key, endpoint, f"{dest}/", unsigned)
     result = subprocess.run(cmd)
     if result.returncode != 0:
         raise RuntimeError(f"aws s3 sync failed (rc={result.returncode}) for s3://{bucket}/{key}")
 
 
-def _stage_container(bucket: str, key: str, dest: Path, endpoint: str | None, runtime: str) -> None:
+def _stage_container(bucket: str, key: str, dest: Path, endpoint: str | None, runtime: str,
+                     unsigned: bool = False) -> None:
     """Run the aws CLI inside a container (the paper's approach): no host Python
     or aws-CLI dependency, just boxy's container engine. Credentials + endpoint
     flow through the environment, exactly like the K8s pod's secret env."""
@@ -201,13 +224,13 @@ def _stage_container(bucket: str, key: str, dest: Path, endpoint: str | None, ru
         # apptainer exec forwards host env by default; call `aws` explicitly
         # (its image ENTRYPOINT is not run by exec).
         cmd = ["apptainer", "exec", "--bind", f"{dest}:/dest", f"docker://{image}",
-               "aws"] + _aws_sync_args(bucket, key, endpoint, "/dest/")
+               "aws"] + _aws_sync_args(bucket, key, endpoint, "/dest/", unsigned)
     else:  # podman / docker: image ENTRYPOINT is `aws`
         cmd = [runtime, "run", "--rm", "--network=host"]
         for var in present:
             cmd += ["-e", var]  # forward the value from boxy's environment
         cmd += ["-v", f"{dest}:/dest", image]
-        cmd += _aws_sync_args(bucket, key, endpoint, "/dest/")
+        cmd += _aws_sync_args(bucket, key, endpoint, "/dest/", unsigned)
     result = subprocess.run(cmd)
     if result.returncode != 0:
         raise RuntimeError(

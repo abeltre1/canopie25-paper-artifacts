@@ -166,6 +166,46 @@ def test_container_backend_builds_podman_command(monkeypatch, tmp_path):
     assert f"{tmp_path / 'Llama'}:/dest" in cmd                  # bind mount
 
 
+def test_no_sign_skips_credentials_and_adds_flag_awscli(monkeypatch, tmp_path):
+    """Public bucket: --no-sign-request needs no creds and passes the flag through."""
+    monkeypatch.setenv("BOXY_S3_BACKEND", "awscli")
+    monkeypatch.setattr(s3.shutil, "which", lambda b: "/usr/bin/aws")
+    seen = {}
+    monkeypatch.setattr(s3.subprocess, "run",
+                        lambda cmd, *a, **k: seen.update(cmd=cmd) or __import__("types").SimpleNamespace(returncode=0))
+    # no AWS_* creds set at all -> would normally raise; --no-sign-request allows it
+    s3.stage_model("s3://public/models/x", str(tmp_path), no_sign=True)
+    assert "--no-sign-request" in seen["cmd"]
+
+
+def test_no_sign_via_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("S3_NO_SIGN_REQUEST", "1")
+    monkeypatch.setenv("BOXY_S3_BACKEND", "container")
+    seen = {}
+    monkeypatch.setattr(s3.subprocess, "run",
+                        lambda cmd, *a, **k: seen.update(cmd=cmd) or __import__("types").SimpleNamespace(returncode=0))
+    s3.stage_model("s3://public/models/x", str(tmp_path), runtime="podman")
+    assert "--no-sign-request" in seen["cmd"]
+
+
+def test_no_sign_boto3_uses_unsigned_config(monkeypatch, tmp_path):
+    pytest.importorskip("botocore")  # UNSIGNED sentinel comes from botocore
+    monkeypatch.setenv("BOXY_S3_BACKEND", "boto3")
+    cap = {}
+    fake = types.ModuleType("boto3")
+
+    def client(_n, endpoint_url=None, config=None):
+        cap["config"] = config
+        return _FakeS3Client({"models/x/config.json": b"{}"})
+
+    fake.client = client
+    monkeypatch.setitem(sys.modules, "boto3", fake)
+    # provide a real botocore UNSIGNED sentinel
+    s3.stage_model("s3://public/models/x", str(tmp_path), no_sign=True)
+    from botocore import UNSIGNED
+    assert cap["config"] is not None and cap["config"].signature_version is UNSIGNED
+
+
 def test_container_backend_apptainer_calls_aws_explicitly(monkeypatch, tmp_path):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "k")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "s")
