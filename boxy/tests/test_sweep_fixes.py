@@ -697,3 +697,69 @@ def test_info_net_never_probes_blocked_registries(monkeypatch):
     urls = [url for _scheme, url in policy.registry_probes()]
     assert not any("modelscope" in u for u in urls)
     assert any("huggingface.co" in u for u in urls) and any("ollama" in u for u in urls)
+
+
+# ---- HF token precedence + validation (field report: 'HF_TOKEN did not take effect') ----
+
+def test_effective_hf_token_env_wins_outright(monkeypatch, tmp_path):
+    """Mirrors RamaLama's verified precedence: HF_TOKEN set => cache IGNORED."""
+    cache = tmp_path / "token"
+    cache.write_text("hf_CACHED\n")
+    monkeypatch.setattr(ramalama_shim.os.path, "expanduser",
+                        lambda p: str(cache) if "huggingface" in p else p)
+    monkeypatch.setenv("HF_TOKEN", "hf_FROMENV")
+    token, source = ramalama_shim.effective_hf_token()
+    assert token == "hf_FROMENV" and "HF_TOKEN env" in source
+    monkeypatch.delenv("HF_TOKEN")
+    token, source = ramalama_shim.effective_hf_token()
+    assert token == "hf_CACHED" and "huggingface-cli" in source
+    monkeypatch.setenv("HF_TOKEN", "")           # empty forces anonymous
+    token, source = ramalama_shim.effective_hf_token()
+    assert token is None and "EMPTY" in source
+
+
+def test_info_names_the_winning_token_source(monkeypatch, tmp_path, capsys):
+    cache = tmp_path / "token"
+    cache.write_text("hf_CACHED\n")
+    monkeypatch.setattr(ramalama_shim.os.path, "expanduser",
+                        lambda p: str(cache) if "huggingface" in p else p)
+    monkeypatch.setenv("HF_TOKEN", "hf_FROMENV")
+    assert main(["info"]) == 0
+    out = capsys.readouterr().out
+    assert "using HF_TOKEN env var" in out
+    assert "IGNORED while HF_TOKEN is set" in out    # both present -> precedence stated
+    assert "hf_FROMENV" not in out and "hf_CACHED" not in out
+
+
+def test_info_net_validates_effective_token(monkeypatch, capsys):
+    import urllib.error
+    import urllib.request
+
+    monkeypatch.setenv("HF_TOKEN", "hf_SOMETOKEN")
+    monkeypatch.setattr(ramalama_shim, "ensure_trust_bundle", lambda: None)
+    monkeypatch.delenv("BOXY_ALLOW_TRANSPORTS", raising=False)
+    seen = {}
+
+    def fake_urlopen(req, timeout=0):
+        url = req if isinstance(req, str) else req.full_url
+        if "whoami" in url:
+            seen["auth"] = req.get_header("Authorization")
+            raise urllib.error.HTTPError(url, 401, "Unauthorized", None, None)
+
+        class R:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        return R()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    rc = main(["info", "--net"])
+    out = capsys.readouterr().out
+    assert seen["auth"] == "Bearer hf_SOMETOKEN"      # the EFFECTIVE token was tested
+    assert "INVALID (HTTP 401)" in out and "re-export HF_TOKEN" in out
+    assert "hf_SOMETOKEN" not in out                  # never printed
+    assert rc == 1                                    # invalid token counts as a failure

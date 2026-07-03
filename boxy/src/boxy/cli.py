@@ -74,9 +74,21 @@ def cmd_info(args: argparse.Namespace) -> int:
     blocked = sorted({policy._canonical(s) for s in policy.REGISTRIES} - set(allowed))
     print(f"registries: allowed [{', '.join(allowed)}]  blocked [{', '.join(blocked)}]"
           + ("" if os.environ.get("BOXY_ALLOW_TRANSPORTS") else "  (default policy)"))
-    # auth STATUS only — values are never printed
+    # auth STATUS only — values are never printed. When BOTH sources exist,
+    # say which one WINS: RamaLama's precedence is HF_TOKEN env outright; the
+    # cache file is ignored while HF_TOKEN is set (verified at its source).
+    token, source = ramalama_shim.effective_hf_token()
     hf_sources = ramalama_shim._hf_token_sources()
-    print(f"auth: HuggingFace token: {'present (' + ' and '.join(hf_sources) + ')' if hf_sources else 'not configured (export HF_TOKEN=... for gated repos)'}")
+    if token:
+        note = f"present, using {source}"
+        if len(hf_sources) > 1:
+            note += " — takes precedence; ~/.cache/huggingface/token is IGNORED while HF_TOKEN is set"
+        note += "  (validate: boxy info --net)"
+    elif source.startswith("HF_TOKEN env var (set but EMPTY"):
+        note = source
+    else:
+        note = "not configured (export HF_TOKEN=... for gated repos)"
+    print(f"auth: HuggingFace token: {note}")
     if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
         s3 = "present (AWS_ACCESS_KEY_ID env)"
     elif os.environ.get("AWS_PROFILE"):
@@ -103,6 +115,30 @@ def _probe_registries() -> int:
 
     ramalama_shim.ensure_trust_bundle()
     failures = 0
+    token, source = ramalama_shim.effective_hf_token()
+    if token:
+        # the definitive "did my token take effect" answer: ask HF who the
+        # EFFECTIVE token belongs to (same resolution as the pull itself)
+        request = urllib.request.Request("https://huggingface.co/api/whoami-v2",
+                                         headers={"Authorization": f"Bearer {token}",
+                                                  "User-Agent": "boxy"})
+        try:
+            import json as _json
+
+            with urllib.request.urlopen(request, timeout=8) as resp:
+                who = _json.load(resp)
+            print(f"net: hf-auth    whoami OK — token from {source} is VALID "
+                  f"(user: {who.get('name', '?')})")
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                print(f"net: hf-auth    token from {source} is INVALID (HTTP {e.code}) — "
+                      f"HF rejects it; gated/private pulls WILL fail. Generate a fresh token at "
+                      f"https://huggingface.co/settings/tokens and re-export HF_TOKEN.")
+                failures += 1
+            else:
+                print(f"net: hf-auth    could not validate (HTTP {e.code})")
+        except Exception as e:
+            print(f"net: hf-auth    could not validate ({getattr(e, 'reason', e)})")
     for scheme, url in policy.registry_probes():
         try:
             with urllib.request.urlopen(url, timeout=8) as resp:

@@ -323,6 +323,24 @@ def _pull_failure_message(model_uri: str, error: Exception, logged: list[str] | 
     return msg
 
 
+def effective_hf_token() -> tuple[str | None, str]:
+    """(token, source) — THE token an hf:// pull will send, resolved with
+    RamaLama's own precedence (verified in its huggingface_token(), used by
+    all five of its request paths): the HF_TOKEN env var WINS outright; the
+    huggingface-cli cache file is never read while HF_TOKEN is set."""
+    if "HF_TOKEN" in os.environ:
+        token = os.environ["HF_TOKEN"].strip() or None
+        return token, "HF_TOKEN env var" if token else "HF_TOKEN env var (set but EMPTY — forces anonymous)"
+    token_path = os.path.expanduser("~/.cache/huggingface/token")
+    if os.path.exists(token_path):
+        try:
+            with open(token_path) as f:
+                return f.read().strip() or None, "~/.cache/huggingface/token (huggingface-cli login)"
+        except OSError:
+            pass
+    return None, "not configured"
+
+
 def _hf_token_sources() -> list[str]:
     """Where RamaLama's HF transport will find a token (its huggingface_token():
     HF_TOKEN env var first, then the huggingface-cli login cache)."""
