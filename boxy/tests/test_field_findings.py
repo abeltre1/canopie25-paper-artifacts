@@ -111,6 +111,24 @@ def test_finding10_missing_volume_source_warns(hops, tmp_path):
     assert not any("does not exist on this host" in w for w in d2.warnings)
 
 
+def test_finding11_macos_publishes_ports_instead_of_host_network(monkeypatch, hops):
+    from boxy.backends import get_backend
+
+    box = Box(name="q", image="i", engine="llama.cpp", model="m.gguf", ports=[8090])
+    inner = ["", "-m", "m.gguf", "--host", "0.0.0.0", "--port", "8001"]
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    cmd = get_backend("podman").build_command(box, hops, inner, {}, [], "none")
+    assert "--network=host" not in cmd
+    assert "-p" in cmd
+    published = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-p"]
+    assert "8090:8090" in published and "8001:8001" in published  # box port + CLI override
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    cmd = get_backend("podman").build_command(box, hops, inner, {}, [], "none")
+    assert "--network=host" in cmd and "-p" not in cmd  # HPC parity preserved
+
+
 def test_finding8_prompts_hard_silenced_at_seam():
     ramalama_shim.detect_accel()
     import ramalama.common as rc
