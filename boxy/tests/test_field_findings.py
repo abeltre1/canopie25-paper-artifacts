@@ -51,13 +51,13 @@ def test_finding3_cli_fallback_message_names_real_cause():
     assert "connection reset by peer" in msg    # surfaces the real error
 
 
-def test_finding4_workdir_without_volume_warns(hops):
+def test_finding4_workdir_without_volume_warns(hops, tmp_path):
     box = Box(name="w", image="i", model="m", workdir="/vllm-workspace/models")
     d = deploy.plan_serve(box, hops, dryrun=True)
     assert any("workdir" in w and "Podman will refuse" in w for w in d.warnings)
     # and the warning reaches the user on stderr through the CLI
     ok = Box(name="w2", image="i", model="m", workdir="/models",
-             volumes=[Volume(source="/x", target="/models")])
+             volumes=[Volume(source=str(tmp_path), target="/models")])
     d2 = deploy.plan_serve(ok, hops, dryrun=True)
     assert d2.warnings == []
 
@@ -97,6 +97,18 @@ def test_finding7_llamacpp_defers_to_image_entrypoint(hops):
     cmd = get_backend("apptainer").build_command(box, hops, ["", "-m", "m.gguf"], {}, [], "cuda")
     assert cmd[:2] == ["apptainer", "run"]
     assert "" not in cmd
+
+
+def test_finding10_missing_volume_source_warns(hops, tmp_path):
+    box = Box(name="v", image="i", model="m",
+              volumes=[Volume(source="/definitely/not/there", target="/models")])
+    d = deploy.plan_serve(box, hops, dryrun=True)
+    assert any("does not exist on this host" in w for w in d.warnings)
+    # existing source: no such warning
+    box2 = Box(name="v2", image="i", model="m",
+               volumes=[Volume(source=str(tmp_path), target="/models")])
+    d2 = deploy.plan_serve(box2, hops, dryrun=True)
+    assert not any("does not exist on this host" in w for w in d2.warnings)
 
 
 def test_finding8_prompts_hard_silenced_at_seam():

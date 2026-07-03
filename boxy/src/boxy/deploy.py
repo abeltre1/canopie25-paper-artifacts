@@ -113,6 +113,17 @@ def _plan(
             "the image must already contain this directory or Podman will refuse to start "
             "(drop `workdir` or add a [[box.volumes]] entry targeting it)"
         )
+    # A bind-mount source missing on THIS host fails immediately under
+    # podman/docker ('statfs ... no such file or directory'). Only a warning:
+    # with a scheduler wrap the path may exist on the compute node instead.
+    # (Field finding #10: Mac run-through, 2026-07.)
+    for source, _target, _options in mounts:
+        if os.path.isabs(source) and not os.path.exists(source):
+            warnings.append(
+                f"volume source {source!r} does not exist on this host — podman/docker will fail "
+                "with 'statfs: no such file or directory' unless it exists on the target node "
+                "(create it, or point [location.staging] models_dir at your model directory)"
+            )
     cmd = backend.build_command(box, location, inner_cmd, env, mounts, accelerator)
     cmd = scheduler.with_modules(cmd, location)
     cmd = scheduler.wrap(cmd, location)
