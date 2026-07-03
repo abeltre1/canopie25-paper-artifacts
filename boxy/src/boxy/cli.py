@@ -622,9 +622,15 @@ def _inner_serve_command(args, model: str, name: str) -> str:
     return shlex.join(inner)
 
 
-def _serve_submission(args, scheduler_name: str, profile) -> int:
+def _serve_submission(args, scheduler_name: str, profile, name_override: str | None = None,
+                      follow: bool = True) -> int:
     """The seamless scheduler path: generate a batch script, submit it, follow
-    the job to READY, print the endpoint — then get out of the way."""
+    the job to READY, print the endpoint — then get out of the way.
+
+    `name_override` pins the job name (used by the --replicas fan-out, which owns
+    the name and prints the shared auto: lines once). `follow=False` submits and
+    returns immediately without the readiness wait (each replica is followed via
+    `boxy list`, not a blocking loop per replica)."""
     import time
 
     from boxy import jobs, readiness, resolve
@@ -633,12 +639,15 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
 
     model, name, decisions = resolve.resolve_submission(
         args.model, scheduler_name, name=args.name, require_exists=not args.dryrun)
-    for line in decisions:
-        print(f"  auto: {line}")
-    if getattr(args, "unique", False):
-        name = _unique_instance_name(name)
-        print(f"  auto: name: {name} (--unique — independent instance; "
-              f"log/endpoint/job are its own)")
+    if name_override is not None:
+        name = name_override
+    else:
+        for line in decisions:
+            print(f"  auto: {line}")
+        if getattr(args, "unique", False):
+            name = _unique_instance_name(name)
+            print(f"  auto: name: {name} (--unique — independent instance; "
+                  f"log/endpoint/job are its own)")
 
     if profile is not None:
         location = profile
@@ -765,6 +774,10 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
                              "model": model, "submitted_from": socket.gethostname(),
                              "log": str(expected_log)})
     print(f"### Submitted {scheduler_name} job {job_id}  ({name})")
+    if not follow:
+        # --replicas fan-out: don't block on this one; it's tracked via boxy list.
+        print(f"###   endpoint (when ready): {jobs.endpoint_path(name)}")
+        return 0
     print("### Waiting for the job to start and the server to become ready ... "
           "(Ctrl-C detaches; the job keeps running)")
 
@@ -823,6 +836,44 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
         print(f"###   status: boxy list      endpoint file: {jobs.endpoint_path(name)}")
         print(f"###   stop:   boxy stop {name}")
         return 0
+
+
+def _serve_replicas(args, scheduler_name: str, profile, replicas: int) -> int:
+    """Data-parallel fan-out: submit K independent instances of the model, each
+    its own batch job named <base>-r0..r{K-1} with its own name/endpoint/log/port.
+    Each replica is itself single-node or (with --nodes>1) a distributed instance.
+    Submission is non-blocking (sbatch/flux-batch return at once); the replicas are
+    then tracked together via `boxy list`."""
+    from boxy import jobs, resolve
+
+    _model, base_name, decisions = resolve.resolve_submission(
+        args.model, scheduler_name, name=args.name, require_exists=not args.dryrun)
+    for line in decisions:
+        print(f"  auto: {line}")
+    if getattr(args, "unique", False):
+        base_name = _unique_instance_name(base_name)
+    names = [f"{base_name}-r{i}" for i in range(replicas)]
+    print(f"  auto: replicas: {replicas} independent instances of {base_name} "
+          f"(data-parallel) — each its own job/endpoint/log: {', '.join(names)}")
+
+    rcs = []
+    for nm in names:
+        print(f"\n### Replica {nm}")
+        rcs.append(_serve_submission(args, scheduler_name, profile, name_override=nm, follow=False))
+
+    if args.dryrun:
+        print(f"\n### dryrun: {replicas} replica batch scripts shown above; nothing submitted")
+        return 0
+    submitted = [nm for nm, rc in zip(names, rcs) if rc == 0]
+    print(f"\n### replicas: {len(submitted)}/{replicas} submitted"
+          + (f", {replicas - len(submitted)} blocked/failed" if len(submitted) < replicas else ""))
+    for nm in submitted:
+        rec = jobs.read_record(nm)
+        if rec:
+            print(f"###   {nm}: {scheduler_name} job {rec['job']}   endpoint: {jobs.endpoint_path(nm)}")
+    if submitted:
+        print("###   watch all: boxy list      stop one: boxy stop <name>")
+    return 0 if len(submitted) == replicas else 1
 
 
 def _rename_container(cmd: list[str], old: str, new: str) -> list[str]:
@@ -904,7 +955,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
             if scheduler_name is None and profile.scheduler in ("slurm", "flux"):
                 scheduler_name = profile.scheduler
         if scheduler_name in ("slurm", "flux"):
+            replicas = getattr(args, "replicas", 1) or 1
+            if replicas > 1:
+                return _serve_replicas(args, scheduler_name, profile, replicas)
             return _serve_submission(args, scheduler_name, profile)
+
+    if (getattr(args, "replicas", 1) or 1) > 1:
+        print("boxy: --replicas is supported on the batch-submission path "
+              "(boxy serve MODEL --scheduler slurm|flux). It doesn't apply to --box, "
+              "--foreground, or scheduler=none. For multiple LOCAL instances, run "
+              "`boxy serve MODEL --unique` once per instance.", file=sys.stderr)
+        return 2
 
     box, location, decisions = _resolve_or_load(args)
     for line in decisions:
@@ -1391,6 +1452,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="append a unique suffix to the name so you can launch MULTIPLE instances of "
                         "the same model at once (each gets its own job, log, and endpoint) instead of "
                         "reusing/blocking on the single deterministic name")
+    p.add_argument("--replicas", type=int, default=1, metavar="K",
+                   help="data-parallel: submit K independent instances of the model, each its own "
+                        "batch job named <base>-r0..r{K-1} with its own endpoint/log/port. Requires "
+                        "--scheduler slurm|flux; composes with --nodes>1 (each replica is itself a "
+                        "distributed instance)")
     p.add_argument("--partition", default=None,
                    help="partition/queue for --scheduler jobs (Slurm --partition, Flux --queue)")
     p.add_argument("--account", default=None,
