@@ -270,6 +270,16 @@ def _pull_failure_message(model_uri: str, error: Exception, logged: list[str] | 
                 " or your venv's bin/activate"
                 "\n  Diagnose per registry: boxy info --net"
             )
+    if "401" in combined and model_uri.startswith(("hf://", "huggingface://")):
+        repo = "/".join(model_uri.split("://", 1)[1].split("/")[:2])
+        msg += (
+            "\n  remedy: HuggingFace answers 401 for two different reasons:\n"
+            f"    1. the repo/file does NOT exist (anonymous requests get 401, not 404) —\n"
+            f"       check https://huggingface.co/{repo} in a browser first;\n"
+            "    2. the repo is gated/private — accept its license on the model page, then\n"
+            "       export HF_TOKEN=<token from https://huggingface.co/settings/tokens>\n"
+            "       (RamaLama also honors a `huggingface-cli login` cached token)."
+        )
     if "cli download not available" in combined:
         msg += (
             "\n  note: RamaLama 0.23's HuggingFace full-repo CLI fallback is unimplemented;"

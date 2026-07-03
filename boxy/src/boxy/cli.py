@@ -202,6 +202,86 @@ def _container_exists(runtime: str, name: str) -> bool:
     return result.returncode == 0
 
 
+def _container_label(runtime: str, name: str) -> str:
+    result = subprocess.run(
+        [runtime, "inspect", "--format", '{{index .Config.Labels "boxy.box"}}', name],
+        capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _container_port(runtime: str, name: str) -> int | None:
+    """The port an existing container actually serves on, parsed from its own
+    command line (boxy always injects --port). The FRESH resolution's port is
+    wrong here by construction: the running instance makes its own port look
+    'busy', so the scan advances past it and the probe would miss."""
+    import json
+
+    result = subprocess.run([runtime, "inspect", "--format", "{{json .Config.Cmd}}", name],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    try:
+        cmd = json.loads(result.stdout) or []
+    except ValueError:
+        return None
+    for i, arg in enumerate(cmd):
+        if arg == "--port" and i + 1 < len(cmd) and str(cmd[i + 1]).isdigit():
+            return int(cmd[i + 1])
+        if isinstance(arg, str) and arg.startswith("--port=") and arg.split("=", 1)[1].isdigit():
+            return int(arg.split("=", 1)[1])
+    return None
+
+
+def _reclaim_or_report(runtime: str, name: str, url: str) -> tuple[int | None, str]:
+    """Name-collision policy (field finding #14, 2026-07):
+
+      * name held by OUR container, answering  -> report the endpoint, exit 0
+        (rerunning `boxy serve MODEL` is idempotent — a suffix here would
+        silently double-serve the model and its memory);
+      * ours, running but not answering        -> say it's still loading;
+      * ours, exited                           -> dump its logs, remove, relaunch;
+      * NOT created by boxy                    -> auto-suffix (-2, -3, ...) and
+        proceed — someone else owns that name, colliding is pure friction.
+
+    Returns (exit code | None to launch, final container name)."""
+    from boxy import readiness
+
+    if not _container_exists(runtime, name):
+        return None, name
+    if _container_label(runtime, name) != name:
+        # foreign owner: walk the suffixes — reclaim OUR suffixed instance if
+        # one exists (keeps reruns idempotent), else take the first free name.
+        for i in range(2, 10):
+            candidate = f"{name}-{i}"
+            if not _container_exists(runtime, candidate):
+                print(f"  auto: name: {candidate} ({name!r} exists but was not created by boxy)")
+                return None, candidate
+            if _container_label(runtime, candidate) == candidate:
+                return _reclaim_or_report(runtime, candidate, url)
+        raise RuntimeError(f"container names {name} and {name}-2..-9 are all taken; pass --name")
+    if _container_running(runtime, name):
+        # ask the CONTAINER for its port: the fresh resolution's port is wrong
+        # by construction (the running instance made it look "busy").
+        actual_port = _container_port(runtime, name)
+        if actual_port:
+            url = f"http://127.0.0.1:{actual_port}"
+        model_id = readiness.wait_ready(url, timeout_s=2, interval_s=0.5)
+        if model_id:
+            print(f"### ALREADY SERVING  {url}/v1   (model: {model_id})")
+            print(f"###   try:  curl -s {url}/v1/models")
+            print(f"###   stop: boxy stop {name}")
+            return 0, name
+        print(f"boxy: {name} is already running but not answering yet (model still loading?)\n"
+              f"  follow: {runtime} logs -f {name}\n"
+              f"  stop:   boxy stop {name}", file=sys.stderr)
+        return 1, name
+    print("boxy: found an exited container from a previous attempt; its last log lines:", file=sys.stderr)
+    _dump_logs(runtime, name)
+    subprocess.run([runtime, "rm", name], capture_output=True)
+    print(f"boxy: removed {name}; relaunching ...", file=sys.stderr)
+    return None, name
+
+
 def _container_running(runtime: str, name: str) -> bool:
     result = subprocess.run([runtime, "inspect", "--format", "{{.State.Running}}", name],
                             capture_output=True, text=True)
@@ -232,11 +312,19 @@ def cmd_serve(args: argparse.Namespace) -> int:
     cname = deployment.box.name
     detach = _detachable(deployment) and not args.foreground and not args.dryrun and args.model
     if detach:
-        if _container_exists(runtime_bin, cname):
-            raise RuntimeError(
-                f"a container named {cname!r} already exists — already serving this model? "
-                f"Stop it with `boxy stop {cname}`, or serve under a different --name."
-            )
+        rc_existing, final_name = _reclaim_or_report(runtime_bin, cname, url)
+        if rc_existing is not None:
+            return rc_existing
+        if final_name != cname:
+            from dataclasses import replace
+
+            deployment.command[:] = [
+                a.replace(f"--name={cname}", f"--name={final_name}")
+                 .replace(f"--label=boxy.box={cname}", f"--label=boxy.box={final_name}")
+                for a in deployment.command
+            ]
+            deployment.box = replace(deployment.box, name=final_name)
+            cname = final_name
         if "--rm" in deployment.command:
             # keep the container after a crash so its logs stay inspectable;
             # `boxy stop` removes it.

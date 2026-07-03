@@ -161,6 +161,23 @@ def test_finding12c_info_reports_tls_state(monkeypatch, capsys):
     assert "MISSING FILE" in capsys.readouterr().out
 
 
+def test_finding15_hf_401_explains_both_causes():
+    """HF answers 401 for NONEXISTENT repos (anonymous gets 401, not 404) as
+    well as gated ones — the message must say to check the URL first, then
+    HF_TOKEN. (Field finding: bartowski/Llama-3.1-8B-GGUF typo, 2026-07.)"""
+    try:
+        try:
+            raise OSError("HTTP Error 401: Unauthorized")
+        except OSError:
+            raise NotImplementedError("huggingface cli download not available")
+    except NotImplementedError as e:
+        msg = ramalama_shim._pull_failure_message(
+            "hf://bartowski/Llama-3.1-8B-GGUF/Llama-3.1-8B-Q4_K_M.gguf", e)
+    assert "does NOT exist" in msg
+    assert "https://huggingface.co/bartowski/Llama-3.1-8B-GGUF" in msg
+    assert "HF_TOKEN" in msg
+
+
 def test_finding3_cli_fallback_message_names_real_cause():
     try:
         try:
