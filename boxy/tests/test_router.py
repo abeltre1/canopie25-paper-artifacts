@@ -2,6 +2,7 @@
 real end-to-end fan-out + SSE streaming + failover test against local backends.
 No cluster needed."""
 
+import http.client
 import json
 import threading
 import urllib.request
@@ -99,6 +100,24 @@ def test_release_decrements():
     assert b.inflight == 3
     p.release(b)
     assert p.snapshot()[0].inflight == 2
+
+
+def test_release_ignores_stale_backend_after_rejoin():
+    # A replica that leaves and rejoins (health-flap) gets a fresh generation; a
+    # stale release from its previous incarnation must NOT steal the new one's slot.
+    pool = router.Pool()
+    pool.replace([router.Backend("r0", "http://h:8000", "h", 8000)])
+    picked = pool.pick()                    # request A reserves on r0 (gen g1)
+    assert picked.inflight == 1
+    pool.replace([])                        # r0 leaves the pool
+    pool.replace([router.Backend("r0", "http://h:8000", "h", 8000)])  # rejoins fresh (gen g2)
+    assert pool.snapshot()[0].inflight == 0
+    b = pool.pick()                         # request B reserves on the fresh r0
+    assert b.inflight == 1
+    pool.release(picked)                    # A's stale release — different gen → ignored
+    assert pool._by_name["r0"].inflight == 1
+    pool.release(b)                         # B's real release
+    assert pool._by_name["r0"].inflight == 0
 
 
 # ---- discovery replace: join / leave / preserve inflight ---------------------
@@ -308,6 +327,58 @@ def test_router_survives_upstream_abort_midstream(tmp_path, monkeypatch):
         srv.shutdown()
         disc.stop()
         good.shutdown()
+        bad.shutdown()
+
+
+class _TruncatingBackend(BaseHTTPRequestHandler):
+    """Answers /v1/models, but its POST declares Content-Length: 100 and sends only
+    10 bytes before closing — a truncated non-streamed response."""
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        body = json.dumps({"object": "list", "data": [{"id": "fake-model"}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "100")  # lies: only sends 10
+        self.end_headers()
+        self.wfile.write(b"x" * 10)
+        self.wfile.flush()
+        self.close_connection = True
+
+
+def test_router_closes_on_truncated_content_length(tmp_path, monkeypatch):
+    # An upstream that under-delivers its Content-Length must make the router CLOSE
+    # the client connection (clean truncation) rather than leave it hung waiting for
+    # bytes that never come (keep-alive desync). The client then sees IncompleteRead.
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
+    bad = ThreadingHTTPServer(("127.0.0.1", 0), _TruncatingBackend)
+    threading.Thread(target=bad.serve_forever, daemon=True).start()
+    port = bad.server_address[1]
+    (tmp_path / "trunc-r0.endpoint.json").write_text(json.dumps(
+        {"name": "trunc-r0", "host": "127.0.0.1", "port": port,
+         "url": f"http://127.0.0.1:{port}", "job": "1"}))
+    pool = router.Pool()
+    disc = router.DiscoveryThread("trunc", pool)
+    disc.scan_once()
+    srv = router.make_server(pool, 0, host="127.0.0.1", connect_timeout=1.0, read_timeout=3.0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    rport = srv.server_address[1]
+    try:
+        resp = _post(rport)
+        with pytest.raises(http.client.IncompleteRead):
+            resp.read()  # closed after 10 of the declared 100 bytes
+    finally:
+        srv.shutdown()
+        disc.stop()
         bad.shutdown()
 
 

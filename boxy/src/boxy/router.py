@@ -42,7 +42,9 @@ HOP_BY_HOP = frozenset({
 @dataclass
 class Backend:
     """One replica endpoint. `url` is `http://host:port` (no `/v1`), matching
-    jobs.write_endpoint_file."""
+    jobs.write_endpoint_file. `gen` distinguishes incarnations of the same name: a
+    replica that leaves and rejoins (health-flap) gets a fresh generation, so a
+    stale release from the previous incarnation can't decrement the new one."""
     name: str
     url: str
     host: str
@@ -50,6 +52,7 @@ class Backend:
     model: str | None = None
     inflight: int = 0
     healthy: bool = True
+    gen: int = 0
 
 
 class Pool:
@@ -64,6 +67,7 @@ class Pool:
         self._lock = threading.Lock()
         self._by_name: dict[str, Backend] = {b.name: b for b in backends}
         self._rr = 0
+        self._gen = 0
         self.policy = policy
 
     def pick(self, exclude: frozenset[str] = frozenset()) -> Backend | None:
@@ -84,7 +88,10 @@ class Pool:
     def release(self, backend: Backend) -> None:
         with self._lock:
             b = self._by_name.get(backend.name)
-            if b is not None and b.inflight > 0:
+            # only decrement if this is the SAME incarnation we reserved on — a
+            # replica that left and rejoined has a fresh gen, so a stale release
+            # must not steal a slot from the new incarnation's live requests.
+            if b is not None and b.gen == backend.gen and b.inflight > 0:
                 b.inflight -= 1
 
     def mark(self, name: str, healthy: bool) -> None:
@@ -102,7 +109,11 @@ class Pool:
             for b in backends:
                 old = self._by_name.get(b.name)
                 if old is not None:
-                    b.inflight = old.inflight
+                    b.inflight = old.inflight  # survivor: carry the live-request count
+                    b.gen = old.gen            # ...and its generation (same incarnation)
+                else:
+                    self._gen += 1
+                    b.gen = self._gen          # (re)join: fresh generation
                 new[b.name] = b
             self._by_name = new
 
@@ -217,6 +228,13 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 while remaining > 0:
                     chunk = resp.read(min(65536, remaining))
                     if not chunk:
+                        # http.client's read(amt) returns b"" on early EOF instead
+                        # of raising (CPython keeps this for back-compat), so a
+                        # truncated upstream would otherwise leave the client hung
+                        # on a keep-alive connection expecting Content-Length bytes
+                        # that never come. Turn the short read into a connection
+                        # close so the client sees a clean truncation, not a desync.
+                        self.close_connection = True
                         break
                     self.wfile.write(chunk)
                     remaining -= len(chunk)
