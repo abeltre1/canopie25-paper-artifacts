@@ -120,7 +120,12 @@ def test_empty_scheme_rest_is_rejected():
 
 def test_unknown_scheme_is_rejected():
     with pytest.raises(RuntimeError, match="unsupported model scheme"):
-        resolve._classify_model("s3://bucket/model.gguf", require_exists=False)
+        resolve._classify_model("gs://bucket/model.gguf", require_exists=False)
+
+
+def test_s3_scheme_is_accepted_for_staging():
+    resolved, note = resolve._classify_model("s3://bucket/meta-llama/Llama", require_exists=False)
+    assert resolved == "s3://bucket/meta-llama/Llama" and "S3 bucket" in note
 
 
 def test_file_scheme_becomes_local_path(gguf):

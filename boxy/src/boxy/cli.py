@@ -53,6 +53,15 @@ def _emit(deployment, dryrun: bool) -> int:
     return deploy.execute(deployment)
 
 
+def _boto3_present() -> bool:
+    try:
+        import boto3  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
 def cmd_info(args: argparse.Namespace) -> int:
     print(f"boxy {version_string()}")
     print(f"ramalama library: {'available' if ramalama_shim.ramalama_available() else 'not installed'}")
@@ -101,8 +110,17 @@ def cmd_info(args: argparse.Namespace) -> int:
     elif os.path.exists(os.path.expanduser("~/.aws/credentials")):
         s3 = "present (~/.aws/credentials)"
     else:
-        s3 = "not configured (only needed for [location.staging] s3_endpoint)"
+        s3 = "not configured (needed to stage s3:// models)"
     print(f"auth: S3 credentials: {s3}")
+    endpoint = os.environ.get("S3_ENDPOINT_URL")
+    if endpoint or os.environ.get("S3_BUCKET_NAME"):
+        target = endpoint or "AWS S3"
+        bucket = os.environ.get("S3_BUCKET_NAME", "")
+        path = os.environ.get("S3_PATH", "")
+        loc = f"  bucket {bucket}/{path}" if bucket else ""
+        backend = ("boto3" if _boto3_present() else "aws CLI" if shutil.which("aws") else
+                   "NONE — pip install boto3 or install the aws CLI")
+        print(f"auth: S3 staging: endpoint {target}{loc}  (via {backend})")
     if getattr(args, "net", False):
         return _probe_registries()
     return 0
@@ -966,11 +984,44 @@ def cmd_pull(args: argparse.Namespace) -> int:
         model = box.model
     if not model:
         raise UsageError("usage: boxy pull MODEL   (or: boxy pull --box box.toml)")
+    if model.startswith("s3://"):
+        return cmd_stage(args)  # s3:// is staged, not RamaLama-pulled
     if not model.startswith(TRANSPORT_SCHEMES):
         print(f"model is a path ({model}); nothing to pull (shared-FS flow)")
         return 0
     path = ramalama_shim.pull_model(model, dryrun=args.dryrun, force=getattr(args, "force", False))
     print(f"model available at: {path}")
+    return 0
+
+
+def cmd_stage(args: argparse.Namespace) -> int:
+    """Stage a model from a site-local S3 bucket to the shared filesystem, then
+    serve it by path. Reads the same env a K8s vLLM deployment uses
+    (S3_ENDPOINT_URL / S3_BUCKET_NAME / S3_PATH / AWS_*)."""
+    from boxy import s3
+
+    model = getattr(args, "model", None)
+    models_dir = getattr(args, "models_dir", None) or "./models"
+    endpoint = getattr(args, "s3_endpoint", None)
+    if not model and getattr(args, "box", None):
+        box = Box.from_toml(args.box)
+        model = box.model
+    if not model:
+        # bare `boxy stage`: fall back entirely to the K8s-style env (bucket+path)
+        if os.environ.get("S3_BUCKET_NAME"):
+            model = "s3://"
+        else:
+            raise UsageError("usage: boxy stage s3://BUCKET/PREFIX   "
+                             "(or set S3_BUCKET_NAME + S3_PATH, or use --box)")
+    if not model.startswith("s3://"):
+        print(f"stage only handles s3:// models; {model!r} is served directly (see boxy pull/serve)",
+              file=sys.stderr)
+        return 2
+    runtime = getattr(args, "runtime", None) or next(
+        (r for r in ("podman", "docker", "apptainer") if shutil.which(r)), "podman")
+    path = s3.stage_model(model, models_dir, endpoint=endpoint, dryrun=getattr(args, "dryrun", False),
+                          runtime=runtime, backend=getattr(args, "s3_backend", "") or "")
+    print(f"model staged at: {path}\n  serve it:  boxy serve {path} [--scheduler slurm|flux --gpus N]")
     return 0
 
 
@@ -1316,12 +1367,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dryrun", action="store_true")
     p.set_defaults(func=cmd_list)
 
-    for name, help_text in (
-        ("alloc", "request nodes via the location's scheduler"),
-        ("stage", "stage models to shared FS / site-local S3"),
-    ):
-        p = sub.add_parser(name, help=f"{help_text} (post-MVP)")
-        p.set_defaults(func=_stub(name))
+    p = sub.add_parser("stage", help="stage a model from a site-local S3 bucket to the shared FS")
+    p.add_argument("model", nargs="?", default=None,
+                   help="s3://BUCKET/PREFIX (bucket/prefix default to S3_BUCKET_NAME/S3_PATH)")
+    p.add_argument("--box", default=None, help="stage the model named by a box TOML profile")
+    p.add_argument("--models-dir", default=None,
+                   help="destination on the shared FS (default: ./models)")
+    p.add_argument("--s3-endpoint", default=None,
+                   help="S3 endpoint URL (default: $S3_ENDPOINT_URL; empty = real AWS)")
+    p.add_argument("--s3-backend", choices=["auto", "boto3", "awscli", "container"], default="auto",
+                   help="how to fetch: boto3 lib, host aws CLI, or aws-cli container (paper-style); "
+                        "default auto (boto3 -> aws -> container)")
+    p.add_argument("--runtime", choices=["podman", "docker", "apptainer"], default=None,
+                   help="container engine for --s3-backend=container")
+    p.add_argument("--dryrun", action="store_true")
+    p.set_defaults(func=cmd_stage)
+
+    p = sub.add_parser("alloc", help="request nodes via the location's scheduler (post-MVP)")
+    p.set_defaults(func=_stub("alloc"))
 
     return parser
 

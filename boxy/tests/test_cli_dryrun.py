@@ -101,5 +101,11 @@ def test_cli_pull_path_model_noop(capsys):
 
 
 def test_cli_stub_commands(capsys):
-    assert main(["stage"]) == 2
+    assert main(["alloc"]) == 2
     assert "not implemented in the MVP" in capsys.readouterr().err
+
+
+def test_stage_without_target_shows_usage(capsys, monkeypatch):
+    monkeypatch.delenv("S3_BUCKET_NAME", raising=False)
+    assert main(["stage"]) == 2
+    assert "usage: boxy stage" in capsys.readouterr().err

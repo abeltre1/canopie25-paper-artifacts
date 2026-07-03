@@ -55,6 +55,10 @@ class Box:
     def model_is_transport_uri(self) -> bool:
         return self.model.startswith(TRANSPORT_SCHEMES)
 
+    @property
+    def model_is_s3(self) -> bool:
+        return self.model.startswith("s3://")
+
     @classmethod
     def from_toml(cls, path: str | Path) -> "Box":
         # every loader error names the file: with --box AND --location the

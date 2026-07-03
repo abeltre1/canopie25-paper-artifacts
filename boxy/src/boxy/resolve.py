@@ -260,6 +260,10 @@ def _classify_model(model: str, require_exists: bool) -> tuple[str, str]:
         # (sweep finding 35).
         model = model[len("file://"):]
     scheme_split = model.split("://", 1)
+    if model.lower().startswith("s3://"):
+        # site-local S3 bucket: staged to the shared FS at serve time, then
+        # served by path (not a RamaLama registry — origin policy N/A).
+        return model, f"model: {model} (S3 bucket — staged to the shared filesystem)"
     if len(scheme_split) == 2 and scheme_split[0].lower() + "://" in TRANSPORT_SCHEMES:
         scheme, rest = scheme_split[0].lower(), scheme_split[1]
         if not rest.strip("/"):
@@ -333,7 +337,8 @@ def resolve(
     decisions += loc_decisions
 
     if engine is None:
-        if not resolved_model.startswith(TRANSPORT_SCHEMES) and not os.path.exists(resolved_model):
+        if (not resolved_model.startswith(TRANSPORT_SCHEMES) and not resolved_model.startswith("s3://")
+                and not os.path.exists(resolved_model)):
             # dryrun with a missing path: don't assert facts about a file that
             # doesn't exist (finding 22) — plan as llama.cpp and say so
             engine = "llama.cpp"

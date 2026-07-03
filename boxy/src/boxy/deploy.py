@@ -65,7 +65,13 @@ def resolve_model(box: Box, location: Location, dryrun: bool) -> tuple[str, list
     """
     if not box.model:
         return "", []
-    if box.model_is_transport_uri:
+    if box.model_is_s3:
+        from boxy import s3
+
+        host_path = s3.stage_model(box.model, location.staging.models_dir,
+                                   endpoint=location.staging.s3_endpoint or None, dryrun=dryrun,
+                                   runtime=location.resolve_runtime())
+    elif box.model_is_transport_uri:
         host_path = ramalama_shim.pull_model(box.model, dryrun=dryrun)
     elif os.path.isabs(box.model):
         host_path = box.model
