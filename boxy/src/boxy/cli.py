@@ -703,7 +703,11 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
             jobs.remove(name)  # stale record from a finished job (S6: dryrun must not mutate)
 
     inner = _inner_serve_command(args, model, name)
-    script_text = scheduler.batch_script(inner, location, name, str(jobs.log_path(name)), site_args)
+    # unique per-job output log: the scheduler substitutes its job-id token
+    # (%j / {{id}}) so repeated submissions never overwrite each other's logs.
+    output_log = str(jobs.log_path(name, scheduler.output_token) if scheduler.output_token
+                     else jobs.log_path(name))
+    script_text = scheduler.batch_script(inner, location, name, output_log, site_args)
     submit = scheduler.submit_command(str(jobs.script_path(name)))
     print(f"### Batch script ({jobs.script_path(name)}):")
     for line in script_text.rstrip().splitlines():
@@ -719,8 +723,10 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
         print(f"boxy: submission failed: {result.stderr.strip() or result.stdout.strip()}", file=sys.stderr)
         return result.returncode
     job_id = scheduler.parse_job_id(result.stdout)
+    expected_log = jobs.log_path(name, job_id)  # where the scheduler should write it
     jobs.write_record(name, {"name": name, "scheduler": scheduler_name, "job": job_id,
-                             "model": model, "submitted_from": socket.gethostname()})
+                             "model": model, "submitted_from": socket.gethostname(),
+                             "log": str(expected_log)})
     print(f"### Submitted {scheduler_name} job {job_id}  ({name})")
     print("### Waiting for the job to start and the server to become ready ... "
           "(Ctrl-C detaches; the job keeps running)")
@@ -737,7 +743,7 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
                 # forever (r2 audit) — detach and leave the job alone
                 print(f"boxy: cannot determine job {job_id}'s state (scheduler unreachable?) — "
                       f"detaching; the job (if alive) keeps running.\n"
-                      f"  status: boxy list    log: {jobs.log_path(name)}\n"
+                      f"  status: boxy list    log: {expected_log}\n"
                       f"  stop:   boxy stop {name}", file=sys.stderr)
                 return 1
             if state != last_state:
@@ -745,7 +751,7 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
                 last_state = state
                 last_note = time.time()
             elif time.time() - last_note > 30:
-                print(f"###   still waiting (job {job_id}: {state}); log: {jobs.log_path(name)}")
+                print(f"###   still waiting (job {job_id}: {state}); log: {expected_log}")
                 last_note = time.time()
             endpoint = jobs.read_endpoint(name)
             if endpoint:
@@ -763,14 +769,15 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
                     return 0
                 if time.time() > ready_deadline:
                     print(f"boxy: server not ready within {args.ready_timeout:.0f}s (job still {state}). "
-                          f"Large models load slowly — watch the log:\n  tail -f {jobs.log_path(name)}\n"
+                          f"Large models load slowly — watch the log:\n  tail -f {expected_log}\n"
                           f"  then: curl -s {url}/v1/models ; stop: boxy stop {name}", file=sys.stderr)
                     return 1
             if state == "DONE":
                 print(f"boxy: job {job_id} ended before the server became ready; last log lines:",
                       file=sys.stderr)
-                _dump_file_tail(jobs.log_path(name))
-                _diagnose_file(jobs.log_path(name))
+                actual_log = jobs.resolve_log(name, job_id)  # the file the scheduler really wrote
+                _dump_file_tail(actual_log)
+                _diagnose_file(actual_log)
                 jobs.remove(name)
                 return 1
             time.sleep(2)

@@ -35,6 +35,7 @@ class Scheduler(ABC):
     # ---- batch submission (the seamless path: submit, detach, rendezvous) ----
 
     directive_prefix: str = ""  # "#SBATCH" / "#FLUX:"
+    output_token: str = ""      # scheduler's job-id substitution for --output (e.g. %j, {{id}})
 
     def resource_directives(self, location: Location) -> list[str]:
         """Scheduler-flag directive lines for the job request (nodes/gpus)."""

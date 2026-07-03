@@ -71,6 +71,17 @@ def test_flux_run_still_uses_gpus_per_node():
     assert "--gpus-per-node=4" in get_scheduler("flux").launch_prefix(loc)
 
 
+def test_output_log_is_unique_per_job_via_scheduler_token(gguf, jobs_dir, capsys):
+    """The scheduler --output carries the job-id token (%j / {{id}}) so repeated
+    submissions never overwrite each other's logs."""
+    main(["serve", str(gguf), "--scheduler", "slurm", "--dryrun"])
+    out = capsys.readouterr().out
+    assert "#SBATCH --output=" in out and "-%j.log" in out
+    main(["serve", str(gguf), "--scheduler", "flux", "--dryrun"])
+    out = capsys.readouterr().out
+    assert "# flux: --output=" in out and "-{{id}}.log" in out
+
+
 def test_flux_queue_directive_lands_in_script(gguf, jobs_dir, capsys):
     """--flux-queue=batch becomes a real, recognised directive under flux."""
     rc = main(["serve", str(gguf), "--scheduler", "flux", "--dryrun", "--flux-queue=batch"])
@@ -158,7 +169,7 @@ def test_unique_flag_gives_distinct_coherent_instance_names(gguf, jobs_dir, monk
     assert names[0] != names[1]                        # distinct per launch
     for name, out in zip(names, outs):
         assert f"# flux: --job-name={name}" in out      # job carries the name
-        assert f"--output=" in out and f"{name}.log" in out  # its own log file
+        assert "--output=" in out and (name + "-{{id}}.log") in out  # its own per-job log
         assert f"--name {name}" in out                  # inner serve + endpoint
         assert f"{name}.endpoint.json" in out
 

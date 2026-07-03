@@ -43,6 +43,7 @@ class FluxScheduler(Scheduler):
     # and default queue). Field report: `--scheduler flux --gpus 4` produced a
     # job with no GPUs because every directive was dropped.
     directive_prefix = "# flux:"
+    output_token = "{{id}}"  # Flux substitutes the job id (mustache) into --output
 
     def resource_directives(self, location: Location) -> list[str]:
         # `flux batch` does not launch tasks, so it speaks SLOTS, not the

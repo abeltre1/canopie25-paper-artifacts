@@ -42,8 +42,24 @@ def script_path(name: str) -> Path:
     return _dir() / f"{name}.sh"
 
 
-def log_path(name: str) -> Path:
+def log_path(name: str, job_id: str = "") -> Path:
+    """The job's output log. With a job_id, the file is per-JOB
+    (<name>-<job_id>.log) so repeated submissions of the same name never
+    overwrite each other's logs; without one, the plain <name>.log."""
+    if job_id:
+        return _dir() / f"{name}-{job_id}.log"
     return _dir() / f"{name}.log"
+
+
+def resolve_log(name: str, job_id: str = "") -> Path:
+    """Best path to the job's log for tailing: the exact per-job file if it
+    exists, else the newest <name>-*.log (the scheduler may render its job-id
+    token differently than the id we parsed), else the plain <name>.log."""
+    exact = log_path(name, job_id)
+    if exact.exists():
+        return exact
+    candidates = sorted(_dir().glob(f"{name}-*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0] if candidates else log_path(name)
 
 
 def write_record(name: str, data: dict) -> Path:

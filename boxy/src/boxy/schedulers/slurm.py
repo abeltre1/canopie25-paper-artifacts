@@ -38,6 +38,7 @@ class SlurmScheduler(Scheduler):
     # ---- batch submission ----
 
     directive_prefix = "#SBATCH"
+    output_token = "%j"  # Slurm substitutes the job id into --output
 
     def resource_directives(self, location: Location) -> list[str]:
         lines = [f"#SBATCH --nodes={location.resources.nodes}"]
