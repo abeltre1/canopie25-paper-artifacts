@@ -595,6 +595,10 @@ def _inner_serve_command(args, model: str, name: str) -> str:
         # the profile's runtime/offline/tuning/staging must reach the compute
         # node too, not just its batch directives (finding 38); shared FS
         inner += ["--location", os.path.abspath(args.location)]
+    mdir = getattr(args, "models_dir", None)
+    if mdir:
+        # absolutize: the compute node must download to the SAME shared-FS path
+        inner += ["--models-dir", os.path.abspath(mdir)]
     for flag, value in (("--engine", args.engine), ("--image", args.image),
                         ("--runtime", args.runtime), ("--accelerator", args.accelerator)):
         if value:
@@ -822,6 +826,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
     box, location, decisions = _resolve_or_load(args)
     for line in decisions:
         print(f"  auto: {line}")
+    mdir = getattr(args, "models_dir", None) or os.environ.get("BOXY_MODELS_DIR")
+    if mdir:
+        # where s3://... models are downloaded (and where ${MODELS_DIR} expands)
+        from dataclasses import replace as _replace
+
+        location = _replace(location, staging=_replace(location.staging, models_dir=mdir))
+        print(f"  auto: download dir: {os.path.abspath(mdir)} (--models-dir)")
     if getattr(args, "unique", False) and args.model and not args.box:
         # container edition of --unique: a fresh name (and thus container name +
         # label) per launch, so `boxy serve MODEL --unique` x N coexist. Ports
@@ -1277,6 +1288,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gpus", type=int, default=None, help="GPUs per node for the --scheduler job request")
     p.add_argument("--nodes", type=int, default=None, help="node count for the --scheduler job request")
     p.add_argument("--name", default=None, help="container name (default: derived from the model)")
+    p.add_argument("--models-dir", default=None,
+                   help="where to download an s3:// model (default: ./models, or "
+                        "[location.staging] models_dir, or $BOXY_MODELS_DIR)")
     p.add_argument("--unique", action="store_true",
                    help="append a unique suffix to the name so you can launch MULTIPLE instances of "
                         "the same model at once (each gets its own job, log, and endpoint) instead of "

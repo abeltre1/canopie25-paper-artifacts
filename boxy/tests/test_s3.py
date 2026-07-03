@@ -157,6 +157,36 @@ def test_valid_aws_file_left_untouched(monkeypatch, tmp_path):
     assert __import__("os").environ["AWS_SHARED_CREDENTIALS_FILE"] == str(good)  # untouched
 
 
+def test_serve_models_dir_sets_download_location(monkeypatch, tmp_path, capsys):
+    """`boxy serve s3://... --models-dir DIR` downloads there and mounts it."""
+    monkeypatch.setenv("S3_ENDPOINT_URL", "https://s3.local:9000")
+    dest = tmp_path / "lustre" / "models"
+    rc = main(["serve", "s3://bkt/meta-llama/Llama", "--engine", "vllm", "--accelerator", "cuda",
+               "--runtime", "docker", "--here", "--dryrun", "--models-dir", str(dest)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"download dir: {dest}" in out
+    assert f"{dest / 'Llama'}:/mnt/models/Llama" in out           # mounted from the chosen dir
+
+
+def test_serve_models_dir_env_var(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("BOXY_MODELS_DIR", str(tmp_path / "scratch"))
+    monkeypatch.setenv("S3_ENDPOINT_URL", "https://s3.local:9000")
+    main(["serve", "s3://bkt/x/Llama", "--engine", "vllm", "--accelerator", "cuda",
+          "--runtime", "docker", "--here", "--dryrun"])
+    assert f"download dir: {tmp_path / 'scratch'}" in capsys.readouterr().out
+
+
+def test_scheduler_forwards_models_dir_absolutized(tmp_path, monkeypatch, capsys):
+    """The compute-node inner serve must download to the same shared-FS path."""
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    main(["serve", "s3://bkt/meta-llama/Llama", "--scheduler", "flux", "--gpus", "1",
+          "--dryrun", "--models-dir", "models/site"])
+    out = capsys.readouterr().out
+    import os as _os
+    assert f"--models-dir {_os.path.abspath('models/site')}" in out   # absolute in the batch script
+
+
 def test_box_model_is_s3():
     assert Box(name="b", engine="vllm", model="s3://bkt/x").model_is_s3
     assert not Box(name="b", engine="vllm", model="hf://a/b").model_is_s3
