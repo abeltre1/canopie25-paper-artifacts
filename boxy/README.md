@@ -1,16 +1,62 @@
 # boxy
 
 Unified, site-portable, offline-first CLI for deploying and serving
-containerized GenAI/LLM services on HPC. This is the Phase-1 MVP of the
-design in [`../SPEC.md`](../SPEC.md) — the Python formalization of the bash
-prototype in [`../hpc-workflow/`](../hpc-workflow/) (`common_boxy.sh`,
-`boxy-run-vllm.sh`).
+containerized GenAI/LLM services on HPC — the Python formalization of the
+bash prototype in [`../hpc-workflow/`](../hpc-workflow/), designed in
+[`../SPEC.md`](../SPEC.md).
 
-Define the app once (a **box**), describe each site once (a **location**),
-and `boxy` composes the right command for that site's container runtime
-(Podman / Apptainer / Docker), scheduler (Slurm / Flux / none), and
-accelerator (CUDA / ROCm) — with air-gapped env, module loads, and site
-tuning applied automatically.
+One command, everything auto-resolved and explained:
+
+```bash
+$ boxy serve hf://Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf
+  auto: model: hf://Qwen/... (transport URI — pulled via RamaLama)
+  auto: scheduler: none (no scheduler on host)
+  auto: accelerator: cuda (autodetected)
+  auto: runtime: podman (podman found on PATH and responding)
+  auto: engine: llama.cpp (model is GGUF)
+  auto: image: ghcr.io/ggml-org/llama.cpp:server-cuda (default for llama.cpp+cuda)
+  auto: port: 8090 (llama.cpp default)
+### Running Command:
+    podman run -d --name=boxy-qwen2.5-0.5b-instruct-q4_k_m ...
+### Waiting for readiness at http://127.0.0.1:8090/v1/models ...
+### READY  http://127.0.0.1:8090/v1   (model: ...)
+###   try:  curl -s http://127.0.0.1:8090/v1/models
+###   stop: boxy stop boxy-qwen2.5-0.5b-instruct-q4_k_m
+```
+
+Every `auto:` decision is overridable by a flag (`--engine --runtime
+--scheduler --accelerator --image --port --name`) or by TOML profiles
+(`--box` = the *what*, `--location` = the *where*). Profiles are how a site's
+quirks (modules, tuning, offline mode, GPU counts) are pinned once and reused.
+
+## How boxy decides (v2 resolution rules)
+
+| Decision | Rule |
+|---|---|
+| model | **Syntax decides**: `hf://`, `ollama://`, `oci://`, ... = remote (pulled via RamaLama); anything else = local path. Bare names are never guessed. |
+| engine | GGUF or `ollama://` → llama.cpp; safetensors/HF repo → vLLM (needs a GPU, detected or `--gpus N`) |
+| accelerator | RamaLama's `get_accel()` (nvidia-smi, ROCm sysfs, ...), normalized (`hip`→`rocm`) |
+| runtime | first of podman > docker > apptainer that is **actually working** (probed, not just on PATH) |
+| image | per engine+accelerator, from RamaLama's own plugin maps where possible |
+| port | engine default (vLLM 8000, llama.cpp 8090), advanced to the next free port when busy |
+| scheduler | **never auto-wrapped.** Inside an allocation: run direct, foreground. On a login node: refuse (see below). `--scheduler slurm\|flux` submits explicitly. |
+
+HPC guard rails (from the design review):
+
+- **Login-node guard**: if `srun`/`flux` is on PATH but you're not inside an
+  allocation, boxy refuses to start an LLM server (shared login nodes) and
+  prints the exact `--scheduler`/allocation alternatives; `--here` overrides.
+- **Inside an allocation** boxy stays in the foreground so the job step owns
+  the server, and prints `http://<hostname>:PORT/v1` plus an `ssh -L` tunnel
+  hint. Detached mode (+ readiness gate + READY banner) is the default only on
+  laptops/workstations.
+- **`--gpus`/`--nodes` are a job request** — they error without `--scheduler`.
+- Submitting a GPU job from a GPU-less login node requires `--accelerator
+  cuda|rocm` (or a `--location` profile): boxy won't guess the compute node's
+  hardware from the wrong machine.
+- On a crash during startup boxy dumps the container's last log lines and
+  cleans up; on a slow model load it leaves the container running and tells
+  you how to follow the logs.
 
 ## Install
 
@@ -27,7 +73,7 @@ uv venv .boxy && source .boxy/bin/activate
 uv pip install -e './boxy[ramalama,test]'
 
 # verify your installed code matches the checkout after any pull:
-python3 -c "import boxy.engines, inspect; print('current' if 'defer' in inspect.getsource(boxy.engines) else 'STALE - reinstall with -e')"
+python3 -c "import boxy.resolve; print('current')" 2>/dev/null || echo 'STALE - reinstall with -e'
 ```
 
 **uv note:** uv-managed standalone Pythons don't inherit the system CA store,
@@ -35,50 +81,53 @@ so HTTPS (model pulls) fails with `CERTIFICATE_VERIFY_FAILED` until you set
 `SSL_CERT_FILE` (see RUNBOOK §2.1 / troubleshooting). `boxy pull` prints the
 remedy if you hit it.
 
-## Quickstart (mirrors the paper's pipeline)
+## Quickstart
 
 ```bash
 # What does this host have?
 boxy info
 
-# Serve Llama-4-Scout on Eldorado (Flux + Apptainer + ROCm MI300a):
-boxy serve --box examples/boxes/vllm.toml \
-           --location examples/locations/eldorado.toml --dryrun
+# Serve a local GGUF (laptop/workstation: detaches, waits, prints READY):
+boxy serve /path/to/model.q4_k_m.gguf
 
-# Same box on HOPS (Slurm + Podman + CUDA H100) — only the location changes:
-boxy serve --box examples/boxes/vllm.toml \
-           --location examples/locations/hops.toml --dryrun
+# Serve straight from HuggingFace / Ollama (pulled via RamaLama transports):
+boxy serve hf://Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf
+boxy serve ollama://granite3-moe
 
-# Pre-build the Apptainer SIF from the OCI image (prototype build_apptainer_image):
-boxy build --box examples/boxes/vllm.toml --location examples/locations/eldorado.toml
+# Foreground with engine logs (Ctrl-C stops it):
+boxy serve model.gguf --foreground
 
-# Prototype-style passthrough (boxy-run-vllm.sh "$@"):
-boxy run --box examples/boxes/vllm.toml --location examples/locations/hops.toml \
-         -- serve my-model --max-model-len=4096
+# Pass engine args through after `--` (yours always win):
+boxy serve model.gguf -- --ctx-size 4096
 
-# Pull a model by transport URI (via RamaLama: hf://, ollama://, oci://):
-boxy pull --box examples/boxes/vllm-hf.toml
+# Inside a Slurm/Flux allocation: runs direct + foreground automatically.
+srun -N1 --gpus-per-node=1 --pty boxy serve /lustre/models/llama-3.1-8b.Q6_K.gguf --foreground
 
-# Lifecycle: list boxy-launched containers, stop one by box name:
+# Submit as a job from the login node (explicit, never automatic):
+boxy serve hf://org/model --scheduler slurm --gpus 4 --accelerator cuda
+
+# Pre-stage a model on the login node (network) for compute nodes (no network):
+boxy pull hf://org/repo/file.gguf
+
+# Freeze what was resolved into reviewable, reusable profiles:
+boxy serve model.gguf --save-profile mysite     # writes mysite.box.toml + mysite.location.toml
+boxy serve --box mysite.box.toml --location mysite.location.toml
+
+# Lifecycle:
 boxy list
-boxy stop --box examples/boxes/vllm.toml
+boxy stop boxy-model-name         # name is printed in the READY banner
 
-# Benchmark a served box (paper's step 5): batch sweep, plot-ready CSV:
+# Everything still works profile-first too (the paper's pipeline):
+boxy serve --box examples/boxes/vllm.toml --location examples/locations/eldorado.toml --dryrun
+boxy build --box examples/boxes/vllm.toml --location examples/locations/eldorado.toml   # OCI -> SIF
 boxy bench --box examples/boxes/vllm.toml --batch-sizes 1,2,4,8 -o results.csv
 
-# Cloud: launch the same box via SkyPilot (delegated; pip install 'boxy-hpc[cloud]'):
+# Cloud: delegate the same box to SkyPilot (pip install 'boxy-hpc[cloud]'):
 boxy launch --box examples/boxes/vllm.toml --location examples/locations/cloud-gpu.toml --serve
-boxy launch --box examples/boxes/vllm.toml --location examples/locations/cloud-gpu.toml --serve --down
 ```
 
-Boxes may omit `image`: boxy picks a default per engine + accelerator
-(vLLM defaults come from RamaLama's own plugin mapping; llama.cpp uses the
-upstream `ghcr.io/ggml-org/llama.cpp:server` image). Boxes without an
-explicit `entrypoint` defer to the image's own ENTRYPOINT — required for
-images that keep their binary off `$PATH`, like upstream llama.cpp.
-
-Drop `--dryrun` to execute. The Eldorado dry-run reproduces the prototype's
-known-good command:
+Drop `--dryrun` from any profile command to execute. The Eldorado dry-run
+reproduces the prototype's known-good command:
 
 ```
 flux run -N2 --gpus-per-node=4 bash -lc 'module load rocm/6.4.0 && exec \
@@ -93,17 +142,23 @@ flux run -N2 --gpus-per-node=4 bash -lc 'module load rocm/6.4.0 && exec \
 ## Smoke test on a real cluster
 
 1. `boxy info` on a login node — confirm runtime + scheduler detection.
-2. `boxy serve ... --dryrun` — eyeball the command against your site docs.
+2. `boxy serve <model> --dryrun` — eyeball the `auto:` decisions + command.
 3. Inside an allocation (`salloc` / `flux alloc`), run without `--dryrun`.
-4. `curl http://<node>:8000/v1/models` — the OpenAI route is up.
+4. `curl http://<node>:PORT/v1/models` — the OpenAI route is up.
 
-## Design rules (from the prototype and paper)
+## Design rules (from the prototype, the paper, and the v2 design review)
 
 - **Boxes never name a runtime or accelerator** — locations do.
+- **Syntax, not filesystem state, classifies a MODEL** — the same command
+  means the same thing on every machine.
+- **A scheduler is never invoked implicitly** — job submission can't be a
+  side effect of serving a model.
 - **User args always win**: box args and location tuning are tacked on last
   and skipped if you already set them.
 - **Offline by default on HPC locations**: `HF_HUB_OFFLINE=1` and friends are
   injected when `offline = true`.
+- **Every automatic choice is printed and overridable** — `auto:` lines are
+  the contract; `--save-profile` freezes them for review and reuse.
 - **RamaLama is a seam, not a hard dependency**: every `ramalama` import
   lives in `src/boxy/ramalama_shim.py`; without it boxy still works with
   explicit locations and path-based models.
@@ -112,19 +167,20 @@ flux run -N2 --gpus-per-node=4 bash -lc 'module load rocm/6.4.0 && exec \
 
 [`DEMO.md`](DEMO.md) records a real end-to-end run: `boxy serve` launching a
 live llama.cpp OpenAI endpoint in a container (in a fully air-gapped sandbox)
-and answering `/v1/chat/completions`, a live `boxy bench` sweep against it,
-plus the cloud-path YAML being accepted by SkyPilot 0.12.3 itself.
+and answering `/v1/chat/completions`, plus the cloud-path YAML being accepted
+by SkyPilot 0.12.3 itself. [`examples/MATRIX.md`](examples/MATRIX.md) shows a
+machine-generated command for every engine × runtime × scheduler combination.
 
 ## Cloud path (SkyPilot delegation)
 
 For cloud sites, boxy doesn't reimplement provisioning — it transpiles the
-same box+location into a SkyPilot task and can launch it directly:
+same box+location into a SkyPilot task:
 
 ```bash
 boxy generate sky --box examples/boxes/vllm.toml \
      --location examples/locations/cloud-gpu.toml --serve -o task.yaml
-boxy launch --box examples/boxes/vllm.toml \
-     --location examples/locations/cloud-gpu.toml --serve   # sky serve up, delegated
+sky launch task.yaml        # batch, or:
+sky serve up task.yaml      # managed serving (SkyServe replicas + readiness probe)
 ```
 
 ## Going to production
@@ -134,20 +190,25 @@ serving on your cluster — laptop first, then Slurm+CUDA, then Flux+ROCm — wi
 expected output at each step, a test-provenance table (what has been *executed*
 vs. verified-by-construction), and a troubleshooting table covering every
 failure observed in real-user testing (SSL/CA bundles, macOS podman prompts,
-amd64-on-ARM, Podman workdir strictness, off-PATH image binaries).
+amd64-on-ARM, Podman workdir strictness).
 
 ## Tests
 
 ```bash
-pytest          # 116 tests, 96% line coverage (+ subprocess-covered paths):
-                # golden-argv vs the prototype, one regression test per audit
-                # gap, bench vs a real HTTP server, a degraded-mode suite run
-                # WITHOUT ramalama on the path, a live Docker cycle
-                # (serve -> inference -> list -> stop), and one regression
-                # test per field finding from real-user runs
+pytest          # 188 tests: golden-argv vs the prototype, one regression test
+                # per audit gap and per field finding, the v2 resolution rules
+                # (login-node guard, hip->rocm, port scan, runtime probes),
+                # bench vs a real HTTP server, a degraded-mode suite run
+                # WITHOUT ramalama on the path, and a live Docker cycle
+                # (serve -> inference -> list -> stop) that skips cleanly
+                # where Docker or the demo image is absent
 ```
 
 ## Not yet implemented (see SPEC.md §8)
 
-`boxy alloc` (interactive allocation), `boxy stage` (S3/shared-FS sync),
-Enroot/Pyxis + Slurm `scrun` backends, and sbatch/detached serving.
+`boxy run MODEL` as an interactive chat REPL (RamaLama parity; `run` is
+reserved for it), engine choice by artifact sniffing after pull (GGUF magic
+bytes instead of URI text), `--pull=never|missing|always`, deferred
+re-resolution on the compute node for `--scheduler` submissions, `boxy alloc`
+(interactive allocation), `boxy stage` (S3/shared-FS sync), Enroot/Pyxis +
+Slurm `scrun` backends, and sbatch/detached job serving.

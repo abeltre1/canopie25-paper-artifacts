@@ -99,7 +99,7 @@ def build_vllm_serve_cmd(
 
 def build_raw_cmd(box: Box, user_args: list[str], location: Location) -> list[str]:
     """`boxy run` passthrough: entrypoint + user args + tack-ons, mirroring
-    the prototype's boxy-run-vllm.sh \"$@\" behavior."""
+    the prototype's boxy-run-vllm.sh "$@" behavior."""
     cmd = ([box.entrypoint] if box.entrypoint else []) + list(user_args)
     cmd = _tack_on_last(cmd, box.args)
     cmd = _tack_on_last(cmd, location.tuning)

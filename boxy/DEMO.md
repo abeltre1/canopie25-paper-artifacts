@@ -6,7 +6,47 @@ a **fully egress-restricted sandbox** (every model host and every container
 registry blob CDN blocked), which is exactly the air-gapped scenario boxy is
 designed for. Everything below is reproducible.
 
-## What ran
+## The v2 one-liner (model-first, everything auto-resolved)
+
+Same sandbox, no TOML files at all — just a model path. Verbatim transcript:
+
+```console
+$ boxy serve $PWD/models/tiny-llama-demo.gguf --image boxy-demo/llamacpp:local --runtime docker
+  auto: model: /…/boxy/models/tiny-llama-demo.gguf (local file)
+  auto: scheduler: none (no scheduler on host)
+  auto: accelerator: none (autodetected)
+  auto: runtime: docker (--runtime)
+  auto: engine: llama.cpp (model is GGUF)
+  auto: image: boxy-demo/llamacpp:local (--image)
+  auto: port: 8090 (llama.cpp default)
+### Running Command:
+    docker run -d --name=boxy-tiny-llama-demo --network=host --ipc=host \
+      --label=boxy.box=boxy-tiny-llama-demo \
+      --volume=/…/models/tiny-llama-demo.gguf:/mnt/models/tiny-llama-demo.gguf:ro \
+      --env OMP_NUM_THREADS=1 boxy-demo/llamacpp:local \
+      -m /mnt/models/tiny-llama-demo.gguf --host 0.0.0.0 --port 8090
+### Waiting for readiness at http://127.0.0.1:8090/v1/models ...
+### READY  http://127.0.0.1:8090/v1   (model: /mnt/models/tiny-llama-demo.gguf)
+###   try:  curl -s http://127.0.0.1:8090/v1/models
+###   stop: boxy stop boxy-tiny-llama-demo
+
+$ curl -s http://127.0.0.1:8090/v1/completions -H 'Content-Type: application/json' \
+    -d '{"model":"demo","prompt":"Hello","max_tokens":8}'
+{"id":"cmpl-…","object":"text_completion", …
+ "usage":{"prompt_tokens":2,"completion_tokens":8,"total_tokens":10}}
+
+$ boxy stop boxy-tiny-llama-demo
+### Running Command:
+    docker stop boxy-tiny-llama-demo
+```
+
+(Only `--image`/`--runtime` are pinned here because this sandbox cannot reach
+any registry; on a connected machine both are auto-resolved too.) The failure
+path is equally automated: a crashing engine (e.g. a bad flag) is detected
+immediately — boxy prints the container's last log lines, removes the crashed
+container, and exits 1, instead of a silent timeout.
+
+## The original profile-based run
 
 ```console
 $ boxy serve --box examples/boxes/llamacpp-demo.toml \
@@ -102,8 +142,7 @@ VALID: SkyPilot 0.12.3 accepted the task
 ```
 
 Launch it with `sky launch task.yaml` (batch) or `sky serve up task.yaml`
-(managed serving) on any machine with cloud credentials — or let boxy do it:
-`boxy launch --box … --location cloud-gpu.toml --serve`.
+(managed serving) on any machine with cloud credentials.
 
 We also confirmed, in SkyPilot 0.12.3's shipped source, that its Slurm
 support (`sky/provision/slurm/`) is Pyxis/Enroot-based and that serving is a

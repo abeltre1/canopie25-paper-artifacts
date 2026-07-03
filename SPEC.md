@@ -3,7 +3,7 @@
 **A unified, site-portable, offline-first CLI for deploying and serving
 containerized GenAI/LLM services on HPC systems.**
 
-Status: Draft design specification (v0.2 — Phase 1 implemented in `boxy/`)
+Status: Draft design specification (v0.1)
 Audience: maintainers scoping the implementation of `boxy`
 Baseline repo: `abeltre1/canopie25-paper-artifacts` (this repo)
 
@@ -225,7 +225,7 @@ Config → get_accel → New/pull → accel_image →    │
 | `Config()` / `DefaultConfig()` | config.py:213/343 | programmatic config; **must set engine/container/image explicitly** (defaults probe the host) | clean |
 | `transport_factory.New()` + `ensure_model_exists()` | transport_factory.py:180, base.py:585 | `boxy pull` for `hf://`, `ollama://`, `oci://`, … | needs-shim |
 | `GlobalModelStore(base_path)` | global_store.py:22 | local store on scratch/shared FS | clean |
-| `VllmPlugin.get_container_image()` | plugins/…/vllm.py:94 | GPU→image selection; powers boxy's default images | clean |
+| `VllmPlugin.get_container_image()` | plugins/…/vllm.py:94 | GPU→image selection | clean |
 | `Engine`/`BaseEngine` command assembly | engine.py | **not reused** — constructor eagerly emits podman argv (fork-worthy); patterns only | — |
 
 Contract notes: args are duck-typed via `getattr` against the Protocols in
@@ -250,7 +250,7 @@ file). **SkyServe serving is not supported on Slurm.**
 
 | boxy need | SkyPilot asset | Mode |
 | --- | --- | --- |
-| Cloud provisioning + cloud serving | `sky.launch()` / `sky serve up` (`sky/client/sdk.py`) | **CALL** — `boxy generate sky` ships today; direct invocation later. Inherit 20+ clouds and SkyServe for free |
+| Cloud provisioning + cloud serving | `sky.launch()` / `sky serve up` (`sky/client/sdk.py`) | **CALL** — Phase 5: transpile box+cloud-location → sky task YAML (`image_id`, `run`, `accelerators`, `service.readiness_probe`) and delegate; inherit 20+ clouds and SkyServe for free |
 | Slurm sbatch + container job plumbing | `sky/provision/slurm/instance.py` | **COPY PATTERN** (Apache-2.0 permits lifting with attribution) — informs boxy's future Enroot/Pyxis backend and detached `sbatch` serving |
 | Serving with a stable route | `sky/serve/` (readiness-probe-gated replica pool, least-load router, replica=one job, re-launch on failure) | **COPY PATTERN** — reimplement against Slurm/Flux jobs for HPC serving (Phase 3+) |
 | Whole framework | client–server core, cloud catalogs, optimizer | **DO NOT VENDOR** — drags in the API server and cloud assumptions |
@@ -310,7 +310,7 @@ A generalization of the vLLM block in `common_boxy.sh`.
 # boxes/vllm-llama4-scout.toml
 [box]
 name          = "vllm-llama4-scout"
-image         = "vllm/vllm-openai:v0.9.1"   # optional; default per engine+accelerator
+image         = "vllm/vllm-openai:v0.9.1"   # OCI ref; SIF derived per-runtime
 entrypoint    = "vllm"
 model         = "hf://meta-llama/Llama-4-Scout-17B-16E-Instruct"
 workdir       = "/vllm-workspace/models"
@@ -413,10 +413,9 @@ takes `--box` and `--location` (or uses the active defaults).
 | `boxy build` | Build/convert image for the location's runtime (OCI→SIF for Apptainer, etc.). | `accel_image()` | SIF build (auto from OCI) |
 | `boxy serve` | Launch the box as a service (vLLM/llama.cpp) via the selected runtime + scheduler; expose OpenAI-compatible endpoint. | RamaLama runtime plugins | runtime backend + scheduler submit + routing |
 | `boxy run` | Interactive / one-shot inference against a box. | RamaLama `run` | scheduler-aware launch |
-| `boxy generate sky` | Transpile box+location to a SkyPilot task YAML (cloud path). | SkyPilot (delegated) | transpiler |
 | `boxy bench` | Throughput/latency sweep (ShareGPT, batch 1–1024); emit plot-ready data. | (wrap a proven offline benchmarker, e.g. GuideLLM) | batch sweep + result export |
-| `boxy list` | List running boxy-launched containers (label `boxy.box`). | — | scheduler job state (later) |
-| `boxy stop` | Stop a running service / cancel its job. | — | `scancel` / `flux cancel` (later) |
+| `boxy list` | List boxes, locations, and running services. | RamaLama `list` | scheduler job state |
+| `boxy stop` | Stop a running service / cancel its job. | RamaLama `stop` | `scancel` / `flux cancel` |
 | `boxy info` | Show detected accelerator, available runtimes, scheduler, site config. | `get_accel()`, `get_default_engine()` | scheduler/runtime probe |
 
 A typical HPC session:
@@ -429,6 +428,75 @@ boxy build  --box vllm-llama4-scout --location hops   # OCI->SIF if Apptainer
 boxy serve  --box vllm-llama4-scout --location hops   # OpenAI endpoint on :8000
 boxy bench  --box vllm-llama4-scout --location hops   # ShareGPT sweep
 ```
+
+---
+
+## 5b. v2 UX — Model-First Automation (implemented)
+
+Field use of the profile-first CLI surfaced a design problem: requiring two
+TOML files before anything runs means *no visible automation* — the opposite
+of `ramalama run granite3-moe`. v2 inverts the surface: **the model is the
+argument; everything else is resolved, printed, and overridable.**
+
+```
+boxy serve MODEL [--engine E] [--runtime R] [--scheduler S] [--accelerator A]
+                 [--image I] [--port P] [--gpus N] [--nodes N] [--name NAME]
+                 [--here] [--foreground] [--save-profile PREFIX] [--dryrun]
+                 [-- extra engine args]
+boxy pull  MODEL                  # pre-stage on a login node (shared $HOME store)
+boxy stop  NAME                   # name printed in the READY banner / boxy list
+```
+
+Resolution rules (each choice printed as an `auto:` line):
+
+1. **MODEL is classified by syntax, never filesystem state**: a transport
+   scheme (`hf://`, `ollama://`, `oci://`, ...) is remote; anything else is a
+   local path. Bare names are never guessed into a registry — a missing path
+   errors with `did you mean ollama://X or hf://<org>/X?`.
+2. **Engine**: GGUF or `ollama://` → llama.cpp; safetensors/HF-repo → vLLM,
+   which requires a GPU (detected, or requested via `--gpus` for a job).
+3. **Accelerator**: RamaLama `get_accel()`, normalized at the seam
+   (`hip`→`rocm`, `cann`→`ascend` — get_accel speaks GPU-runtime dialect,
+   boxy's location/image/backend maps speak platform names).
+4. **Runtime**: first *working* runtime of podman > docker > apptainer —
+   probed (`podman info`) not just PATH-checked, because HPC nodes routinely
+   carry rootless-broken podman binaries.
+5. **Image**: engine+accelerator default from RamaLama's plugin maps;
+   llama.cpp on non-CUDA GPUs uses `quay.io/ramalama/{rocm,intel-gpu,...}`
+   (upstream ghcr server image is CPU-only) with `llama-server` named
+   explicitly (on `$PATH` there, not the image ENTRYPOINT).
+6. **Port**: engine default (vLLM 8000, llama.cpp 8090) bind-tested and
+   advanced past busy ports; explicit `--port` wins and is never scanned.
+7. **Scheduler: never auto-wrapped.** Three contexts:
+   - *inside an allocation* (`SLURM_JOB_ID`/`FLUX_*`): run direct,
+     **foreground** (the job step owns the server lifetime; a daemonized
+     container would be reaped by the epilog), endpoint printed as
+     `http://<hostname>:PORT/v1` with an `ssh -L` hint;
+   - *login node* (scheduler CLI on PATH, no allocation): **refuse** with the
+     exact `--scheduler`/allocation alternatives; `--here` overrides;
+   - *workstation/laptop*: detach (`-d`), poll `/v1/models` readiness, print
+     the `### READY` banner + stop hint; `--foreground` opts out.
+8. `--gpus/--nodes` describe a job request → error without `--scheduler`.
+   GPU submission from a GPU-less login node requires `--accelerator` (boxy
+   refuses to bake the submitting node's wrong autodetection into the job).
+9. Detached serves drop `--rm` so crash logs survive; a startup crash is
+   detected immediately (container-alive polling), the last log lines are
+   dumped, and the container is removed. `boxy stop NAME` = stop + rm.
+10. `--save-profile PREFIX` freezes the resolved pair to
+    `PREFIX.box.toml`/`PREFIX.location.toml` (with a header warning that
+    values were autodetected on that node) — the bridge from v2 automation
+    back to reviewable, air-gap-friendly profiles. Profile mode (`--box`,
+    now with optional `--location`) remains fully supported.
+
+The v2 contract was adversarially reviewed by a three-perspective design
+panel (RamaLama-parity, HPC-operator, minimal-surface); all verdicts
+"sound-with-fixes". Fixes folded in: items 1, 3–9 above. Deliberately
+declined: foreground-by-default on laptops (the readiness-gated READY banner
+is the automation users validated in the field; `--foreground` is one flag
+away). Deferred to the roadmap: `boxy run MODEL` as an interactive chat REPL
+(the verb stays reserved for it), engine choice by artifact sniffing after
+pull (GGUF magic bytes instead of URI text), `--pull=never|missing|always`,
+and deferred re-resolution on the compute node for `--scheduler` submissions.
 
 ---
 
@@ -528,8 +596,8 @@ leverages both projects *behind seams*, absorbing neither.**
   vendoring ~300 lines of accelerator probes under MIT attribution.
 - **SkyPilot → optional cloud backend behind a subprocess/SDK boundary.**
   Never a hard dependency (its API-server model must not infect the air-gapped
-  path). `boxy generate sky` ships today; direct `sky launch`/`sky serve up`
-  invocation is the remaining Phase 5 work.
+  path). Phase 5 adds a `cloud` location kind that transpiles to a sky task
+  YAML and calls `sky launch` / `sky serve up`.
 - **Why not fully standalone (absorb everything)?** Neither project's gaps can
   be configured away — RamaLama has no HPC layer, SkyPilot can't serve on
   Slurm or run air-gapped — so `boxy` must own the HPC layer *either way*.
@@ -617,9 +685,8 @@ SkyPilot are implementation details it can swap out.
 ### Sources
 
 - SkyPilot: `github.com/skypilot-org/skypilot`; `docs.skypilot.co`;
-  `blog.skypilot.co/slurm-vs-k8s`; `sky/provision/slurm/instance.py`;
-  `sky/client/sdk.py`
-- RamaLama: `github.com/containers/ramalama` (v0.23.0 source)
+  `blog.skypilot.co/slurm-vs-k8s`
+- RamaLama: `github.com/containers/ramalama`
 - Pyxis/Enroot: `github.com/NVIDIA/pyxis`; AMD Enroot/Pyxis toolkit docs
 - Slurm OCI/scrun: `slurm.schedmd.com/containers.html`, `/scrun.html`
 - This repo's paper: arXiv 2509.20603 / `doi.org/10.1145/3731599.3767356`

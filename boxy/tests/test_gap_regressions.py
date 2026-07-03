@@ -71,9 +71,13 @@ def test_gap7_default_image_resolved_from_engine_and_accelerator(eldorado):
     d = deploy.plan_serve(box, eldorado, dryrun=True)
     assert d.box.image  # resolved
     assert "vllm" in d.box.image.lower() or "rocm" in d.box.image.lower()
+    # GGUF on a ROCm location must get a GPU-capable llama.cpp image (the
+    # upstream ghcr server image is CPU-only) with llama-server named
+    # explicitly — it is on $PATH there, not the image ENTRYPOINT.
     llbox = Box(name="noimg2", engine="llama.cpp", model="m.gguf")
     d2 = deploy.plan_serve(llbox, eldorado, dryrun=True)
-    assert "llama.cpp" in d2.box.image
+    assert "rocm" in d2.box.image
+    assert d2.box.entrypoint == "llama-server"
 
 
 def test_gap7b_missing_required_key_is_clean_error(tmp_path):

@@ -8,7 +8,7 @@ from tests.conftest import EXAMPLES
 def test_box_from_toml():
     box = Box.from_toml(EXAMPLES / "boxes" / "vllm.toml")
     assert box.name == "vllm"
-    assert box.image == "vllm/vllm-openai:v0.9.1"
+    assert box.image == "vllm/vllm-openai:v0.24.0"
     assert box.volumes[0].source == "${MODELS_DIR}"
     assert box.args["tensor_parallel_size"] == 4
     assert not box.model_is_transport_uri

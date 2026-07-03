@@ -70,6 +70,20 @@ def resolve_model(box: Box, location: Location, dryrun: bool) -> tuple[str, list
     return box.model, []
 
 
+def _apply_defaults(box: Box, accelerator: str) -> Box:
+    """RamaLama-informed default image for the box's engine + this location's
+    accelerator (SPEC §3c: leverage, don't reinvent). Runs BEFORE the inner
+    command is built: some default images need an explicit entrypoint."""
+    if not box.image:
+        image = ramalama_shim.default_image(box.engine, accelerator)
+        box = replace(box, image=image)
+        if not box.entrypoint:
+            entrypoint = ramalama_shim.default_entrypoint(box.engine, image)
+            if entrypoint:
+                box = replace(box, entrypoint=entrypoint)
+    return box
+
+
 def plan_serve(
     box: Box,
     location: Location,
@@ -77,14 +91,18 @@ def plan_serve(
     extra_args: list[str] | None = None,
     dryrun: bool = False,
 ) -> Deployment:
+    accelerator = location.resolve_accelerator()
+    box = _apply_defaults(box, accelerator)
     model_path, extra_mounts = resolve_model(box, location, dryrun)
     inner = engines.build_serve_cmd(box, location, model_path, port=port, extra_args=extra_args)
-    return _plan(box, location, inner, extra_mounts, dryrun)
+    return _plan(box, location, inner, extra_mounts, dryrun, accelerator)
 
 
 def plan_run(box: Box, location: Location, user_args: list[str], dryrun: bool = False) -> Deployment:
+    accelerator = location.resolve_accelerator()
+    box = _apply_defaults(box, accelerator)
     inner = engines.build_raw_cmd(box, user_args, location)
-    return _plan(box, location, inner, [], dryrun)
+    return _plan(box, location, inner, [], dryrun, accelerator)
 
 
 def _plan(
@@ -93,12 +111,8 @@ def _plan(
     inner_cmd: list[str],
     extra_mounts: list[tuple[str, str, str]],
     dryrun: bool,
+    accelerator: str,
 ) -> Deployment:
-    accelerator = location.resolve_accelerator()
-    if not box.image:
-        # RamaLama-informed default image for the box's engine + this
-        # location's accelerator (SPEC §3c: leverage, don't reinvent).
-        box = replace(box, image=ramalama_shim.default_image(box.engine, accelerator))
     backend = get_backend(location.resolve_runtime())
     scheduler = get_scheduler(location.scheduler)
     env = envs.build_env(box.env, accelerator, location.offline, engine=box.engine)

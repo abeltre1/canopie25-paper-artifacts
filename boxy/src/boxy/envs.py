@@ -1,6 +1,6 @@
 """Environment-variable sets for boxes, from the paper's prototype (common_boxy.sh).
 
-Merge order (later wins): base -> engine hygiene -> offline -> box.env.
+Merge order (later wins): base -> offline -> accelerator quirks -> box.env.
 The user's box definition always has the last word.
 """
 

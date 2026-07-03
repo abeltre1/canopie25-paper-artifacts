@@ -1,6 +1,4 @@
 # Demo box: llama.cpp OpenAI server on a locally-built image (air-gap flow).
-# See DEMO.md for the full recorded run and how to build the local image;
-# on a connected machine you can set image = "ghcr.io/ggml-org/llama.cpp:server".
 [box]
 name = "llamacpp-demo"
 image = "boxy-demo/llamacpp:local"

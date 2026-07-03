@@ -200,7 +200,9 @@ def test_sky_export_port_override_and_llamacpp(vllm_box):
     assert "ports: [9999]" in yaml_text and "--port=9999" in yaml_text
     llbox = Box(name="l", image="i", engine="llama.cpp", model="m.gguf", ports=[8080])
     yaml_text = sky_export.to_sky_task(llbox, loc)
-    assert "llama-server -m m.gguf" in yaml_text
+    # sky runs in a shell, so the deferred entrypoint resolves to the
+    # upstream image's concrete binary path
+    assert "/app/llama-server -m m.gguf" in yaml_text
 
 
 # ---------- cloud details ----------
@@ -239,7 +241,7 @@ def test_cli_generate_stdout_mode(capsys):
     rc = main(["generate", "sky", "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
                "--location", str(EXAMPLES / "locations" / "cloud-gpu.toml")])
     assert rc == 0
-    assert "image_id: docker:vllm/vllm-openai:v0.9.1" in capsys.readouterr().out
+    assert "image_id: docker:vllm/vllm-openai:v0.24.0" in capsys.readouterr().out
 
 
 def test_cli_pull_no_model_is_error(tmp_path, capsys):

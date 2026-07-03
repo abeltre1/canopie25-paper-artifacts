@@ -53,6 +53,13 @@ def ramalama_available() -> bool:
         return False
 
 
+# get_accel() speaks GPU-runtime dialect ("hip" for AMD, "cann" for Ascend);
+# boxy's vocabulary is the platform name ("rocm", "ascend") — location.toml,
+# image maps, and backend GPU args all use it. Normalize at the seam, or every
+# v2 command dead-ends on a ROCm node with "unknown accelerator 'hip'".
+_ACCEL_NORMALIZE = {"hip": "rocm", "cann": "ascend"}
+
+
 def detect_accel() -> str:
     """GPU autodetect via ramalama.common.get_accel() (probes nvidia-smi, ROCm, ...).
 
@@ -64,10 +71,21 @@ def detect_accel() -> str:
         _silence_prompts()
         from ramalama.common import get_accel
     except Exception:
+        import shutil
+        import sys
+
+        if shutil.which("nvidia-smi") or shutil.which("rocm-smi"):
+            print(
+                "warning: a GPU tool is on PATH but the 'ramalama' package is not importable, "
+                "so boxy cannot autodetect the accelerator (a CPU image would be chosen). "
+                "Install boxy with the [ramalama] extra, or pass --accelerator explicitly.",
+                file=sys.stderr,
+            )
         return "none"
     accel = str(get_accel())
-    # ramalama returns e.g. "cuda", "rocm", "intel", ... or "none"
-    return accel.split(":")[0] if accel else "none"
+    # ramalama returns e.g. "cuda", "hip", "intel", "cann", ... or "none"
+    accel = accel.split(":")[0] if accel else "none"
+    return _ACCEL_NORMALIZE.get(accel, accel)
 
 
 def accel_env_vars() -> dict[str, str]:
@@ -190,14 +208,61 @@ def _ramalama_vllm_image(accelerator: str) -> str | None:
         return None
 
 
+# llama.cpp on non-CUDA GPUs: the upstream ghcr server image is CPU-only, so a
+# GGUF on a ROCm/Intel node would silently burn the allocation on CPU inference.
+# Use RamaLama's accelerator images (llama-server on $PATH) for those.
+_LLAMACPP_ACCEL_IMAGES = {
+    "rocm": "quay.io/ramalama/rocm:latest",
+    "intel": "quay.io/ramalama/intel-gpu:latest",
+    "musa": "quay.io/ramalama/musa:latest",
+    "ascend": "quay.io/ramalama/cann:latest",
+    "vulkan": "quay.io/ramalama/ramalama:latest",
+    "asahi": "quay.io/ramalama/asahi:latest",
+}
+
+
+def _ramalama_llamacpp_image(accelerator: str) -> str | None:
+    """Ask RamaLama's llama.cpp plugin for its accelerator->image mapping
+    (version-tagged quay.io/ramalama images); returns None when unavailable."""
+    try:
+        from ramalama.config import DefaultConfig
+        from ramalama.plugins.loader import get_runtime
+
+        gpu_type = {
+            "rocm": "HIP_VISIBLE_DEVICES",
+            "intel": "INTEL_VISIBLE_DEVICES",
+            "musa": "MUSA_VISIBLE_DEVICES",
+            "ascend": "ASCEND_VISIBLE_DEVICES",
+            "vulkan": "GGML_VK_VISIBLE_DEVICES",
+            "asahi": "ASAHI_VISIBLE_DEVICES",
+        }.get(accelerator)
+        if gpu_type is None:
+            return None
+        return get_runtime("llama.cpp").get_container_image(DefaultConfig(), gpu_type)
+    except Exception:
+        return None
+
+
+def default_entrypoint(engine: str, image: str) -> str:
+    """"" means "defer to the image ENTRYPOINT" (ghcr llama.cpp keeps its binary
+    at /app/llama-server, off $PATH). RamaLama's images put llama-server ON
+    $PATH but their ENTRYPOINT is not the server — name it explicitly there."""
+    if engine == "llama.cpp" and image.startswith("quay.io/ramalama/"):
+        return "llama-server"
+    return ""
+
+
 def default_image(engine: str, accelerator: str) -> str:
     """Default container image when a box omits `image`, per engine+accelerator.
 
-    vLLM defaults come from RamaLama's own plugin mapping when importable
-    (falling back to the static map); llama.cpp uses the upstream server image.
+    Defaults come from RamaLama's own plugin mappings when importable (falling
+    back to static maps). llama.cpp keeps the field-tested upstream ghcr images
+    for cuda/cpu; GPU accelerators map to RamaLama's accel images.
     """
     if engine == "llama.cpp":
         if accelerator == "cuda":
             return "ghcr.io/ggml-org/llama.cpp:server-cuda"
+        if accelerator in _LLAMACPP_ACCEL_IMAGES:
+            return _ramalama_llamacpp_image(accelerator) or _LLAMACPP_ACCEL_IMAGES[accelerator]
         return "ghcr.io/ggml-org/llama.cpp:server"
     return _ramalama_vllm_image(accelerator) or vllm_image_for(accelerator)
