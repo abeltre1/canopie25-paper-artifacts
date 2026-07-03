@@ -40,10 +40,13 @@ class SlurmScheduler(Scheduler):
     directive_prefix = "#SBATCH"
     output_token = "%j"  # Slurm substitutes the job id into --output
 
-    def resource_directives(self, location: Location) -> list[str]:
+    def resource_directives(self, location: Location, distributed: bool = False) -> list[str]:
         lines = [f"#SBATCH --nodes={location.resources.nodes}"]
         if location.resources.gpus_per_node:
             lines.append(f"#SBATCH --gpus-per-node={location.resources.gpus_per_node}")
+        if distributed:
+            # one Ray launcher (srun task) per node
+            lines.append("#SBATCH --ntasks-per-node=1")
         return lines
 
     def site_directive(self, kind: str, value: str) -> str:

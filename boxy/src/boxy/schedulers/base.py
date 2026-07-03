@@ -37,8 +37,9 @@ class Scheduler(ABC):
     directive_prefix: str = ""  # "#SBATCH" / "#FLUX:"
     output_token: str = ""      # scheduler's job-id substitution for --output (e.g. %j, {{id}})
 
-    def resource_directives(self, location: Location) -> list[str]:
-        """Scheduler-flag directive lines for the job request (nodes/gpus)."""
+    def resource_directives(self, location: Location, distributed: bool = False) -> list[str]:
+        """Scheduler-flag directive lines for the job request (nodes/gpus).
+        `distributed` requests one task per node (Ray needs one launcher per node)."""
         raise NotImplementedError
 
     def site_directive(self, kind: str, value: str) -> str:
@@ -55,13 +56,13 @@ class Scheduler(ABC):
         return f"--{key}={value}" if value is not None else f"--{key}"
 
     def batch_script(self, inner_command: str, location: Location, name: str,
-                     log_file: str, site_args: list[str]) -> str:
+                     log_file: str, site_args: list[str], distributed: bool = False) -> str:
         """A complete batch script: directives + module loads + exec inner.
         `site_args` are raw scheduler flags in this scheduler's spelling
         (e.g. --license=tscratch:1)."""
         lines = ["#!/bin/bash"]
         lines.append(f"{self.directive_prefix} --job-name={name}")
-        lines += self.resource_directives(location)
+        lines += self.resource_directives(location, distributed)
         for arg in site_args:
             # sbatch's directive parser splits on whitespace unless quoted:
             # --comment=hello world  ->  'Invalid directive: world' (r2 audit)

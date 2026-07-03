@@ -37,6 +37,14 @@ class Deployment:
     # `--` wins there), so banners/probes/publishing never disagree with the
     # server. 0 for run-mode deployments with no port. (Sweep findings 2/10/25.)
     port: int = 0
+    # Multi-node distributed (Ray) serving: `command` runs the HEAD (ray head +
+    # vllm serve); `worker_command` is the bare per-node worker container to be
+    # placed on the N-1 non-head nodes via srun by the caller. (tp, pp) is the
+    # derived parallelism; world_size = tp*pp.
+    distributed: bool = False
+    worker_command: list[str] | None = None
+    parallelism: tuple[int, int] | None = None
+    world_size: int = 0
 
 
 def _expand(value: str, location: Location) -> str:
@@ -127,14 +135,49 @@ def plan_serve(
     port: int | None = None,
     extra_args: list[str] | None = None,
     dryrun: bool = False,
+    distributed: bool = False,
+    head_ip: str = "",
 ) -> Deployment:
     accelerator = location.resolve_accelerator()
     box = _apply_defaults(box, accelerator)
     model_path, extra_mounts = resolve_model(box, location, dryrun)
+    if distributed:
+        return _plan_distributed(box, location, model_path, extra_mounts, accelerator,
+                                 port, extra_args, head_ip, dryrun)
     inner = engines.build_serve_cmd(box, location, model_path, port=port, extra_args=extra_args)
     deployment = _plan(box, location, inner, extra_mounts, dryrun, accelerator)
     deployment.port = engines.serving_port(inner, box)
     return deployment
+
+
+def _plan_distributed(box, location, model_path, extra_mounts, accelerator,
+                      port, extra_args, head_ip, dryrun) -> Deployment:
+    """Head + worker plan for multi-node Ray serving. The HEAD command (ray head
+    + vllm serve) runs directly on this node — NOT wrapped in srun (that would
+    launch N colliding copies); the worker command is placed on the other nodes
+    by the caller. TP/PP are derived from the geometry and baked into the vLLM
+    argv (a user/box/tuning value still wins)."""
+    from boxy import distributed
+
+    tp, pp, world = distributed.derive_parallelism(location.resources)
+    gpus = location.resources.gpus_per_node
+    vllm_argv = engines.build_serve_cmd(box, location, model_path, port=port,
+                                        extra_args=extra_args, parallelism=(tp, pp))
+    head_inner = distributed.ray_head_inner(vllm_argv, gpus, world)
+    head = _plan(box, location, head_inner, extra_mounts, dryrun, accelerator, wrap=False)
+
+    worker_box = replace(box, name=f"{box.name}-worker")
+    worker_inner = distributed.ray_worker_inner(gpus)
+    worker_env = {distributed.HEAD_ENV: head_ip} if head_ip else {}
+    worker = _plan(worker_box, location, worker_inner, extra_mounts, dryrun, accelerator,
+                   wrap=False, extra_env=worker_env)
+
+    head.distributed = True
+    head.parallelism = (tp, pp)
+    head.world_size = world
+    head.port = engines.serving_port(vllm_argv, box)
+    head.worker_command = worker.command
+    return head
 
 
 def plan_run(box: Box, location: Location, user_args: list[str], dryrun: bool = False) -> Deployment:
@@ -151,10 +194,14 @@ def _plan(
     extra_mounts: list[tuple[str, str, str]],
     dryrun: bool,
     accelerator: str,
+    wrap: bool = True,
+    extra_env: dict[str, str] | None = None,
 ) -> Deployment:
     backend = get_backend(location.resolve_runtime())
     scheduler = get_scheduler(location.scheduler)
     env = envs.build_env(box.env, accelerator, location.offline, engine=box.engine)
+    if extra_env:
+        env.update(extra_env)
     mounts = resolve_mounts(box, location) + extra_mounts
     warnings: list[str] = []
     # Podman (unlike Docker) refuses to start when the workdir doesn't exist
@@ -186,7 +233,8 @@ def _plan(
             )
     cmd = backend.build_command(box, location, inner_cmd, env, mounts, accelerator)
     cmd = scheduler.with_modules(cmd, location)
-    cmd = scheduler.wrap(cmd, location)
+    if wrap:  # distributed head/worker run directly / via their own srun — no launch-prefix wrap
+        cmd = scheduler.wrap(cmd, location)
     prepare = (backend.prepare(box, location, dryrun, accelerator=accelerator)
                if backend.image_format == "sif" else [])
     return Deployment(

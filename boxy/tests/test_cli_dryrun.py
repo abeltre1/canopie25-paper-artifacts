@@ -45,6 +45,26 @@ def test_user_args_never_overridden(vllm_box, eldorado):
 
 
 def test_cli_serve_dryrun_examples(capsys):
+    # eldorado is a 2-node vLLM location, so it now auto-distributes; --no-distributed
+    # degrades it to the classic single wrapped container (flux run -> apptainer SIF).
+    rc = main(
+        [
+            "serve",
+            "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
+            "--location", str(EXAMPLES / "locations" / "eldorado.toml"),
+            "--no-distributed",
+            "--dryrun",
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "### Running Command:" in out
+    assert "flux run" in out and "apptainer" in out and "vllm-rocm.sif" in out
+
+
+def test_cli_serve_dryrun_distributed_flux(capsys):
+    # the same 2-node vLLM location, distributed: a Ray head (runs directly) plus a
+    # flux-run worker fan-out to the other node, with TP/PP derived from geometry.
     rc = main(
         [
             "serve",
@@ -55,7 +75,11 @@ def test_cli_serve_dryrun_examples(capsys):
     )
     assert rc == 0
     out = capsys.readouterr().out
-    assert "### Running Command:" in out
+    assert "### Head" in out and "### Worker" in out
+    assert "ray start --head" in out and "ray start --address=${BOXY_RAY_HEAD}" in out
+    assert "--tensor-parallel-size=4" in out and "--pipeline-parallel-size=2" in out
+    assert "--distributed-executor-backend=ray" in out
+    # flux location -> workers placed with flux run (not local containers)
     assert "flux run" in out and "apptainer" in out and "vllm-rocm.sif" in out
 
 

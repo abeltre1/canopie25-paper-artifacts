@@ -69,11 +69,14 @@ def build_serve_cmd(
     host: str = "0.0.0.0",
     port: int | None = None,
     extra_args: list[str] | None = None,
+    parallelism: tuple[int, int] | None = None,
 ) -> list[str]:
-    """Dispatch to the box's inference engine (box.engine)."""
+    """Dispatch to the box's inference engine (box.engine). `parallelism` is a
+    (tensor_parallel_size, pipeline_parallel_size) derived from the allocation
+    geometry for multi-node distributed vLLM (ignored by llama.cpp)."""
     if box.engine == "llama.cpp":
         return build_llamacpp_serve_cmd(box, location, model_path, host, port, extra_args)
-    return build_vllm_serve_cmd(box, location, model_path, host, port, extra_args)
+    return build_vllm_serve_cmd(box, location, model_path, host, port, extra_args, parallelism)
 
 
 def build_llamacpp_serve_cmd(
@@ -116,9 +119,14 @@ def build_vllm_serve_cmd(
     host: str = "0.0.0.0",
     port: int | None = None,
     extra_args: list[str] | None = None,
+    parallelism: tuple[int, int] | None = None,
 ) -> list[str]:
     """`vllm serve <model> ...` argv, with box.args then location.tuning
-    applied, then the defaults last (user-supplied args always win)."""
+    applied, then the defaults last (user-supplied args always win).
+
+    `parallelism` = (tensor_parallel_size, pipeline_parallel_size) derived from
+    the multi-node allocation geometry; tacked on last so a user/box/tuning value
+    for either still wins."""
     entrypoint = box.entrypoint or "vllm"
     cmd = [entrypoint, "serve", model_path]
     cmd += list(extra_args or [])
@@ -128,6 +136,13 @@ def build_vllm_serve_cmd(
         tuning.pop("port", None)
     cmd = _tack_on_last(cmd, box_args)
     cmd = _tack_on_last(cmd, tuning)
+    # Multi-node distributed serving: derive tensor/pipeline parallelism from the
+    # geometry (TP within a node, PP across nodes) and use the Ray backend. Only
+    # for nodes>1 (the caller passes parallelism); a user/box/tuning value wins.
+    if parallelism is not None:
+        tp, pp = parallelism
+        cmd = _tack_on_last(cmd, {"tensor_parallel_size": tp, "pipeline_parallel_size": pp,
+                                  "distributed_executor_backend": "ray"})
     # HPC default: model stores live on NFS/Lustre, where vLLM >= 0.24 auto-enables
     # the 'prefetch' safetensors strategy — which has misloaded checkpoints (field
     # report: 'weights were not initialized from checkpoint' on a standard

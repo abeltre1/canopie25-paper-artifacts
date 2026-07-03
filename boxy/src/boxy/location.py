@@ -22,6 +22,7 @@ class Resources:
     nodes: int = 1
     gpus_per_node: int = 0
     accelerator_type: str = ""  # e.g. "H100", "MI300"; used by the cloud/sky path
+    distributed: bool | None = None  # multi-node Ray serving; None = auto (on for vllm+nodes>1)
 
 
 @dataclass

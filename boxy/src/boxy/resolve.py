@@ -196,6 +196,7 @@ def auto_location(
     nodes: int = 1,
     here: bool = False,
     sources: dict | None = None,
+    distributed: bool | None = None,
 ) -> tuple[Location, list[str]]:
     """Resolve the *where* (used for bare-MODEL serves and for --box without
     --location). Explicit flags win; everything else is detected and explained.
@@ -210,11 +211,17 @@ def auto_location(
     else:
         decisions.append(f"scheduler: {scheduler} ({sources.get('scheduler', '--scheduler')})")
 
-    if scheduler == "none" and (gpus > 0 or nodes > 1):
+    if scheduler == "none" and (gpus > 0 or nodes > 1) and not here and distributed is not True:
+        # ...unless this is distributed serving (a Ray set of containers) or the
+        # inner compute-node serve (--here inside an allocation), where the
+        # geometry drives tensor/pipeline parallelism.
         raise RuntimeError(
             "--gpus/--nodes describe a scheduler job request and have no effect without "
-            "--scheduler slurm|flux (GPU pass-through itself follows the detected accelerator)"
+            "--scheduler slurm|flux (GPU pass-through itself follows the detected accelerator). "
+            "For multi-node serving on this host, add --distributed."
         )
+    if nodes > 1 and gpus > 0 and (distributed is True or scheduler == "none"):
+        decisions.append(f"resources: {nodes} node(s) x {gpus} GPU(s)")
 
     if accelerator is not None:
         decisions.append(f"accelerator: {accelerator} ({sources.get('accelerator', '--accelerator')})")
@@ -325,6 +332,7 @@ def resolve(
     here: bool = False,
     require_exists: bool = True,
     sources: dict | None = None,
+    distributed: bool | None = None,
 ) -> Resolution:
     decisions: list[str] = []
     resolved_model, model_decision = _classify_model(model, require_exists)
@@ -332,7 +340,7 @@ def resolve(
 
     location, loc_decisions = auto_location(
         runtime=runtime, scheduler=scheduler, accelerator=accelerator, gpus=gpus, nodes=nodes,
-        here=here, sources=sources
+        here=here, sources=sources, distributed=distributed
     )
     decisions += loc_decisions
 

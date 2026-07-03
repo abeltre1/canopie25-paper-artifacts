@@ -219,6 +219,7 @@ def _resolve_or_load(args: argparse.Namespace):
                 gpus=args.gpus or 0,
                 nodes=args.nodes or 1,
                 here=args.here,
+                distributed=getattr(args, "distributed", None),
             )
             decisions += loc_decisions
         location = _overlay_location_flags(location, args, decisions)
@@ -261,6 +262,7 @@ def _resolve_or_load(args: argparse.Namespace):
         here=args.here,
         require_exists=not args.dryrun,
         sources=sources,
+        distributed=getattr(args, "distributed", None),
     )
     if profile is not None:
         # keep the profile's site details (modules/tuning/offline/staging/
@@ -599,6 +601,16 @@ def _inner_serve_command(args, model: str, name: str) -> str:
     if mdir:
         # absolutize: the compute node must download to the SAME shared-FS path
         inner += ["--models-dir", os.path.abspath(mdir)]
+    # geometry the compute node needs to derive Ray parallelism (currently only
+    # the batch directives carried these); the head-node boxy re-decides distributed.
+    if args.nodes:
+        inner += ["--nodes", str(args.nodes)]
+    if args.gpus:
+        inner += ["--gpus", str(args.gpus)]
+    if getattr(args, "distributed", None) is True:
+        inner += ["--distributed"]
+    elif getattr(args, "distributed", None) is False:
+        inner += ["--no-distributed"]
     for flag, value in (("--engine", args.engine), ("--image", args.image),
                         ("--runtime", args.runtime), ("--accelerator", args.accelerator)):
         if value:
@@ -722,11 +734,17 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
             jobs.remove(name)  # stale record from a finished job (S6: dryrun must not mutate)
 
     inner = _inner_serve_command(args, model, name)
+    # request one task per node when the job will serve distributed (Ray needs a
+    # launcher per node). Engine isn't resolved login-side, but a multi-node
+    # vllm-shaped request means distributed unless --no-distributed; the harmless
+    # case (llama.cpp) just gets one task per node, which is what we want anyway.
+    want_distributed = getattr(args, "distributed", None) is not False and location.resources.nodes > 1
     # unique per-job output log: the scheduler substitutes its job-id token
     # (%j / {{id}}) so repeated submissions never overwrite each other's logs.
     output_log = str(jobs.log_path(name, scheduler.output_token) if scheduler.output_token
                      else jobs.log_path(name))
-    script_text = scheduler.batch_script(inner, location, name, output_log, site_args)
+    script_text = scheduler.batch_script(inner, location, name, output_log, site_args,
+                                         distributed=want_distributed)
     submit = scheduler.submit_command(str(jobs.script_path(name)))
     print(f"### Batch script ({jobs.script_path(name)}):")
     for line in script_text.rstrip().splitlines():
@@ -807,6 +825,71 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
         return 0
 
 
+def _rename_container(cmd: list[str], old: str, new: str) -> list[str]:
+    """Clone a container run command with a fresh --name/label (for local worker
+    replicas that would otherwise collide on the container name)."""
+    return [a.replace(f"--name={old}", f"--name={new}").replace(f"boxy.box={old}", f"boxy.box={new}")
+            for a in cmd]
+
+
+def _serve_distributed(args, box, location) -> int:
+    """Serve ONE vLLM instance across the allocation via a Ray cluster. This
+    (head) node runs `ray start --head` + `vllm serve`; the other nodes join. The
+    worker placement adapts to the allocation we're in: srun (Slurm), flux run
+    (Flux), or a set of containers on the local host (no scheduler)."""
+    import subprocess
+
+    from boxy import deploy, distributed, jobs
+
+    # How workers are placed across the allocation: the location's scheduler when
+    # it names one (so a login-node dryrun for a slurm/flux profile previews the
+    # right srun/flux-run fan-out), else the live allocation env — SLURM_JOB_ID/
+    # FLUX_JOB_ID — for the submitted-into-allocation case where the re-invoked
+    # boxy carries no --location, else a local set of containers.
+    launcher = (location.scheduler
+                if location.scheduler in ("slurm", "flux")
+                else distributed.detect_launcher())
+    head_node, head_ip, _ = distributed.discover_topology(launcher)
+    nodes, gpus = location.resources.nodes, location.resources.gpus_per_node
+    try:
+        dep = deploy.plan_serve(box, location, port=args.port, extra_args=args.args,
+                                dryrun=args.dryrun, distributed=True, head_ip=head_ip)
+    except RuntimeError as e:  # e.g. gpus_per_node unknown
+        print(f"boxy: {e}", file=sys.stderr)
+        return 2
+    tp, pp = dep.parallelism
+    worker = dep.worker_command or []
+    prefix = distributed.worker_launch_prefix(launcher, head_node, nodes)
+    # slurm/flux fan ONE worker command out to the N-1 nodes; 'none' runs N-1
+    # worker containers locally, each with its own name.
+    worker_cmds = ([prefix + worker] if prefix
+                   else [_rename_container(worker, f"{box.name}-worker", f"{box.name}-worker{i}")
+                         for i in range(nodes - 1)])
+    print(f"  auto: distributed vLLM: {nodes} nodes x {gpus} GPU -> tensor-parallel={tp}, "
+          f"pipeline-parallel={pp} (world {dep.world_size}) via Ray "
+          f"({'local containers' if launcher == 'none' else launcher} launcher)")
+    for w in dep.warnings:
+        print(f"warning: {w}", file=sys.stderr)
+    print(f"### Head ({head_node}):\n    {shlex.join(dep.command)}")
+    for wc in worker_cmds:
+        print(f"### Worker:\n    {shlex.join(wc)}")
+    if args.dryrun:
+        return 0
+    if getattr(args, "endpoint_file", None):
+        jobs.write_endpoint_file(
+            args.endpoint_file, name=dep.box.name, port=dep.port,
+            job_id=os.environ.get("SLURM_JOB_ID") or os.environ.get("FLUX_JOB_ID", ""))
+    print(f"### Endpoint (once the cluster forms and the model loads): "
+          f"http://{head_node}:{dep.port}/v1")
+    procs = [subprocess.Popen(wc) for wc in worker_cmds]
+    try:
+        return deploy.execute(dep)  # head: ray head + wait-for-cluster + vllm serve (foreground)
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.terminate()
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     from boxy import deploy, readiness
 
@@ -869,6 +952,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
         if ignored:
             print(f"warning: ignoring {' '.join(ignored)} — no scheduler in play "
                   f"(scheduler is 'none'; add --scheduler slurm|flux)", file=sys.stderr)
+    from boxy import distributed as _dist
+
+    dist_flag = getattr(args, "distributed", None)
+    if dist_flag is None:  # fall back to the profile's [location.resources] distributed
+        dist_flag = location.resources.distributed
+    if _dist.is_distributed(box.engine, location.resources.nodes, dist_flag):
+        return _serve_distributed(args, box, location)
     deployment = deploy.plan_serve(box, location, port=args.port, extra_args=args.args, dryrun=args.dryrun)
     if getattr(args, "save_profile", None):
         from dataclasses import replace as dc_replace
@@ -1291,6 +1381,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--models-dir", default=None,
                    help="where to download an s3:// model (default: ./models, or "
                         "[location.staging] models_dir, or $BOXY_MODELS_DIR)")
+    p.add_argument("--distributed", dest="distributed", action="store_true", default=None,
+                   help="serve one vLLM instance across the allocated nodes via Ray "
+                        "(tensor-parallel per node x pipeline-parallel across nodes; auto-on for "
+                        "vllm + --nodes>1)")
+    p.add_argument("--no-distributed", dest="distributed", action="store_false",
+                   help="force single-node serving even with --nodes>1 (no Ray)")
     p.add_argument("--unique", action="store_true",
                    help="append a unique suffix to the name so you can launch MULTIPLE instances of "
                         "the same model at once (each gets its own job, log, and endpoint) instead of "

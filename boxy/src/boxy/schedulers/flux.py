@@ -45,7 +45,7 @@ class FluxScheduler(Scheduler):
     directive_prefix = "# flux:"
     output_token = "{{id}}"  # Flux substitutes the job id (mustache) into --output
 
-    def resource_directives(self, location: Location) -> list[str]:
+    def resource_directives(self, location: Location, distributed: bool = False) -> list[str]:
         # `flux batch` does not launch tasks, so it speaks SLOTS, not the
         # per-node GPU spelling that `flux run`/`flux alloc` accept. GPUs are
         # requested with -g/--gpus-per-slot; map "nodes x gpus_per_node" onto

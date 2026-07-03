@@ -23,7 +23,9 @@ def test_matrix_serve_dryrun(box, location, capsys):
     ])
     out = capsys.readouterr().out
     assert rc == 0, f"{box} x {location} failed"
-    assert "### Running Command:" in out
+    # a runnable plan was produced: either a single container (### Running
+    # Command:) or, for a multi-node vLLM box, the Ray head+worker plan (### Head:).
+    assert "### Running Command:" in out or "### Head" in out
 
 
 def test_matrix_doc_exists_and_covers_all_combos():
