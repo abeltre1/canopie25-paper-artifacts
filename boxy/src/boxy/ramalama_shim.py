@@ -279,6 +279,66 @@ class _LogTap(logging.Handler):
         self.lines.append(record.getMessage())
 
 
+def _safetensors_tensor_names(path: str):
+    """The tensor names declared in a safetensors file's header, read cheaply
+    (8-byte little-endian header length + that many JSON bytes — no data, no
+    dependency). None if the header can't be read (truncated/corrupt)."""
+    import json
+    import struct
+
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(8)
+            if len(raw) < 8:
+                return None
+            n = struct.unpack("<Q", raw)[0]
+            header = json.loads(f.read(n))
+    except (OSError, ValueError, struct.error):
+        return None
+    return {k for k in header if k != "__metadata__"}
+
+
+def verify_safetensors_complete(model_dir: str) -> list[str]:
+    """Cross-check a sharded-safetensors model dir against its index. Returns a
+    list of problems (empty = OK / not a sharded-safetensors model). Catches the
+    silent partial pull that makes vLLM crash with 'weights were not initialized
+    from checkpoint' only after a multi-minute load (field: an incomplete
+    RamaLama store copy shared across two clusters)."""
+    import glob
+    import json
+
+    if not os.path.isdir(model_dir):
+        return []
+    indexes = glob.glob(os.path.join(model_dir, "*.safetensors.index.json"))
+    if not indexes:
+        return []  # single-file or non-safetensors model — nothing to cross-check
+    try:
+        weight_map = json.load(open(indexes[0])).get("weight_map", {})
+    except (OSError, ValueError):
+        return []
+    if not weight_map:
+        return []
+    referenced = set(weight_map.values())
+    present = {os.path.basename(p) for p in glob.glob(os.path.join(model_dir, "*.safetensors"))}
+    missing_shards = sorted(referenced - present)
+    if missing_shards:
+        shown = ", ".join(missing_shards[:3]) + (" ..." if len(missing_shards) > 3 else "")
+        return [f"{len(missing_shards)} of {len(referenced)} safetensors shard file(s) missing: {shown}"]
+    expected = set(weight_map.keys())
+    found: set[str] = set()
+    for shard in sorted(referenced):
+        names = _safetensors_tensor_names(os.path.join(model_dir, shard))
+        if names is None:
+            return [f"shard {shard} is truncated/corrupt (unreadable header)"]
+        found |= names
+    missing = sorted(expected - found)
+    if missing:
+        shown = ", ".join(missing[:3]) + (" ..." if len(missing) > 3 else "")
+        return [f"{len(missing)} weight tensor(s) in the index are absent from the shards "
+                f"(incomplete checkpoint): {shown}"]
+    return []
+
+
 def pull_model(model_uri: str, dryrun: bool = False, quiet: bool = False, force: bool = False) -> str:
     """Pull a model via RamaLama transports (hf://, ollama://, oci://, ...).
 

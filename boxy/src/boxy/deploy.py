@@ -67,12 +67,35 @@ def resolve_model(box: Box, location: Location, dryrun: bool) -> tuple[str, list
         return "", []
     if box.model_is_transport_uri:
         host_path = ramalama_shim.pull_model(box.model, dryrun=dryrun)
-        name = PurePosixPath(host_path).name
-        return f"{STORE_MOUNT}/{name}", [(host_path, f"{STORE_MOUNT}/{name}", "ro")]
-    if os.path.isabs(box.model):
-        name = PurePosixPath(box.model).name
-        return f"{STORE_MOUNT}/{name}", [(box.model, f"{STORE_MOUNT}/{name}", "ro")]
-    return box.model, []
+    elif os.path.isabs(box.model):
+        host_path = box.model
+    else:
+        return box.model, []  # relative shared-FS path (resolves against the workdir mount)
+    _verify_checkpoint(box, host_path, dryrun)
+    name = PurePosixPath(host_path).name
+    return f"{STORE_MOUNT}/{name}", [(host_path, f"{STORE_MOUNT}/{name}", "ro")]
+
+
+def _verify_checkpoint(box: Box, host_path: str, dryrun: bool) -> None:
+    """Fail fast on an incomplete safetensors checkpoint (vLLM only, real run):
+    otherwise vLLM loads for minutes, then dies with 'weights were not
+    initialized from checkpoint', burning the allocation. Opt out with
+    BOXY_NO_MODEL_VERIFY=1."""
+    if dryrun or box.engine != "vllm" or os.environ.get("BOXY_NO_MODEL_VERIFY"):
+        return
+    problems = ramalama_shim.verify_safetensors_complete(host_path)
+    if problems:
+        raise RuntimeError(
+            "boxy: the model checkpoint on disk is incomplete/corrupt — vLLM would load for "
+            "minutes and then crash with 'weights were not initialized from checkpoint':\n  - "
+            + "\n  - ".join(problems)
+            + f"\n  path: {host_path}\n"
+            "  fix: re-pull clean —  boxy pull <model> --force\n"
+            "       or download directly and serve by path:\n"
+            "         huggingface-cli download <repo> --local-dir DIR --exclude 'original/*'\n"
+            "         boxy serve DIR ...\n"
+            "  (bypass this check with BOXY_NO_MODEL_VERIFY=1)"
+        )
 
 
 def _apply_defaults(box: Box, accelerator: str) -> Box:

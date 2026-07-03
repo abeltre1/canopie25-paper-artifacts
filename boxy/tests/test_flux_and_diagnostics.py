@@ -360,6 +360,91 @@ def test_version_string_plain_outside_a_checkout(tmp_path, monkeypatch):
     assert boxy.version_string() == boxy.__version__
 
 
+# ---- incomplete-checkpoint guard --------------------------------------------
+
+def _write_safetensors(path, tensor_names):
+    """Minimal valid safetensors: 8-byte header length + JSON header."""
+    import json
+    import struct
+
+    header = {name: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]} for name in tensor_names}
+    blob = json.dumps(header).encode()
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(blob)))
+        f.write(blob)
+        f.write(b"\x00\x00")
+
+
+def _write_index(path, weight_map):
+    import json
+
+    json.dump({"weight_map": weight_map}, open(path, "w"))
+
+
+def test_verify_safetensors_complete_passes_when_all_tensors_present(tmp_path):
+    from boxy import ramalama_shim as s
+
+    _write_safetensors(tmp_path / "model-00001-of-00002.safetensors", ["a", "b"])
+    _write_safetensors(tmp_path / "model-00002-of-00002.safetensors", ["c"])
+    _write_index(tmp_path / "model.safetensors.index.json",
+                 {"a": "model-00001-of-00002.safetensors", "b": "model-00001-of-00002.safetensors",
+                  "c": "model-00002-of-00002.safetensors"})
+    assert s.verify_safetensors_complete(str(tmp_path)) == []
+
+
+def test_verify_flags_missing_shard_file(tmp_path):
+    from boxy import ramalama_shim as s
+
+    _write_safetensors(tmp_path / "model-00001-of-00002.safetensors", ["a"])  # shard 2 never written
+    _write_index(tmp_path / "model.safetensors.index.json",
+                 {"a": "model-00001-of-00002.safetensors", "b": "model-00002-of-00002.safetensors"})
+    problems = s.verify_safetensors_complete(str(tmp_path))
+    assert problems and "shard file" in problems[0]
+
+
+def test_verify_flags_tensor_present_in_index_absent_in_shards(tmp_path):
+    """The field case: shard files all present, but they don't contain every
+    tensor the index declares (the layernorms)."""
+    from boxy import ramalama_shim as s
+
+    _write_safetensors(tmp_path / "model-00001-of-00001.safetensors", ["a"])  # missing 'b'
+    _write_index(tmp_path / "model.safetensors.index.json",
+                 {"a": "model-00001-of-00001.safetensors", "b": "model-00001-of-00001.safetensors"})
+    problems = s.verify_safetensors_complete(str(tmp_path))
+    assert problems and "incomplete checkpoint" in problems[0] and "b" in problems[0]
+
+
+def test_verify_noop_for_non_safetensors(tmp_path):
+    from boxy import ramalama_shim as s
+
+    assert s.verify_safetensors_complete(str(tmp_path / "nope")) == []   # missing dir
+    (tmp_path / "model.gguf").write_bytes(b"GGUF")
+    assert s.verify_safetensors_complete(str(tmp_path)) == []            # no index -> skip
+
+
+def test_serve_fast_fails_on_incomplete_checkpoint(tmp_path, monkeypatch):
+    """plan_serve raises before launch when a vLLM safetensors checkpoint is
+    incomplete, instead of letting vLLM burn the allocation."""
+    import pytest
+
+    from boxy import deploy
+    from boxy.box import Box
+    from boxy.location import Location
+
+    model = tmp_path / "Llama"
+    model.mkdir()
+    _write_safetensors(model / "model-00001-of-00001.safetensors", ["a"])
+    _write_index(model / "model.safetensors.index.json",
+                 {"a": "model-00001-of-00001.safetensors", "b": "model-00001-of-00001.safetensors"})
+    box = Box(name="b", engine="vllm", model=str(model), image="vllm/vllm-openai", entrypoint="vllm")
+    monkeypatch.delenv("BOXY_NO_MODEL_VERIFY", raising=False)
+    with pytest.raises(RuntimeError, match="incomplete/corrupt"):
+        deploy.plan_serve(box, Location(name="l", accelerator="cuda", runtime="podman"))
+    # opt-out lets it through
+    monkeypatch.setenv("BOXY_NO_MODEL_VERIFY", "1")
+    deploy.plan_serve(box, Location(name="l", accelerator="cuda", runtime="podman"))  # no raise
+
+
 def test_diagnose_unknown_returns_none():
     assert diagnostics.diagnose("Server started on port 8000. Ready.") is None
     assert diagnostics.diagnose("") is None
