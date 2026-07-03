@@ -181,7 +181,7 @@ def test_finding15_hf_401_probe_gives_a_verdict(monkeypatch, verdict, expect):
     """HF 401 has three unrelated causes (stale token / nonexistent repo /
     gated repo) — boxy probes anonymously and names the actual one.
     (Field findings 15+16: three 401s in a row on a Mac, 2026-07.)"""
-    monkeypatch.setattr(ramalama_shim, "_probe_hf_repo", lambda repo: verdict)
+    monkeypatch.setattr(ramalama_shim, "_hf_repo_info", lambda repo: (verdict, []))
     monkeypatch.setattr(ramalama_shim, "_hf_token_sources", lambda: [])
     msg = ramalama_shim._pull_failure_message(
         "hf://bartowski/Llama-3.1-8B-GGUF/Llama-3.1-8B-Q4_K_M.gguf", _hf_401_error())
@@ -192,12 +192,45 @@ def test_finding15_hf_401_probe_gives_a_verdict(monkeypatch, verdict, expect):
 def test_finding16_stale_token_named_as_401_cause(monkeypatch):
     """A stale cached token 401s EVERY repo — when a token source exists, the
     message must name it and give the anonymous-retry command."""
-    monkeypatch.setattr(ramalama_shim, "_probe_hf_repo", lambda repo: "public")
+    monkeypatch.setattr(ramalama_shim, "_hf_repo_info", lambda repo: ("public", []))
     monkeypatch.setattr(ramalama_shim, "_hf_token_sources",
                         lambda: ["~/.cache/huggingface/token (huggingface-cli login)"])
     msg = ramalama_shim._pull_failure_message("hf://org/repo/f.gguf", _hf_401_error())
     assert "token IS being sent" in msg and "HF_TOKEN=''" in msg
     assert "EVERY repo, even public ones" in msg
+
+
+def _hf_404_error():
+    try:
+        raise RuntimeError('"Failed to pull model: \'... HTTP Error 404: Not Found\'"')
+    except RuntimeError as e:
+        return e
+
+
+def test_finding17_hf_404_lists_actual_gguf_files(monkeypatch):
+    """404 with working auth = wrong path. Quantizers name files unpredictably
+    (TheBloke lowercases, bartowski doesn't) — list what the repo really has.
+    (Field finding: guessed file name, Mac 2026-07.)"""
+    monkeypatch.setattr(ramalama_shim, "_hf_repo_info",
+                        lambda repo: ("public", ["tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+                                                 "tinyllama-1.1b-chat-v1.0.Q8_0.gguf"]))
+    msg = ramalama_shim._pull_failure_message(
+        "hf://TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/TinyLlama-WRONG.gguf", _hf_404_error())
+    assert "has no file named" in msg
+    assert "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf" in msg    # the real files, listed
+    assert "boxy serve hf://TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf" in msg
+
+
+def test_finding17b_hf_404_missing_repo_points_at_search(monkeypatch):
+    monkeypatch.setattr(ramalama_shim, "_hf_repo_info", lambda repo: ("missing", []))
+    msg = ramalama_shim._pull_failure_message("hf://bartowski/Nope-GGUF/x.gguf", _hf_404_error())
+    assert "does not exist" in msg and "models?search=Nope-GGUF" in msg and "ollama://" in msg
+
+
+def test_finding17c_hf_404_repo_without_ggufs(monkeypatch):
+    monkeypatch.setattr(ramalama_shim, "_hf_repo_info", lambda repo: ("public", []))
+    msg = ramalama_shim._pull_failure_message("hf://meta-llama/Llama-3-8B/x.gguf", _hf_404_error())
+    assert "contains no .gguf files" in msg and "tree/main" in msg
 
 
 def test_finding16b_token_sources_detection(monkeypatch, tmp_path):

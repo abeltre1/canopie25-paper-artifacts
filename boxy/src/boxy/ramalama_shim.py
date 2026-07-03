@@ -272,6 +272,8 @@ def _pull_failure_message(model_uri: str, error: Exception, logged: list[str] | 
             )
     if "401" in combined and model_uri.startswith(("hf://", "huggingface://")):
         msg += _hf_401_diagnosis(model_uri)
+    elif "404" in combined and model_uri.startswith(("hf://", "huggingface://")):
+        msg += _hf_404_diagnosis(model_uri)
     if "cli download not available" in combined:
         msg += (
             "\n  note: RamaLama 0.23's HuggingFace full-repo CLI fallback is unimplemented;"
@@ -291,9 +293,10 @@ def _hf_token_sources() -> list[str]:
     return sources
 
 
-def _probe_hf_repo(repo: str) -> str | None:
-    """Anonymous existence/gating check via the public HF API. Returns
-    'public' | 'gated' | 'missing' | None (offline/unreachable — no verdict)."""
+def _hf_repo_info(repo: str) -> tuple[str | None, list[str]]:
+    """Anonymous check via the public HF API. Returns (status, gguf_files):
+    status 'public' | 'gated' | 'missing' | None (offline — no verdict);
+    gguf_files = the .gguf filenames the repo actually contains."""
     import json
     import urllib.error
     import urllib.request
@@ -303,13 +306,15 @@ def _probe_hf_repo(repo: str) -> str | None:
                                      headers={"User-Agent": "boxy"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.load(resp)
-        return "gated" if data.get("gated") else "public"
+        files = [s.get("rfilename", "") for s in data.get("siblings", [])]
+        ggufs = [f for f in files if f.lower().endswith(".gguf")]
+        return ("gated" if data.get("gated") else "public"), ggufs
     except urllib.error.HTTPError as e:
         if e.code in (401, 404):
-            return "missing"
-        return None
+            return "missing", []
+        return None, []
     except Exception:
-        return None
+        return None, []
 
 
 def _hf_401_diagnosis(model_uri: str) -> str:
@@ -327,18 +332,18 @@ def _hf_401_diagnosis(model_uri: str) -> str:
             f"  revoked token makes HF return 401 for EVERY repo, even public ones. Retry without it:\n"
             f"      HF_TOKEN='' boxy serve {model_uri}"
         )
-    verdict = _probe_hf_repo(repo)
-    if verdict == "public":
+    status, _files = _hf_repo_info(repo)
+    if status == "public":
         lines.append(
             f"  probe: {repo} EXISTS and is PUBLIC (anonymous API check just succeeded), so the 401\n"
             f"  is your token or proxy — the HF_TOKEN='' retry above should work."
         )
-    elif verdict == "gated":
+    elif status == "gated":
         lines.append(
             f"  probe: {repo} exists but is GATED — accept its license at\n"
             f"  https://huggingface.co/{repo} then export HF_TOKEN=<token from hf.co/settings/tokens>."
         )
-    elif verdict == "missing":
+    elif status == "missing":
         lines.append(
             f"  probe: an anonymous check of {repo} also failed — that repo does not exist under this\n"
             f"  exact name (or is private). Verify https://huggingface.co/{repo} in a browser;\n"
@@ -350,6 +355,43 @@ def _hf_401_diagnosis(model_uri: str) -> str:
             f"  in a browser: nonexistent repos get 401 anonymously; gated ones need HF_TOKEN.)"
         )
     return "\n  remedy: HuggingFace answered 401.\n" + "\n".join(lines)
+
+
+def _hf_404_diagnosis(model_uri: str) -> str:
+    """404 with working auth means the PATH is wrong. Quantizers name files
+    unpredictably (TheBloke lowercases, bartowski doesn't), so list the GGUF
+    files the repo ACTUALLY contains instead of making the user guess.
+    (Field finding #17: three guessed repo/file names in a row, 2026-07.)"""
+    parts = model_uri.split("://", 1)[1].split("/")
+    repo = "/".join(parts[:2])
+    filename = "/".join(parts[2:])
+    status, ggufs = _hf_repo_info(repo)
+    if status in ("public", "gated") and filename:
+        if ggufs:
+            shown = ggufs[:12]
+            listing = "\n      ".join(shown)
+            more = "" if len(ggufs) <= 12 else f"\n      ... and {len(ggufs) - 12} more"
+            return (
+                f"\n  remedy: the repo {repo} exists, but has no file named {filename!r}.\n"
+                f"  GGUF files it DOES contain:\n      {listing}{more}\n"
+                f"  e.g.:  boxy serve hf://{repo}/{shown[0]}"
+            )
+        return (
+            f"\n  remedy: the repo {repo} exists but contains no .gguf files — it is probably a\n"
+            f"  safetensors repo (vLLM/GPU territory) or the wrong repo:\n"
+            f"  https://huggingface.co/{repo}/tree/main"
+        )
+    if status == "missing":
+        name = repo.split("/")[-1]
+        return (
+            f"\n  remedy: the repo {repo} does not exist. Find the right owner/repo:\n"
+            f"      https://huggingface.co/models?search={name}\n"
+            f"  — or skip repo-name guessing entirely: boxy serve ollama://<model-name>"
+        )
+    return (
+        f"\n  remedy: not found — browse https://huggingface.co/{repo}/tree/main for the exact\n"
+        f"  repo and filename (could not reach the HF API to list it for you)."
+    )
 
 
 def vllm_image_for(accelerator: str) -> str:

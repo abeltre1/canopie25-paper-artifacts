@@ -41,13 +41,28 @@ def test_safetensors_needs_gpu_for_vllm():
 
 
 def test_safetensors_no_gpu_error_gives_concrete_alternatives():
-    """The refusal must hand the user runnable next steps for THEIR model,
-    not placeholders (field finding: Meta-Llama-3-8B-Instruct on a Mac)."""
+    """The refusal must hand the user runnable next steps for THEIR model.
+    It must NOT invent repo names (two guessed-repo 404s in the field) —
+    point at search + ollama instead."""
     with pytest.raises(RuntimeError) as e:
         resolve.infer_engine("hf://meta-llama/Meta-Llama-3-8B-Instruct", "none")
     msg = str(e.value)
-    assert "hf://bartowski/Meta-Llama-3-8B-Instruct-GGUF/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf" in msg
+    assert "'Meta-Llama-3-8B-Instruct GGUF'" in msg      # search phrase for THEIR model
+    assert "ollama://" in msg
     assert "--scheduler slurm|flux" in msg and "hf://meta-llama/Meta-Llama-3-8B-Instruct" in msg
+
+
+def test_port_probe_sees_wildcard_binds():
+    """macOS gvproxy binds 0.0.0.0; a 127.0.0.1+SO_REUSEADDR test claims that
+    port is free and the launch dies with 'proxy already running' (field
+    finding 18). The probe must conflict with wildcard listeners."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as wild:
+        wild.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        wild.bind(("", 0))
+        wild.listen(1)
+        port = wild.getsockname()[1]
+        assert resolve._port_taken(port) is True
+    assert resolve._port_taken(port) is False  # released after close
 
 
 def test_hip_and_cann_normalized_at_the_seam(monkeypatch):

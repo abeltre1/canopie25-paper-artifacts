@@ -349,6 +349,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     rc = deploy.execute(deployment)  # returns immediately (-d)
     if rc != 0:
+        if "-p" in deployment.command:
+            # macOS podman-machine: gvproxy refuses a port forward another
+            # container (running OR exited) still claims. (Field finding #18.)
+            print(f"boxy: launch failed. If the error says 'proxy already running' or 'address already\n"
+                  f"in use', another container still claims port {port}:\n"
+                  f"  find it:  {runtime_bin} ps -a --filter label=boxy.box\n"
+                  f"  stop it:  boxy stop <name>    (or rerun with --port {port + 1})\n"
+                  f"  stale forward with no container: {runtime_bin} machine stop && {runtime_bin} machine start",
+                  file=sys.stderr)
         return rc
     print(f"### Waiting for readiness at {url}/v1/models ...")
     try:

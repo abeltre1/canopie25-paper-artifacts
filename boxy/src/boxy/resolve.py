@@ -64,9 +64,11 @@ def infer_engine(model: str, accelerator: str, gpus: int = 0) -> tuple[str, str]
     raise RuntimeError(
         f"model {model!r} is a safetensors/HF repo: that needs vLLM and a GPU, and none was "
         f"detected on this host.\n"
-        f"  CPU serving here:  use a GGUF build with llama.cpp — community quants are usually at\n"
-        f"      boxy serve hf://bartowski/{base}-GGUF/{base}-Q4_K_M.gguf\n"
-        f"      (verify the exact repo/file on huggingface.co, or use ollama://<name>)\n"
+        f"  CPU serving here:  use a GGUF build with llama.cpp — search huggingface.co for\n"
+        f"      '{base} GGUF' (publishers like TheBloke, bartowski, QuantFactory), then:\n"
+        f"      boxy serve hf://<owner>/<repo>/<file>.gguf\n"
+        f"      (on a wrong file name, boxy lists the repo's actual GGUF files)\n"
+        f"      — or skip repo guessing entirely:  boxy serve ollama://<name>\n"
         f"  GPU cluster:       this command works as-is on a GPU node; from a login node submit it:\n"
         f"      boxy serve {model} --scheduler slurm|flux --gpus N --accelerator cuda|rocm\n"
         f"  Or override:       --engine/--accelerator if detection is wrong on this host."
@@ -146,18 +148,33 @@ def detect_scheduler_context(here: bool = False) -> tuple[str, str]:
     return "none", "no scheduler on host"
 
 
+def _port_taken(port: int) -> bool:
+    # Something answering on loopback? Catches listeners the bind test can
+    # miss (e.g. forwarders bound to other interfaces).
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.25)
+        if probe.connect_ex(("127.0.0.1", port)) == 0:
+            return True
+    # Wildcard bind WITHOUT SO_REUSEADDR: on macOS/BSD, SO_REUSEADDR lets a
+    # 127.0.0.1 bind succeed while another process (podman-machine's gvproxy)
+    # holds 0.0.0.0 on the same port — which is exactly how a "free" port
+    # then dies with gvproxy's "proxy already running". (Field finding #18.)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("", port))
+        except OSError:
+            return True
+    return False
+
+
 def _free_port(preferred: int) -> tuple[int, str]:
-    """Bind-test `preferred` and walk forward to the first free port (shared
+    """Probe `preferred` and walk forward to the first free port (shared
     login/compute nodes collide on fixed defaults). Explicit --port skips this."""
     for offset in range(64):
         candidate = preferred + offset
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                s.bind(("127.0.0.1", candidate))
-            except OSError:
-                continue
-            return candidate, "" if offset == 0 else f"; {preferred} was busy"
+        if _port_taken(candidate):
+            continue
+        return candidate, "" if offset == 0 else f"; {preferred} was busy"
     raise RuntimeError(f"no free port found in [{preferred}, {preferred + 63}]; pass --port explicitly")
 
 
