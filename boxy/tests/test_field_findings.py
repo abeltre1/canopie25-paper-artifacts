@@ -161,21 +161,54 @@ def test_finding12c_info_reports_tls_state(monkeypatch, capsys):
     assert "MISSING FILE" in capsys.readouterr().out
 
 
-def test_finding15_hf_401_explains_both_causes():
-    """HF answers 401 for NONEXISTENT repos (anonymous gets 401, not 404) as
-    well as gated ones — the message must say to check the URL first, then
-    HF_TOKEN. (Field finding: bartowski/Llama-3.1-8B-GGUF typo, 2026-07.)"""
+def _hf_401_error():
     try:
         try:
             raise OSError("HTTP Error 401: Unauthorized")
         except OSError:
             raise NotImplementedError("huggingface cli download not available")
     except NotImplementedError as e:
-        msg = ramalama_shim._pull_failure_message(
-            "hf://bartowski/Llama-3.1-8B-GGUF/Llama-3.1-8B-Q4_K_M.gguf", e)
-    assert "does NOT exist" in msg
-    assert "https://huggingface.co/bartowski/Llama-3.1-8B-GGUF" in msg
-    assert "HF_TOKEN" in msg
+        return e
+
+
+@pytest.mark.parametrize("verdict,expect", [
+    ("public", "EXISTS and is PUBLIC"),
+    ("gated", "GATED"),
+    ("missing", "does not exist under this"),
+    (None, "could not reach the HF API"),
+])
+def test_finding15_hf_401_probe_gives_a_verdict(monkeypatch, verdict, expect):
+    """HF 401 has three unrelated causes (stale token / nonexistent repo /
+    gated repo) — boxy probes anonymously and names the actual one.
+    (Field findings 15+16: three 401s in a row on a Mac, 2026-07.)"""
+    monkeypatch.setattr(ramalama_shim, "_probe_hf_repo", lambda repo: verdict)
+    monkeypatch.setattr(ramalama_shim, "_hf_token_sources", lambda: [])
+    msg = ramalama_shim._pull_failure_message(
+        "hf://bartowski/Llama-3.1-8B-GGUF/Llama-3.1-8B-Q4_K_M.gguf", _hf_401_error())
+    assert expect in msg
+    assert "bartowski/Llama-3.1-8B-GGUF" in msg
+
+
+def test_finding16_stale_token_named_as_401_cause(monkeypatch):
+    """A stale cached token 401s EVERY repo — when a token source exists, the
+    message must name it and give the anonymous-retry command."""
+    monkeypatch.setattr(ramalama_shim, "_probe_hf_repo", lambda repo: "public")
+    monkeypatch.setattr(ramalama_shim, "_hf_token_sources",
+                        lambda: ["~/.cache/huggingface/token (huggingface-cli login)"])
+    msg = ramalama_shim._pull_failure_message("hf://org/repo/f.gguf", _hf_401_error())
+    assert "token IS being sent" in msg and "HF_TOKEN=''" in msg
+    assert "EVERY repo, even public ones" in msg
+
+
+def test_finding16b_token_sources_detection(monkeypatch, tmp_path):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setattr(ramalama_shim.os.path, "expanduser",
+                        lambda p: str(tmp_path / "token") if "huggingface" in p else p)
+    assert ramalama_shim._hf_token_sources() == []
+    monkeypatch.setenv("HF_TOKEN", "hf_stale")
+    (tmp_path / "token").write_text("hf_old")
+    sources = ramalama_shim._hf_token_sources()
+    assert len(sources) == 2 and "HF_TOKEN" in sources[0]
 
 
 def test_finding3_cli_fallback_message_names_real_cause():

@@ -271,21 +271,85 @@ def _pull_failure_message(model_uri: str, error: Exception, logged: list[str] | 
                 "\n  Diagnose per registry: boxy info --net"
             )
     if "401" in combined and model_uri.startswith(("hf://", "huggingface://")):
-        repo = "/".join(model_uri.split("://", 1)[1].split("/")[:2])
-        msg += (
-            "\n  remedy: HuggingFace answers 401 for two different reasons:\n"
-            f"    1. the repo/file does NOT exist (anonymous requests get 401, not 404) —\n"
-            f"       check https://huggingface.co/{repo} in a browser first;\n"
-            "    2. the repo is gated/private — accept its license on the model page, then\n"
-            "       export HF_TOKEN=<token from https://huggingface.co/settings/tokens>\n"
-            "       (RamaLama also honors a `huggingface-cli login` cached token)."
-        )
+        msg += _hf_401_diagnosis(model_uri)
     if "cli download not available" in combined:
         msg += (
             "\n  note: RamaLama 0.23's HuggingFace full-repo CLI fallback is unimplemented;"
             " the direct download above is the path that must succeed."
         )
     return msg
+
+
+def _hf_token_sources() -> list[str]:
+    """Where RamaLama's HF transport will find a token (its huggingface_token():
+    HF_TOKEN env var first, then the huggingface-cli login cache)."""
+    sources = []
+    if os.environ.get("HF_TOKEN"):
+        sources.append("the HF_TOKEN env var")
+    if os.path.exists(os.path.expanduser("~/.cache/huggingface/token")):
+        sources.append("~/.cache/huggingface/token (huggingface-cli login)")
+    return sources
+
+
+def _probe_hf_repo(repo: str) -> str | None:
+    """Anonymous existence/gating check via the public HF API. Returns
+    'public' | 'gated' | 'missing' | None (offline/unreachable — no verdict)."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(f"https://huggingface.co/api/models/{repo}",
+                                     headers={"User-Agent": "boxy"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.load(resp)
+        return "gated" if data.get("gated") else "public"
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 404):
+            return "missing"
+        return None
+    except Exception:
+        return None
+
+
+def _hf_401_diagnosis(model_uri: str) -> str:
+    """HF returns 401 for three unrelated causes: a stale token sent
+    automatically (fails EVERY repo, even public), a nonexistent repo
+    (anonymous requests never see 404), or a gated repo. Probe and give a
+    verdict instead of a guessing list. (Field finding #16: three 401s in a
+    row on the user's Mac, 2026-07.)"""
+    repo = "/".join(model_uri.split("://", 1)[1].split("/")[:2])
+    lines = []
+    sources = _hf_token_sources()
+    if sources:
+        lines.append(
+            f"  note: a HuggingFace token IS being sent (from {' and '.join(sources)}). A stale or\n"
+            f"  revoked token makes HF return 401 for EVERY repo, even public ones. Retry without it:\n"
+            f"      HF_TOKEN='' boxy serve {model_uri}"
+        )
+    verdict = _probe_hf_repo(repo)
+    if verdict == "public":
+        lines.append(
+            f"  probe: {repo} EXISTS and is PUBLIC (anonymous API check just succeeded), so the 401\n"
+            f"  is your token or proxy — the HF_TOKEN='' retry above should work."
+        )
+    elif verdict == "gated":
+        lines.append(
+            f"  probe: {repo} exists but is GATED — accept its license at\n"
+            f"  https://huggingface.co/{repo} then export HF_TOKEN=<token from hf.co/settings/tokens>."
+        )
+    elif verdict == "missing":
+        lines.append(
+            f"  probe: an anonymous check of {repo} also failed — that repo does not exist under this\n"
+            f"  exact name (or is private). Verify https://huggingface.co/{repo} in a browser;\n"
+            f"  search huggingface.co for the model name to find the right owner/repo."
+        )
+    else:
+        lines.append(
+            f"  (could not reach the HF API to probe {repo} — check https://huggingface.co/{repo}\n"
+            f"  in a browser: nonexistent repos get 401 anonymously; gated ones need HF_TOKEN.)"
+        )
+    return "\n  remedy: HuggingFace answered 401.\n" + "\n".join(lines)
 
 
 def vllm_image_for(accelerator: str) -> str:
