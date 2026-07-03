@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from types import SimpleNamespace
 
 # ramalama configures an INFO-level logger on import (proxy discovery etc.);
@@ -278,11 +279,16 @@ class _LogTap(logging.Handler):
         self.lines.append(record.getMessage())
 
 
-def pull_model(model_uri: str, dryrun: bool = False, quiet: bool = False) -> str:
+def pull_model(model_uri: str, dryrun: bool = False, quiet: bool = False, force: bool = False) -> str:
     """Pull a model via RamaLama transports (hf://, ollama://, oci://, ...).
 
     Returns the resolved host path of the model inside boxy's store.
     Raises RuntimeError with guidance if ramalama is not installed.
+
+    force=True removes any cached snapshot first, so a partial/corrupt copy
+    (e.g. a download interrupted by an earlier TLS/network error, which then
+    fails to load with 'weights were not initialized from checkpoint') is
+    replaced by a clean re-pull.
     """
     try:
         _silence_prompts()
@@ -306,6 +312,13 @@ def pull_model(model_uri: str, dryrun: bool = False, quiet: bool = False) -> str
     ensure_trust_bundle()
     args = _store_args(model_uri, dryrun=dryrun, quiet=quiet)
     transport = New(model_uri, args)
+    if force and not dryrun:
+        args.ignore = True  # remove() must not raise when nothing is cached yet
+        try:
+            if transport.remove(args):
+                print(f"boxy: removed cached {model_uri} — re-pulling clean", file=sys.stderr)
+        except Exception as e:  # a failed cleanup must not block the re-pull
+            print(f"boxy: could not remove the cached copy ({e}); pulling over it", file=sys.stderr)
     tap = _LogTap()
     ramalama_logger = logging.getLogger("ramalama")
     ramalama_logger.addHandler(tap)

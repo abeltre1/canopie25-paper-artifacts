@@ -37,34 +37,32 @@ def _weights_not_initialized(m: "re.Match[str]", log: str) -> str:
     # message can say WHICH weights and confirm the layernorm-only signature.
     names = re.findall(r"model\.layers\.\d+\.[A-Za-z0-9_.]+", log)
     uniq_suffix = sorted({n.split(".", 3)[-1] for n in names})
-    layernorm_only = bool(uniq_suffix) and all(
-        s.endswith("layernorm.weight") or s.endswith("norm.weight") for s in uniq_suffix
-    )
+    nfs = bool(re.search(r"Filesystem type for checkpoints:\s*(NFS|Lustre)|Prefetching checkpoint",
+                         log, re.IGNORECASE))
     detail = ""
     if uniq_suffix:
         shown = ", ".join(uniq_suffix[:4]) + (" ..." if len(uniq_suffix) > 4 else "")
         detail = f"Missing weights are all: {shown}\n"
-        if layernorm_only:
-            detail += (
-                "Only the norm weights are missing (the big proj/mlp tensors loaded),\n"
-                "so this is NOT a bad/partial download — it is an architecture <-> engine\n"
-                "version mismatch: the checkpoint stores these under a name this vLLM\n"
-                "build does not map.\n"
-            )
+    if nfs:
+        detail += (
+            "The checkpoint is on a NETWORK filesystem (NFS/Lustre) and vLLM >= 0.24\n"
+            "auto-enables its 'prefetch' loader there, which has been observed to\n"
+            "MISLOAD shards (weights silently skipped). This is the most likely cause.\n"
+        )
     return _fmt(
-        "vLLM could not place some checkpoint weights (model <-> engine version mismatch)",
+        "vLLM could not place some checkpoint weights — bad load, not (usually) the model",
         detail
         + "\n"
-        "Fix, in order:\n"
-        "  1. Stop using the 'latest' vLLM image; pin the tag the model card\n"
-        "     recommends, e.g.  boxy serve <model> --engine vllm \\\n"
-        "                          --image vllm/vllm-openai:vX.Y.Z\n"
-        "  2. Check the model's config.json 'architectures' is supported by that\n"
-        "     vLLM build (vllm --help / supported-models list). A brand-new arch\n"
-        "     needs a newer image; a custom one may need --trust-remote-code or\n"
-        "     (newer vLLM) --model-impl transformers.\n"
-        "  3. If the model is a hybrid / not yet supported on vLLM, serve it on\n"
-        "     llama.cpp instead:  boxy serve <gguf-model>   (boxy's default engine).",
+        "Fix, in order (cheapest first):\n"
+        "  1. NETWORK-FS load bug (esp. if the log says NFS/Lustre/Prefetching):\n"
+        "     force the eager loader —  boxy serve <model> -- --safetensors-load-strategy eager\n"
+        "     (boxy now defaults vLLM to eager; disable with BOXY_NO_VLLM_EAGER=1).\n"
+        "  2. PARTIAL/CORRUPT checkpoint (a pull interrupted by an earlier TLS/network\n"
+        "     error leaves a short shard): re-pull and re-verify —\n"
+        "       boxy pull <model> --force      (then rerun serve)\n"
+        "  3. Only if 1-2 don't fix it, a genuine model<->vLLM version mismatch: pin the\n"
+        "     image tag the model card recommends (--image vllm/vllm-openai:vX.Y.Z), or\n"
+        "     serve a GGUF build on llama.cpp:  boxy serve <gguf-model>.",
     )
 
 
@@ -120,6 +118,16 @@ def _engine_core_generic(m: "re.Match[str]", log: str) -> str:
     )
 
 
+def _unknown_load_strategy(m: "re.Match[str]", log: str) -> str:
+    return _fmt(
+        "Your vLLM predates the --safetensors-load-strategy flag boxy adds by default",
+        "boxy defaults vLLM to '--safetensors-load-strategy eager' (correct for the\n"
+        "NFS/Lustre stores HPC uses), but vLLM < 0.24 doesn't know that flag.\n"
+        "  Disable boxy's default:  BOXY_NO_VLLM_EAGER=1 boxy serve ...\n"
+        "  Or pin a vLLM >= 0.24 image:  --image vllm/vllm-openai:v0.24.0 (or newer).",
+    )
+
+
 def _gguf_load_fail(m: "re.Match[str]", log: str) -> str:
     return _fmt(
         "llama.cpp could not load the GGUF model file",
@@ -152,6 +160,12 @@ RULES: list[Rule] = [
         re.compile(r"(?:CUDA out of memory|torch\.(?:cuda\.)?OutOfMemoryError|HIP out of memory|"
                    r"No available memory for the cache blocks)", re.IGNORECASE),
         _cuda_oom,
+    ),
+    Rule(
+        "vllm-unknown-load-strategy",
+        re.compile(r"unrecognized arguments:.*safetensors-load-strategy|"
+                   r"error:.*--safetensors-load-strategy", re.IGNORECASE),
+        _unknown_load_strategy,
     ),
     Rule(
         "rocm-arch-mismatch",

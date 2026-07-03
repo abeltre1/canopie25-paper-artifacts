@@ -223,6 +223,80 @@ def test_specific_signature_beats_generic_wrapper():
     assert "version mismatch" in hint.lower()  # weights rule, not the generic wrapper
 
 
+def test_diagnose_weights_on_nfs_leads_with_load_bug(monkeypatch):
+    """On an NFS-backed checkpoint the diagnosis must lead with the eager/re-pull
+    fix, not 'version mismatch' (field report: standard Llama-3.1-8B on NFS)."""
+    log = (VLLM_WEIGHTS_ERR +
+           "\n[weight_utils.py:849] Filesystem type for checkpoints: NFS. Checkpoint size: 10.30 GiB."
+           "\n[weight_utils.py:811] Prefetching checkpoint files into page cache started")
+    hint = diagnostics.diagnose(log)
+    assert "NETWORK filesystem" in hint or "network" in hint.lower()
+    assert "--safetensors-load-strategy eager" in hint
+    assert "--force" in hint  # re-pull path
+
+
+def test_diagnose_unknown_load_strategy_flag():
+    hint = diagnostics.diagnose("vllm serve: error: unrecognized arguments: "
+                                "--safetensors-load-strategy=eager")
+    assert hint is not None and "BOXY_NO_VLLM_EAGER=1" in hint
+
+
+def test_vllm_defaults_to_eager_load_strategy(monkeypatch):
+    from boxy.box import Box
+    from boxy.engines import build_vllm_serve_cmd
+    from boxy.location import Location
+
+    monkeypatch.delenv("BOXY_NO_VLLM_EAGER", raising=False)
+    box = Box(name="b", engine="vllm", model="/m", entrypoint="vllm")
+    cmd = build_vllm_serve_cmd(box, Location(name="l"), "/m")
+    assert "--safetensors-load-strategy=eager" in cmd
+
+
+def test_vllm_eager_is_overridable_and_env_disablable(monkeypatch):
+    from boxy.box import Box
+    from boxy.engines import build_vllm_serve_cmd
+    from boxy.location import Location
+
+    box = Box(name="b", engine="vllm", model="/m", entrypoint="vllm")
+    # user value wins (no duplicate, no override)
+    monkeypatch.delenv("BOXY_NO_VLLM_EAGER", raising=False)
+    cmd = build_vllm_serve_cmd(box, Location(name="l"), "/m",
+                               extra_args=["--safetensors-load-strategy", "prefetch"])
+    assert "prefetch" in cmd and "--safetensors-load-strategy=eager" not in cmd
+    # env disables it entirely (e.g. vLLM < 0.24)
+    monkeypatch.setenv("BOXY_NO_VLLM_EAGER", "1")
+    cmd = build_vllm_serve_cmd(box, Location(name="l"), "/m")
+    assert not any("safetensors-load-strategy" in a for a in cmd)
+
+
+def test_pull_force_removes_then_repulls(monkeypatch, capsys):
+    """boxy pull --force wipes a cached (possibly corrupt) snapshot before pulling."""
+    from boxy import ramalama_shim as s
+
+    calls = {"removed": False, "pulled": False}
+
+    class FakeTransport:
+        def remove(self, args):
+            calls["removed"] = getattr(args, "ignore", False)  # boxy sets ignore=True
+            return True
+
+        def ensure_model_exists(self, args):
+            calls["pulled"] = True
+
+        def _get_entry_model_path(self, *a):
+            return "/store/model"
+
+    monkeypatch.setattr(s, "ensure_trust_bundle", lambda: None)
+    monkeypatch.setattr(s, "_store_args", lambda uri, **k: __import__("types").SimpleNamespace())
+    import ramalama.transports.transport_factory as tf
+
+    monkeypatch.setattr(tf, "New", lambda uri, args: FakeTransport())
+    path = s.pull_model("hf://o/m", force=True)
+    assert path == "/store/model"
+    assert calls["removed"] is True and calls["pulled"] is True
+    assert "removed cached" in capsys.readouterr().err
+
+
 def test_diagnose_unknown_returns_none():
     assert diagnostics.diagnose("Server started on port 8000. Ready.") is None
     assert diagnostics.diagnose("") is None

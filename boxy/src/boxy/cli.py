@@ -950,7 +950,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
     if not model.startswith(TRANSPORT_SCHEMES):
         print(f"model is a path ({model}); nothing to pull (shared-FS flow)")
         return 0
-    path = ramalama_shim.pull_model(model, dryrun=args.dryrun)
+    path = ramalama_shim.pull_model(model, dryrun=args.dryrun, force=getattr(args, "force", False))
     print(f"model available at: {path}")
     return 0
 
@@ -1242,6 +1242,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("model", nargs="?", default=None,
                    help="transport URI (hf://, ollama://, oci://); alternative: --box")
     p.add_argument("--box", default=None, help="pull the model named by a box TOML profile")
+    p.add_argument("--force", action="store_true",
+                   help="remove any cached copy and re-pull clean (fixes a partial/corrupt "
+                        "download from an interrupted pull)")
     p.add_argument("--dryrun", action="store_true")
     p.set_defaults(func=cmd_pull)
 

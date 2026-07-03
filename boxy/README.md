@@ -135,6 +135,11 @@ boxy serve hf://org/model --scheduler slurm --gpus 4 --accelerator cuda --foregr
 
 # Pre-stage a model on the login node (network) for compute nodes (no network):
 boxy pull hf://org/repo/file.gguf
+boxy pull hf://org/repo --force    # wipe a partial/corrupt cache and re-pull clean
+
+# vLLM note: boxy defaults `--safetensors-load-strategy eager` (vLLM's recommendation
+# for the NFS/Lustre stores HPC uses; vLLM>=0.24's NFS auto-prefetch can misload shards).
+# Override per-serve with `-- --safetensors-load-strategy prefetch`, or BOXY_NO_VLLM_EAGER=1.
 
 # Freeze what was resolved into reviewable, reusable profiles:
 boxy serve model.gguf --save-profile mysite     # writes mysite.box.toml + mysite.location.toml

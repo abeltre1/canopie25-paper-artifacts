@@ -230,7 +230,7 @@ def test_stop_without_name_or_box_is_usage_error(capsys):
 def test_pull_accepts_positional_uri(monkeypatch, capsys):
     seen = {}
 
-    def fake_pull(uri, dryrun=False, quiet=False):
+    def fake_pull(uri, dryrun=False, quiet=False, force=False):
         seen["uri"] = uri
         return "/store/blob"
 

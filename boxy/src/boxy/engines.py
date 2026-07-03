@@ -128,6 +128,17 @@ def build_vllm_serve_cmd(
         tuning.pop("port", None)
     cmd = _tack_on_last(cmd, box_args)
     cmd = _tack_on_last(cmd, tuning)
+    # HPC default: model stores live on NFS/Lustre, where vLLM >= 0.24 auto-enables
+    # the 'prefetch' safetensors strategy — which has misloaded checkpoints (field
+    # report: 'weights were not initialized from checkpoint' on a standard
+    # Llama-3.1-8B served from an NFS store). 'eager' reads each shard fully before
+    # load and is vLLM's own recommendation for network filesystems. A user/box
+    # value wins; disable entirely with BOXY_NO_VLLM_EAGER=1 (e.g. vLLM < 0.24,
+    # which does not know this flag).
+    import os
+
+    if not os.environ.get("BOXY_NO_VLLM_EAGER"):
+        cmd = _tack_on_last(cmd, {"safetensors_load_strategy": "eager"})
     resolved_port = port or (box.ports[0] if box.ports else default_port("vllm"))
     cmd = _tack_on_last(cmd, {"host": host, "port": resolved_port})
     return cmd
