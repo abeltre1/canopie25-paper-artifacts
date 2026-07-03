@@ -123,6 +123,10 @@ boxy serve hf://org/model-GGUF/file.gguf --scheduler slurm --gpus 1 \
 # — new site flags never require a boxy change. Ctrl-C detaches; job keeps going.
 boxy serve <model> --scheduler flux --gpus 4 --flux-queue=pbatch     # Flux: identical
 
+# Launch MANY of the same model at once — each gets its own job, log, endpoint:
+boxy serve <model> --scheduler flux --gpus 4 --unique   # repeat freely, no name clash
+# (default name is a stable singleton so a plain rerun reconnects instead of duplicating.)
+
 # Inside a Slurm/Flux allocation: runs direct + foreground automatically.
 srun -N1 --gpus-per-node=1 --pty boxy serve /lustre/models/llama-3.1-8b.Q6_K.gguf
 

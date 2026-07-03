@@ -511,6 +511,24 @@ def _diagnose_file(path, scan_tail: int = 400) -> None:
     _print_diagnosis("\n".join(lines))
 
 
+def _unique_instance_name(base: str) -> str:
+    """Append a readable, collision-checked suffix so N launches of the SAME
+    model coexist: each instance gets its own record / endpoint / script / log
+    (all keyed by this name) and its own scheduler job. Format:
+    <base>-<mmdd-HHMMSS>-<hex> — sortable by launch time, unique by the hex."""
+    import secrets
+    import time as _time
+
+    from boxy import jobs
+
+    stamp = _time.strftime("%m%d-%H%M%S")
+    for _ in range(20):
+        candidate = f"{base}-{stamp}-{secrets.token_hex(2)}"
+        if jobs.read_record(candidate) is None and not jobs.endpoint_path(candidate).exists():
+            return candidate
+    return f"{base}-{stamp}-{secrets.token_hex(6)}"
+
+
 def _job_state(scheduler, job_id: str) -> str:
     """PENDING | RUNNING | DONE | UNKNOWN. A scheduler that cannot be REACHED
     (controller down, squeue missing) must be UNKNOWN, never DONE: squeue's
@@ -583,6 +601,10 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
         args.model, scheduler_name, name=args.name, require_exists=not args.dryrun)
     for line in decisions:
         print(f"  auto: {line}")
+    if getattr(args, "unique", False):
+        name = _unique_instance_name(name)
+        print(f"  auto: name: {name} (--unique — independent instance; "
+              f"log/endpoint/job are its own)")
 
     if profile is not None:
         location = profile
@@ -763,6 +785,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
     box, location, decisions = _resolve_or_load(args)
     for line in decisions:
         print(f"  auto: {line}")
+    if getattr(args, "unique", False) and args.model and not args.box:
+        # container edition of --unique: a fresh name (and thus container name +
+        # label) per launch, so `boxy serve MODEL --unique` x N coexist. Ports
+        # already auto-increment for scheduler=none, so no port clash either.
+        from dataclasses import replace as _replace
+
+        box = _replace(box, name=_unique_instance_name(box.name))
+        print(f"  auto: name: {box.name} (--unique — independent instance)")
     dynamic = getattr(args, "dynamic_flags", [])
     site_flags = [("partition", getattr(args, "partition", None)),
                   ("account", getattr(args, "account", None)),
@@ -1176,6 +1206,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gpus", type=int, default=None, help="GPUs per node for the --scheduler job request")
     p.add_argument("--nodes", type=int, default=None, help="node count for the --scheduler job request")
     p.add_argument("--name", default=None, help="container name (default: derived from the model)")
+    p.add_argument("--unique", action="store_true",
+                   help="append a unique suffix to the name so you can launch MULTIPLE instances of "
+                        "the same model at once (each gets its own job, log, and endpoint) instead of "
+                        "reusing/blocking on the single deterministic name")
     p.add_argument("--partition", default=None,
                    help="partition/queue for --scheduler jobs (Slurm --partition, Flux --queue)")
     p.add_argument("--account", default=None,

@@ -117,6 +117,63 @@ def test_matching_scheduler_record_message_unchanged(gguf, jobs_dir, monkeypatch
     assert "already submitted as flux job f123" in err
 
 
+# ---- --unique: launch multiple of the same model ----------------------------
+
+def test_unique_flag_gives_distinct_coherent_instance_names(gguf, jobs_dir, monkeypatch, capsys):
+    """--unique keys the WHOLE instance (job-name, --output log, endpoint file,
+    inner --name) off one fresh suffix so N launches of the same model coexist."""
+    import re
+    import secrets
+
+    tokens = iter(["aaaa", "bbbb"])
+    monkeypatch.setattr(secrets, "token_hex", lambda n: next(tokens))
+
+    outs = []
+    for _ in range(2):
+        assert main(["serve", str(gguf), "--scheduler", "flux", "--gpus", "1",
+                     "--unique", "--dryrun"]) == 0
+        outs.append(capsys.readouterr().out)
+
+    names = [re.search(r"auto: name: (\S+) \(--unique", o).group(1) for o in outs]
+    assert names[0] != names[1]                        # distinct per launch
+    for name, out in zip(names, outs):
+        assert f"# flux: --job-name={name}" in out      # job carries the name
+        assert f"--output=" in out and f"{name}.log" in out  # its own log file
+        assert f"--name {name}" in out                  # inner serve + endpoint
+        assert f"{name}.endpoint.json" in out
+
+
+def test_without_unique_name_is_deterministic(gguf, jobs_dir, capsys):
+    """Default stays a stable singleton name (reconnect/idempotent submit)."""
+    import re
+
+    main(["serve", str(gguf), "--scheduler", "flux", "--dryrun"])
+    out1 = capsys.readouterr().out
+    main(["serve", str(gguf), "--scheduler", "flux", "--dryrun"])
+    out2 = capsys.readouterr().out
+    assert "(--unique" not in out1
+    j1 = re.search(r"--job-name=(\S+)", out1).group(1)
+    j2 = re.search(r"--job-name=(\S+)", out2).group(1)
+    assert j1 == j2
+
+
+def test_unique_instance_name_avoids_existing_record(jobs_dir, monkeypatch):
+    """The suffix loop skips a token already taken by a live record."""
+    import secrets
+    import time
+
+    from boxy import cli, jobs
+
+    monkeypatch.setattr(time, "strftime", lambda fmt: "0101-000000")  # freeze the stamp
+    tokens = iter(["dead", "beef"])
+    monkeypatch.setattr(secrets, "token_hex", lambda n: next(tokens))
+    # pre-seat the record the first token would produce
+    first = "boxy-m-0101-000000-dead"
+    jobs.write_record(first, {"name": first, "scheduler": "flux", "job": "1"})
+    name = cli._unique_instance_name("boxy-m")
+    assert name == "boxy-m-0101-000000-beef"   # skipped the taken 'dead' token
+
+
 # ---- engine-startup diagnostics ---------------------------------------------
 
 VLLM_WEIGHTS_ERR = """
