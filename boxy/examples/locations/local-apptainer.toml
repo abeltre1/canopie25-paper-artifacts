@@ -1,0 +1,8 @@
+# Linux workstation with Apptainer, no scheduler, CPU (or set accelerator).
+[location]
+name = "local-apptainer"
+scheduler = "none"
+accelerator = "none"
+runtime = "apptainer"
+[location.staging]
+models_dir = "./models"

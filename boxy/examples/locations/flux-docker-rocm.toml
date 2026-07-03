@@ -1,0 +1,12 @@
+# Flux cluster with Docker + AMD GPUs (uncommon; completeness).
+[location]
+name = "flux-docker-rocm"
+scheduler = "flux"
+accelerator = "rocm"
+runtime = "docker"
+offline = true
+[location.resources]
+nodes = 1
+gpus_per_node = 4
+[location.staging]
+models_dir = "./models"

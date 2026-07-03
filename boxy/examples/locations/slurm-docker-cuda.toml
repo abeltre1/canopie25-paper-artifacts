@@ -1,0 +1,12 @@
+# Slurm cluster where Docker is the sanctioned runtime (less common).
+[location]
+name = "slurm-docker-cuda"
+scheduler = "slurm"
+accelerator = "cuda"
+runtime = "docker"
+offline = true
+[location.resources]
+nodes = 1
+gpus_per_node = 4
+[location.staging]
+models_dir = "./models"

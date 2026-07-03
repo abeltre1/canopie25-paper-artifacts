@@ -1,0 +1,8 @@
+# Laptop/workstation with Podman, no scheduler (macOS: ports auto-published).
+[location]
+name = "local-podman"
+scheduler = "none"
+accelerator = "none"
+runtime = "podman"
+[location.staging]
+models_dir = "./models"
