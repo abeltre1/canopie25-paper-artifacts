@@ -83,6 +83,18 @@ def test_cli_serve_dryrun_distributed_flux(capsys):
     assert "flux run" in out and "apptainer" in out and "vllm-rocm.sif" in out
 
 
+def test_cli_serve_trust_remote_code(capsys):
+    # --trust-remote-code adds the vLLM flag; the scheduler path forwards it to the
+    # compute-node inner serve (re-applied engine-aware there).
+    rc = main(["serve", "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
+               "--location", str(EXAMPLES / "locations" / "hops.toml"),
+               "--no-distributed", "--trust-remote-code", "--dryrun"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "--trust-remote-code" in out
+    assert "trust-remote-code: enabled" in out
+
+
 def test_cli_run_passthrough_dryrun(capsys):
     rc = main(
         [

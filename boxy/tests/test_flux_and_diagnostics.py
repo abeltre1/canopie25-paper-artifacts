@@ -229,6 +229,15 @@ def test_diagnose_vllm_weights_not_initialized():
     assert "llama.cpp" in hint
 
 
+def test_diagnose_trust_remote_code():
+    log = ("pydantic_core._pydantic_core.ValidationError: The repository /mnt/models/x contains "
+           "custom code which must be executed to correctly load the model. Please pass the argument "
+           "`trust_remote_code=True` to allow custom code to be run.")
+    hint = diagnostics.diagnose(log)
+    assert hint is not None and "trust_remote_code" in hint
+    assert "--trust-remote-code" in hint
+
+
 def test_diagnose_cuda_oom():
     hint = diagnostics.diagnose("torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate ...")
     assert hint is not None and "out of memory" in hint.lower()

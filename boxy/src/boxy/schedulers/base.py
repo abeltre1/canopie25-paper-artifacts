@@ -77,6 +77,29 @@ class Scheduler(ABC):
         lines.append(f"exec {inner_command}")
         return "\n".join(lines) + "\n"
 
+    def group_batch_script(self, inner_commands: list[str], location: Location, name: str,
+                           log_file: str, site_args: list[str]) -> str:
+        """A batch script that runs SEVERAL co-located servers on one node (the
+        --replicas bin-packing case): the allocation grants the node's GPUs, and
+        each inner command is a GPU-pinned server launched in the background; the
+        script `wait`s on all of them so the job stays alive while they serve."""
+        lines = ["#!/bin/bash"]
+        lines.append(f"{self.directive_prefix} --job-name={name}")
+        lines += self.resource_directives(location)
+        for arg in site_args:
+            if "=" in arg and any(c.isspace() for c in arg.split("=", 1)[1]):
+                flag, value = arg.split("=", 1)
+                arg = f'{flag}="{value.replace(chr(34), chr(92) + chr(34))}"'
+            lines.append(f"{self.directive_prefix} {arg}")
+        lines.append(f"{self.directive_prefix} --output={log_file}")
+        lines.append("")
+        for module in location.modules:
+            lines.append(f"module load {module}")
+        for cmd in inner_commands:
+            lines.append(f"{cmd} &")
+        lines.append("wait")
+        return "\n".join(lines) + "\n"
+
     def submit_command(self, script: str) -> list[str]:
         raise NotImplementedError
 

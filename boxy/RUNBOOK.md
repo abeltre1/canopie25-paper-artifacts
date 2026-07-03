@@ -243,12 +243,23 @@ boxy serve <model> --scheduler slurm --nodes 2 --gpus 4 --dryrun
 boxy serve <model> --scheduler slurm --nodes 2 --gpus 4     # for real; READY -> curl -> boxy stop <name>
 
 # --- B. N INDEPENDENT instances (data-parallel replicas) -----------------------
-# K separate jobs, each its own name/endpoint/log/port, all in `boxy list`.
-# Composes with --nodes>1 (each replica is itself distributed).
+# Replicas BIN-PACK onto a node's GPUs: with --gpus = the node's GPU count and the
+# default --gpus-per-replica 1, K replicas share ONE node (K // 1 per node), each
+# pinned to its own GPU (CUDA/HIP/ROCR_VISIBLE_DEVICES) on its own port 8000,8001,…
+# So 4 replicas on a 4-GPU node = 1 node job, NOT 4 nodes. tensor-parallel per
+# replica = --gpus-per-replica (1 by default; raise it for a bigger model).
 boxy serve <model> --scheduler slurm --gpus 4 --replicas 4 --dryrun
-# EXPECT: four batch scripts <base>-r0..-r3; the summary lists each job + endpoint.
-boxy serve <model> --scheduler slurm --gpus 4 --replicas 4      # for real
-boxy list                                                       # watch all four
+# EXPECT: "packed 4/node -> 1 node job(s)"; one #SBATCH --gpus-per-node=4 job that
+#   launches 4 GPU-pinned servers (--visible-gpus 0..3, --port 8000..8003) + wait.
+boxy serve <model> --scheduler slurm --gpus 4 --replicas 4      # for real (1 node, 4 GPUs)
+boxy list                                                       # the job + its 4 replica endpoints
+boxy stop <base>                                                # cancels the job -> all 4 replicas
+# Knobs: --gpus-per-replica 2 -> 2 replicas/4-GPU node, each tensor-parallel=2.
+#        K > (gpus//R) overflows to ceil(K/rpn) node jobs (<base>-n0, -n1, …).
+#        --replicas K --nodes N>1 -> each replica is itself an N-node distributed
+#        instance (data-parallel of model-parallel).
+# Note: GPU pinning uses absolute indices, correct for the exclusive full-node
+# allocations HPC partitions grant (--gpus = the node's GPU count).
 
 # --- B'. ONE URL in front of the replicas (built-in router) --------------------
 # Present a single OpenAI endpoint load-balanced (least-outstanding) across the K

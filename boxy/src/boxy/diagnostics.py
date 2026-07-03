@@ -128,6 +128,19 @@ def _unknown_load_strategy(m: "re.Match[str]", log: str) -> str:
     )
 
 
+def _trust_remote_code(m: "re.Match[str]", log: str) -> str:
+    return _fmt(
+        "This model needs trust_remote_code — it ships custom loader code vLLM must run",
+        "The model repo contains custom Python that vLLM won't execute unless you opt in\n"
+        "(common for new/custom architectures, e.g. NVIDIA Nemotron-Parse).\n"
+        "  Fix:  boxy serve <model> ... --trust-remote-code\n"
+        "        (equivalently, forward it yourself:  ... -- --trust-remote-code)\n"
+        "  Only enable it for models you trust — it runs code shipped in the repo.\n"
+        "  If it still fails after this, the architecture may be too new for this vLLM\n"
+        "  build — pin a newer --image vllm/vllm-openai:<tag>.",
+    )
+
+
 def _gguf_load_fail(m: "re.Match[str]", log: str) -> str:
     return _fmt(
         "llama.cpp could not load the GGUF model file",
@@ -144,6 +157,12 @@ RULES: list[Rule] = [
         "vllm-weights-not-initialized",
         re.compile(r"weights?\s+were\s+not\s+initialized\s+from\s+checkpoint", re.IGNORECASE),
         _weights_not_initialized,
+    ),
+    Rule(
+        "vllm-trust-remote-code",
+        re.compile(r"trust_remote_code\s*=\s*True|contains custom code which must be executed",
+                   re.IGNORECASE),
+        _trust_remote_code,
     ),
     Rule(
         "vllm-unsupported-arch",

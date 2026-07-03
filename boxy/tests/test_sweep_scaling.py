@@ -101,9 +101,11 @@ def test_sweep_replicas_dryrun_fans_out(capsys):
                "--sweep-replicas", "1,2", "--dryrun"])
     assert rc == 0
     out = capsys.readouterr().out
-    # replicas=2 rung fans out to two per-replica jobs, tagged x2 then -r0/-r1
-    assert "--job-name=boxy-meta-llama-3.1-8b-x2-r0" in out
-    assert "--job-name=boxy-meta-llama-3.1-8b-x2-r1" in out
+    # replicas=2 rung bin-packs both replicas onto one node job (tagged x2), each a
+    # co-located GPU-pinned server named x2-r0 / x2-r1.
+    assert "--job-name=boxy-meta-llama-3.1-8b-x2" in out
+    assert "--name boxy-meta-llama-3.1-8b-x2-r0" in out
+    assert "--name boxy-meta-llama-3.1-8b-x2-r1" in out
 
 
 def test_sweep_requires_exactly_one_axis(capsys):

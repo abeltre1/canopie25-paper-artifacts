@@ -130,7 +130,8 @@ boxy serve <model> --scheduler flux --gpus 4 --unique   # repeat freely, no name
 # SCALE OUT — three orthogonal modes (all --dryrun-able; see RUNBOOK §4.5):
 # 1) One instance ACROSS nodes (model-parallel via Ray; auto-on for vLLM+nodes>1):
 boxy serve <model> --scheduler slurm --nodes 2 --gpus 4   # TP=GPUs/node, PP=nodes
-# 2) N INDEPENDENT replicas (data-parallel; each its own job/endpoint, composes with --nodes):
+# 2) N INDEPENDENT replicas (data-parallel), BIN-PACKED onto a node's GPUs
+#    (4 replicas x 1 GPU = 1 node, not 4); --gpus-per-replica R gives each TP=R:
 boxy serve <model> --scheduler slurm --gpus 4 --replicas 4
 #    ...with ONE load-balanced URL in front (built-in login-node router):
 boxy serve <model> --scheduler slurm --gpus 4 --replicas 4 --router   # http://<login>:8000/v1

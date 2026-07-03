@@ -583,10 +583,19 @@ def _dump_file_tail(path, tail: int = 30) -> str:
         return ""
 
 
-def _inner_serve_command(args, model: str, name: str) -> str:
+def _inner_serve_command(args, model: str, name: str, *, port: int | None = None,
+                         visible_gpus: str | None = None, gpus: int | None = None,
+                         forward_geometry: bool = True,
+                         extra_engine_args: list[str] | None = None) -> str:
     """The command the batch job runs ON the compute node: boxy itself, in
     foreground (the job step owns the server), re-resolving hardware there
-    and publishing its endpoint over the shared filesystem."""
+    and publishing its endpoint over the shared filesystem.
+
+    Overrides (for the co-located --replicas fan-out): `port` pins the serve port,
+    `visible_gpus` pins the container to specific GPU ids, `gpus` forwards a
+    per-replica GPU count, `forward_geometry=False` suppresses the --nodes/--gpus/
+    --distributed pass-through (each replica is a single-node instance), and
+    `extra_engine_args` are appended after `--` (e.g. --tensor-parallel-size=R)."""
     from boxy import jobs
 
     boxy_bin = shutil.which("boxy")
@@ -601,24 +610,33 @@ def _inner_serve_command(args, model: str, name: str) -> str:
     if mdir:
         # absolutize: the compute node must download to the SAME shared-FS path
         inner += ["--models-dir", os.path.abspath(mdir)]
-    # geometry the compute node needs to derive Ray parallelism (currently only
-    # the batch directives carried these); the head-node boxy re-decides distributed.
-    if args.nodes:
-        inner += ["--nodes", str(args.nodes)]
-    if args.gpus:
-        inner += ["--gpus", str(args.gpus)]
-    if getattr(args, "distributed", None) is True:
-        inner += ["--distributed"]
-    elif getattr(args, "distributed", None) is False:
-        inner += ["--no-distributed"]
+    if forward_geometry:
+        # geometry the compute node needs to derive Ray parallelism (currently only
+        # the batch directives carried these); the head-node boxy re-decides distributed.
+        if args.nodes:
+            inner += ["--nodes", str(args.nodes)]
+        if args.gpus:
+            inner += ["--gpus", str(args.gpus)]
+        if getattr(args, "distributed", None) is True:
+            inner += ["--distributed"]
+        elif getattr(args, "distributed", None) is False:
+            inner += ["--no-distributed"]
+    if gpus is not None:
+        inner += ["--gpus", str(gpus)]
+    if visible_gpus is not None:
+        inner += ["--visible-gpus", visible_gpus]
+    if getattr(args, "trust_remote_code", False):
+        inner += ["--trust-remote-code"]  # re-applied engine-aware on the compute node
     for flag, value in (("--engine", args.engine), ("--image", args.image),
                         ("--runtime", args.runtime), ("--accelerator", args.accelerator)):
         if value:
             inner += [flag, value]
-    if args.port:
-        inner += ["--port", str(args.port)]
-    if args.args:
-        inner += ["--"] + list(args.args)
+    resolved_port = port if port is not None else args.port
+    if resolved_port:
+        inner += ["--port", str(resolved_port)]
+    tail = list(extra_engine_args or []) + list(args.args or [])
+    if tail:
+        inner += ["--"] + tail
     return shlex.join(inner)
 
 
@@ -838,14 +856,47 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
         return 0
 
 
+def _serve_replicas_multinode(args, scheduler_name, profile, replicas, base_name, router_port) -> int:
+    """--replicas K --nodes N>1: K replicas, each a MULTI-NODE distributed instance
+    (a full Ray job spanning N nodes). One distributed job per replica; non-blocking."""
+    from boxy import jobs
+
+    names = [f"{base_name}-r{i}" for i in range(replicas)]
+    print(f"  auto: replicas: {replicas} distributed instances of {base_name} — each "
+          f"{args.nodes} nodes x {args.gpus or '?'} GPU (data-parallel of model-parallel)")
+    rcs = []
+    for nm in names:
+        print(f"\n### Replica {nm}")
+        rcs.append(_serve_submission(args, scheduler_name, profile, name_override=nm, follow=False))
+    if args.dryrun:
+        print(f"\n### dryrun: {replicas} distributed replica job(s) shown above; nothing submitted")
+        return 0
+    submitted = [nm for nm, rc in zip(names, rcs) if rc == 0]
+    print(f"\n### replicas: {len(submitted)}/{replicas} submitted")
+    for nm in submitted:
+        rec = jobs.read_record(nm)
+        if rec:
+            print(f"###   {nm}: {scheduler_name} job {rec['job']}")
+    if submitted:
+        print("###   watch: boxy list      stop: boxy stop <name>")
+    if router_port and submitted:
+        _run_router(base_name, router_port, args.ready_timeout, submitted)
+    return 0 if len(submitted) == replicas else 1
+
+
 def _serve_replicas(args, scheduler_name: str, profile, replicas: int, router_port: int | None = None) -> int:
-    """Data-parallel fan-out: submit K independent instances of the model, each
-    its own batch job named <base>-r0..r{K-1} with its own name/endpoint/log/port.
-    Each replica is itself single-node or (with --nodes>1) a distributed instance.
-    Submission is non-blocking (sbatch/flux-batch return at once); the replicas are
-    then tracked together via `boxy list`. With `router_port`, once the replicas
-    are READY a built-in login-node router fronts them on one OpenAI URL."""
+    """Data-parallel fan-out. By default (single-node replicas) K replicas BIN-PACK
+    onto a node's GPUs — rpn = --gpus // --gpus-per-replica per node, each replica
+    pinned to its own GPU(s) on its own port — so K replicas take ceil(K/rpn) node
+    jobs, not one whole node each. With --nodes>1 each replica is instead a
+    multi-node distributed instance (see _serve_replicas_multinode). With
+    `router_port`, once the replicas are READY a login-node router fronts them."""
+    import math
+    from dataclasses import replace as dc_replace
+
     from boxy import jobs, resolve
+    from boxy.location import Location, Resources
+    from boxy.schedulers import get_scheduler
 
     _model, base_name, decisions = resolve.resolve_submission(
         args.model, scheduler_name, name=args.name, require_exists=not args.dryrun)
@@ -853,33 +904,99 @@ def _serve_replicas(args, scheduler_name: str, profile, replicas: int, router_po
         print(f"  auto: {line}")
     if getattr(args, "unique", False):
         base_name = _unique_instance_name(base_name)
-    names = [f"{base_name}-r{i}" for i in range(replicas)]
-    print(f"  auto: replicas: {replicas} independent instances of {base_name} "
-          f"(data-parallel) — each its own job/endpoint/log: {', '.join(names)}")
 
-    rcs = []
-    for nm in names:
-        print(f"\n### Replica {nm}")
-        rcs.append(_serve_submission(args, scheduler_name, profile, name_override=nm, follow=False))
+    if args.nodes and args.nodes > 1:
+        # each replica is itself a MULTI-NODE distributed (Ray) instance:
+        # data-parallel OF model-parallel. Keep one distributed job per replica.
+        return _serve_replicas_multinode(args, scheduler_name, profile, replicas, base_name, router_port)
+
+    # Bin-pack: each replica uses R GPUs; a node with --gpus GPUs holds rpn = gpus//R
+    # replicas (each pinned to its own GPU set), so K replicas need ceil(K/rpn) node
+    # jobs — NOT one whole node per replica.
+    r = max(1, getattr(args, "gpus_per_replica", 1) or 1)
+    gpus_per_node = args.gpus if args.gpus else r
+    if gpus_per_node < r:
+        print(f"boxy: --gpus {gpus_per_node} < --gpus-per-replica {r}: a replica needs {r} GPU(s) "
+              f"but the per-node budget is {gpus_per_node}. Raise --gpus or lower "
+              f"--gpus-per-replica.", file=sys.stderr)
+        return 2
+    rpn = max(1, gpus_per_node // r)
+    nodes = math.ceil(replicas / rpn)
+    replica_names = [f"{base_name}-r{i}" for i in range(replicas)]
+    tp_args = ["--tensor-parallel-size", str(r)] if r > 1 else None
+    print(f"  auto: replicas: {replicas} x {r} GPU (tensor-parallel={r}), packed {rpn}/node "
+          f"-> {nodes} node job(s){' + router' if router_port else ''}")
+
+    base_loc = (profile if profile is not None
+                else Location(name="auto", scheduler=scheduler_name, resources=Resources()))
+    scheduler = get_scheduler(scheduler_name)
+    site_args = list(base_loc.scheduler_args)
+    for kind, value in (("partition", args.partition), ("account", args.account), ("time", args.time)):
+        if value:
+            site_args.append(scheduler.site_directive(kind, value))
+    site_args += list(getattr(args, "scheduler_args", None) or [])
+    dynamic = getattr(args, "dynamic_flags", [])
+    site_args += [scheduler.dynamic_directive(k, v) for s, k, v in dynamic if s == scheduler_name]
+
+    submitted_jobs: list[tuple[str, str]] = []
+    failed = 0
+    for n in range(nodes):
+        members = list(range(n * rpn, min(replicas, (n + 1) * rpn)))
+        m = len(members)
+        job_name = base_name if nodes == 1 else f"{base_name}-n{n}"
+        loc = dc_replace(base_loc, resources=Resources(
+            nodes=1, gpus_per_node=m * r, accelerator_type=base_loc.resources.accelerator_type))
+        inner_cmds = []
+        for slot, i in enumerate(members):
+            ids = ",".join(str(g) for g in range(slot * r, slot * r + r))
+            inner_cmds.append(_inner_serve_command(
+                args, args.model, replica_names[i], port=8000 + slot, visible_gpus=ids,
+                gpus=r, forward_geometry=False, extra_engine_args=tp_args))
+        output_log = str(jobs.log_path(job_name, scheduler.output_token) if scheduler.output_token
+                         else jobs.log_path(job_name))
+        script_text = scheduler.group_batch_script(inner_cmds, loc, job_name, output_log, site_args)
+        submit = scheduler.submit_command(str(jobs.script_path(job_name)))
+        print(f"\n### Node job {job_name}: {m} replica(s) x {r} GPU = {m * r} GPU on 1 node "
+              f"({', '.join(replica_names[i] for i in members)})")
+        print(f"### Batch script ({jobs.script_path(job_name)}):")
+        for line in script_text.rstrip().splitlines():
+            print(f"    {line}")
+        print(f"### Submit Command:\n    {shlex.join(submit)}")
+        if args.dryrun:
+            continue
+        jobs.script_path(job_name).write_text(script_text)
+        for i in members:
+            jobs.endpoint_path(replica_names[i]).unlink(missing_ok=True)
+        result = subprocess.run(submit, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"boxy: submission failed for {job_name}: "
+                  f"{result.stderr.strip() or result.stdout.strip()}", file=sys.stderr)
+            failed += 1
+            continue
+        job_id = scheduler.parse_job_id(result.stdout)
+        jobs.write_record(job_name, {
+            "name": job_name, "scheduler": scheduler_name, "job": job_id, "model": args.model,
+            "submitted_from": socket.gethostname(), "replicas": [replica_names[i] for i in members],
+            "log": str(jobs.log_path(job_name, job_id))})
+        submitted_jobs.append((job_name, job_id))
+        print(f"### Submitted {scheduler_name} job {job_id}  ({job_name})")
 
     if args.dryrun:
-        print(f"\n### dryrun: {replicas} replica batch scripts shown above; nothing submitted")
+        print(f"\n### dryrun: {nodes} node job(s) for {replicas} replicas (packed {rpn}/node); "
+              f"nothing submitted")
         if router_port:
             print(f"### dryrun: would then start the login-node router on :{router_port} "
-                  f"fronting {base_name}-r0..r{replicas - 1}")
+                  f"fronting {base_name}-r*")
         return 0
-    submitted = [nm for nm, rc in zip(names, rcs) if rc == 0]
-    print(f"\n### replicas: {len(submitted)}/{replicas} submitted"
-          + (f", {replicas - len(submitted)} blocked/failed" if len(submitted) < replicas else ""))
-    for nm in submitted:
-        rec = jobs.read_record(nm)
-        if rec:
-            print(f"###   {nm}: {scheduler_name} job {rec['job']}   endpoint: {jobs.endpoint_path(nm)}")
-    if submitted:
-        print("###   watch all: boxy list      stop one: boxy stop <name>")
-    if router_port and submitted:
-        _run_router(base_name, router_port, args.ready_timeout, submitted)
-    return 0 if len(submitted) == replicas else 1
+    print(f"\n### replicas: {len(submitted_jobs)}/{nodes} node job(s) submitted for {replicas} replicas")
+    for jn, jid in submitted_jobs:
+        print(f"###   {jn}: {scheduler_name} job {jid}")
+    if submitted_jobs:
+        stop_hint = base_name if nodes == 1 else f"{base_name}-n0 .. -n{nodes - 1}"
+        print(f"###   watch: boxy list      stop: boxy stop {stop_hint}")
+    if router_port and submitted_jobs:
+        _run_router(base_name, router_port, args.ready_timeout, replica_names)
+    return 0 if failed == 0 else 1
 
 
 def _run_router(base_name: str, port: int, ready_timeout: float, names: list[str]) -> None:
@@ -1010,6 +1127,26 @@ def cmd_serve(args: argparse.Namespace) -> int:
     box, location, decisions = _resolve_or_load(args)
     for line in decisions:
         print(f"  auto: {line}")
+    vgpus = getattr(args, "visible_gpus", None)
+    if vgpus:
+        # pin this instance to specific GPU ids inside the container (co-located
+        # --replicas: N servers share a node, each on its own GPU). Set every
+        # accelerator's app-level selector; box.env still wins if the user set one.
+        from dataclasses import replace as _replace
+
+        pins = {k: vgpus for k in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")}
+        box = _replace(box, env={**pins, **box.env})
+        print(f"  auto: GPU pin: visible devices {vgpus} (CUDA/HIP/ROCR_VISIBLE_DEVICES)")
+    if getattr(args, "trust_remote_code", False):
+        # vLLM-only flag; llama.cpp's server rejects unknown args. Fold it into the
+        # engine extras so it reaches plan_serve AND the distributed/replica paths.
+        if box.engine == "vllm":
+            if "--trust-remote-code" not in (args.args or []):
+                args.args = list(args.args or []) + ["--trust-remote-code"]
+            print("  auto: trust-remote-code: enabled (vLLM will run the model's custom code)")
+        else:
+            print(f"  auto: trust-remote-code: ignored (engine is {box.engine}, not vllm)",
+                  file=sys.stderr)
     mdir = getattr(args, "models_dir", None) or os.environ.get("BOXY_MODELS_DIR")
     if mdir:
         # where s3://... models are downloaded (and where ${MODELS_DIR} expands)
@@ -1321,10 +1458,13 @@ def cmd_stop(args: argparse.Namespace) -> int:
     record = jobs.read_record(target)
     if record:
         # scheduler-submitted serve: cancel the job (the job step owns the
-        # server, so the container dies with it)
+        # server(s), so the container(s) die with it). A replica group job hosts
+        # several servers on one node — cancelling reaps them all.
         scheduler = get_scheduler(record["scheduler"])
         rc = _run_or_print(scheduler.cancel_command(record["job"]), args.dryrun)
         if not args.dryrun:
+            for replica in record.get("replicas", []):
+                jobs.endpoint_path(replica).unlink(missing_ok=True)
             jobs.remove(target)
         return rc
 
@@ -1351,10 +1491,21 @@ def cmd_list(args: argparse.Namespace) -> int:
         print("scheduler jobs:")
         for record in records:
             state = _job_state(get_scheduler(record["scheduler"]), record["job"])
-            endpoint = jobs.read_endpoint(record["name"])
-            url = f"{endpoint['url']}/v1" if endpoint else "-"
-            print(f"  {record['name']}  {record['scheduler']} job {record['job']}  {state}  {url}")
+            replicas = record.get("replicas")
+            if replicas:
+                # a replica group job: one job, several co-located servers
+                print(f"  {record['name']}  {record['scheduler']} job {record['job']}  {state}  "
+                      f"({len(replicas)} replicas)")
+                for rn in replicas:
+                    ep = jobs.read_endpoint(rn)
+                    print(f"      {rn}  {ep['url'] + '/v1' if ep else '-'}")
+            else:
+                endpoint = jobs.read_endpoint(record["name"])
+                url = f"{endpoint['url']}/v1" if endpoint else "-"
+                print(f"  {record['name']}  {record['scheduler']} job {record['job']}  {state}  {url}")
             if state == "DONE" and not args.dryrun:
+                for rn in replicas or []:
+                    jobs.endpoint_path(rn).unlink(missing_ok=True)
                 jobs.remove(record["name"])  # reap finished jobs from the list
     location = Location.from_toml(args.location) if args.location else None
     try:
@@ -1696,6 +1847,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "batch job named <base>-r0..r{K-1} with its own endpoint/log/port. Requires "
                         "--scheduler slurm|flux; composes with --nodes>1 (each replica is itself a "
                         "distributed instance)")
+    p.add_argument("--gpus-per-replica", type=int, default=1, metavar="R", dest="gpus_per_replica",
+                   help="GPUs each --replicas instance uses (default 1). Replicas bin-pack onto a "
+                        "node: (--gpus // R) replicas per node, each pinned to its own GPU(s). R>1 "
+                        "gives each replica tensor-parallel=R")
+    p.add_argument("--visible-gpus", default=None, dest="visible_gpus", help=argparse.SUPPRESS)
+    p.add_argument("--trust-remote-code", action="store_true", dest="trust_remote_code",
+                   help="let vLLM run the model repo's custom loader code (needed by some new/"
+                        "custom architectures, e.g. Nemotron-Parse). Only for models you trust")
     p.add_argument("--router", nargs="?", type=int, const=8000, default=None,
                    metavar="PORT",
                    help="with --replicas K, after the replicas are READY start the built-in login-node "
