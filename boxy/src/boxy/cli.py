@@ -17,7 +17,7 @@ import socket
 import subprocess
 import sys
 
-from boxy import __version__, ramalama_shim
+from boxy import ramalama_shim, version_string
 from boxy.backends import BACKENDS
 from boxy.box import TRANSPORT_SCHEMES, Box
 from boxy.location import ACCELERATORS, Location
@@ -54,7 +54,7 @@ def _emit(deployment, dryrun: bool) -> int:
 
 
 def cmd_info(args: argparse.Namespace) -> int:
-    print(f"boxy {__version__}")
+    print(f"boxy {version_string()}")
     print(f"ramalama library: {'available' if ramalama_shim.ramalama_available() else 'not installed'}")
     print(f"accelerator: {ramalama_shim.detect_accel()}")
     runtimes = [name for name in BACKENDS if shutil.which(name)]
@@ -1196,7 +1196,7 @@ def _stub(name: str):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="boxy", description=__doc__)
-    parser.add_argument("--version", action="version", version=f"boxy {__version__}")
+    parser.add_argument("--version", action="version", version=f"boxy {version_string()}")
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
     p = sub.add_parser("info", help="show detected accelerator, runtimes, schedulers, TLS state")

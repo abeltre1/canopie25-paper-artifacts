@@ -332,6 +332,34 @@ def test_pull_force_removes_then_repulls(monkeypatch, capsys):
     assert "removed cached" in capsys.readouterr().err
 
 
+def test_version_string_reports_git_commit_in_a_checkout(tmp_path, monkeypatch):
+    """boxy info / --version must expose the checkout's commit so a stale editable
+    install is obvious (field: `boxy 0.1.0` alone can't tell old from new)."""
+    import boxy
+
+    # fake a checkout: <root>/.git/HEAD -> a branch ref with a slash in it
+    git = tmp_path / "repo" / ".git"
+    (git / "refs" / "heads" / "claude").mkdir(parents=True)
+    (git / "HEAD").write_text("ref: refs/heads/claude/my-branch\n")
+    (git / "refs" / "heads" / "claude" / "my-branch").write_text("abcdef1234567890\n")
+    pkg = tmp_path / "repo" / "boxy" / "src" / "boxy"
+    pkg.mkdir(parents=True)
+    monkeypatch.setattr(boxy, "__file__", str(pkg / "__init__.py"))
+
+    sha, branch = boxy._read_git_revision()
+    assert sha == "abcdef1" and branch == "claude/my-branch"   # full branch, short sha
+    assert "git abcdef1" in boxy.version_string() and "claude/my-branch" in boxy.version_string()
+
+
+def test_version_string_plain_outside_a_checkout(tmp_path, monkeypatch):
+    import boxy
+
+    loose = tmp_path / "site-packages" / "boxy"
+    loose.mkdir(parents=True)
+    monkeypatch.setattr(boxy, "__file__", str(loose / "__init__.py"))
+    assert boxy.version_string() == boxy.__version__
+
+
 def test_diagnose_unknown_returns_none():
     assert diagnostics.diagnose("Server started on port 8000. Ready.") is None
     assert diagnostics.diagnose("") is None
