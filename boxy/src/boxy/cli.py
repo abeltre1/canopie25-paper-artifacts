@@ -1372,6 +1372,164 @@ def cmd_bench(args: argparse.Namespace) -> int:
     return 0
 
 
+def _sweep_axis(args) -> tuple[str, list[int]]:
+    """Exactly one of --sweep-nodes / --sweep-replicas, parsed to a list of ints
+    (powers of two by convention, but any positive ints are allowed)."""
+    sn = getattr(args, "sweep_nodes", None)
+    sr = getattr(args, "sweep_replicas", None)
+    if bool(sn) == bool(sr):
+        raise UsageError("boxy sweep needs exactly one of --sweep-nodes or --sweep-replicas "
+                         "(a comma list, e.g. 1,2,4,8)")
+    axis, raw = ("nodes", sn) if sn else ("replicas", sr)
+    try:
+        values = [int(x) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        raise UsageError(f"--sweep-{axis} must be a comma list of integers, got {raw!r}") from None
+    if not values or any(v < 1 for v in values):
+        raise UsageError(f"--sweep-{axis} must be positive integers, got {raw!r}")
+    return axis, values
+
+
+def _parse_batch_sizes(args) -> list[int]:
+    from boxy import bench
+
+    if not getattr(args, "batch_sizes", None):
+        return bench.DEFAULT_BATCH_SIZES
+    try:
+        return [int(b) for b in args.batch_sizes.split(",")]
+    except ValueError:
+        raise UsageError(f"--batch-sizes must be a comma list of integers, "
+                         f"got {args.batch_sizes!r}") from None
+
+
+def _rung_serve_args(args, nodes: int, replicas: int, name: str) -> argparse.Namespace:
+    """A serve-shaped args namespace for one sweep rung, carrying everything
+    _serve_submission/_serve_replicas read (geometry set for this rung)."""
+    return argparse.Namespace(
+        model=args.model, name=name, dryrun=args.dryrun, unique=False,
+        replicas=replicas, gpus=args.gpus, nodes=nodes,
+        scheduler_args=list(getattr(args, "scheduler_args", []) or []),
+        partition=getattr(args, "partition", None), account=getattr(args, "account", None),
+        time=getattr(args, "time", None), save_profile=None, distributed=None,
+        ready_timeout=args.ready_timeout, engine=getattr(args, "engine", None),
+        image=getattr(args, "image", None), runtime=getattr(args, "runtime", None),
+        accelerator=getattr(args, "accelerator", None), port=None,
+        location=getattr(args, "location", None), models_dir=getattr(args, "models_dir", None),
+        args=[], dynamic_flags=[], foreground=False,
+    )
+
+
+def _sweep_wait_endpoints(names: list[str], timeout_s: float) -> list[str]:
+    """Poll the shared-FS endpoint files until every rung server is READY (or
+    timeout); return the ready URLs."""
+    import time
+
+    from boxy import jobs, readiness
+
+    deadline = time.time() + timeout_s
+    ready: dict[str, str] = {}
+    print(f"###   waiting up to {timeout_s:.0f}s for {len(names)} endpoint(s) to become ready ...")
+    while len(ready) < len(names) and time.time() < deadline:
+        for n in names:
+            if n in ready:
+                continue
+            ep = jobs.read_endpoint(n)
+            if ep and readiness.wait_ready(ep["url"], timeout_s=3, interval_s=1):
+                ready[n] = ep["url"]
+                print(f"###   ready: {n} -> {ep['url']}/v1")
+        if len(ready) < len(names):
+            time.sleep(3)
+    return [ready[n] for n in names if n in ready]
+
+
+def _sweep_teardown(name: str) -> None:
+    """Cancel a rung's scheduler job and drop its record."""
+    from boxy import jobs
+    from boxy.schedulers import get_scheduler
+
+    rec = jobs.read_record(name)
+    if not rec:
+        return
+    try:
+        subprocess.run(get_scheduler(rec["scheduler"]).cancel_command(rec["job"]), capture_output=True)
+    finally:
+        jobs.remove(name)
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    """Scaling study: for each rung (a node or replica count), submit the config,
+    wait until it's READY, benchmark it, tear it down, and finally print a scaling
+    comparison table. This is the paper's scaling deliverable."""
+    from boxy import bench, resolve
+
+    axis, values = _sweep_axis(args)
+    scheduler_name = args.scheduler
+    profile = Location.from_toml(args.location) if args.location else None
+    if scheduler_name is None and profile and profile.scheduler in ("slurm", "flux"):
+        scheduler_name = profile.scheduler
+    if scheduler_name not in ("slurm", "flux"):
+        raise UsageError("boxy sweep needs --scheduler slurm|flux (each rung is a cluster job "
+                         "that boxy submits, benchmarks, then tears down)")
+    batch_sizes = _parse_batch_sizes(args)
+    _model, base_name, _ = resolve.resolve_submission(
+        args.model, scheduler_name, name=args.name, require_exists=not args.dryrun)
+
+    print(f"### Scaling sweep: {axis} = {', '.join(map(str, values))}   "
+          f"(batch sizes {batch_sizes}, max_tokens {args.max_tokens}, "
+          f"{'keep' if args.keep else 'tear down'} each rung)")
+    report = bench.ScalingReport(axis=axis, model="", max_tokens=args.max_tokens)
+    for v in values:
+        # rung tag: n<v> for nodes, x<v> for replica-count (x avoids clashing with
+        # the per-replica -r0..-r{K-1} suffix the fan-out appends).
+        rung_base = f"{base_name}-{'n' if axis == 'nodes' else 'x'}{v}"
+        nodes = v if axis == "nodes" else (args.nodes or 1)
+        reps = v if axis == "replicas" else 1
+        print(f"\n## Rung {axis}={v}  ({nodes} node(s) x {args.gpus if args.gpus else '?'} GPU, "
+              f"{reps} replica(s))")
+        ra = _rung_serve_args(args, nodes=nodes, replicas=reps, name=rung_base)
+        if reps > 1:
+            _serve_replicas(ra, scheduler_name, profile, reps)
+            names = [f"{rung_base}-r{i}" for i in range(reps)]
+        else:
+            _serve_submission(ra, scheduler_name, profile, name_override=rung_base, follow=False)
+            names = [rung_base]
+        if args.dryrun:
+            print(f"##   then: bench {batch_sizes} across the rung endpoint(s), "
+                  f"{'keep' if args.keep else 'tear down'}")
+            continue
+        urls = _sweep_wait_endpoints(names, args.ready_timeout)
+        if not urls:
+            print(f"warning: rung {axis}={v}: no endpoint ready within {args.ready_timeout:.0f}s; "
+                  f"skipping", file=sys.stderr)
+            if not args.keep:
+                for n in names:
+                    _sweep_teardown(n)
+            continue
+        rep = bench.run_scaling_point(urls, batch_sizes, max_tokens=args.max_tokens, dataset=args.dataset)
+        report.model = report.model or rep.model
+        pt = bench.summarize_point(f"{axis}={v}", axis, v, len(urls), rep)
+        report.points.append(pt)
+        print(f"##   {axis}={v}: peak {pt.tokens_per_s:.1f} tok/s @ batch {pt.peak_batch} "
+              f"(p50 {pt.latency_p50_ms:.0f} ms) across {len(urls)} endpoint(s)")
+        if not args.keep:
+            for n in names:
+                _sweep_teardown(n)
+            print(f"##   torn down {axis}={v}")
+
+    if args.dryrun:
+        print(f"\n### dryrun: {len(values)} rungs planned; nothing submitted")
+        return 0
+    print("\n### Scaling results")
+    print(report.to_table())
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(report.to_csv())
+        print(f"wrote {args.output}")
+    if args.json:
+        print(report.to_json())
+    return 0
+
+
 def cmd_launch(args: argparse.Namespace) -> int:
     from boxy import cloud
 
@@ -1518,6 +1676,38 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="print JSON instead of a table")
     p.add_argument("--dryrun", action="store_true")
     p.set_defaults(func=cmd_bench)
+
+    p = sub.add_parser("sweep", help="scaling study: submit each rung (nodes or replicas in "
+                                     "powers of 2), benchmark it, tear it down, print a comparison table")
+    p.add_argument("model", help="model to serve on each rung (same MODEL as boxy serve)")
+    p.add_argument("--sweep-nodes", default=None, metavar="LIST",
+                   help="node counts to sweep, comma list (e.g. 1,2,4,8) — one distributed instance per rung")
+    p.add_argument("--sweep-replicas", default=None, metavar="LIST",
+                   help="replica counts to sweep, comma list (e.g. 1,2,4,8) — K data-parallel instances per rung")
+    p.add_argument("--scheduler", choices=["slurm", "flux"], default=None,
+                   help="scheduler to submit rungs to (or take it from --location)")
+    p.add_argument("--location", default=None, help="site TOML profile")
+    p.add_argument("--gpus", type=int, default=None, help="GPUs per node for each rung")
+    p.add_argument("--nodes", type=int, default=None,
+                   help="nodes per replica when sweeping --sweep-replicas (default 1)")
+    p.add_argument("--engine", choices=["llama.cpp", "vllm"], default=None)
+    p.add_argument("--image", default=None)
+    p.add_argument("--runtime", choices=["podman", "docker", "apptainer"], default=None)
+    p.add_argument("--accelerator", choices=list(ACCELERATORS), default=None)
+    p.add_argument("--partition", default=None)
+    p.add_argument("--account", default=None)
+    p.add_argument("--time", default=None)
+    p.add_argument("--scheduler-arg", action="append", default=[], dest="scheduler_args", metavar="FLAG")
+    p.add_argument("--batch-sizes", default=None, help="comma list, default 1,2,4,...,1024")
+    p.add_argument("--max-tokens", type=int, default=32)
+    p.add_argument("--dataset", default=None, help="JSON list of prompts or ShareGPT JSON")
+    p.add_argument("--ready-timeout", type=float, default=1800.0,
+                   help="seconds to wait for each rung to become ready (default 1800)")
+    p.add_argument("--keep", action="store_true", help="leave each rung running instead of tearing it down")
+    p.add_argument("-o", "--output", default=None, help="write the scaling table as CSV here")
+    p.add_argument("--json", action="store_true", help="print the scaling report as JSON too")
+    p.add_argument("--dryrun", action="store_true", help="print the sweep plan without submitting")
+    p.set_defaults(func=cmd_sweep, name=None, models_dir=None)
 
     p = sub.add_parser("launch", help="launch the box on cloud via SkyPilot (delegated)")
     p.add_argument("--box", required=True)
