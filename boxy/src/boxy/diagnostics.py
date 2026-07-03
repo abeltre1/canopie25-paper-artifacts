@@ -90,6 +90,36 @@ def _unsupported_arch(m: "re.Match[str]", log: str) -> str:
     )
 
 
+def _rocm_arch_mismatch(m: "re.Match[str]", log: str) -> str:
+    return _fmt(
+        "ROCm/HIP GPU error — likely a GPU-architecture <-> image mismatch",
+        "The vLLM ROCm image was not built for this node's GPU arch (gfx...), or the\n"
+        "host ROCm/driver version does not match the image.\n"
+        "  1. Confirm the node's arch:  rocminfo | grep gfx   (e.g. gfx90a=MI200,\n"
+        "     gfx942=MI300). The image must support that gfx target.\n"
+        "  2. Pin an image tag built for your ROCm version instead of :latest:\n"
+        "     boxy serve <model> --engine vllm --image docker.io/vllm/vllm-openai-rocm:<tag>\n"
+        "  3. Check the container sees the GPUs: the podman run must pass\n"
+        "     --device /dev/kfd --device /dev/dri (boxy's rocm backend does this;\n"
+        "     verify with: boxy serve ... --dryrun).\n"
+        "  4. As a fallback, serve a GGUF build on llama.cpp:  boxy serve <gguf-model>.",
+    )
+
+
+def _engine_core_generic(m: "re.Match[str]", log: str) -> str:
+    # Last-resort: the outer vLLM wrapper with no signature we recognise. Point
+    # the user at where the REAL exception is so they stop pasting the wrapper.
+    return _fmt(
+        "vLLM engine core failed to start — the actionable error is higher up",
+        "'Engine core initialization failed. See root cause above' is only the\n"
+        "outer wrapper. The real exception is printed ABOVE this line in the\n"
+        "container log — usually a Python Traceback ending in ValueError/RuntimeError,\n"
+        "an out-of-memory line, or a HIP/CUDA error.\n"
+        "  See it all:  <podman|docker> logs <container>   (or the job --output log)\n"
+        "  Then match it to: model<->vLLM version, GPU OOM, or GPU-arch/image mismatch.",
+    )
+
+
 def _gguf_load_fail(m: "re.Match[str]", log: str) -> str:
     return _fmt(
         "llama.cpp could not load the GGUF model file",
@@ -124,10 +154,26 @@ RULES: list[Rule] = [
         _cuda_oom,
     ),
     Rule(
+        "rocm-arch-mismatch",
+        re.compile(r"(?:HIP error|hipError|no kernel image is available for execution|"
+                   r"invalid device function|device kernel image is invalid|"
+                   r"gfx\d{3,}\w*\s+(?:is\s+)?not\s+supported|rocm.*not\s+compatible)",
+                   re.IGNORECASE),
+        _rocm_arch_mismatch,
+    ),
+    Rule(
         "gguf-load-fail",
         re.compile(r"(?:failed to load model|unable to load model|llama_load_model_from_file|"
                    r"invalid magic|GGUF|unknown model architecture)", re.IGNORECASE),
         _gguf_load_fail,
+    ),
+    # LAST: the generic vLLM wrapper. Only fires when nothing specific matched,
+    # so a real signature above always wins.
+    Rule(
+        "vllm-engine-core-generic",
+        re.compile(r"Engine core initialization failed|EngineCore failed to start|"
+                   r"Failed core proc", re.IGNORECASE),
+        _engine_core_generic,
     ),
 ]
 

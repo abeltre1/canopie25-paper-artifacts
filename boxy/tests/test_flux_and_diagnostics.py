@@ -143,6 +143,29 @@ def test_diagnose_cuda_oom():
     assert "--gpu-memory-utilization" in hint
 
 
+def test_diagnose_rocm_hip_error():
+    hint = diagnostics.diagnose("RuntimeError: HIP error: no kernel image is available for execution")
+    assert hint is not None and "gfx" in hint and "rocminfo" in hint
+
+
+def test_diagnose_engine_core_wrapper_alone_points_up():
+    """The outer 'Engine core initialization failed' wrapper with no recognised
+    root cause tells the user the real error is higher in the log."""
+    wrapper = ("RuntimeError: Engine core initialization failed. See root cause above. "
+               "Failed core proc(s): {}")
+    hint = diagnostics.diagnose(wrapper)
+    assert hint is not None and "actionable error is higher up" in hint
+
+
+def test_specific_signature_beats_generic_wrapper():
+    """When the real cause AND the wrapper are both present, the specific rule
+    wins (ordering: generic wrapper is last)."""
+    both = (VLLM_WEIGHTS_ERR + "\n"
+            "RuntimeError: Engine core initialization failed. See root cause above.")
+    hint = diagnostics.diagnose(both)
+    assert "version mismatch" in hint.lower()  # weights rule, not the generic wrapper
+
+
 def test_diagnose_unknown_returns_none():
     assert diagnostics.diagnose("Server started on port 8000. Ready.") is None
     assert diagnostics.diagnose("") is None

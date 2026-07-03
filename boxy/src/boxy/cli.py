@@ -458,7 +458,8 @@ def _reclaim_or_report(runtime: str, name: str, url: str) -> tuple[int | None, s
               f"  stop:   boxy stop {name}", file=sys.stderr)
         return 1, name
     print("boxy: found an exited container from a previous attempt; its last log lines:", file=sys.stderr)
-    _print_diagnosis(_dump_logs(runtime, name))
+    _dump_logs(runtime, name)
+    _diagnose_container(runtime, name)
     subprocess.run([runtime, "rm", name], capture_output=True)
     print(f"boxy: removed {name}; relaunching ...", file=sys.stderr)
     return None, name
@@ -484,13 +485,30 @@ def _dump_logs(runtime: str, name: str, tail: int = 50) -> str:
 
 
 def _print_diagnosis(log_text: str) -> None:
-    """Scan dumped engine logs for a known failure signature and, if found,
-    print a plain-language fix instead of leaving the user with a raw trace."""
+    """Scan engine-log text for a known failure signature and, if found, print a
+    plain-language fix instead of leaving the user with a raw trace."""
     from boxy import diagnostics
 
     hint = diagnostics.diagnose(log_text)
     if hint:
         print(hint, file=sys.stderr)
+
+
+def _diagnose_container(runtime: str, name: str, scan_tail: int = 400) -> None:
+    """Diagnose over a WIDE log window (not just the ~50 human-printed lines):
+    vLLM prints a generic 'Engine core initialization failed. See root cause
+    above' wrapper, and the actual exception can be dozens of lines earlier."""
+    result = subprocess.run([runtime, "logs", "--tail", str(scan_tail), name],
+                            capture_output=True, text=True)
+    _print_diagnosis((result.stdout or "") + "\n" + (result.stderr or ""))
+
+
+def _diagnose_file(path, scan_tail: int = 400) -> None:
+    try:
+        lines = open(path, errors="replace").read().splitlines()[-scan_tail:]
+    except OSError:
+        return
+    _print_diagnosis("\n".join(lines))
 
 
 def _job_state(scheduler, job_id: str) -> str:
@@ -714,8 +732,8 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
             if state == "DONE":
                 print(f"boxy: job {job_id} ended before the server became ready; last log lines:",
                       file=sys.stderr)
-                log_text = _dump_file_tail(jobs.log_path(name))
-                _print_diagnosis(log_text)
+                _dump_file_tail(jobs.log_path(name))
+                _diagnose_file(jobs.log_path(name))
                 jobs.remove(name)
                 return 1
             time.sleep(2)
@@ -860,8 +878,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         )
     except RuntimeError:
         print(f"boxy: server exited during startup; last log lines from {cname}:", file=sys.stderr)
-        log_text = _dump_logs(runtime_bin, cname)
-        _print_diagnosis(log_text)
+        _dump_logs(runtime_bin, cname)
+        _diagnose_container(runtime_bin, cname)
         subprocess.run([runtime_bin, "rm", "-f", cname], capture_output=True)
         return 1
     if model_id is None:
