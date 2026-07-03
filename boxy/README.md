@@ -127,6 +127,14 @@ boxy serve <model> --scheduler flux --gpus 4 --flux-queue=pbatch     # Flux: ide
 boxy serve <model> --scheduler flux --gpus 4 --unique   # repeat freely, no name clash
 # (default name is a stable singleton so a plain rerun reconnects instead of duplicating.)
 
+# SCALE OUT — three orthogonal modes (all --dryrun-able; see RUNBOOK §4.5):
+# 1) One instance ACROSS nodes (model-parallel via Ray; auto-on for vLLM+nodes>1):
+boxy serve <model> --scheduler slurm --nodes 2 --gpus 4   # TP=GPUs/node, PP=nodes
+# 2) N INDEPENDENT replicas (data-parallel; each its own job/endpoint, composes with --nodes):
+boxy serve <model> --scheduler slurm --gpus 4 --replicas 4
+# 3) Scaling SWEEP (submit -> READY -> bench -> teardown per rung; prints a comparison table):
+boxy sweep <model> --scheduler slurm --gpus 4 --sweep-nodes 1,2,4,8 -o scaling.csv
+
 # Inside a Slurm/Flux allocation: runs direct + foreground automatically.
 srun -N1 --gpus-per-node=1 --pty boxy serve /lustre/models/llama-3.1-8b.Q6_K.gguf
 

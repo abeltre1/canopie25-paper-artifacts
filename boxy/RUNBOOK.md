@@ -220,6 +220,54 @@ curl -s http://localhost:8000/v1/models
 # NOTE eldorado.toml carries the MI300a HBM tuning (gpu-memory-utilization=0.7).
 ```
 
+## 4.5 Scaling out — distributed, replicas, and sweeps
+
+Three orthogonal ways to use more than one node/GPU. All are `--dryrun`-able:
+print the exact jobs before spending an allocation.
+
+```bash
+# --- A. One instance ACROSS nodes (model-parallel, via Ray) --------------------
+# Auto-on for vLLM whenever --nodes>1: tensor-parallel = GPUs/node (intra-node),
+# pipeline-parallel = nodes (inter-node). Works on Slurm, Flux, or a bare set of
+# containers with no scheduler. --no-distributed forces a single container.
+boxy serve <model> --scheduler slurm --nodes 2 --gpus 4 --dryrun
+# EXPECT: #SBATCH --ntasks-per-node=1, and the compute-node inner serve reports
+#   "distributed vLLM: 2 nodes x 4 GPU -> tensor-parallel=4, pipeline-parallel=2
+#    (world 8) via Ray (slurm launcher)"; a Ray head (ray start --head + vllm
+#    serve --tensor-parallel-size=4 --pipeline-parallel-size=2
+#    --distributed-executor-backend=ray) plus an srun worker fan-out to the other
+#    node (ray start --address=$BOXY_RAY_HEAD:6379 --block).
+# On the node, sanity-check the cluster formed before/while the model loads:
+#   ray status          # EXPECT: 2 nodes, 8 GPUs total
+#   nvidia-smi          # (run per node) EXPECT: all GPUs busy once loaded
+boxy serve <model> --scheduler slurm --nodes 2 --gpus 4     # for real; READY -> curl -> boxy stop <name>
+
+# --- B. N INDEPENDENT instances (data-parallel replicas) -----------------------
+# K separate jobs, each its own name/endpoint/log/port, all in `boxy list`.
+# Composes with --nodes>1 (each replica is itself distributed).
+boxy serve <model> --scheduler slurm --gpus 4 --replicas 4 --dryrun
+# EXPECT: four batch scripts <base>-r0..-r3; the summary lists each job + endpoint.
+boxy serve <model> --scheduler slurm --gpus 4 --replicas 4      # for real
+boxy list                                                       # watch all four
+
+# --- C. Scaling SWEEP (the paper's study) --------------------------------------
+# Step one axis in powers of two; each rung is submitted, waited-to-READY,
+# benchmarked, and torn down; a comparison table is printed at the end.
+boxy sweep <model> --scheduler slurm --gpus 4 --sweep-nodes 1,2,4,8 --dryrun
+boxy sweep <model> --scheduler slurm --gpus 4 --sweep-nodes 1,2,4,8 -o scaling.csv
+# EXPECT (### Scaling results): nodes | servers | peakBS | req/s | tok/s | p50 | p95 | speedup
+# --sweep-replicas 1,2,4,8 sweeps the data-parallel axis instead (fleet-aggregated
+# throughput). --keep leaves rungs up; --max-tokens / --batch-sizes / --dataset as
+# in `boxy bench`.
+```
+
+Prereqs for A/C: the model must sit on a within-cluster shared FS reachable by all
+allocated nodes (the store or `--models-dir`); the checkpoint-completeness guard
+catches a partial copy before the long load. Each cluster is self-contained — run
+the same command on each login node; state lives in that cluster's `BOXY_JOBS_DIR`
+(default `~/.local/share/boxy/jobs`). Set a cluster-local `BOXY_JOBS_DIR` if `$HOME`
+is shared across sites.
+
 ## 5. Cloud (SkyPilot delegation; optional)
 
 ```bash
