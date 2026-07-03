@@ -68,30 +68,42 @@ def cmd_info(args: argparse.Namespace) -> int:
     else:
         print("tls: system default CA store (if pulls fail with CERTIFICATE_VERIFY_FAILED, "
               "set SSL_CERT_FILE — and persist it in your shell profile)")
+    from boxy import policy
+
+    allowed = policy.allowed_transports()
+    blocked = sorted({policy._canonical(s) for s in policy.REGISTRIES} - set(allowed))
+    print(f"registries: allowed [{', '.join(allowed)}]  blocked [{', '.join(blocked)}]"
+          + ("" if os.environ.get("BOXY_ALLOW_TRANSPORTS") else "  (default policy)"))
+    # auth STATUS only — values are never printed
+    hf_sources = ramalama_shim._hf_token_sources()
+    print(f"auth: HuggingFace token: {'present (' + ' and '.join(hf_sources) + ')' if hf_sources else 'not configured (export HF_TOKEN=... for gated repos)'}")
+    if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
+        s3 = "present (AWS_ACCESS_KEY_ID env)"
+    elif os.environ.get("AWS_PROFILE"):
+        s3 = f"profile '{os.environ['AWS_PROFILE']}' (AWS_PROFILE env)"
+    elif os.path.exists(os.path.expanduser("~/.aws/credentials")):
+        s3 = "present (~/.aws/credentials)"
+    else:
+        s3 = "not configured (only needed for [location.staging] s3_endpoint)"
+    print(f"auth: S3 credentials: {s3}")
     if getattr(args, "net", False):
         return _probe_registries()
     return 0
 
 
-# Model-host registries boxy pulls from (in-process, so Python's trust store
-# applies; container-image pulls go through podman/docker's own trust).
-_REGISTRY_PROBES = (
-    ("hf://", "https://huggingface.co"),
-    ("ollama://", "https://registry.ollama.ai/v2/"),
-    ("ms://", "https://modelscope.cn"),
-)
-
-
 def _probe_registries() -> int:
-    """`boxy info --net`: try each model registry with the CURRENT trust store
-    (after boxy's certifi merge, like a real pull). Any HTTP response — even
-    401/404 — proves TLS worked; only transport errors are failures."""
+    """`boxy info --net`: try each ALLOWED model registry with the CURRENT
+    trust store (after boxy's certifi merge, like a real pull). Registries
+    outside the policy allowlist are not even probed. Any HTTP response —
+    even 401/404 — proves TLS worked; only transport errors are failures."""
     import urllib.error
     import urllib.request
 
+    from boxy import policy
+
     ramalama_shim.ensure_trust_bundle()
     failures = 0
-    for scheme, url in _REGISTRY_PROBES:
+    for scheme, url in policy.registry_probes():
         try:
             with urllib.request.urlopen(url, timeout=8) as resp:
                 print(f"net: {scheme:10s} {url}  OK (HTTP {resp.status})")

@@ -337,7 +337,13 @@ def test_pinned_quay_image_gets_llama_server_entrypoint(gguf):
 
 # ---- shim robustness (findings 18/30/31/32) ----
 
-def test_oci_pull_rejected_with_boxy_wording():
+def test_oci_pull_rejected_with_boxy_wording(monkeypatch):
+    # default policy blocks oci:// before anything else
+    monkeypatch.delenv("BOXY_ALLOW_TRANSPORTS", raising=False)
+    with pytest.raises(RuntimeError, match="registry allowlist"):
+        ramalama_shim.pull_model("oci://quay.io/ramalama/smollm:135m", dryrun=True)
+    # even when opted in, the store-only pull path can't drive an engine
+    monkeypatch.setenv("BOXY_ALLOW_TRANSPORTS", "hf,ollama,oci")
     with pytest.raises(RuntimeError, match="container engine to pull"):
         ramalama_shim.pull_model("oci://quay.io/ramalama/smollm:135m", dryrun=True)
 
@@ -636,3 +642,58 @@ def test_r2_decision_lines_name_profile_provenance(gguf, capsys):
     assert rc == 0
     assert "scheduler: slurm (location profile)" in out   # was: "(--scheduler)"
     assert "accelerator: cuda (location profile)" in out
+
+
+# ---- registry origin policy + auth visibility (user requirement, 2026-07) ----
+
+def test_modelscope_blocked_by_default(monkeypatch, capsys):
+    monkeypatch.delenv("BOXY_ALLOW_TRANSPORTS", raising=False)
+    rc = main(["serve", "ms://qwen/Qwen2-7B-Instruct", "--here", "--dryrun"])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "modelscope.cn" in err and "China" in err
+    assert "BOXY_ALLOW_TRANSPORTS" in err          # the deliberate override is named
+
+
+def test_modelscope_blocked_in_pull_and_profile_path(monkeypatch, tmp_path, capsys):
+    """The policy must hold on EVERY pull path, not just model-mode serve."""
+    monkeypatch.delenv("BOXY_ALLOW_TRANSPORTS", raising=False)
+    with pytest.raises(RuntimeError, match="modelscope.cn"):
+        ramalama_shim.pull_model("ms://qwen/x.gguf", dryrun=True)
+    box = tmp_path / "b.toml"
+    box.write_text('[box]\nname="b"\nimage="i:1"\nengine="llama.cpp"\nmodel="modelscope://qwen/x.gguf"\n')
+    rc = main(["pull", "--box", str(box)])
+    assert rc == 1
+    assert "modelscope.cn" in capsys.readouterr().err
+
+
+def test_transport_optin_is_explicit_env(monkeypatch):
+    from boxy import policy
+
+    monkeypatch.setenv("BOXY_ALLOW_TRANSPORTS", "hf,ollama,ms")
+    policy.check_transport("ms://qwen/x.gguf")     # no raise
+    monkeypatch.delenv("BOXY_ALLOW_TRANSPORTS")
+    assert policy.allowed_transports() == ("hf", "ollama")
+
+
+def test_info_shows_policy_and_auth_status_never_values(monkeypatch, capsys):
+    monkeypatch.delenv("BOXY_ALLOW_TRANSPORTS", raising=False)
+    monkeypatch.setenv("HF_TOKEN", "hf_SUPERSECRETVALUE")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIASECRETID")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "S3CR3T")
+    rc = main(["info"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "registries: allowed [hf, ollama]" in out and "ms" in out.split("blocked")[1]
+    assert "HuggingFace token: present" in out
+    assert "S3 credentials: present" in out
+    assert "SUPERSECRETVALUE" not in out and "AKIASECRETID" not in out and "S3CR3T" not in out
+
+
+def test_info_net_never_probes_blocked_registries(monkeypatch):
+    from boxy import policy
+
+    monkeypatch.delenv("BOXY_ALLOW_TRANSPORTS", raising=False)
+    urls = [url for _scheme, url in policy.registry_probes()]
+    assert not any("modelscope" in u for u in urls)
+    assert any("huggingface.co" in u for u in urls) and any("ollama" in u for u in urls)

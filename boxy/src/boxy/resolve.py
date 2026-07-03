@@ -267,6 +267,9 @@ def _classify_model(model: str, require_exists: bool) -> tuple[str, str]:
                 f"malformed model URI {model!r}: nothing after the scheme "
                 f"(an unset shell variable? e.g. hf://$ORG/$FILE)"
             )
+        from boxy import policy
+
+        policy.check_transport(f"{scheme}://{rest}")  # registry origin allowlist
         return f"{scheme}://{rest}", f"model: {scheme}://{rest} (transport URI — pulled via RamaLama)"
     if len(scheme_split) == 2:
         raise RuntimeError(

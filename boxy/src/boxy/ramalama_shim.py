@@ -241,6 +241,9 @@ def pull_model(model_uri: str, dryrun: bool = False, quiet: bool = False) -> str
             "(pip install 'boxy-hpc[ramalama]'); for air-gapped sites set "
             "box.model to a path on the shared filesystem instead"
         ) from e
+    from boxy import policy
+
+    policy.check_transport(model_uri)  # registry origin allowlist (env-controlled)
     if model_uri.startswith(("oci://", "docker://")):
         raise RuntimeError(
             f"{model_uri.split('://')[0]}:// models need a container engine to pull, which "

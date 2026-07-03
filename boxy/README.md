@@ -41,6 +41,17 @@ quirks (modules, tuning, offline mode, GPU counts) are pinned once and reused.
 | port | engine default (vLLM 8000, llama.cpp 8090), advanced to the next free port when busy |
 | scheduler | **never invoked implicitly.** Inside an allocation: run direct, foreground. On a login node: refuse (see below). `--scheduler slurm\|flux` **submits a batch job**: boxy writes the sbatch/`flux batch` script (any `--slurm-*`/`--flux-*` flag passes through), the job re-runs boxy on the compute node, the endpoint arrives over the shared FS, and boxy prints READY and detaches. `--foreground` = attached srun/flux-run instead. |
 
+**Registry origin policy:** boxy only pulls from an allowlist of registries —
+default `hf` (huggingface.co) and `ollama` (registry.ollama.ai). ModelScope
+(`ms://`, modelscope.cn — operated by Alibaba from China) and all other
+transports are **blocked by default**; the refusal names the registry and its
+origin. Opting in is a deliberate, auditable act:
+`export BOXY_ALLOW_TRANSPORTS=hf,ollama,ms` — env-only on purpose, so a TOML
+profile in a repo can never widen the policy silently. `boxy info` shows the
+active allow/block lists plus auth status (HuggingFace token, S3 credentials —
+status and source only, values are never printed), and `boxy info --net`
+probes only allowed registries.
+
 HPC guard rails (from the design review):
 
 - **Login-node guard**: if `srun`/`flux` is on PATH but you're not inside an

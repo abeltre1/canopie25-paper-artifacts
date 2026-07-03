@@ -114,19 +114,18 @@ def test_finding13c_info_net_probes_registries(monkeypatch, capsys):
 
     def fake_urlopen(url, timeout=0):
         if "ollama" in url:
-            raise urllib.error.URLError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
-        if "modelscope" in url:
             raise urllib.error.HTTPError(url, 403, "Forbidden", None, None)
         return FakeResp()
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(ramalama_shim, "ensure_trust_bundle", lambda: None)
+    monkeypatch.delenv("BOXY_ALLOW_TRANSPORTS", raising=False)
     rc = main(["info", "--net"])
     out = capsys.readouterr().out
-    assert rc == 1  # one registry failed
+    assert rc == 0  # HTTP errors still prove TLS; nothing actually failed
     assert "hf://" in out and "OK (HTTP 200)" in out
-    assert "OK (TLS fine; HTTP 403)" in out          # HTTP errors still prove TLS
-    assert "FAIL" in out and "CERTIFICATE_VERIFY_FAILED" in out
+    assert "OK (TLS fine; HTTP 403)" in out
+    assert "modelscope" not in out                   # blocked registries are not probed
 
 
 def test_finding12b_log_tap_captures_ramalama_errors(monkeypatch):
