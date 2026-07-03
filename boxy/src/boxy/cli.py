@@ -658,7 +658,22 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
             rec_scheduler = scheduler
         state = _job_state(rec_scheduler, record["job"])
         mismatch = rec_sched_name != scheduler_name
-        if state != "DONE":
+        # A record from a DIFFERENT scheduler whose launcher isn't even installed
+        # here belongs to another cluster (labs share $HOME across sites, so an
+        # eldorado flux record shows up on a slurm-only hops login node). boxy
+        # cannot manage that job from this host, so it must NOT block a local
+        # submission — take over the name locally. Field report: a flux job on
+        # eldorado blocked `--scheduler slurm` on hops.
+        rec_bin = rec_scheduler.submit_command("_")[0]
+        if mismatch and shutil.which(rec_bin) is None:
+            print(f"warning: ignoring a stale {rec_sched_name} record for {name} "
+                  f"(job {record['job']}) — '{rec_bin}' isn't installed on this host, so that "
+                  f"job belongs to another cluster. Submitting a fresh {scheduler_name} job and "
+                  f"taking over the name here. (If the {rec_sched_name} job is still running, "
+                  f"stop it from its own cluster.)", file=sys.stderr)
+            if not args.dryrun:
+                jobs.remove(name)
+        elif state != "DONE":
             endpoint = jobs.read_endpoint(name)
             if endpoint and state in ("PENDING", "RUNNING"):
                 model_id = readiness.wait_ready(endpoint["url"], timeout_s=2, interval_s=0.5)
@@ -684,7 +699,7 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
                 print(f"boxy: {name} is already submitted as {rec_sched_name} job {record['job']} "
                       f"({state}) — watch: boxy list; stop: boxy stop {name}", file=sys.stderr)
             return 1
-        if not args.dryrun:
+        elif not args.dryrun:
             jobs.remove(name)  # stale record from a finished job (S6: dryrun must not mutate)
 
     inner = _inner_serve_command(args, model, name)

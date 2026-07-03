@@ -83,7 +83,8 @@ def test_flux_queue_directive_lands_in_script(gguf, jobs_dir, capsys):
 
 def test_stale_slurm_record_probed_with_slurm_not_flux(gguf, jobs_dir, monkeypatch, capsys):
     """A leftover slurm record must be queried with the slurm state command and
-    must not wedge a new flux submission behind a bogus 'unreachable'."""
+    must not wedge a new flux submission behind a bogus 'unreachable'. Here the
+    OTHER scheduler IS installed locally, so boxy stays safe and blocks."""
     jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "1786916"})
 
     seen = {}
@@ -91,10 +92,11 @@ def test_stale_slurm_record_probed_with_slurm_not_flux(gguf, jobs_dir, monkeypat
     def fake_job_state(scheduler, job_id):
         seen["scheduler_name"] = scheduler.name
         seen["job"] = job_id
-        return "UNKNOWN"  # slurm not reachable on this flux-only login node
+        return "UNKNOWN"  # slurm controller not reachable
 
     from boxy import cli
     monkeypatch.setattr(cli, "_job_state", fake_job_state)
+    monkeypatch.setattr(cli.shutil, "which", lambda b: "/usr/bin/" + b)  # both schedulers present
 
     rc = main(["serve", str(gguf), "--scheduler", "flux", "--dryrun", "--name", "boxy-m"])
     assert rc == 1
@@ -105,6 +107,24 @@ def test_stale_slurm_record_probed_with_slurm_not_flux(gguf, jobs_dir, monkeypat
     assert "slurm job 1786916" in err
     assert "submitted under 'slurm'" in err and "you asked for 'flux'" in err
     assert "boxy stop boxy-m" in err
+
+
+def test_foreign_record_from_another_cluster_does_not_block(gguf, jobs_dir, monkeypatch, capsys):
+    """A flux record on a slurm-only host (shared $HOME across clusters) must not
+    block a slurm submission — flux isn't installed here, so that job belongs to
+    another cluster. boxy takes over the name and submits. Field report: hops."""
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "flux", "job": "f2ZoxD9R5fqh"})
+
+    from boxy import cli
+    monkeypatch.setattr(cli, "_job_state", lambda s, j: "UNKNOWN")
+    # sbatch present (slurm host), flux absent (foreign scheduler)
+    monkeypatch.setattr(cli.shutil, "which", lambda b: "/usr/bin/sbatch" if b == "sbatch" else None)
+
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--dryrun", "--name", "boxy-m"])
+    assert rc == 0                                   # proceeded, did NOT block
+    err = capsys.readouterr().err
+    assert "ignoring a stale flux record" in err
+    assert "another cluster" in err
 
 
 def test_matching_scheduler_record_message_unchanged(gguf, jobs_dir, monkeypatch, capsys):
