@@ -39,7 +39,7 @@ def test_finding2_ssl_failure_message_has_remedy():
     assert "SSL_CERT_FILE" in msg and "root cause" in msg and "CERTIFICATE_VERIFY_FAILED" in msg
 
 
-def test_finding12_chainless_retry_error_still_surfaces_ssl_remedy():
+def test_finding12_chainless_retry_error_still_surfaces_ssl_remedy(monkeypatch):
     """ramalama's downloader logs the SSL error per retry, then raises a FRESH
     ConnectionError with no chain ('Download failed after multiple attempts').
     boxy must still name the root cause and the remedy, from the log tap.
@@ -49,9 +49,84 @@ def test_finding12_chainless_retry_error_still_surfaces_ssl_remedy():
         "unable to get local issuer certificate (_ssl.c:1028)"
     ] * 4
     err = ConnectionError("\nDownload failed after multiple attempts.\nPossible causes:\n- Internet ...")
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
     msg = ramalama_shim._pull_failure_message("ollama://granite3-moe", err, logged=logged)
     assert "root cause" in msg and "CERTIFICATE_VERIFY_FAILED" in msg
     assert "SSL_CERT_FILE" in msg and "persist" in msg  # sticky remedy, not a one-shell export
+    # with SSL_CERT_FILE already set, the remedy explains REPLACE semantics instead
+    monkeypatch.setenv("SSL_CERT_FILE", "/some/site-ca.crt")
+    msg = ramalama_shim._pull_failure_message("ollama://granite3-moe", err, logged=logged)
+    assert "REPLACES" in msg and "boxy info --net" in msg and "certifi" in msg
+
+
+def test_finding13_trust_bundle_merges_site_ca_with_certifi(monkeypatch, tmp_path, capsys):
+    """SSL_CERT_FILE holding only the site CA breaks non-intercepted registries
+    (verified: SSL_CERT_FILE REPLACES the trust store). boxy merges public CAs
+    with the site CA before pulling. (Field finding: Mac run-through #3.)"""
+    site = tmp_path / "site-ca.crt"
+    site.write_text("-----BEGIN CERTIFICATE-----\nSITECA\n-----END CERTIFICATE-----\n")
+    public = tmp_path / "certifi.pem"
+    public.write_text("-----BEGIN CERTIFICATE-----\nPUBLIC\n-----END CERTIFICATE-----\n")
+    monkeypatch.setenv("SSL_CERT_FILE", str(site))
+    monkeypatch.delenv("BOXY_NO_CA_MERGE", raising=False)
+    monkeypatch.setattr(ramalama_shim, "DEFAULT_STORE", str(tmp_path / "store"))
+    import certifi
+
+    monkeypatch.setattr(certifi, "where", lambda: str(public))
+    merged = ramalama_shim.ensure_trust_bundle()
+    assert merged and os.environ["SSL_CERT_FILE"] == merged
+    text = Path(merged).read_text()
+    assert "SITECA" in text and "PUBLIC" in text  # both trust roots survive
+    assert "merged" in capsys.readouterr().err     # the decision is printed
+    # idempotent: a second call sees the merged file and leaves it alone
+    assert ramalama_shim.ensure_trust_bundle() == merged
+
+
+def test_finding13b_trust_bundle_edge_cases(monkeypatch, tmp_path, capsys):
+    # missing site file -> loud warning, no merge (OpenSSL ignores bad paths silently)
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "nope.crt"))
+    assert ramalama_shim.ensure_trust_bundle() is None
+    assert "does not exist" in capsys.readouterr().err
+    # opt-out respected
+    site = tmp_path / "ca.crt"
+    site.write_text("x")
+    monkeypatch.setenv("SSL_CERT_FILE", str(site))
+    monkeypatch.setenv("BOXY_NO_CA_MERGE", "1")
+    assert ramalama_shim.ensure_trust_bundle() is None
+    # unset -> nothing to do
+    monkeypatch.delenv("BOXY_NO_CA_MERGE")
+    monkeypatch.delenv("SSL_CERT_FILE")
+    assert ramalama_shim.ensure_trust_bundle() is None
+
+
+def test_finding13c_info_net_probes_registries(monkeypatch, capsys):
+    import urllib.error
+    import urllib.request
+
+    class FakeResp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(url, timeout=0):
+        if "ollama" in url:
+            raise urllib.error.URLError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+        if "modelscope" in url:
+            raise urllib.error.HTTPError(url, 403, "Forbidden", None, None)
+        return FakeResp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(ramalama_shim, "ensure_trust_bundle", lambda: None)
+    rc = main(["info", "--net"])
+    out = capsys.readouterr().out
+    assert rc == 1  # one registry failed
+    assert "hf://" in out and "OK (HTTP 200)" in out
+    assert "OK (TLS fine; HTTP 403)" in out          # HTTP errors still prove TLS
+    assert "FAIL" in out and "CERTIFICATE_VERIFY_FAILED" in out
 
 
 def test_finding12b_log_tap_captures_ramalama_errors(monkeypatch):

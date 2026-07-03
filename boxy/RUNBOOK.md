@@ -77,14 +77,21 @@ at the readiness timeout, the container is left running and boxy prints the
 are what you'll use once a site profile exists (`--save-profile` writes one).
 
 ```bash
-# 2.1 If on a network with TLS interception, or using a uv/standalone Python:
-pip install certifi
-export SSL_CERT_FILE=$(python3 -m certifi)          # or your site CA bundle
+# 2.1 TLS setup (uv/standalone Pythons, TLS-intercepting networks). Two facts govern this:
+#   - SSL_CERT_FILE REPLACES Python's trust store (it does not add to it), so a file
+#     holding only your site/proxy CA breaks every registry that is NOT intercepted
+#     with that CA — hf:// can work while ollama:// fails in the same shell;
+#   - OpenSSL SILENTLY ignores a missing SSL_CERT_FILE path (then everything fails).
+# boxy handles the first automatically: when SSL_CERT_FILE is set and certifi is
+# installed (it is a boxy dependency), pulls use a merged bundle = public CAs + your
+# site CA (disable: BOXY_NO_CA_MERGE=1). So the setup is just:
+export SSL_CERT_FILE=/path/to/your/site-ca.crt      # or $(python3 -m certifi) if no interception
 # PERSIST IT — an export dies with its shell (new terminal = broken pulls again):
 echo "export SSL_CERT_FILE=$SSL_CERT_FILE" >> ~/.zshrc   # or ~/.bashrc / your venv's bin/activate
-python3 -c "import urllib.request as u; print(u.urlopen('https://huggingface.co').status)"
-# EXPECT: 200.  If CERTIFICATE_VERIFY_FAILED -> point SSL_CERT_FILE at your site CA.
-# `boxy info` shows the active TLS state (and flags a missing cert file).
+boxy info --net
+# EXPECT: "net: hf:// ... OK", "net: ollama:// ... OK" — any FAIL line names the registry
+# you cannot pull from and why. `boxy info` alone shows the TLS state offline
+# (and flags a missing cert file).
 
 # 2.2 Pull a real model (single-file GGUF: no HF CLI needed, ~400 MB)
 boxy pull hf://Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf
@@ -184,7 +191,8 @@ boxy launch --box ... --location ... --serve --down     # teardown
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `SSL: CERTIFICATE_VERIFY_FAILED` on pull | Python without CA bundle (uv/standalone) or TLS-intercepting proxy | `pip install certifi; export SSL_CERT_FILE=$(python3 -m certifi)` — or your site CA bundle. **Persist it** (`~/.zshrc`/`~/.bashrc` or the venv's `bin/activate`) — an `export` dies with its shell, which is why this recurs in new terminals. boxy prints this remedy (incl. on ollama:// pulls, whose retry loop used to mask it); `boxy info` shows the current TLS state. |
+| `SSL: CERTIFICATE_VERIFY_FAILED` on pull, no `SSL_CERT_FILE` set | Python without CA bundle (uv/standalone) or TLS-intercepting proxy | `pip install certifi; export SSL_CERT_FILE=$(python3 -m certifi)` — or your site CA bundle. **Persist it** (`~/.zshrc`/`~/.bashrc` or the venv's `bin/activate`) — an `export` dies with its shell. |
+| `CERTIFICATE_VERIFY_FAILED` **with** `SSL_CERT_FILE` set (e.g. hf:// works, ollama:// fails) | `SSL_CERT_FILE` *replaces* the trust store: a site-CA-only file breaks non-intercepted registries; a missing path is silently ignored (everything breaks) | `ls -l "$SSL_CERT_FILE"` first. boxy auto-merges certifi's public CAs with your site CA at pull time (certifi is a boxy dep; `BOXY_NO_CA_MERGE=1` disables). Diagnose per registry: `boxy info --net`. |
 | Interactive *"proceed without GPU?"* prompt (macOS podman) | RamaLama's applehv check | Fixed — boxy suppresses it automatically. Re-enable: `export RAMALAMA_USER__NO_MISSING_GPU_PROMPT=false` |
 | `huggingface cli download not available` | RamaLama 0.23's repo-pull fallback is unimplemented; the *direct* download failed first | boxy now shows the root-cause error + remedy instead of this dead-end message |
 | `workdir "..." does not exist on container` (Podman) | box sets a workdir no volume provides | Fixed in examples; boxy now warns before launch on any box with this pattern |

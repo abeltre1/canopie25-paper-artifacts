@@ -63,7 +63,43 @@ def cmd_info(args: argparse.Namespace) -> int:
     else:
         print("tls: system default CA store (if pulls fail with CERTIFICATE_VERIFY_FAILED, "
               "set SSL_CERT_FILE — and persist it in your shell profile)")
+    if getattr(args, "net", False):
+        return _probe_registries()
     return 0
+
+
+# Model-host registries boxy pulls from (in-process, so Python's trust store
+# applies; container-image pulls go through podman/docker's own trust).
+_REGISTRY_PROBES = (
+    ("hf://", "https://huggingface.co"),
+    ("ollama://", "https://registry.ollama.ai/v2/"),
+    ("ms://", "https://modelscope.cn"),
+)
+
+
+def _probe_registries() -> int:
+    """`boxy info --net`: try each model registry with the CURRENT trust store
+    (after boxy's certifi merge, like a real pull). Any HTTP response — even
+    401/404 — proves TLS worked; only transport errors are failures."""
+    import urllib.error
+    import urllib.request
+
+    ramalama_shim.ensure_trust_bundle()
+    failures = 0
+    for scheme, url in _REGISTRY_PROBES:
+        try:
+            with urllib.request.urlopen(url, timeout=8) as resp:
+                print(f"net: {scheme:10s} {url}  OK (HTTP {resp.status})")
+        except urllib.error.HTTPError as e:
+            print(f"net: {scheme:10s} {url}  OK (TLS fine; HTTP {e.code})")
+        except Exception as e:
+            reason = getattr(e, "reason", e)
+            print(f"net: {scheme:10s} {url}  FAIL ({reason})")
+            failures += 1
+    if failures:
+        print("net: FAILing registries cannot be pulled from this shell — "
+              "if the reason is CERTIFICATE_VERIFY_FAILED, see the SSL_CERT_FILE notes in RUNBOOK §2.1")
+    return 1 if failures else 0
 
 
 def _resolve_or_load(args: argparse.Namespace):
@@ -435,7 +471,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"boxy {__version__}")
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
-    p = sub.add_parser("info", help="show detected accelerator, runtimes, and schedulers")
+    p = sub.add_parser("info", help="show detected accelerator, runtimes, schedulers, TLS state")
+    p.add_argument("--net", action="store_true",
+                   help="also probe each model registry with the current trust store")
     p.set_defaults(func=cmd_info)
 
     p = sub.add_parser(

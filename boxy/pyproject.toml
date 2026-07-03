@@ -11,6 +11,10 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Angel M. Beltre" }]
 keywords = ["hpc", "genai", "vllm", "apptainer", "podman", "slurm", "flux"]
+# certifi: public CAs for the TLS trust-bundle merge (SSL_CERT_FILE REPLACES
+# the trust store; sites with partial TLS interception need site CA + public
+# CAs together). Tiny, pure-data, load-bearing for model pulls.
+dependencies = ["certifi"]
 
 # RamaLama is an optional (but recommended) library dependency: boxy degrades
 # gracefully without it (no accelerator autodetect, no transport pulls).

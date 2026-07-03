@@ -128,6 +128,58 @@ def _store_args(model: str, dryrun: bool = False, quiet: bool = False) -> Simple
     )
 
 
+def ensure_trust_bundle() -> str | None:
+    """Repair the TLS trust store for pulls. Two verified OpenSSL behaviors
+    bite HPC users (field finding #13, Mac run-through #3, 2026-07):
+
+      * SSL_CERT_FILE REPLACES the trust store — a file holding only the
+        site/proxy CA breaks every registry that is NOT intercepted with that
+        CA (hf:// works, ollama:// fails, same shell);
+      * a missing SSL_CERT_FILE path is SILENTLY ignored — everything fails.
+
+    When SSL_CERT_FILE is set and certifi is importable, merge public CAs +
+    the site CA into one bundle in boxy's store and point this process at it
+    (env changes are picked up by later urlopen calls — verified). The site
+    CA is preserved, so intercepted hosts still verify. Opt out with
+    BOXY_NO_CA_MERGE=1. Returns the merged path, or None if nothing done."""
+    import sys
+
+    site = os.environ.get("SSL_CERT_FILE")
+    if not site or os.environ.get("BOXY_NO_CA_MERGE"):
+        return None
+    if not os.path.exists(site):
+        print(
+            f"warning: SSL_CERT_FILE={site} does not exist — OpenSSL silently ignores missing "
+            f"paths, so ALL TLS verification will fail. Fix the path (ls -l \"$SSL_CERT_FILE\").",
+            file=sys.stderr,
+        )
+        return None
+    if site.endswith("ca-merged.crt"):  # already ours
+        return site
+    try:
+        import certifi
+
+        public = certifi.where()
+    except Exception:
+        return None
+    merged = os.path.join(DEFAULT_STORE, "ca-merged.crt")
+    os.makedirs(DEFAULT_STORE, exist_ok=True)
+    with open(public, "rb") as f:
+        bundle = f.read()
+    with open(site, "rb") as f:
+        bundle += b"\n" + f.read()
+    with open(merged, "wb") as f:
+        f.write(bundle)
+    os.environ["SSL_CERT_FILE"] = merged
+    print(
+        f"tls: merged your SSL_CERT_FILE ({site}) with certifi's public CAs -> {merged}\n"
+        f"     (site CA kept; needed because SSL_CERT_FILE replaces the trust store. "
+        f"Disable: BOXY_NO_CA_MERGE=1)",
+        file=sys.stderr,
+    )
+    return merged
+
+
 class _LogTap(logging.Handler):
     """Capture RamaLama's WARNING+ log records during a pull. Its downloader
     logs the real error (e.g. the SSL failure) on every retry but then raises
@@ -158,6 +210,7 @@ def pull_model(model_uri: str, dryrun: bool = False, quiet: bool = False) -> str
             "(pip install 'boxy-hpc[ramalama]'); for air-gapped sites set "
             "box.model to a path on the shared filesystem instead"
         ) from e
+    ensure_trust_bundle()
     args = _store_args(model_uri, dryrun=dryrun, quiet=quiet)
     transport = New(model_uri, args)
     tap = _LogTap()
@@ -195,15 +248,28 @@ def _pull_failure_message(model_uri: str, error: Exception, logged: list[str] | 
     elif distinct_logged:
         msg += f"\n  root cause: {distinct_logged[0]}"
     if "CERTIFICATE_VERIFY_FAILED" in combined:
-        msg += (
-            "\n  remedy: your Python has no usable CA bundle (common with uv/standalone builds"
-            " and TLS-intercepting proxies). Run:\n"
-            "    pip install certifi && export SSL_CERT_FILE=$(python3 -m certifi)\n"
-            "  or point SSL_CERT_FILE at your site's CA bundle."
-            "\n  NOTE: an `export` only lives in that one shell — if this worked before, persist it:\n"
-            "    echo 'export SSL_CERT_FILE=<path-to-ca.crt>' >> ~/.zshrc   # or ~/.bashrc,"
-            " or your venv's bin/activate"
-        )
+        if os.environ.get("SSL_CERT_FILE"):
+            msg += (
+                "\n  remedy: SSL_CERT_FILE is set but verification still failed. SSL_CERT_FILE"
+                " REPLACES Python's trust store, so:\n"
+                "    1. missing file? OpenSSL silently ignores bad paths:  ls -l \"$SSL_CERT_FILE\"\n"
+                "    2. site-CA-only file? registries that are NOT intercepted by that CA fail"
+                " (hf:// can work while ollama:// fails).\n"
+                "       Fix: pip install certifi — boxy then merges public CAs with your site CA"
+                " automatically (BOXY_NO_CA_MERGE=1 disables).\n"
+                "  Diagnose per registry: boxy info --net"
+            )
+        else:
+            msg += (
+                "\n  remedy: your Python has no usable CA bundle (common with uv/standalone builds"
+                " and TLS-intercepting proxies). Run:\n"
+                "    pip install certifi && export SSL_CERT_FILE=$(python3 -m certifi)\n"
+                "  or point SSL_CERT_FILE at your site's CA bundle."
+                "\n  NOTE: an `export` only lives in that one shell — if this worked before, persist it:\n"
+                "    echo 'export SSL_CERT_FILE=<path-to-ca.crt>' >> ~/.zshrc   # or ~/.bashrc,"
+                " or your venv's bin/activate"
+                "\n  Diagnose per registry: boxy info --net"
+            )
     if "cli download not available" in combined:
         msg += (
             "\n  note: RamaLama 0.23's HuggingFace full-repo CLI fallback is unimplemented;"
