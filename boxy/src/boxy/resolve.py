@@ -60,11 +60,16 @@ def infer_engine(model: str, accelerator: str, gpus: int = 0) -> tuple[str, str]
         return "vllm", f"safetensors/HF repo + {accelerator} GPU"
     if gpus > 0:
         return "vllm", f"safetensors/HF repo + --gpus {gpus} requested for the job"
+    base = model.rstrip("/").rsplit("/", 1)[-1]
     raise RuntimeError(
-        f"model {model!r} looks like a safetensors/HF repo, which needs vLLM and a GPU, "
-        f"but no GPU was detected on this host. Use a GGUF build of the model "
-        f"(e.g. hf://<org>/<name>-GGUF/<file>.gguf) for CPU serving with llama.cpp, "
-        f"or pass --engine/--accelerator explicitly (with --gpus N for a scheduler job)."
+        f"model {model!r} is a safetensors/HF repo: that needs vLLM and a GPU, and none was "
+        f"detected on this host.\n"
+        f"  CPU serving here:  use a GGUF build with llama.cpp — community quants are usually at\n"
+        f"      boxy serve hf://bartowski/{base}-GGUF/{base}-Q4_K_M.gguf\n"
+        f"      (verify the exact repo/file on huggingface.co, or use ollama://<name>)\n"
+        f"  GPU cluster:       this command works as-is on a GPU node; from a login node submit it:\n"
+        f"      boxy serve {model} --scheduler slurm|flux --gpus N --accelerator cuda|rocm\n"
+        f"  Or override:       --engine/--accelerator if detection is wrong on this host."
     )
 
 

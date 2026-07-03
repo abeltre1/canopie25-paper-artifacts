@@ -40,6 +40,16 @@ def test_safetensors_needs_gpu_for_vllm():
     assert engine == "vllm" and "--gpus" in why
 
 
+def test_safetensors_no_gpu_error_gives_concrete_alternatives():
+    """The refusal must hand the user runnable next steps for THEIR model,
+    not placeholders (field finding: Meta-Llama-3-8B-Instruct on a Mac)."""
+    with pytest.raises(RuntimeError) as e:
+        resolve.infer_engine("hf://meta-llama/Meta-Llama-3-8B-Instruct", "none")
+    msg = str(e.value)
+    assert "hf://bartowski/Meta-Llama-3-8B-Instruct-GGUF/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf" in msg
+    assert "--scheduler slurm|flux" in msg and "hf://meta-llama/Meta-Llama-3-8B-Instruct" in msg
+
+
 def test_hip_and_cann_normalized_at_the_seam(monkeypatch):
     """ramalama's get_accel() says 'hip'/'cann'; boxy speaks 'rocm'/'ascend'.
     Without normalization every v2 command dies on a ROCm node."""
