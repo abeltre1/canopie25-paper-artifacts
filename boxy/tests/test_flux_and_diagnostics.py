@@ -229,6 +229,15 @@ def test_diagnose_vllm_weights_not_initialized():
     assert "llama.cpp" in hint
 
 
+def test_diagnose_missing_python_package():
+    log = ("ImportError: This modeling file requires the following packages that were not found "
+           "in your environment: open_clip. Run `pip install open_clip`")
+    hint = diagnostics.diagnose(log)
+    assert hint is not None
+    assert "open_clip" in hint
+    assert "--image" in hint and "pip install" in hint
+
+
 def test_diagnose_cert_verify_failed():
     log = ("'[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local "
            "issuer certificate (_ssl.c:1010)' thrown while requesting HEAD https://huggingface.co/...")

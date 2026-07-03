@@ -128,6 +128,29 @@ def _unknown_load_strategy(m: "re.Match[str]", log: str) -> str:
     )
 
 
+def _missing_python_package(m: "re.Match[str]", log: str) -> str:
+    mm = re.search(r"requires the following packages that were not found[^:]*:\s*([^\n.]+)", log, re.I)
+    pkgs = mm.group(1).strip().rstrip(".") if mm else ""
+    if not pkgs:
+        also = re.findall(r"No module named '([^']+)'", log)
+        pkgs = ", ".join(sorted(set(also))) if also else "the package(s) named above"
+    pip = " ".join(p.strip() for p in pkgs.replace(",", " ").split() if p.strip()) or pkgs
+    return _fmt(
+        f"The model needs a Python package the vLLM image doesn't ship: {pkgs}",
+        "This model's custom code imports a package not in vllm/vllm-openai (common for\n"
+        "VLMs with a custom vision tower — e.g. Nemotron-Parse needs open_clip).\n"
+        "Fix: serve a custom image that layers the package onto the vLLM image.\n"
+        "  1. Build it once on the login node (which has network):\n"
+        f"       printf 'FROM docker.io/vllm/vllm-openai:v0.24.0\\nRUN pip install {pip}\\n' > Dockerfile.boxy\n"
+        "       podman build -t localhost/vllm-extra:latest -f Dockerfile.boxy .\n"
+        "  2. Serve with it:\n"
+        "       boxy serve <model> --image localhost/vllm-extra:latest --trust-remote-code ...\n"
+        "  The package is then baked in — no compute-node install needed.\n"
+        "  Note: the PyPI name can differ from the import name (e.g. open_clip is the\n"
+        "  package open_clip_torch) — if pip can't find it, search for the right name.",
+    )
+
+
 def _cert_verify_failed(m: "re.Match[str]", log: str) -> str:
     return _fmt(
         "TLS certificate verification failed INSIDE the container (site CA not trusted)",
@@ -174,6 +197,12 @@ RULES: list[Rule] = [
         "vllm-weights-not-initialized",
         re.compile(r"weights?\s+were\s+not\s+initialized\s+from\s+checkpoint", re.IGNORECASE),
         _weights_not_initialized,
+    ),
+    Rule(
+        "missing-python-package",
+        re.compile(r"requires the following packages that were not found|"
+                   r"ImportError:.*Run `pip install", re.IGNORECASE),
+        _missing_python_package,
     ),
     Rule(
         "tls-cert-verify-failed",
