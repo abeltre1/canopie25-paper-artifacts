@@ -229,6 +229,14 @@ def test_diagnose_vllm_weights_not_initialized():
     assert "llama.cpp" in hint
 
 
+def test_diagnose_cert_verify_failed():
+    log = ("'[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local "
+           "issuer certificate (_ssl.c:1010)' thrown while requesting HEAD https://huggingface.co/...")
+    hint = diagnostics.diagnose(log)
+    assert hint is not None and "site CA" in hint
+    assert "SSL_CERT_FILE" in hint
+
+
 def test_diagnose_trust_remote_code():
     log = ("pydantic_core._pydantic_core.ValidationError: The repository /mnt/models/x contains "
            "custom code which must be executed to correctly load the model. Please pass the argument "

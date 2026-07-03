@@ -187,6 +187,30 @@ def plan_run(box: Box, location: Location, user_args: list[str], dryrun: bool = 
     return _plan(box, location, inner, [], dryrun, accelerator)
 
 
+CA_CONTAINER_PATH = "/etc/ssl/certs/boxy-ca-merged.pem"
+
+
+def _propagate_ca_bundle(env: dict, mounts: list) -> None:
+    """Mount boxy's merged CA (certifi public CAs + your site CA) into the container
+    and point its TLS stacks at it, so IN-CONTAINER HuggingFace/transformers/httpx
+    downloads trust the site CA. Without this a model that fetches code or weights
+    at load (custom architectures, remote-code deps) dies with CERTIFICATE_VERIFY_
+    FAILED even though host-side pulls work.
+
+    Only the MERGED bundle is propagated (it contains the public CAs too, so public
+    HTTPS keeps working) — never a bare site CA, which would REPLACE the container's
+    trust and break huggingface.co. No-op when the merge is disabled/absent or the
+    user set the cert env in [box.env]."""
+    ca = os.environ.get("SSL_CERT_FILE")
+    if not ca or not ca.endswith("ca-merged.crt") or not os.path.isfile(ca):
+        return
+    if any(target == CA_CONTAINER_PATH for _, target, _ in mounts):
+        return
+    mounts.append((ca, CA_CONTAINER_PATH, "ro"))
+    for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        env.setdefault(var, CA_CONTAINER_PATH)  # box.env still wins (already merged)
+
+
 def _plan(
     box: Box,
     location: Location,
@@ -203,6 +227,7 @@ def _plan(
     if extra_env:
         env.update(extra_env)
     mounts = resolve_mounts(box, location) + extra_mounts
+    _propagate_ca_bundle(env, mounts)
     warnings: list[str] = []
     # Podman (unlike Docker) refuses to start when the workdir doesn't exist
     # in the image; a workdir no volume provides is usually a box bug.

@@ -128,6 +128,23 @@ def _unknown_load_strategy(m: "re.Match[str]", log: str) -> str:
     )
 
 
+def _cert_verify_failed(m: "re.Match[str]", log: str) -> str:
+    return _fmt(
+        "TLS certificate verification failed INSIDE the container (site CA not trusted)",
+        "A download from inside the container (HuggingFace/transformers fetching model\n"
+        "code or weights at load) hit your site's TLS-intercepting proxy and the\n"
+        "container did not trust the site CA.\n"
+        "  boxy now mounts its merged CA bundle into the container automatically when\n"
+        "  SSL_CERT_FILE is set on the LOGIN node before you submit. So:\n"
+        "   1. export SSL_CERT_FILE=/path/to/your/site-ca.crt   (persist it), then\n"
+        "      re-run boxy serve — the compute-node container will trust it too.\n"
+        "   2. Make sure BOXY_NO_CA_MERGE is NOT set (it disables the merge+mount).\n"
+        "   3. This model also fetches a SEPARATE repo's remote code at load, which\n"
+        "      needs network egress from the COMPUTE node. If the node is air-gapped,\n"
+        "      pre-download every required repo on the login node and serve offline.",
+    )
+
+
 def _trust_remote_code(m: "re.Match[str]", log: str) -> str:
     return _fmt(
         "This model needs trust_remote_code — it ships custom loader code vLLM must run",
@@ -157,6 +174,12 @@ RULES: list[Rule] = [
         "vllm-weights-not-initialized",
         re.compile(r"weights?\s+were\s+not\s+initialized\s+from\s+checkpoint", re.IGNORECASE),
         _weights_not_initialized,
+    ),
+    Rule(
+        "tls-cert-verify-failed",
+        re.compile(r"CERTIFICATE_VERIFY_FAILED|unable to get local issuer certificate|"
+                   r"self.signed certificate in certificate chain", re.IGNORECASE),
+        _cert_verify_failed,
     ),
     Rule(
         "vllm-trust-remote-code",

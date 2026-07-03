@@ -83,6 +83,29 @@ def test_cli_serve_dryrun_distributed_flux(capsys):
     assert "flux run" in out and "apptainer" in out and "vllm-rocm.sif" in out
 
 
+def test_ca_bundle_propagated_into_container(vllm_box, hops, tmp_path, monkeypatch):
+    # boxy's merged CA is mounted into the container + the TLS env points at it, so
+    # in-container HuggingFace downloads trust the site CA.
+    ca = tmp_path / "ca-merged.crt"
+    ca.write_text("-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n")
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca))
+    d = deploy.plan_serve(vllm_box, hops, dryrun=True)
+    cmd = " ".join(d.command)
+    assert f"{ca}:/etc/ssl/certs/boxy-ca-merged.pem:ro" in cmd
+    for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        assert f"{var}=/etc/ssl/certs/boxy-ca-merged.pem" in cmd
+
+
+def test_ca_bundle_not_propagated_for_bare_site_cert(vllm_box, hops, tmp_path, monkeypatch):
+    # a bare site CA (not boxy's merged bundle) must NOT be mounted — replacing the
+    # container trust with a site-only cert would break public HTTPS (huggingface.co).
+    bare = tmp_path / "site.crt"
+    bare.write_text("-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n")
+    monkeypatch.setenv("SSL_CERT_FILE", str(bare))
+    d = deploy.plan_serve(vllm_box, hops, dryrun=True)
+    assert "boxy-ca-merged.pem" not in " ".join(d.command)
+
+
 def test_cli_serve_trust_remote_code(capsys):
     # --trust-remote-code adds the vLLM flag; the scheduler path forwards it to the
     # compute-node inner serve (re-applied engine-aware there).
