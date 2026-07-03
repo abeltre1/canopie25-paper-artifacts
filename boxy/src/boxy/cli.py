@@ -658,19 +658,20 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
             rec_scheduler = scheduler
         state = _job_state(rec_scheduler, record["job"])
         mismatch = rec_sched_name != scheduler_name
-        # A record from a DIFFERENT scheduler whose launcher isn't even installed
-        # here belongs to another cluster (labs share $HOME across sites, so an
-        # eldorado flux record shows up on a slurm-only hops login node). boxy
-        # cannot manage that job from this host, so it must NOT block a local
-        # submission — take over the name locally. Field report: a flux job on
-        # eldorado blocked `--scheduler slurm` on hops.
-        rec_bin = rec_scheduler.submit_command("_")[0]
-        if mismatch and shutil.which(rec_bin) is None:
+        # A job under a DIFFERENT scheduler that we cannot confirm is alive (state
+        # UNKNOWN) is NOT ours to protect: it lives on another cluster (labs share
+        # $HOME across sites, so an eldorado flux record shows up on a hops slurm
+        # login node) or on a scheduler instance we can't reach from here. Blocking
+        # the local submission would strand the user. A different-scheduler job we
+        # CAN see resolves to PENDING/RUNNING (handled below), never UNKNOWN, so
+        # this only fires for genuinely unreachable foreign jobs. (Same-scheduler
+        # UNKNOWN is a controller flap — that still blocks, to never double-submit.)
+        if mismatch and state == "UNKNOWN":
             print(f"warning: ignoring a stale {rec_sched_name} record for {name} "
-                  f"(job {record['job']}) — '{rec_bin}' isn't installed on this host, so that "
-                  f"job belongs to another cluster. Submitting a fresh {scheduler_name} job and "
-                  f"taking over the name here. (If the {rec_sched_name} job is still running, "
-                  f"stop it from its own cluster.)", file=sys.stderr)
+                  f"(job {record['job']}) — it can't be reached from this host, so it belongs to "
+                  f"another cluster/scheduler. Submitting a fresh {scheduler_name} job and taking "
+                  f"over the name here. (If the {rec_sched_name} job is still running, stop it from "
+                  f"its own cluster.)", file=sys.stderr)
             if not args.dryrun:
                 jobs.remove(name)
         elif state != "DONE":
@@ -683,14 +684,10 @@ def _serve_submission(args, scheduler_name: str, profile) -> int:
                     print(f"###   stop: boxy stop {name}")
                     return 0
             if state == "UNKNOWN":
-                hint = (f" That job was submitted under '{rec_sched_name}' but you asked for "
-                        f"'{scheduler_name}'; if the old scheduler isn't available here, clear it "
-                        f"with boxy stop {name} and rerun."
-                        if mismatch else
-                        f" Retry when it answers, or boxy stop {name}.")
+                # same scheduler, controller unreachable: never reap a maybe-live job
                 print(f"boxy: cannot determine the state of {rec_sched_name} job "
-                      f"{record['job']} ({name}) — scheduler unreachable? Not resubmitting.{hint}",
-                      file=sys.stderr)
+                      f"{record['job']} ({name}) — scheduler unreachable? Not resubmitting. "
+                      f"Retry when it answers, or boxy stop {name}.", file=sys.stderr)
             elif mismatch:
                 print(f"boxy: {name} is already submitted as a {rec_sched_name} job "
                       f"({record['job']}, {state}), but you requested {scheduler_name}. "

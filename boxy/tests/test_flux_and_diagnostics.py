@@ -92,10 +92,9 @@ def test_flux_queue_directive_lands_in_script(gguf, jobs_dir, capsys):
 
 # ---- stale cross-scheduler record -------------------------------------------
 
-def test_stale_slurm_record_probed_with_slurm_not_flux(gguf, jobs_dir, monkeypatch, capsys):
-    """A leftover slurm record must be queried with the slurm state command and
-    must not wedge a new flux submission behind a bogus 'unreachable'. Here the
-    OTHER scheduler IS installed locally, so boxy stays safe and blocks."""
+def test_stale_record_probed_with_its_own_scheduler(gguf, jobs_dir, monkeypatch, capsys):
+    """A leftover slurm record must be queried with the SLURM state command, not
+    the requested flux one (a slurm job id is meaningless to `flux jobs`)."""
     jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "1786916"})
 
     seen = {}
@@ -103,39 +102,44 @@ def test_stale_slurm_record_probed_with_slurm_not_flux(gguf, jobs_dir, monkeypat
     def fake_job_state(scheduler, job_id):
         seen["scheduler_name"] = scheduler.name
         seen["job"] = job_id
-        return "UNKNOWN"  # slurm controller not reachable
+        return "UNKNOWN"
 
     from boxy import cli
     monkeypatch.setattr(cli, "_job_state", fake_job_state)
-    monkeypatch.setattr(cli.shutil, "which", lambda b: "/usr/bin/" + b)  # both schedulers present
-
-    rc = main(["serve", str(gguf), "--scheduler", "flux", "--dryrun", "--name", "boxy-m"])
-    assert rc == 1
+    main(["serve", str(gguf), "--scheduler", "flux", "--dryrun", "--name", "boxy-m"])
     # probed the RECORD's scheduler (slurm), not the requested one (flux)
     assert seen["scheduler_name"] == "slurm"
     assert seen["job"] == "1786916"
-    err = capsys.readouterr().err
-    assert "slurm job 1786916" in err
-    assert "submitted under 'slurm'" in err and "you asked for 'flux'" in err
-    assert "boxy stop boxy-m" in err
 
 
 def test_foreign_record_from_another_cluster_does_not_block(gguf, jobs_dir, monkeypatch, capsys):
-    """A flux record on a slurm-only host (shared $HOME across clusters) must not
-    block a slurm submission — flux isn't installed here, so that job belongs to
-    another cluster. boxy takes over the name and submits. Field report: hops."""
-    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "flux", "job": "f2ZoxD9R5fqh"})
+    """A different-scheduler job we can't reach (shared $HOME across clusters:
+    an eldorado flux record on a hops slurm login node) must NOT block a local
+    submission — boxy takes over the name and submits. Field report: hops."""
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "flux", "job": "f2Zp2gRTakud"})
 
     from boxy import cli
-    monkeypatch.setattr(cli, "_job_state", lambda s, j: "UNKNOWN")
-    # sbatch present (slurm host), flux absent (foreign scheduler)
-    monkeypatch.setattr(cli.shutil, "which", lambda b: "/usr/bin/sbatch" if b == "sbatch" else None)
+    monkeypatch.setattr(cli, "_job_state", lambda s, j: "UNKNOWN")  # flux job unreachable here
 
     rc = main(["serve", str(gguf), "--scheduler", "slurm", "--dryrun", "--name", "boxy-m"])
     assert rc == 0                                   # proceeded, did NOT block
     err = capsys.readouterr().err
     assert "ignoring a stale flux record" in err
     assert "another cluster" in err
+
+
+def test_same_scheduler_unknown_still_blocks(gguf, jobs_dir, monkeypatch, capsys):
+    """Safety unchanged: a SAME-scheduler job we can't confirm (controller flap)
+    must NOT be resubmitted — that would double-submit a maybe-live job."""
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "42"})
+
+    from boxy import cli
+    monkeypatch.setattr(cli, "_job_state", lambda s, j: "UNKNOWN")
+
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--dryrun", "--name", "boxy-m"])
+    assert rc == 1                                   # blocked, not resubmitted
+    err = capsys.readouterr().err
+    assert "Not resubmitting" in err and "scheduler unreachable" in err
 
 
 def test_matching_scheduler_record_message_unchanged(gguf, jobs_dir, monkeypatch, capsys):
