@@ -250,6 +250,19 @@ boxy serve <model> --scheduler slurm --gpus 4 --replicas 4 --dryrun
 boxy serve <model> --scheduler slurm --gpus 4 --replicas 4      # for real
 boxy list                                                       # watch all four
 
+# --- B'. ONE URL in front of the replicas (built-in router) --------------------
+# Present a single OpenAI endpoint load-balanced (least-outstanding) across the K
+# replicas. Runs on the login node; discovers replicas from the endpoint files and
+# fails over if one dies. Two ways:
+boxy serve <model> --scheduler slurm --gpus 4 --replicas 4 --router  # submit + front on :8000
+boxy router <base>                                                  # front an existing set (see boxy list)
+# then point any OpenAI client at http://<login-node>:8000/v1 (ssh -L 8000:<login>:8000).
+# For production scale (TLS/auth/>~hundreds of concurrent streams), emit a real proxy
+# config from the live endpoints instead of running the built-in one:
+boxy router <base> --emit nginx   > boxy.conf      # or --emit haproxy | litellm
+# (See the scaling note below: the built-in router is right for benchmark scale; the
+#  GPUs, not the proxy, are the bottleneck. Beyond that, run the emitted nginx/haproxy/litellm.)
+
 # --- C. Scaling SWEEP (the paper's study) --------------------------------------
 # Step one axis in powers of two; each rung is submitted, waited-to-READY,
 # benchmarked, and torn down; a comparison table is printed at the end.

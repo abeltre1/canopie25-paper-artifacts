@@ -114,6 +114,21 @@ def read_endpoint(name: str) -> dict | None:
     return None
 
 
+def list_endpoints(base: str) -> list[dict]:
+    """Every published endpoint for a replica set: the `<base>-r*` endpoint files
+    (as written by `boxy serve --replicas K`), returned as read_endpoint dicts.
+    Used by the router to discover the replicas to load-balance across."""
+    out = []
+    suffix = ".endpoint.json"
+    # `-r[0-9]*` requires a digit after -r so base "m" does not swallow a different
+    # set "m-rock-r0"; replica indices are always numeric (<base>-r0..r{K-1}).
+    for path in sorted(_dir().glob(f"{base}-r[0-9]*{suffix}")):
+        ep = read_endpoint(path.name[: -len(suffix)])
+        if ep:
+            out.append(ep)
+    return out
+
+
 def remove(name: str) -> None:
     for path in (record_path(name), endpoint_path(name), script_path(name)):
         try:

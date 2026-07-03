@@ -132,6 +132,9 @@ boxy serve <model> --scheduler flux --gpus 4 --unique   # repeat freely, no name
 boxy serve <model> --scheduler slurm --nodes 2 --gpus 4   # TP=GPUs/node, PP=nodes
 # 2) N INDEPENDENT replicas (data-parallel; each its own job/endpoint, composes with --nodes):
 boxy serve <model> --scheduler slurm --gpus 4 --replicas 4
+#    ...with ONE load-balanced URL in front (built-in login-node router):
+boxy serve <model> --scheduler slurm --gpus 4 --replicas 4 --router   # http://<login>:8000/v1
+boxy router <base> --emit nginx                                       # or hand off to a real proxy
 # 3) Scaling SWEEP (submit -> READY -> bench -> teardown per rung; prints a comparison table):
 boxy sweep <model> --scheduler slurm --gpus 4 --sweep-nodes 1,2,4,8 -o scaling.csv
 

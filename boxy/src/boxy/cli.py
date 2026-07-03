@@ -838,12 +838,13 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
         return 0
 
 
-def _serve_replicas(args, scheduler_name: str, profile, replicas: int) -> int:
+def _serve_replicas(args, scheduler_name: str, profile, replicas: int, router_port: int | None = None) -> int:
     """Data-parallel fan-out: submit K independent instances of the model, each
     its own batch job named <base>-r0..r{K-1} with its own name/endpoint/log/port.
     Each replica is itself single-node or (with --nodes>1) a distributed instance.
     Submission is non-blocking (sbatch/flux-batch return at once); the replicas are
-    then tracked together via `boxy list`."""
+    then tracked together via `boxy list`. With `router_port`, once the replicas
+    are READY a built-in login-node router fronts them on one OpenAI URL."""
     from boxy import jobs, resolve
 
     _model, base_name, decisions = resolve.resolve_submission(
@@ -863,6 +864,9 @@ def _serve_replicas(args, scheduler_name: str, profile, replicas: int) -> int:
 
     if args.dryrun:
         print(f"\n### dryrun: {replicas} replica batch scripts shown above; nothing submitted")
+        if router_port:
+            print(f"### dryrun: would then start the login-node router on :{router_port} "
+                  f"fronting {base_name}-r0..r{replicas - 1}")
         return 0
     submitted = [nm for nm, rc in zip(names, rcs) if rc == 0]
     print(f"\n### replicas: {len(submitted)}/{replicas} submitted"
@@ -873,7 +877,38 @@ def _serve_replicas(args, scheduler_name: str, profile, replicas: int) -> int:
             print(f"###   {nm}: {scheduler_name} job {rec['job']}   endpoint: {jobs.endpoint_path(nm)}")
     if submitted:
         print("###   watch all: boxy list      stop one: boxy stop <name>")
+    if router_port and submitted:
+        _run_router(base_name, router_port, args.ready_timeout, submitted)
     return 0 if len(submitted) == replicas else 1
+
+
+def _run_router(base_name: str, port: int, ready_timeout: float, names: list[str]) -> None:
+    """Wait for the replicas to become READY, then run the built-in login-node
+    router in the foreground on `port`, fronting them with one OpenAI URL."""
+    from boxy import router
+
+    urls = _sweep_wait_endpoints(names, ready_timeout)
+    if not urls:
+        print(f"### router: no replica became ready within {ready_timeout:.0f}s; not starting router",
+              file=sys.stderr)
+        return
+    pool = router.Pool()
+    disc = router.DiscoveryThread(base_name, pool)
+    disc.scan_once()  # populate before accepting requests (avoid first-hit 503)
+    disc.start()
+    host = socket.gethostname()
+    srv = router.make_server(pool, port)
+    print(f"### Router  http://{host}:{port}/v1  -> {base_name}-r* "
+          f"({len(pool.snapshot())} replica(s), least-outstanding)")
+    print(f"###   from your workstation: ssh -L {port}:{host}:{port} <login-node>")
+    print("###   Ctrl-C stops the router; the replicas keep running (boxy list / boxy stop <name>)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n### Router stopped; replicas still running.")
+    finally:
+        srv.shutdown()
+        disc.stop()
 
 
 def _rename_container(cmd: list[str], old: str, new: str) -> list[str]:
@@ -957,7 +992,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
         if scheduler_name in ("slurm", "flux"):
             replicas = getattr(args, "replicas", 1) or 1
             if replicas > 1:
-                return _serve_replicas(args, scheduler_name, profile, replicas)
+                return _serve_replicas(args, scheduler_name, profile, replicas,
+                                       router_port=getattr(args, "router", None))
+            if getattr(args, "router", None):
+                print("boxy: --router load-balances across --replicas; add --replicas K "
+                      "(K>1). For a single instance just use its endpoint.", file=sys.stderr)
+                return 2
             return _serve_submission(args, scheduler_name, profile)
 
     if (getattr(args, "replicas", 1) or 1) > 1:
@@ -1326,6 +1366,47 @@ def cmd_list(args: argparse.Namespace) -> int:
     return _run_or_print([runtime, "ps", "--filter", "label=boxy.box"], args.dryrun)
 
 
+def cmd_router(args: argparse.Namespace) -> int:
+    """Front a replica set (<base>-r*) with one OpenAI URL. Default: run the
+    built-in load-balancing proxy on the login node. --emit prints a config for a
+    production proxy (nginx/haproxy/litellm) instead of running anything."""
+    from boxy import jobs, router
+
+    endpoints = jobs.list_endpoints(args.base)
+    if args.emit:
+        if not endpoints:
+            raise UsageError(f"no endpoint files for {args.base}-r* in the jobs dir — is the replica "
+                             f"set up? (check `boxy list`; base is the name before -r0/-r1/…)")
+        emitter = {"nginx": router.emit_nginx, "haproxy": router.emit_haproxy,
+                   "litellm": router.emit_litellm}[args.emit]
+        print(emitter(args.base, endpoints, args.port) if args.emit != "litellm"
+              else emitter(args.base, endpoints))
+        return 0
+    if args.dryrun:
+        print(f"### Router plan: base={args.base}  listen=:{args.port}  policy={args.policy}  "
+              f"discovered={len(endpoints)} replica(s) "
+              f"({', '.join(e['name'] for e in endpoints) or 'none yet'})")
+        return 0
+    pool = router.Pool(policy=args.policy)
+    disc = router.DiscoveryThread(args.base, pool, interval=args.refresh)
+    disc.scan_once()  # populate before serving (avoid a first-hit 503)
+    disc.start()
+    host = socket.gethostname()
+    srv = router.make_server(pool, args.port)
+    print(f"### Router  http://{host}:{args.port}/v1  -> {args.base}-r* "
+          f"({len(pool.snapshot())} replica(s), {args.policy})")
+    print(f"###   from your workstation: ssh -L {args.port}:{host}:{args.port} <login-node>")
+    print("###   Ctrl-C stops the router; the replicas keep running")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n### Router stopped.")
+    finally:
+        srv.shutdown()
+        disc.stop()
+    return 0
+
+
 def cmd_bench(args: argparse.Namespace) -> int:
     from boxy import bench
 
@@ -1615,6 +1696,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "batch job named <base>-r0..r{K-1} with its own endpoint/log/port. Requires "
                         "--scheduler slurm|flux; composes with --nodes>1 (each replica is itself a "
                         "distributed instance)")
+    p.add_argument("--router", nargs="?", type=int, const=8000, default=None,
+                   metavar="PORT",
+                   help="with --replicas K, after the replicas are READY start the built-in login-node "
+                        "router on PORT (default 8000) presenting ONE OpenAI URL load-balanced across "
+                        "them (least-outstanding). For production scale use `boxy router --emit`")
     p.add_argument("--partition", default=None,
                    help="partition/queue for --scheduler jobs (Slurm --partition, Flux --queue)")
     p.add_argument("--account", default=None,
@@ -1733,6 +1819,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime", choices=["podman", "docker"], default=None)
     p.add_argument("--dryrun", action="store_true")
     p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("router",
+                       help="front a --replicas set (<base>-r*) with ONE OpenAI URL (load-balanced)")
+    p.add_argument("base", help="replica base name — the <base> of <base>-r0..r{K-1} (see `boxy list`)")
+    p.add_argument("--port", type=int, default=8000, help="listen port (default 8000)")
+    p.add_argument("--policy", choices=["least", "round-robin"], default="least",
+                   help="load-balancing policy (default: least-outstanding-requests — best for LLMs)")
+    p.add_argument("--emit", choices=["nginx", "haproxy", "litellm"], default=None,
+                   help="instead of running the built-in proxy, PRINT a config for a production proxy "
+                        "(nginx/haproxy/litellm) built from the live replica endpoints")
+    p.add_argument("--refresh", type=float, default=10.0,
+                   help="seconds between replica re-scans (join/leave discovery; default 10)")
+    p.add_argument("--dryrun", action="store_true", help="print the router plan without serving")
+    p.set_defaults(func=cmd_router)
 
     p = sub.add_parser("stage", help="stage a model from a site-local S3 bucket to the shared FS")
     p.add_argument("model", nargs="?", default=None,

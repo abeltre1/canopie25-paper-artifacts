@@ -1,0 +1,325 @@
+"""Router: pool/pick (pure), discovery join/leave, config emitters (pure), and a
+real end-to-end fan-out + SSE streaming + failover test against local backends.
+No cluster needed."""
+
+import json
+import threading
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
+
+from boxy import jobs, router
+
+EPS = [
+    {"name": "demo-r0", "host": "node01", "port": 8000, "url": "http://node01:8000"},
+    {"name": "demo-r1", "host": "node02", "port": 8000, "url": "http://node02:8000"},
+]
+
+
+# ---- emit (pure) -------------------------------------------------------------
+
+
+def test_emit_nginx_least_conn_and_servers():
+    out = router.emit_nginx("Meta-Llama-3.1-8B", EPS, listen_port=9000)
+    assert "least_conn;" in out
+    assert "server node01:8000" in out and "server node02:8000" in out
+    assert "listen 9000;" in out
+    assert "proxy_buffering off" in out  # SSE-safe
+    assert "upstream boxy_meta_llama_3_1_8b" in out  # sanitized identifier
+
+
+def test_emit_haproxy_leastconn_and_healthcheck():
+    out = router.emit_haproxy("demo", EPS)
+    assert "balance leastconn" in out
+    assert "option httpchk GET /v1/models" in out
+    assert out.count("server r") == 2
+
+
+def test_emit_litellm_one_entry_per_replica_same_model_name():
+    out = router.emit_litellm("demo", EPS)
+    assert out.count("model_name: demo") == 2       # both share the name → LB
+    assert "api_base: http://node01:8000/v1" in out
+    assert "routing_strategy: least-busy" in out
+
+
+# ---- pool / pick (pure) ------------------------------------------------------
+
+
+def _pool(*inflight):
+    return router.Pool([router.Backend(f"r{i}", f"http://h{i}:8000", f"h{i}", 8000, inflight=n)
+                        for i, n in enumerate(inflight)])
+
+
+def test_pick_least_outstanding_wins():
+    p = _pool(3, 0, 5)
+    b = p.pick()
+    assert b.name == "r1" and b.inflight == 1  # least loaded, reserved
+
+
+def test_pick_round_robin_tiebreak_and_exclude():
+    p = _pool(0, 0, 0)
+    first = p.pick()
+    second = p.pick(exclude=frozenset({first.name}))
+    assert first.name != second.name           # ties rotate + exclude skips
+    assert p.pick(exclude=frozenset({"r0", "r1", "r2"})) is None  # all excluded
+
+
+def test_pick_none_when_all_unhealthy():
+    p = _pool(0, 0)
+    for b in p.snapshot():
+        p.mark(b.name, False)
+    assert p.pick() is None
+
+
+def test_concurrent_picks_reserve_distinct_slots():
+    # 3 concurrent picks (no release) on 3 idle backends must reserve 3 distinct
+    # backends — the select+reserve is atomic under the lock (no stampede).
+    p = _pool(0, 0, 0)
+    picked = []
+    lock = threading.Lock()
+
+    def grab():
+        b = p.pick()
+        with lock:
+            picked.append(b.name)
+
+    threads = [threading.Thread(target=grab) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(picked) == ["r0", "r1", "r2"]
+    assert all(b.inflight == 1 for b in p.snapshot())
+
+
+def test_release_decrements():
+    p = _pool(2)
+    b = p.pick()
+    assert b.inflight == 3
+    p.release(b)
+    assert p.snapshot()[0].inflight == 2
+
+
+# ---- discovery replace: join / leave / preserve inflight ---------------------
+
+
+def test_discovery_join_leave_preserves_inflight(monkeypatch):
+    from boxy import readiness
+
+    state = {"eps": [dict(EPS[0], url="http://h0:8000", host="h0"),
+                     dict(EPS[1], url="http://h1:8000", host="h1")]}
+    for i, e in enumerate(state["eps"]):
+        e["name"] = f"base-r{i}"
+    monkeypatch.setattr(jobs, "list_endpoints", lambda base: state["eps"])
+    monkeypatch.setattr(readiness, "wait_ready", lambda url, **k: "fake-model")
+
+    pool = router.Pool()
+    disc = router.DiscoveryThread("base", pool)
+    disc.scan_once()
+    assert {b.name for b in pool.snapshot()} == {"base-r0", "base-r1"}
+
+    pool._by_name["base-r0"].inflight = 3          # survivor has load
+    # base-r1 leaves, base-r2 joins
+    state["eps"] = [state["eps"][0], {"name": "base-r2", "host": "h2", "port": 8000, "url": "http://h2:8000"}]
+    disc.scan_once()
+    assert {b.name for b in pool.snapshot()} == {"base-r0", "base-r2"}
+    assert pool._by_name["base-r0"].inflight == 3  # preserved across the swap
+
+
+# ---- jobs.list_endpoints -----------------------------------------------------
+
+
+def test_list_endpoints_globs_replica_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
+    for i in range(3):
+        jobs.write_endpoint(f"myset-r{i}", 8000 + i, job_id=str(i))
+    jobs.write_endpoint("other-r0", 9000)          # different base — must not match
+    jobs.write_endpoint("myset2-r0", 9001)         # base is a prefix — must not match
+    jobs.write_endpoint("myset-rockery-r0", 9002)  # -r not followed by a digit — must not match
+    found = jobs.list_endpoints("myset")
+    assert sorted(e["name"] for e in found) == ["myset-r0", "myset-r1", "myset-r2"]
+
+
+# ---- end-to-end: real backends, fan-out + SSE + failover ---------------------
+
+
+class _FakeBackend(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/v1/models":
+            self._json({"object": "list", "data": [{"id": "fake-model", "object": "model"}]})
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        payload = json.loads(self.rfile.read(n)) if n else {}
+        self.server.hits += 1
+        if payload.get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for tok in ("Hel", "lo", "[DONE]"):
+                frame = f"data: {tok}\n\n".encode()
+                self.wfile.write(b"%X\r\n" % len(frame) + frame + b"\r\n")
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        else:
+            self._json({"choices": [{"text": "ok"}], "server": self.server.tag,
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+
+def _start_backend(tag):
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _FakeBackend)
+    srv.hits = 0
+    srv.tag = tag
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+@pytest.fixture
+def router_over_two_backends(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
+    backends = [_start_backend("A"), _start_backend("B")]
+    for i, s in enumerate(backends):
+        port = s.server_address[1]
+        jobs.write_endpoint(f"e2e-r{i}", port, job_id=str(i))
+        # jobs writes host=gethostname; rewrite to 127.0.0.1 so the test reaches it
+        ep = tmp_path / f"e2e-r{i}.endpoint.json"
+        d = json.loads(ep.read_text())
+        d.update(host="127.0.0.1", url=f"http://127.0.0.1:{port}")
+        ep.write_text(json.dumps(d))
+    pool = router.Pool()
+    disc = router.DiscoveryThread("e2e", pool)
+    disc.scan_once()
+    srv = router.make_server(pool, 0, host="127.0.0.1", connect_timeout=1.0, read_timeout=5.0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    rport = srv.server_address[1]
+    yield rport, backends, pool
+    srv.shutdown()
+    disc.stop()
+    for s in backends:
+        s.shutdown()
+
+
+def _post(rport, stream=False):
+    body = json.dumps({"model": "fake-model", "prompt": "hi", "max_tokens": 4, "stream": stream}).encode()
+    req = urllib.request.Request(f"http://127.0.0.1:{rport}/v1/completions", data=body,
+                                 headers={"Content-Type": "application/json"})
+    return urllib.request.urlopen(req, timeout=5)
+
+
+def test_router_discovers_both_backends(router_over_two_backends):
+    _, _, pool = router_over_two_backends
+    assert len(pool.snapshot()) == 2
+    assert all(b.model == "fake-model" for b in pool.snapshot())
+
+
+def test_router_fans_out_across_replicas(router_over_two_backends):
+    rport, backends, _ = router_over_two_backends
+    for _ in range(10):
+        resp = _post(rport)
+        assert resp.status == 200
+        json.load(resp)
+    assert backends[0].hits > 0 and backends[1].hits > 0        # both used
+    assert backends[0].hits + backends[1].hits == 10           # nothing dropped
+
+
+def test_router_streams_sse(router_over_two_backends):
+    rport, _, _ = router_over_two_backends
+    resp = _post(rport, stream=True)
+    assert resp.status == 200
+    body = resp.read().decode()
+    assert "data: Hel" in body and "data: lo" in body
+    assert "data: [DONE]" in body                              # full SSE relayed intact
+
+
+class _AbortBackend(BaseHTTPRequestHandler):
+    """Answers /v1/models (so it looks healthy) but aborts every POST mid-chunk —
+    simulates a replica dying while streaming."""
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        body = json.dumps({"object": "list", "data": [{"id": "fake-model"}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.send_response(200)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        self.wfile.write(b"64\r\npartial")  # declares 0x64=100 bytes, sends 7, then closes
+        self.wfile.flush()
+        self.close_connection = True
+
+
+def test_router_survives_upstream_abort_midstream(tmp_path, monkeypatch):
+    # A replica that dies mid-stream (after headers) must NOT crash the router or
+    # trigger a double send_response — the router truncates that one and stays up.
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
+    good = _start_backend("good")
+    bad = ThreadingHTTPServer(("127.0.0.1", 0), _AbortBackend)
+    threading.Thread(target=bad.serve_forever, daemon=True).start()
+    for name, s in (("mix-r0", good), ("mix-r1", bad)):
+        port = s.server_address[1]
+        (tmp_path / f"{name}.endpoint.json").write_text(json.dumps(
+            {"name": name, "host": "127.0.0.1", "port": port,
+             "url": f"http://127.0.0.1:{port}", "job": "1"}))
+    pool = router.Pool()
+    disc = router.DiscoveryThread("mix", pool)
+    disc.scan_once()
+    srv = router.make_server(pool, 0, host="127.0.0.1", connect_timeout=1.0, read_timeout=3.0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    rport = srv.server_address[1]
+    try:
+        for _ in range(4):  # hit the aborting replica among others; must not wedge
+            try:
+                _post(rport, stream=True).read()
+            except Exception:
+                pass
+        oks = 0
+        for _ in range(6):  # the router is still alive; the good replica still serves
+            try:
+                r = _post(rport)
+                r.read()
+                oks += r.status == 200
+            except Exception:
+                pass
+        assert oks >= 1
+    finally:
+        srv.shutdown()
+        disc.stop()
+        good.shutdown()
+        bad.shutdown()
+
+
+def test_router_fails_over_when_a_replica_dies(router_over_two_backends):
+    rport, backends, _ = router_over_two_backends
+    backends[0].shutdown()
+    backends[0].server_close()                                 # free the port → connect refused
+    ok = 0
+    for _ in range(6):
+        resp = _post(rport)
+        if resp.status == 200:
+            ok += 1
+            json.load(resp)
+    assert ok == 6                                             # all served via the survivor
+    assert backends[1].hits >= 6
