@@ -9,6 +9,19 @@ from boxy.location import Location
 from tests.conftest import EXAMPLES
 
 
+@pytest.fixture(autouse=True)
+def laptop_host(monkeypatch):
+    """These tests assert laptop/workstation behavior; the test environment
+    may itself have a scheduler installed (the sandbox runs a real Slurm for
+    the live E2E), which would trip the login-node guard. Hide srun/flux from
+    RESOLUTION only — guard-specific tests patch `which` themselves."""
+    import shutil as _shutil
+
+    real_which = _shutil.which
+    monkeypatch.setattr("boxy.resolve.shutil.which",
+                        lambda name: None if name in ("srun", "flux") else real_which(name))
+
+
 @pytest.fixture
 def gguf(tmp_path):
     model = tmp_path / "tiny-llama.q4_k_m.gguf"
@@ -45,13 +58,45 @@ def test_serve_gpus_without_scheduler_is_error(gguf, capsys):
     assert "--scheduler" in capsys.readouterr().err
 
 
-def test_serve_scheduler_submission_dryrun(gguf, capsys):
+def test_serve_scheduler_submits_batch_job_dryrun(gguf, capsys, monkeypatch, tmp_path):
+    """MODEL + --scheduler now SUBMITS (sbatch) instead of wrapping srun:
+    the batch script re-invokes boxy on the compute node."""
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--gpus", "2", "--nodes", "1",
+               "--partition", "short", "--account", "fy260064",
+               "--scheduler-arg=--license=tscratch:1", "--dryrun"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "#SBATCH --gpus-per-node=2" in out and "#SBATCH --nodes=1" in out
+    assert "#SBATCH --partition=short" in out and "#SBATCH --account=fy260064" in out
+    assert "#SBATCH --license=tscratch:1" in out
+    assert "sbatch --parsable" in out
+    assert "--foreground --here" in out and "--endpoint-file" in out  # inner re-resolution
+    assert "resolved on the compute node" in out
+    assert "srun" not in out
+
+
+def test_serve_scheduler_foreground_keeps_attached_srun(gguf, capsys):
     rc = main(["serve", str(gguf), "--runtime", "podman", "--scheduler", "slurm",
-               "--accelerator", "cuda", "--gpus", "2", "--nodes", "1", "--dryrun"])
+               "--accelerator", "cuda", "--gpus", "2", "--nodes", "1",
+               "--foreground", "--dryrun"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "srun" in out and "--gpus-per-node=2" in out
-    assert "auto: scheduler: slurm (--scheduler)" in out
+    assert "#SBATCH" not in out
+
+
+def test_serve_flux_submission_uses_flux_spellings(gguf, capsys, monkeypatch, tmp_path):
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
+    rc = main(["serve", str(gguf), "--scheduler", "flux", "--gpus", "4",
+               "--partition", "pbatch", "--account", "guests", "--time", "4h", "--dryrun"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "#FLUX: --gpus-per-node=4" in out
+    assert "#FLUX: --queue=pbatch" in out       # partition -> queue
+    assert "#FLUX: --bank=guests" in out        # account -> bank
+    assert "#FLUX: -t 4h" in out                # time -> -t
+    assert "flux batch" in out
 
 
 def test_serve_save_profile_round_trips(gguf, tmp_path, capsys):

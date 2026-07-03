@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -296,12 +297,189 @@ def _dump_logs(runtime: str, name: str, tail: int = 50) -> None:
             print(stream.rstrip(), file=sys.stderr)
 
 
+def _job_state(scheduler, job_id: str) -> str:
+    try:
+        result = subprocess.run(scheduler.state_command(job_id), capture_output=True,
+                                text=True, timeout=20)
+    except Exception:
+        return "UNKNOWN"
+    if result.returncode != 0:
+        return "DONE" if not result.stdout.strip() else "UNKNOWN"
+    return scheduler.interpret_state(result.stdout)
+
+
+def _dump_file_tail(path, tail: int = 30) -> None:
+    try:
+        lines = open(path, errors="replace").read().splitlines()[-tail:]
+        for line in lines:
+            print(f"    {line}", file=sys.stderr)
+    except OSError:
+        print(f"    (no log at {path} yet)", file=sys.stderr)
+
+
+def _inner_serve_command(args, model: str, name: str) -> str:
+    """The command the batch job runs ON the compute node: boxy itself, in
+    foreground (the job step owns the server), re-resolving hardware there
+    and publishing its endpoint over the shared filesystem."""
+    from boxy import jobs
+
+    boxy_bin = shutil.which("boxy")
+    base = [boxy_bin] if boxy_bin else [sys.executable, "-m", "boxy.cli"]
+    inner = base + ["serve", model, "--foreground", "--here",
+                    "--name", name, "--endpoint-file", str(jobs.endpoint_path(name))]
+    for flag, value in (("--engine", args.engine), ("--image", args.image),
+                        ("--runtime", args.runtime), ("--accelerator", args.accelerator)):
+        if value:
+            inner += [flag, value]
+    if args.port:
+        inner += ["--port", str(args.port)]
+    if args.args:
+        inner += ["--"] + list(args.args)
+    return shlex.join(inner)
+
+
+def _serve_submission(args, scheduler_name: str, profile) -> int:
+    """The seamless scheduler path: generate a batch script, submit it, follow
+    the job to READY, print the endpoint — then get out of the way."""
+    import time
+
+    from boxy import jobs, readiness, resolve
+    from boxy.location import Location, Resources
+    from boxy.schedulers import get_scheduler
+
+    model, name, decisions = resolve.resolve_submission(
+        args.model, scheduler_name, name=args.name, require_exists=not args.dryrun)
+    for line in decisions:
+        print(f"  auto: {line}")
+
+    location = profile or Location(
+        name="auto", scheduler=scheduler_name,
+        resources=Resources(nodes=args.nodes, gpus_per_node=args.gpus))
+    scheduler = get_scheduler(scheduler_name)
+    site_args = list(location.scheduler_args)
+    for kind, value in (("partition", args.partition), ("account", args.account), ("time", args.time)):
+        if value:
+            site_args.append(scheduler.site_directive(kind, value))
+    site_args += list(args.scheduler_args or [])
+    dynamic = getattr(args, "dynamic_flags", [])
+    site_args += [scheduler.dynamic_directive(k, v) for s, k, v in dynamic if s == scheduler_name]
+    ignored = [f"--{s}-{k}" for s, k, v in dynamic if s != scheduler_name]
+    if ignored:
+        print(f"warning: ignoring {' '.join(ignored)} (active scheduler is {scheduler_name})",
+              file=sys.stderr)
+
+    if args.save_profile:
+        print("note: --save-profile is not yet supported for batch submissions "
+              "(the box resolves on the compute node)", file=sys.stderr)
+
+    # deterministic name = singleton lock, batch edition
+    record = jobs.read_record(name)
+    if record:
+        state = _job_state(scheduler, record["job"])
+        if state in ("PENDING", "RUNNING"):
+            endpoint = jobs.read_endpoint(name)
+            if endpoint:
+                model_id = readiness.wait_ready(endpoint["url"], timeout_s=2, interval_s=0.5)
+                if model_id:
+                    print(f"### ALREADY SERVING  {endpoint['url']}/v1   "
+                          f"(model: {model_id}, {record['scheduler']} job {record['job']})")
+                    print(f"###   stop: boxy stop {name}")
+                    return 0
+            print(f"boxy: {name} is already submitted as {record['scheduler']} job {record['job']} "
+                  f"({state}) — watch: boxy list; stop: boxy stop {name}", file=sys.stderr)
+            return 1
+        jobs.remove(name)  # stale record from a finished job
+
+    inner = _inner_serve_command(args, model, name)
+    script_text = scheduler.batch_script(inner, location, name, str(jobs.log_path(name)), site_args)
+    submit = scheduler.submit_command(str(jobs.script_path(name)))
+    print(f"### Batch script ({jobs.script_path(name)}):")
+    for line in script_text.rstrip().splitlines():
+        print(f"    {line}")
+    print(f"### Submit Command:\n    {shlex.join(submit)}")
+    if args.dryrun:
+        return 0
+
+    jobs.script_path(name).write_text(script_text)
+    jobs.endpoint_path(name).unlink(missing_ok=True)
+    result = subprocess.run(submit, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"boxy: submission failed: {result.stderr.strip() or result.stdout.strip()}", file=sys.stderr)
+        return result.returncode
+    job_id = scheduler.parse_job_id(result.stdout)
+    jobs.write_record(name, {"name": name, "scheduler": scheduler_name, "job": job_id,
+                             "model": model, "submitted_from": socket.gethostname()})
+    print(f"### Submitted {scheduler_name} job {job_id}  ({name})")
+    print("### Waiting for the job to start and the server to become ready ... "
+          "(Ctrl-C detaches; the job keeps running)")
+
+    last_state, ready_deadline = None, None
+    try:
+        while True:
+            state = _job_state(scheduler, job_id)
+            if state != last_state:
+                print(f"###   job {job_id}: {state}")
+                last_state = state
+            endpoint = jobs.read_endpoint(name)
+            if endpoint:
+                url = endpoint["url"]
+                if ready_deadline is None:
+                    ready_deadline = time.time() + args.ready_timeout
+                    print(f"###   server starting on {endpoint['host']} — "
+                          f"waiting for readiness at {url}/v1/models")
+                model_id = readiness.wait_ready(url, timeout_s=3, interval_s=1)
+                if model_id:
+                    print(f"### READY  {url}/v1   (model: {model_id}, {scheduler_name} job {job_id})")
+                    print(f"###   try:   curl -s {url}/v1/models")
+                    print(f"###   tunnel: ssh -L {endpoint['port']}:{endpoint['host']}:{endpoint['port']} <login-node>")
+                    print(f"###   stop:  boxy stop {name}")
+                    return 0
+                if time.time() > ready_deadline:
+                    print(f"boxy: server not ready within {args.ready_timeout:.0f}s (job still {state}). "
+                          f"Large models load slowly — watch the log:\n  tail -f {jobs.log_path(name)}\n"
+                          f"  then: curl -s {url}/v1/models ; stop: boxy stop {name}", file=sys.stderr)
+                    return 1
+            if state == "DONE":
+                print(f"boxy: job {job_id} ended before the server became ready; last log lines:",
+                      file=sys.stderr)
+                _dump_file_tail(jobs.log_path(name))
+                jobs.remove(name)
+                return 1
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print(f"\n### Detached — {scheduler_name} job {job_id} keeps running.")
+        print(f"###   status: boxy list      endpoint file: {jobs.endpoint_path(name)}")
+        print(f"###   stop:   boxy stop {name}")
+        return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     from boxy import deploy, readiness
+
+    # Seamless scheduler path: MODEL + slurm/flux (via flag or --location
+    # profile) submits a batch job unless --foreground pins the attached
+    # srun/flux-run mode.
+    if args.model and not args.foreground and not args.box:
+        scheduler_name = args.scheduler
+        profile = None
+        if args.location:
+            profile = Location.from_toml(args.location)
+            if scheduler_name is None and profile.scheduler in ("slurm", "flux"):
+                scheduler_name = profile.scheduler
+        if scheduler_name in ("slurm", "flux"):
+            return _serve_submission(args, scheduler_name, profile)
 
     box, location, decisions = _resolve_or_load(args)
     for line in decisions:
         print(f"  auto: {line}")
+    dynamic = getattr(args, "dynamic_flags", [])
+    if dynamic and location.scheduler in ("slurm", "flux"):
+        # attached srun/flux-run mode: pass-through flags apply to the launcher
+        from boxy.schedulers import get_scheduler
+
+        sched_obj = get_scheduler(location.scheduler)
+        location.scheduler_args.extend(
+            sched_obj.dynamic_directive(k, v) for s, k, v in dynamic if s == location.scheduler)
     deployment = deploy.plan_serve(box, location, port=args.port, extra_args=args.args, dryrun=args.dryrun)
     if getattr(args, "save_profile", None):
         _save_profile(args.save_profile, deployment.box, deployment.location)
@@ -338,6 +516,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
     print(f"### Running Command:\n    {shlex.join(deployment.command)}")
     if args.dryrun:
         return 0
+
+    if getattr(args, "endpoint_file", None):
+        # batch-job rendezvous: publish host+port over the shared FS so the
+        # submitting boxy (on the login node) can find and readiness-gate us
+        import json
+
+        with open(args.endpoint_file, "w") as f:
+            json.dump({"name": cname, "host": socket.gethostname(), "port": port,
+                       "url": f"http://{socket.gethostname()}:{port}",
+                       "job": os.environ.get("SLURM_JOB_ID") or os.environ.get("FLUX_JOB_ID", "")}, f)
+            f.write("\n")
 
     if not detach:
         if deployment.location.scheduler == "none":
@@ -483,12 +672,26 @@ def _run_or_print(cmd: list[str], dryrun: bool) -> int:
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
+    from boxy import jobs
+    from boxy.schedulers import get_scheduler
+
     if args.name:
         target = args.name
     elif args.box:
         target = Box.from_toml(args.box).name
     else:
         raise ValueError("usage: boxy stop NAME   (names are printed at serve time and by `boxy list`)")
+
+    record = jobs.read_record(target)
+    if record:
+        # scheduler-submitted serve: cancel the job (the job step owns the
+        # server, so the container dies with it)
+        scheduler = get_scheduler(record["scheduler"])
+        rc = _run_or_print(scheduler.cancel_command(record["job"]), args.dryrun)
+        if not args.dryrun:
+            jobs.remove(target)
+        return rc
+
     location = Location.from_toml(args.location) if args.location else None
     runtime = args.runtime or _container_runtime(location)
     rc = _run_or_print([runtime, "stop", target], args.dryrun)
@@ -499,8 +702,26 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
+    from boxy import jobs
+    from boxy.schedulers import get_scheduler
+
+    records = jobs.list_records()
+    if records:
+        print("scheduler jobs:")
+        for record in records:
+            state = _job_state(get_scheduler(record["scheduler"]), record["job"])
+            endpoint = jobs.read_endpoint(record["name"])
+            url = f"{endpoint['url']}/v1" if endpoint else "-"
+            print(f"  {record['name']}  {record['scheduler']} job {record['job']}  {state}  {url}")
+            if state == "DONE":
+                jobs.remove(record["name"])  # reap finished jobs from the list
     location = Location.from_toml(args.location) if args.location else None
-    runtime = args.runtime or _container_runtime(location)
+    try:
+        runtime = args.runtime or _container_runtime(location)
+    except RuntimeError:
+        if records:
+            return 0  # jobs listed; no container runtime on this host is fine
+        raise
     return _run_or_print([runtime, "ps", "--filter", "label=boxy.box"], args.dryrun)
 
 
@@ -594,12 +815,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gpus", type=int, default=0, help="GPUs per node for the --scheduler job request")
     p.add_argument("--nodes", type=int, default=1, help="node count for the --scheduler job request")
     p.add_argument("--name", default=None, help="container name (default: derived from the model)")
+    p.add_argument("--partition", default=None,
+                   help="partition/queue for --scheduler jobs (Slurm --partition, Flux --queue)")
+    p.add_argument("--account", default=None,
+                   help="account/bank for --scheduler jobs (Slurm --account, Flux --bank)")
+    p.add_argument("--time", default=None,
+                   help="time limit for --scheduler jobs (e.g. 4:00:00)")
+    p.add_argument("--scheduler-arg", action="append", default=[], dest="scheduler_args", metavar="FLAG",
+                   help="extra raw scheduler flag for the job (repeatable), "
+                        "e.g. --scheduler-arg=--license=tscratch:1")
     p.add_argument("--here", action="store_true",
                    help="allow serving directly on a scheduler login node (bypasses the guard)")
     p.add_argument("--foreground", action="store_true",
-                   help="stay attached with engine logs (default inside allocations / under --scheduler)")
+                   help="stay attached with engine logs; with --scheduler, uses attached srun/flux-run "
+                        "instead of submitting a batch job")
     p.add_argument("--ready-timeout", type=float, default=180.0,
-                   help="seconds to wait for the endpoint when detached (default 180)")
+                   help="seconds to wait for the endpoint once the server starts (default 180)")
+    p.add_argument("--endpoint-file", default=None, help=argparse.SUPPRESS)
     p.add_argument("--save-profile", default=None, metavar="PREFIX",
                    help="write the resolved config to PREFIX.box.toml + PREFIX.location.toml")
     p.add_argument("--dryrun", action="store_true", help="print the command instead of executing it")
@@ -677,6 +909,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+_DYNAMIC_FLAG = re.compile(r"^--(slurm|flux)-([A-Za-z0-9][A-Za-z0-9-]*)(?:=(.*))?$")
+
+
 def main(argv: list[str] | None = None) -> int:
     # Everything after a standalone `--` is engine args, verbatim. argparse
     # cannot express this next to optional positionals (a `*` positional only
@@ -686,7 +921,24 @@ def main(argv: list[str] | None = None) -> int:
     if "--" in argv:
         split = argv.index("--")
         argv, extra = argv[:split], argv[split + 1:]
-    args = build_parser().parse_args(argv)
+    args, unknown = build_parser().parse_known_args(argv)
+    # Scheduler flag pass-through: any --slurm-FLAG[=VALUE] / --flux-FLAG[=VALUE]
+    # flows into the job request untranslated except for spelling — new
+    # scheduler flags never require a boxy change. Values need `=`.
+    dynamic: list[tuple[str, str, str | None]] = []
+    bad: list[str] = []
+    for token in unknown:
+        match = _DYNAMIC_FLAG.match(token)
+        if match and getattr(args, "subcommand", "") == "serve":
+            dynamic.append((match[1], match[2], match[3]))
+        else:
+            bad.append(token)
+    if bad:
+        print(f"boxy: error: unrecognized arguments: {' '.join(bad)}\n"
+              f"  (scheduler flags pass through as --slurm-FLAG[=VALUE] or --flux-FLAG[=VALUE])",
+              file=sys.stderr)
+        return 2
+    args.dynamic_flags = dynamic
     try:
         if extra:
             if not hasattr(args, "args"):

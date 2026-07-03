@@ -20,6 +20,8 @@ Be precise about what "tested" means. Three tiers:
 | **v2** `boxy serve MODEL` → auto-decisions → detach → `### READY` → curl → `boxy stop NAME` | **E** | CI sandbox (air-gapped) |
 | **v2** crash fast-fail (bad engine flag → log dump → cleanup, rc 1) | **E** | CI sandbox |
 | **v2** login-node guard / hip→rocm / port scan / runtime probes | **E** (unit) → **P** on cluster | CI sandbox |
+| **v3** `--scheduler slurm` batch submission → PENDING→RUNNING→READY→curl→idempotent rerun→stop | **E** | CI sandbox vs a REAL single-node Slurm 23.11 |
+| **v3** Flux batch submission (same code path, flux spellings) | **G** → **P** | needs a Flux cluster (no flux-core package here) |
 | `bench` sweep against a live endpoint | **E** | CI sandbox |
 | `pull` hf:// full repo through RamaLama | **E** | User's Mac (after SSL fix) |
 | `pull`/serve interplay on **Podman** (mount, store path, argv) | **E**\* | User's Mac — \*container start blocked only by amd64-image-on-ARM |
@@ -125,6 +127,45 @@ step 3. `boxy pull --box examples/boxes/vllm-hf.toml` on the laptop IS a
 valid test of the full-repo pull path.
 
 ## 3. Slurm + Podman + CUDA cluster (HOPS-class)
+
+### 3.0 The seamless path — one command from the login node
+
+`--scheduler` SUBMITS a batch job (sbatch / flux batch): the job re-runs boxy
+on the compute node (so accelerator/image/port resolve where they're true),
+publishes its endpoint over the shared filesystem, and the login-side boxy
+follows it to READY. **Verified end-to-end against a real Slurm cluster**
+(single-node, in the CI sandbox: submit → PENDING → RUNNING → READY → curl →
+idempotent rerun → `boxy stop` = scancel).
+
+```bash
+# pre-stage once (login node has network; store is on shared $HOME):
+boxy pull hf://TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+
+# one command; ANY sbatch flag passes through as --slurm-FLAG[=VALUE]:
+boxy serve hf://TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --scheduler slurm --gpus 1 \
+  --slurm-partition=short --slurm-account=fy260064 --slurm-license=tscratch:1
+# EXPECT:
+#   ### Submitted slurm job N  (boxy-tinyllama-...)
+#   ###   job N: PENDING ... RUNNING
+#   ### READY  http://<node>:8090/v1   (model: ..., slurm job N)
+# Ctrl-C while waiting DETACHES (the job keeps running).
+
+boxy list                          # job state + endpoint, plus containers
+boxy stop boxy-tinyllama-...       # scancel; the job step owns the server
+
+# Flux is identical; flags pass through as --flux-FLAG[=VALUE]:
+boxy serve <model> --scheduler flux --gpus 4 --flux-queue=pbatch --flux-bank=guests
+
+# Portable spellings if you prefer them: --partition/--account/--time translate
+# per scheduler (slurm --partition / flux --queue, etc). Site defaults belong
+# in a --location profile:  scheduler_args = ["--partition=short", ...]
+boxy serve <model> --location hops.toml
+```
+
+Notes: `--foreground` keeps the old attached `srun`/`flux run` mode. Batch
+logs live at `~/.local/share/boxy/jobs/<name>.log` — boxy dumps their tail
+automatically if the job dies before READY.
 
 ```bash
 # 3.1 Login node

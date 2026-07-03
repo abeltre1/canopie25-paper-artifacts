@@ -236,6 +236,44 @@ def auto_location(
     return location, decisions
 
 
+def _classify_model(model: str, require_exists: bool) -> tuple[str, str]:
+    """Syntax decides: a transport scheme means remote; anything else is a local
+    path, full stop. Bare names are never guessed into registries — same
+    command, same meaning, on every machine. Returns (resolved, decision)."""
+    if model.startswith(TRANSPORT_SCHEMES):
+        return model, f"model: {model} (transport URI — pulled via RamaLama)"
+    resolved = os.path.abspath(model)
+    if not os.path.exists(resolved):
+        if require_exists:
+            base = model.rsplit("/", 1)[-1]
+            raise RuntimeError(
+                f"no such model file: {model!r}. MODEL is a local path or a transport URI — "
+                f"did you mean ollama://{base} or hf://<org>/{base}?"
+            )
+        return resolved, f"model: {resolved} (local path; not present — dryrun)"
+    return resolved, f"model: {resolved} (local file)"
+
+
+def resolve_submission(
+    model: str,
+    scheduler: str,
+    name: str | None = None,
+    require_exists: bool = True,
+) -> tuple[str, str, list[str]]:
+    """Login-side resolution for a batch submission: classify the model and
+    name the job. Hardware truths (accelerator/engine/image/port/runtime) are
+    deliberately NOT resolved here — the inner `boxy serve` re-resolves them
+    ON the compute node, where they are actually true (the design review's
+    'wrong locus' fix). Returns (resolved_model, name, decisions)."""
+    resolved_model, model_decision = _classify_model(model, require_exists)
+    decisions = [
+        model_decision,
+        f"scheduler: {scheduler} (submitting a batch job — detaches once READY)",
+        "accelerator/engine/image/port: resolved on the compute node at job start",
+    ]
+    return resolved_model, name or _slug(model), decisions
+
+
 def resolve(
     model: str,
     engine: str | None = None,
@@ -251,25 +289,8 @@ def resolve(
     require_exists: bool = True,
 ) -> Resolution:
     decisions: list[str] = []
-
-    # Syntax decides: a transport scheme means remote; anything else is a local
-    # path, full stop. Bare names are never guessed into registries — same
-    # command, same meaning, on every machine.
-    if model.startswith(TRANSPORT_SCHEMES):
-        resolved_model = model
-        decisions.append(f"model: {model} (transport URI — pulled via RamaLama)")
-    else:
-        resolved_model = os.path.abspath(model)
-        if not os.path.exists(resolved_model):
-            if require_exists:
-                base = model.rsplit("/", 1)[-1]
-                raise RuntimeError(
-                    f"no such model file: {model!r}. MODEL is a local path or a transport URI — "
-                    f"did you mean ollama://{base} or hf://<org>/{base}?"
-                )
-            decisions.append(f"model: {resolved_model} (local path; not present — dryrun)")
-        else:
-            decisions.append(f"model: {resolved_model} (local file)")
+    resolved_model, model_decision = _classify_model(model, require_exists)
+    decisions.append(model_decision)
 
     location, loc_decisions = auto_location(
         runtime=runtime, scheduler=scheduler, accelerator=accelerator, gpus=gpus, nodes=nodes, here=here

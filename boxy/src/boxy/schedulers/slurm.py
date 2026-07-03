@@ -11,9 +11,13 @@ class SlurmScheduler(Scheduler):
     launcher = "srun"
 
     def launch_prefix(self, location: Location) -> list[str]:
+        import shlex
+
         prefix = [self.launcher, f"--nodes={location.resources.nodes}"]
         if location.resources.gpus_per_node:
             prefix.append(f"--gpus-per-node={location.resources.gpus_per_node}")
+        for arg in location.scheduler_args:  # site flags apply to srun too
+            prefix += shlex.split(arg)
         return prefix
 
     def host_env_fixups(self) -> list[str]:
@@ -25,3 +29,44 @@ class SlurmScheduler(Scheduler):
         if location.resources.gpus_per_node:
             cmd.append(f"--gpus-per-node={location.resources.gpus_per_node}")
         return cmd
+
+    # ---- batch submission ----
+
+    directive_prefix = "#SBATCH"
+
+    def resource_directives(self, location: Location) -> list[str]:
+        lines = [f"#SBATCH --nodes={location.resources.nodes}"]
+        if location.resources.gpus_per_node:
+            lines.append(f"#SBATCH --gpus-per-node={location.resources.gpus_per_node}")
+        return lines
+
+    def site_directive(self, kind: str, value: str) -> str:
+        return {"partition": f"--partition={value}",
+                "account": f"--account={value}",
+                "time": f"--time={value}"}[kind]
+
+    def submit_command(self, script: str) -> list[str]:
+        return ["sbatch", "--parsable", script]
+
+    def parse_job_id(self, submit_stdout: str) -> str:
+        # --parsable prints "jobid" or "jobid;cluster"
+        last = super().parse_job_id(submit_stdout)
+        return last.split(";")[0]
+
+    def cancel_command(self, job_id: str) -> list[str]:
+        return ["scancel", job_id]
+
+    def state_command(self, job_id: str) -> list[str]:
+        return ["squeue", "-h", "-j", job_id, "-o", "%T"]
+
+    def interpret_state(self, stdout: str) -> str:
+        state = stdout.strip().upper()
+        if not state:
+            return "DONE"  # left the queue
+        if state in ("PENDING", "CONFIGURING"):
+            return "PENDING"
+        if state in ("RUNNING", "COMPLETING"):
+            return "RUNNING"
+        if state in ("COMPLETED", "CANCELLED", "FAILED", "TIMEOUT", "PREEMPTED", "NODE_FAIL", "OUT_OF_MEMORY"):
+            return "DONE"
+        return "UNKNOWN"

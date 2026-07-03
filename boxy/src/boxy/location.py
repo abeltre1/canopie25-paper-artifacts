@@ -41,6 +41,9 @@ class Location:
     resources: Resources = field(default_factory=Resources)
     modules: list[str] = field(default_factory=list)
     staging: Staging = field(default_factory=Staging)
+    # Raw site flags for batch submissions, in the scheduler's own spelling
+    # (e.g. ["--partition=short", "--license=tscratch:1", "--account=fy260064"]).
+    scheduler_args: list[str] = field(default_factory=list)
     # Site quirks mapped to engine args, appended last unless the user
     # already set them (e.g. MI300a: gpu_memory_utilization = 0.7).
     tuning: dict[str, object] = field(default_factory=dict)

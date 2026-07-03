@@ -39,7 +39,7 @@ quirks (modules, tuning, offline mode, GPU counts) are pinned once and reused.
 | runtime | first of podman > docker > apptainer that is **actually working** (probed, not just on PATH) |
 | image | per engine+accelerator, from RamaLama's own plugin maps where possible |
 | port | engine default (vLLM 8000, llama.cpp 8090), advanced to the next free port when busy |
-| scheduler | **never auto-wrapped.** Inside an allocation: run direct, foreground. On a login node: refuse (see below). `--scheduler slurm\|flux` submits explicitly. |
+| scheduler | **never invoked implicitly.** Inside an allocation: run direct, foreground. On a login node: refuse (see below). `--scheduler slurm\|flux` **submits a batch job**: boxy writes the sbatch/`flux batch` script (any `--slurm-*`/`--flux-*` flag passes through), the job re-runs boxy on the compute node, the endpoint arrives over the shared FS, and boxy prints READY and detaches. `--foreground` = attached srun/flux-run instead. |
 
 HPC guard rails (from the design review):
 
@@ -100,11 +100,23 @@ boxy serve model.gguf --foreground
 # Pass engine args through after `--` (yours always win):
 boxy serve model.gguf -- --ctx-size 4096
 
-# Inside a Slurm/Flux allocation: runs direct + foreground automatically.
-srun -N1 --gpus-per-node=1 --pty boxy serve /lustre/models/llama-3.1-8b.Q6_K.gguf --foreground
+# THE SEAMLESS HPC PATH — one command from the login node. boxy generates and
+# submits the batch job, re-resolves hardware ON the compute node, waits for
+# readiness over the shared FS, prints the endpoint, and detaches:
+boxy serve hf://org/model-GGUF/file.gguf --scheduler slurm --gpus 1 \
+    --slurm-partition=short --slurm-account=myacct --slurm-license=tscratch:1
+#   ### Submitted slurm job 12345  (boxy-file)
+#   ###   job 12345: PENDING ... RUNNING
+#   ### READY  http://cn042:8090/v1   (model: ..., slurm job 12345)
+# ANY scheduler flag passes through as --slurm-FLAG[=VALUE] / --flux-FLAG[=VALUE]
+# — new site flags never require a boxy change. Ctrl-C detaches; job keeps going.
+boxy serve <model> --scheduler flux --gpus 4 --flux-queue=pbatch     # Flux: identical
 
-# Submit as a job from the login node (explicit, never automatic):
-boxy serve hf://org/model --scheduler slurm --gpus 4 --accelerator cuda
+# Inside a Slurm/Flux allocation: runs direct + foreground automatically.
+srun -N1 --gpus-per-node=1 --pty boxy serve /lustre/models/llama-3.1-8b.Q6_K.gguf
+
+# Attached (old-style srun wrap) instead of batch submission:
+boxy serve hf://org/model --scheduler slurm --gpus 4 --accelerator cuda --foreground
 
 # Pre-stage a model on the login node (network) for compute nodes (no network):
 boxy pull hf://org/repo/file.gguf
