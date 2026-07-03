@@ -14,14 +14,20 @@ tuning applied automatically.
 
 ## Install
 
+Use an **editable** install (`-e`) while boxy is under active development —
+a plain `pip install ./boxy` COPIES the code into site-packages, and after
+that `git pull` changes nothing until you reinstall. (This bit a real user.)
+
 ```bash
 # pip
-pip install ./boxy                 # core (stdlib only)
-pip install './boxy[ramalama]'     # + RamaLama: GPU autodetect, model pulls
+pip install -e './boxy[ramalama,test]'
 
 # uv
 uv venv .boxy && source .boxy/bin/activate
 uv pip install -e './boxy[ramalama,test]'
+
+# verify your installed code matches the checkout after any pull:
+python3 -c "import boxy.engines, inspect; print('current' if 'defer' in inspect.getsource(boxy.engines) else 'STALE - reinstall with -e')"
 ```
 
 **uv note:** uv-managed standalone Pythons don't inherit the system CA store,
@@ -67,7 +73,9 @@ boxy launch --box examples/boxes/vllm.toml --location examples/locations/cloud-g
 
 Boxes may omit `image`: boxy picks a default per engine + accelerator
 (vLLM defaults come from RamaLama's own plugin mapping; llama.cpp uses the
-upstream `ghcr.io/ggml-org/llama.cpp:server` image).
+upstream `ghcr.io/ggml-org/llama.cpp:server` image). Boxes without an
+explicit `entrypoint` defer to the image's own ENTRYPOINT — required for
+images that keep their binary off `$PATH`, like upstream llama.cpp.
 
 Drop `--dryrun` to execute. The Eldorado dry-run reproduces the prototype's
 known-good command:
@@ -126,12 +134,12 @@ serving on your cluster — laptop first, then Slurm+CUDA, then Flux+ROCm — wi
 expected output at each step, a test-provenance table (what has been *executed*
 vs. verified-by-construction), and a troubleshooting table covering every
 failure observed in real-user testing (SSL/CA bundles, macOS podman prompts,
-amd64-on-ARM, Podman workdir strictness).
+amd64-on-ARM, Podman workdir strictness, off-PATH image binaries).
 
 ## Tests
 
 ```bash
-pytest          # 113 tests, 96% line coverage (+ subprocess-covered paths):
+pytest          # 116 tests, 96% line coverage (+ subprocess-covered paths):
                 # golden-argv vs the prototype, one regression test per audit
                 # gap, bench vs a real HTTP server, a degraded-mode suite run
                 # WITHOUT ramalama on the path, a live Docker cycle
