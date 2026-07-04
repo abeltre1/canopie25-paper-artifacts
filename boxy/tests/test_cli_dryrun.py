@@ -106,6 +106,42 @@ def test_ca_bundle_not_propagated_for_bare_site_cert(vllm_box, hops, tmp_path, m
     assert "boxy-ca-merged.pem" not in " ".join(d.command)
 
 
+def test_pip_builds_derived_image(vllm_box, hops):
+    # --pip layers the package onto the base image via a build prepare command; the
+    # run command then references the derived tag.
+    d = deploy.plan_serve(vllm_box, hops, dryrun=True, pip=["open_clip_torch"])
+    assert d.prepare_commands, "expected a build prepare command"
+    prep = " ".join(d.prepare_commands[0])
+    assert "pip install --no-cache-dir" in prep and "open_clip_torch" in prep
+    assert "image exists" in prep and "flock" in prep  # idempotent + race-safe
+    assert "localhost/boxy-ext:" in " ".join(d.command)
+
+
+def test_pip_tag_is_deterministic_and_order_independent(vllm_box, hops):
+    a = deploy.plan_serve(vllm_box, hops, dryrun=True, pip=["a", "b"])
+    b = deploy.plan_serve(vllm_box, hops, dryrun=True, pip=["b", "a"])
+    ta = next(x for x in " ".join(a.command).split() if x.startswith("localhost/boxy-ext:"))
+    tb = next(x for x in " ".join(b.command).split() if x.startswith("localhost/boxy-ext:"))
+    assert ta == tb  # content hash over sorted packages
+
+
+def test_pip_apptainer_warns_and_does_not_build(vllm_box, eldorado):
+    d = deploy.plan_serve(vllm_box, eldorado, dryrun=True, pip=["open_clip_torch"])
+    assert any("needs an OCI runtime" in w for w in d.warnings)
+    assert "localhost/boxy-ext:" not in " ".join(d.command)
+
+
+def test_cli_serve_pip_dryrun_and_forwarding(capsys):
+    rc = main(["serve", "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
+               "--location", str(EXAMPLES / "locations" / "hops.toml"),
+               "--no-distributed", "--pip", "open_clip_torch", "--dryrun"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "### Prepare:" in out
+    assert "pip install --no-cache-dir" in out and "open_clip_torch" in out
+    assert "localhost/boxy-ext:" in out
+
+
 def test_cli_serve_trust_remote_code(capsys):
     # --trust-remote-code adds the vLLM flag; the scheduler path forwards it to the
     # compute-node inner serve (re-applied engine-aware there).

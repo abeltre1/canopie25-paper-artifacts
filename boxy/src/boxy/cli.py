@@ -627,6 +627,8 @@ def _inner_serve_command(args, model: str, name: str, *, port: int | None = None
         inner += ["--visible-gpus", visible_gpus]
     if getattr(args, "trust_remote_code", False):
         inner += ["--trust-remote-code"]  # re-applied engine-aware on the compute node
+    for pkg in getattr(args, "pip", None) or []:
+        inner += ["--pip", pkg]  # derived image is built on the compute node
     for flag, value in (("--engine", args.engine), ("--image", args.image),
                         ("--runtime", args.runtime), ("--accelerator", args.accelerator)):
         if value:
@@ -856,18 +858,25 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
         return 0
 
 
-def _serve_replicas_multinode(args, scheduler_name, profile, replicas, base_name, router_port) -> int:
-    """--replicas K --nodes N>1: K replicas, each a MULTI-NODE distributed instance
-    (a full Ray job spanning N nodes). One distributed job per replica; non-blocking."""
+def _serve_replicas_multinode(args, scheduler_name, profile, replicas, base_name, router_port,
+                              nodes_per_replica) -> int:
+    """--replicas K --nodes-per-replica M: K replicas, each a MULTI-NODE distributed
+    instance (a full Ray job spanning M nodes). One distributed job per replica."""
+    import copy
+
     from boxy import jobs
 
+    # each replica submission is a distributed job of M nodes (distributed auto-on
+    # for nodes>1); --nodes-per-replica is the per-replica span, so set the geometry.
+    per_replica = copy.copy(args)
+    per_replica.nodes = nodes_per_replica
     names = [f"{base_name}-r{i}" for i in range(replicas)]
     print(f"  auto: replicas: {replicas} distributed instances of {base_name} — each "
-          f"{args.nodes} nodes x {args.gpus or '?'} GPU (data-parallel of model-parallel)")
+          f"{nodes_per_replica} nodes x {args.gpus or '?'} GPU (data-parallel of model-parallel)")
     rcs = []
     for nm in names:
         print(f"\n### Replica {nm}")
-        rcs.append(_serve_submission(args, scheduler_name, profile, name_override=nm, follow=False))
+        rcs.append(_serve_submission(per_replica, scheduler_name, profile, name_override=nm, follow=False))
     if args.dryrun:
         print(f"\n### dryrun: {replicas} distributed replica job(s) shown above; nothing submitted")
         return 0
@@ -905,14 +914,17 @@ def _serve_replicas(args, scheduler_name: str, profile, replicas: int, router_po
     if getattr(args, "unique", False):
         base_name = _unique_instance_name(base_name)
 
-    if args.nodes and args.nodes > 1:
-        # each replica is itself a MULTI-NODE distributed (Ray) instance:
-        # data-parallel OF model-parallel. Keep one distributed job per replica.
-        return _serve_replicas_multinode(args, scheduler_name, profile, replicas, base_name, router_port)
+    npr = max(1, getattr(args, "nodes_per_replica", 1) or 1)
+    if npr > 1:
+        # each replica is itself a MULTI-NODE distributed (Ray) instance spanning M
+        # nodes: data-parallel OF model-parallel (explicit opt-in).
+        return _serve_replicas_multinode(args, scheduler_name, profile, replicas,
+                                         base_name, router_port, nodes_per_replica=npr)
 
-    # Bin-pack: each replica uses R GPUs; a node with --gpus GPUs holds rpn = gpus//R
-    # replicas (each pinned to its own GPU set), so K replicas need ceil(K/rpn) node
-    # jobs — NOT one whole node per replica.
+    # Bin-pack across a node pool. A node fits rpn_cap = --gpus // R replicas (each R
+    # GPUs). --nodes N spreads the K replicas across N nodes (ceil(K/N) per node);
+    # without --nodes, pack tight (rpn_cap per node). Each replica is pinned to its
+    # own GPU(s) on its own port. --nodes is the POOL size here, never per-replica.
     r = max(1, getattr(args, "gpus_per_replica", 1) or 1)
     gpus_per_node = args.gpus if args.gpus else r
     if gpus_per_node < r:
@@ -920,12 +932,21 @@ def _serve_replicas(args, scheduler_name: str, profile, replicas: int, router_po
               f"but the per-node budget is {gpus_per_node}. Raise --gpus or lower "
               f"--gpus-per-replica.", file=sys.stderr)
         return 2
-    rpn = max(1, gpus_per_node // r)
-    nodes = math.ceil(replicas / rpn)
+    rpn_cap = max(1, gpus_per_node // r)
+    if args.nodes and args.nodes > 1:
+        per_node = math.ceil(replicas / args.nodes)
+        if per_node > rpn_cap:
+            print(f"boxy: {replicas} replicas across {args.nodes} node(s) needs {per_node} per node, "
+                  f"but a node only fits {rpn_cap} at {r} GPU(s) each (--gpus {gpus_per_node}). "
+                  f"Raise --gpus or --nodes, or lower --replicas.", file=sys.stderr)
+            return 2
+    else:
+        per_node = rpn_cap
+    nodes = math.ceil(replicas / per_node)
     replica_names = [f"{base_name}-r{i}" for i in range(replicas)]
     tp_args = ["--tensor-parallel-size", str(r)] if r > 1 else None
-    print(f"  auto: replicas: {replicas} x {r} GPU (tensor-parallel={r}), packed {rpn}/node "
-          f"-> {nodes} node job(s){' + router' if router_port else ''}")
+    print(f"  auto: replicas: {replicas} x {r} GPU (tensor-parallel={r}), {per_node}/node "
+          f"across {nodes} node job(s){' + router' if router_port else ''}")
 
     base_loc = (profile if profile is not None
                 else Location(name="auto", scheduler=scheduler_name, resources=Resources()))
@@ -941,7 +962,7 @@ def _serve_replicas(args, scheduler_name: str, profile, replicas: int, router_po
     submitted_jobs: list[tuple[str, str]] = []
     failed = 0
     for n in range(nodes):
-        members = list(range(n * rpn, min(replicas, (n + 1) * rpn)))
+        members = list(range(n * per_node, min(replicas, (n + 1) * per_node)))
         m = len(members)
         job_name = base_name if nodes == 1 else f"{base_name}-n{n}"
         loc = dc_replace(base_loc, resources=Resources(
@@ -982,7 +1003,7 @@ def _serve_replicas(args, scheduler_name: str, profile, replicas: int, router_po
         print(f"### Submitted {scheduler_name} job {job_id}  ({job_name})")
 
     if args.dryrun:
-        print(f"\n### dryrun: {nodes} node job(s) for {replicas} replicas (packed {rpn}/node); "
+        print(f"\n### dryrun: {nodes} node job(s) for {replicas} replicas ({per_node}/node); "
               f"nothing submitted")
         if router_port:
             print(f"### dryrun: would then start the login-node router on :{router_port} "
@@ -1056,7 +1077,8 @@ def _serve_distributed(args, box, location) -> int:
     nodes, gpus = location.resources.nodes, location.resources.gpus_per_node
     try:
         dep = deploy.plan_serve(box, location, port=args.port, extra_args=args.args,
-                                dryrun=args.dryrun, distributed=True, head_ip=head_ip)
+                                dryrun=args.dryrun, distributed=True, head_ip=head_ip,
+                                pip=getattr(args, "pip", None))
     except RuntimeError as e:  # e.g. gpus_per_node unknown
         print(f"boxy: {e}", file=sys.stderr)
         return 2
@@ -1197,7 +1219,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         dist_flag = location.resources.distributed
     if _dist.is_distributed(box.engine, location.resources.nodes, dist_flag):
         return _serve_distributed(args, box, location)
-    deployment = deploy.plan_serve(box, location, port=args.port, extra_args=args.args, dryrun=args.dryrun)
+    deployment = deploy.plan_serve(box, location, port=args.port, extra_args=args.args,
+                                   dryrun=args.dryrun, pip=getattr(args, "pip", None))
     if getattr(args, "save_profile", None):
         from dataclasses import replace as dc_replace
 
@@ -1827,7 +1850,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--image", default=None, help="container image (default: per engine+accelerator)")
     p.add_argument("--port", type=int, default=None, help="serving port (default: engine default, next free)")
     p.add_argument("--gpus", type=int, default=None, help="GPUs per node for the --scheduler job request")
-    p.add_argument("--nodes", type=int, default=None, help="node count for the --scheduler job request")
+    p.add_argument("--nodes", type=int, default=None,
+                   help="node count for the job. For one instance: nodes to distribute across "
+                        "(Ray). With --replicas: the POOL size to spread the replicas across "
+                        "(NOT per-replica; see --nodes-per-replica for that)")
     p.add_argument("--name", default=None, help="container name (default: derived from the model)")
     p.add_argument("--models-dir", default=None,
                    help="where to download an s3:// model (default: ./models, or "
@@ -1851,10 +1877,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="GPUs each --replicas instance uses (default 1). Replicas bin-pack onto a "
                         "node: (--gpus // R) replicas per node, each pinned to its own GPU(s). R>1 "
                         "gives each replica tensor-parallel=R")
+    p.add_argument("--nodes-per-replica", type=int, default=1, metavar="M", dest="nodes_per_replica",
+                   help="make each --replicas instance a MULTI-NODE distributed (Ray) instance "
+                        "spanning M nodes (default 1 = single-node replicas). With M>1, --nodes is "
+                        "ignored; total nodes = replicas x M")
     p.add_argument("--visible-gpus", default=None, dest="visible_gpus", help=argparse.SUPPRESS)
     p.add_argument("--trust-remote-code", action="store_true", dest="trust_remote_code",
                    help="let vLLM run the model repo's custom loader code (needed by some new/"
                         "custom architectures, e.g. Nemotron-Parse). Only for models you trust")
+    p.add_argument("--pip", action="append", default=None, metavar="PKG",
+                   help="serve a thin image with extra pip package(s) baked on: FROM the base "
+                        "image + pip install PKG. Repeatable. Built on the serving node, cached by "
+                        "content hash. OCI runtimes (podman/docker) only")
     p.add_argument("--router", nargs="?", type=int, const=8000, default=None,
                    metavar="PORT",
                    help="with --replicas K, after the replicas are READY start the built-in login-node "

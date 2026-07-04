@@ -15,7 +15,7 @@ def test_replicas_bin_pack_onto_one_node(capsys):
                "--gpus", "4", "--replicas", "4", "--dryrun"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "packed 4/node -> 1 node job(s)" in out
+    assert "4/node across 1 node job(s)" in out
     assert out.count("### Node job") == 1
     assert out.count("#SBATCH --nodes=1") == 1
     assert "#SBATCH --gpus-per-node=4" in out
@@ -34,7 +34,7 @@ def test_replicas_gpus_per_replica_sets_tensor_parallel(capsys):
                "--replicas", "2", "--gpus-per-replica", "2", "--dryrun"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "packed 2/node -> 1 node job(s)" in out
+    assert "2/node across 1 node job(s)" in out
     assert "--visible-gpus 0,1" in out and "--visible-gpus 2,3" in out
     assert out.count("--tensor-parallel-size 2") == 2
 
@@ -45,7 +45,7 @@ def test_replicas_overflow_to_multiple_node_jobs(capsys):
                "--gpus", "4", "--replicas", "6", "--dryrun"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "packed 4/node -> 2 node job(s)" in out
+    assert "4/node across 2 node job(s)" in out
     assert "--job-name=boxy-meta-llama-3.1-8b-n0" in out
     assert "--job-name=boxy-meta-llama-3.1-8b-n1" in out
     assert "#SBATCH --gpus-per-node=4" in out and "#SBATCH --gpus-per-node=2" in out
@@ -60,11 +60,31 @@ def test_replicas_guard_gpus_per_replica_exceeds_budget(capsys):
     assert "gpus-per-replica" in capsys.readouterr().err
 
 
-def test_replicas_compose_with_distributed(capsys):
-    # --nodes>1: each replica is itself a 2-node distributed instance (one Ray task
-    # per node), so it stays one distributed job per replica.
+def test_replicas_spread_across_node_pool(capsys):
+    # --nodes N with --replicas is the POOL size: 6 replicas across 3 nodes = 2/node.
     rc = main(["serve", "Meta-Llama-3.1-8B", "--scheduler", "slurm",
-               "--nodes", "2", "--gpus", "4", "--replicas", "2", "--dryrun"])
+               "--gpus", "4", "--nodes", "3", "--replicas", "6", "--dryrun"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "2/node across 3 node job(s)" in out
+    assert out.count("### Node job") == 3
+    assert "#SBATCH --gpus-per-node=2" in out  # 2 replicas x 1 GPU per node
+    for i in range(6):
+        assert f"--name boxy-meta-llama-3.1-8b-r{i}" in out
+
+
+def test_replicas_nodes_pool_too_small_is_guarded(capsys):
+    rc = main(["serve", "Meta-Llama-3.1-8B", "--scheduler", "slurm",
+               "--gpus", "4", "--nodes", "2", "--replicas", "12", "--dryrun"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "needs 6 per node" in err and "only fits 4" in err
+
+
+def test_replicas_nodes_per_replica_is_distributed(capsys):
+    # --nodes-per-replica M>1: each replica is an M-node distributed (Ray) instance.
+    rc = main(["serve", "Meta-Llama-3.1-8B", "--scheduler", "slurm",
+               "--gpus", "4", "--replicas", "2", "--nodes-per-replica", "2", "--dryrun"])
     assert rc == 0
     out = capsys.readouterr().out
     assert out.count("### Replica ") == 2
@@ -120,7 +140,7 @@ def test_replicas_flux_bin_packs(capsys):
                "--gpus", "4", "--replicas", "2", "--dryrun"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "packed 4/node -> 1 node job(s)" in out
+    assert "4/node across 1 node job(s)" in out
     assert "# flux: --job-name=boxy-meta-llama-3.1-8b" in out  # ONE flux job
     assert "flux batch" in out
     for i in range(2):

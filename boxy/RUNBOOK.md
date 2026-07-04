@@ -249,17 +249,32 @@ boxy serve <model> --scheduler slurm --nodes 2 --gpus 4     # for real; READY ->
 # So 4 replicas on a 4-GPU node = 1 node job, NOT 4 nodes. tensor-parallel per
 # replica = --gpus-per-replica (1 by default; raise it for a bigger model).
 boxy serve <model> --scheduler slurm --gpus 4 --replicas 4 --dryrun
-# EXPECT: "packed 4/node -> 1 node job(s)"; one #SBATCH --gpus-per-node=4 job that
+# EXPECT: "4/node across 1 node job(s)"; one #SBATCH --gpus-per-node=4 job that
 #   launches 4 GPU-pinned servers (--visible-gpus 0..3, --port 8000..8003) + wait.
 boxy serve <model> --scheduler slurm --gpus 4 --replicas 4      # for real (1 node, 4 GPUs)
 boxy list                                                       # the job + its 4 replica endpoints
 boxy stop <base>                                                # cancels the job -> all 4 replicas
-# Knobs: --gpus-per-replica 2 -> 2 replicas/4-GPU node, each tensor-parallel=2.
-#        K > (gpus//R) overflows to ceil(K/rpn) node jobs (<base>-n0, -n1, …).
-#        --replicas K --nodes N>1 -> each replica is itself an N-node distributed
-#        instance (data-parallel of model-parallel).
+# Knobs:
+#   --gpus-per-replica 2  -> 2 replicas/4-GPU node, each tensor-parallel=2.
+#   --nodes N             -> the POOL SIZE: spread K replicas across N nodes
+#                           (12 replicas --nodes 4 = 3/node across 4 node jobs).
+#                           NOT per-replica. Errors if K needs > gpus//R per node.
+#   (no --nodes)          -> tight-pack gpus//R per node -> ceil(K/rpn) node jobs.
+#   --nodes-per-replica M -> each replica is itself an M-node distributed (Ray)
+#                           instance (data-parallel of model-parallel; total = K x M).
 # Note: GPU pinning uses absolute indices, correct for the exclusive full-node
 # allocations HPC partitions grant (--gpus = the node's GPU count).
+
+# --- B''. Models that need an extra pip package (--pip) ------------------------
+# Some models import a package the stock vLLM image lacks (e.g. a custom VLM vision
+# tower needs open_clip_torch). --pip bakes it onto the base image on the SERVING
+# node (cached by content hash), no hand-written Dockerfile. OCI (podman/docker):
+boxy serve hf://nvidia/NVIDIA-Nemotron-Parse-v1.2 --scheduler slurm --gpus 4 \
+    --trust-remote-code --pip open_clip_torch --dryrun
+# EXPECT: a "### Prepare:" line building localhost/boxy-ext:<hash> FROM the base +
+#   pip install, and the run command uses that tag. Repeatable (--pip A --pip B).
+# The build runs where the container runs (compute node for batch) and needs pip
+# egress there. Prefer --image <tag> if you already built one (apptainer: --image).
 
 # --- B'. ONE URL in front of the replicas (built-in router) --------------------
 # Present a single OpenAI endpoint load-balanced (least-outstanding) across the K
