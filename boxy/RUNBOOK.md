@@ -265,16 +265,18 @@ boxy stop <base>                                                # cancels the jo
 # Note: GPU pinning uses absolute indices, correct for the exclusive full-node
 # allocations HPC partitions grant (--gpus = the node's GPU count).
 
-# --- B''. Models that need an extra pip package (--pip) ------------------------
+# --- B''. Models that need an extra pip package (build your own --image) -------
 # Some models import a package the stock vLLM image lacks (e.g. a custom VLM vision
-# tower needs open_clip_torch). --pip bakes it onto the base image on the SERVING
-# node (cached by content hash), no hand-written Dockerfile. OCI (podman/docker):
+# tower needs open_clip_torch — note the PyPI name differs from the import name).
+# Build a thin derived image once, then serve it with --image:
+printf 'FROM docker.io/vllm/vllm-openai:v0.24.0\nRUN pip install open_clip_torch\n' > Dockerfile.boxy
+podman build -t localhost/vllm-extra:latest -f Dockerfile.boxy .
 boxy serve hf://nvidia/NVIDIA-Nemotron-Parse-v1.2 --scheduler slurm --gpus 4 \
-    --trust-remote-code --pip open_clip_torch --dryrun
-# EXPECT: a "### Prepare:" line building localhost/boxy-ext:<hash> FROM the base +
-#   pip install, and the run command uses that tag. Repeatable (--pip A --pip B).
-# The build runs where the container runs (compute node for batch) and needs pip
-# egress there. Prefer --image <tag> if you already built one (apptainer: --image).
+    --trust-remote-code --image localhost/vllm-extra:latest
+# NOTE: the image must be visible where the container RUNS. If the compute node
+# doesn't share the login node's podman store, build on the compute node (salloc,
+# then podman build there) or push the tag to a registry your site provides.
+# (boxy's crash diagnosis prints this recipe when it sees the ImportError.)
 
 # --- B'. ONE URL in front of the replicas (built-in router) --------------------
 # Present a single OpenAI endpoint load-balanced (least-outstanding) across the K

@@ -6,9 +6,7 @@ Pipeline:  resolve accel/runtime -> env merge -> model & mounts ->
 
 from __future__ import annotations
 
-import hashlib
 import os
-import shlex
 import subprocess
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
@@ -139,22 +137,21 @@ def plan_serve(
     dryrun: bool = False,
     distributed: bool = False,
     head_ip: str = "",
-    pip: list[str] | None = None,
 ) -> Deployment:
     accelerator = location.resolve_accelerator()
     box = _apply_defaults(box, accelerator)
     model_path, extra_mounts = resolve_model(box, location, dryrun)
     if distributed:
         return _plan_distributed(box, location, model_path, extra_mounts, accelerator,
-                                 port, extra_args, head_ip, dryrun, pip)
+                                 port, extra_args, head_ip, dryrun)
     inner = engines.build_serve_cmd(box, location, model_path, port=port, extra_args=extra_args)
-    deployment = _plan(box, location, inner, extra_mounts, dryrun, accelerator, pip=pip)
+    deployment = _plan(box, location, inner, extra_mounts, dryrun, accelerator)
     deployment.port = engines.serving_port(inner, box)
     return deployment
 
 
 def _plan_distributed(box, location, model_path, extra_mounts, accelerator,
-                      port, extra_args, head_ip, dryrun, pip=None) -> Deployment:
+                      port, extra_args, head_ip, dryrun) -> Deployment:
     """Head + worker plan for multi-node Ray serving. The HEAD command (ray head
     + vllm serve) runs directly on this node — NOT wrapped in srun (that would
     launch N colliding copies); the worker command is placed on the other nodes
@@ -167,13 +164,13 @@ def _plan_distributed(box, location, model_path, extra_mounts, accelerator,
     vllm_argv = engines.build_serve_cmd(box, location, model_path, port=port,
                                         extra_args=extra_args, parallelism=(tp, pp))
     head_inner = distributed.ray_head_inner(vllm_argv, gpus, world)
-    head = _plan(box, location, head_inner, extra_mounts, dryrun, accelerator, wrap=False, pip=pip)
+    head = _plan(box, location, head_inner, extra_mounts, dryrun, accelerator, wrap=False)
 
     worker_box = replace(box, name=f"{box.name}-worker")
     worker_inner = distributed.ray_worker_inner(gpus)
     worker_env = {distributed.HEAD_ENV: head_ip} if head_ip else {}
     worker = _plan(worker_box, location, worker_inner, extra_mounts, dryrun, accelerator,
-                   wrap=False, extra_env=worker_env, pip=pip)
+                   wrap=False, extra_env=worker_env)
 
     head.distributed = True
     head.parallelism = (tp, pp)
@@ -188,30 +185,6 @@ def plan_run(box: Box, location: Location, user_args: list[str], dryrun: bool = 
     box = _apply_defaults(box, accelerator)
     inner = engines.build_raw_cmd(box, user_args, location)
     return _plan(box, location, inner, [], dryrun, accelerator)
-
-
-def _derived_image_build(base: str, pkgs: list[str], runtime: str) -> tuple[str, list[str]]:
-    """Build a thin image `FROM <base> RUN pip install <pkgs>` on the serving node so
-    a model needing an extra package (custom VLM towers etc.) just works, without a
-    hand-written Dockerfile. Returns (derived_tag, prepare_command).
-
-    The tag is a content hash of base+packages -> a deterministic cache key, so a
-    repeat serve (and every co-located --replicas server on the node) reuses the
-    image instead of rebuilding. The prepare command is idempotent AND race-safe:
-    it skips when the image already exists, and serializes the first build across
-    concurrent replicas with `flock` (double-checking inside the lock)."""
-    digest = hashlib.sha1(f"{base}\n{' '.join(sorted(pkgs))}".encode()).hexdigest()[:12]
-    tag = f"localhost/boxy-ext:{digest}"
-    lock = f"/tmp/boxy-build-{digest}.lock"
-    pkg_str = " ".join(pkgs)
-    dockerfile = (f"printf 'FROM %s\\nRUN pip install --no-cache-dir %s\\n' "
-                  f"{shlex.quote(base)} {shlex.quote(pkg_str)}")
-    inner = (f"{runtime} image exists {shlex.quote(tag)} || "
-             f'{{ d=$(mktemp -d); {dockerfile} > "$d/Dockerfile"; '
-             f'{runtime} build -t {shlex.quote(tag)} "$d"; }}')
-    script = (f"{runtime} image exists {shlex.quote(tag)} || "
-              f"flock {shlex.quote(lock)} sh -c {shlex.quote(inner)}")
-    return tag, ["sh", "-lc", script]
 
 
 CA_CONTAINER_PATH = "/etc/ssl/certs/boxy-ca-merged.pem"
@@ -247,7 +220,6 @@ def _plan(
     accelerator: str,
     wrap: bool = True,
     extra_env: dict[str, str] | None = None,
-    pip: list[str] | None = None,
 ) -> Deployment:
     backend = get_backend(location.resolve_runtime())
     scheduler = get_scheduler(location.scheduler)
@@ -284,28 +256,12 @@ def _plan(
                 "with 'statfs: no such file or directory' unless it exists on the target node "
                 "(create it, or point [location.staging] models_dir at your model directory)"
             )
-    # --pip: serve a thin image with the extra package(s) baked onto the base. OCI
-    # only (podman/docker build); the build runs on THIS (serving) node via the
-    # prepare command. box.image must be swapped BEFORE build_command so the run
-    # references the derived tag.
-    pip_prepare: list[list[str]] = []
-    if pip:
-        if backend.image_format == "oci" and box.image:
-            tag, prep = _derived_image_build(box.image, pip, backend.name)
-            box = replace(box, image=tag)
-            pip_prepare = [prep]
-        else:
-            warnings.append(
-                f"--pip {' '.join(pip)} needs an OCI runtime (podman/docker) to build a derived "
-                f"image; the {backend.name} runtime uses {backend.image_format} images — bake the "
-                "package into your image and pass it with --image instead."
-            )
     cmd = backend.build_command(box, location, inner_cmd, env, mounts, accelerator)
     cmd = scheduler.with_modules(cmd, location)
     if wrap:  # distributed head/worker run directly / via their own srun — no launch-prefix wrap
         cmd = scheduler.wrap(cmd, location)
-    prepare = pip_prepare + (backend.prepare(box, location, dryrun, accelerator=accelerator)
-                             if backend.image_format == "sif" else [])
+    prepare = (backend.prepare(box, location, dryrun, accelerator=accelerator)
+               if backend.image_format == "sif" else [])
     return Deployment(
         box=box,
         location=location,

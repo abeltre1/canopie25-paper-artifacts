@@ -627,8 +627,6 @@ def _inner_serve_command(args, model: str, name: str, *, port: int | None = None
         inner += ["--visible-gpus", visible_gpus]
     if getattr(args, "trust_remote_code", False):
         inner += ["--trust-remote-code"]  # re-applied engine-aware on the compute node
-    for pkg in getattr(args, "pip", None) or []:
-        inner += ["--pip", pkg]  # derived image is built on the compute node
     for flag, value in (("--engine", args.engine), ("--image", args.image),
                         ("--runtime", args.runtime), ("--accelerator", args.accelerator)):
         if value:
@@ -1077,8 +1075,7 @@ def _serve_distributed(args, box, location) -> int:
     nodes, gpus = location.resources.nodes, location.resources.gpus_per_node
     try:
         dep = deploy.plan_serve(box, location, port=args.port, extra_args=args.args,
-                                dryrun=args.dryrun, distributed=True, head_ip=head_ip,
-                                pip=getattr(args, "pip", None))
+                                dryrun=args.dryrun, distributed=True, head_ip=head_ip)
     except RuntimeError as e:  # e.g. gpus_per_node unknown
         print(f"boxy: {e}", file=sys.stderr)
         return 2
@@ -1219,8 +1216,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         dist_flag = location.resources.distributed
     if _dist.is_distributed(box.engine, location.resources.nodes, dist_flag):
         return _serve_distributed(args, box, location)
-    deployment = deploy.plan_serve(box, location, port=args.port, extra_args=args.args,
-                                   dryrun=args.dryrun, pip=getattr(args, "pip", None))
+    deployment = deploy.plan_serve(box, location, port=args.port, extra_args=args.args, dryrun=args.dryrun)
     if getattr(args, "save_profile", None):
         from dataclasses import replace as dc_replace
 
@@ -1885,10 +1881,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--trust-remote-code", action="store_true", dest="trust_remote_code",
                    help="let vLLM run the model repo's custom loader code (needed by some new/"
                         "custom architectures, e.g. Nemotron-Parse). Only for models you trust")
-    p.add_argument("--pip", action="append", default=None, metavar="PKG",
-                   help="serve a thin image with extra pip package(s) baked on: FROM the base "
-                        "image + pip install PKG. Repeatable. Built on the serving node, cached by "
-                        "content hash. OCI runtimes (podman/docker) only")
     p.add_argument("--router", nargs="?", type=int, const=8000, default=None,
                    metavar="PORT",
                    help="with --replicas K, after the replicas are READY start the built-in login-node "

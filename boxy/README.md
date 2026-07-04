@@ -135,8 +135,9 @@ boxy serve <model> --scheduler slurm --nodes 2 --gpus 4   # TP=GPUs/node, PP=nod
 #    (12 replicas --nodes 4 = 3/node); --gpus-per-replica R gives each TP=R;
 #    --nodes-per-replica M makes each replica an M-node distributed instance:
 boxy serve <model> --scheduler slurm --gpus 4 --replicas 4
-# Needs a package the image lacks? bake it on (built on the serving node, cached):
-boxy serve <model> --pip open_clip_torch    # or pass a prebuilt --image <tag>
+# Needs a package the image lacks? build a thin image yourself and pass it:
+#   podman build -t localhost/vllm-extra:latest ...   (FROM vllm image + pip install)
+boxy serve <model> --image localhost/vllm-extra:latest
 #    ...with ONE load-balanced URL in front (built-in login-node router):
 boxy serve <model> --scheduler slurm --gpus 4 --replicas 4 --router   # http://<login>:8000/v1
 boxy router <base> --emit nginx                                       # or hand off to a real proxy
