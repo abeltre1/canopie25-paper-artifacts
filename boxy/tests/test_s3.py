@@ -82,6 +82,7 @@ def _install_fake_boto3(monkeypatch, objects, capture=None):
 
 
 def test_stage_downloads_prefix_with_boto3(monkeypatch, tmp_path):
+    pytest.importorskip("boto3")  # the boto3 backend path needs the real lib (CI installs [test] only)
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "k")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "s")
     monkeypatch.setenv("S3_ENDPOINT_URL", "https://s3.local:9000")

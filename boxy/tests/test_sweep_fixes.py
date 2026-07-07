@@ -367,14 +367,19 @@ def test_trust_bundle_directory_and_unwritable_store(monkeypatch, tmp_path, caps
 
 
 def test_bad_loglevel_env_does_not_crash(monkeypatch):
+    import os
     import subprocess
     import sys
+    from pathlib import Path
 
+    repo = Path(__file__).parent.parent  # portable: derive paths, never hardcode
+    pythonpath = os.pathsep.join(
+        [str(repo / "src")] + [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p])
     result = subprocess.run(
         [sys.executable, "-c", "import boxy.cli; print('ok')"],
-        env={"BOXY_RAMALAMA_LOGLEVEL": "debug", "PYTHONPATH": "src:/home/user/ramalama", "PATH": "/usr/bin:/bin"},
-        capture_output=True, text=True,
-        cwd="/tmp/claude-0/-home-user/b9fd7f3c-6c0b-57ce-9dff-6366c0a08ece/scratchpad/work/boxy",
+        env={"BOXY_RAMALAMA_LOGLEVEL": "debug", "PYTHONPATH": pythonpath,
+             "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        capture_output=True, text=True, cwd=str(repo),
     )
     assert result.returncode == 0 and "ok" in result.stdout
 
