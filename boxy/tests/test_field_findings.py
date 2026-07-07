@@ -193,7 +193,7 @@ def test_finding12b_log_tap_captures_ramalama_errors(monkeypatch):
 def test_finding12c_info_reports_tls_state(monkeypatch, capsys):
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)
     assert main(["info"]) == 0
-    assert "tls: system default CA store" in capsys.readouterr().out
+    assert "system default CA store" in capsys.readouterr().out
     monkeypatch.setenv("SSL_CERT_FILE", "/nonexistent/ca.crt")
     assert main(["info"]) == 0
     assert "MISSING FILE" in capsys.readouterr().out

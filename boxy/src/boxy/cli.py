@@ -61,32 +61,51 @@ def _boto3_present() -> bool:
         return False
 
 
+def _info_section(title: str, rows: list[tuple[str, str]]) -> None:
+    """Readable info block: a section header + label/value rows in an aligned
+    column (labels keep their trailing colon so greps like 'accelerator:' hold)."""
+    print(f"\n{title}")
+    width = max(len(label) for label, _ in rows) + 1
+    for label, value in rows:
+        print(f"  {label + ':':<{width}}  {value}")
+
+
 def cmd_info(args: argparse.Namespace) -> int:
     print(f"boxy {version_string()}")
-    print(f"ramalama library: {'available' if ramalama_shim.ramalama_available() else 'not installed'}")
-    print(f"accelerator: {ramalama_shim.detect_accel()}")
+
     runtimes = [name for name in BACKENDS if shutil.which(name)]
-    print(f"container runtimes: {', '.join(runtimes) or 'none found'}")
     launchers = [name for name, probe in (("slurm", "srun"), ("flux", "flux")) if shutil.which(probe)]
-    print(f"schedulers: {', '.join(launchers) or 'none found'}")
+    _info_section("host", [
+        ("accelerator", ramalama_shim.detect_accel()),
+        ("container runtimes", ", ".join(runtimes) or "none found"),
+        ("schedulers", ", ".join(launchers) or "none found"),
+        ("ramalama library", "available" if ramalama_shim.ramalama_available() else "not installed"),
+    ])
+
     ssl_cert = os.environ.get("SSL_CERT_FILE")
     if ssl_cert:
         status = "" if os.path.exists(ssl_cert) else "  (MISSING FILE!)"
-        print(f"tls: SSL_CERT_FILE={ssl_cert}{status}")
+        tls = f"SSL_CERT_FILE={ssl_cert}{status}"
     else:
         os_bundle = ramalama_shim.discover_os_ca_bundle()
         if os_bundle:
-            print(f"tls: system default CA store; boxy auto-merges the OS trust store "
-                  f"({os_bundle}) with certifi on pull (disable: BOXY_NO_CA_MERGE=1)")
+            tls = (f"system default CA store; boxy auto-merges the OS trust store "
+                   f"({os_bundle}) with certifi on pull (disable: BOXY_NO_CA_MERGE=1)")
         else:
-            print("tls: system default CA store; no OS CA bundle found — if pulls fail with "
-                  "CERTIFICATE_VERIFY_FAILED, set SSL_CERT_FILE to your site CA and persist it")
+            tls = ("system default CA store; no OS CA bundle found — if pulls fail with "
+                   "CERTIFICATE_VERIFY_FAILED, set SSL_CERT_FILE to your site CA and persist it")
     from boxy import policy
 
     allowed = policy.allowed_transports()
     blocked = sorted({policy._canonical(s) for s in policy.REGISTRIES} - set(allowed))
-    print(f"registries: allowed [{', '.join(allowed)}]  blocked [{', '.join(blocked)}]"
-          + ("" if os.environ.get("BOXY_ALLOW_TRANSPORTS") else "  (default policy)"))
+    registries = (f"allowed [{', '.join(allowed)}]   blocked [{', '.join(blocked)}]"
+                  + ("" if os.environ.get("BOXY_ALLOW_TRANSPORTS") else "   (default policy)"))
+    remote = os.environ.get("BOXY_SSH_HOST")
+    net_rows = [("tls", tls), ("registries", registries)]
+    if remote:
+        net_rows.append(("remote", f"{remote} (BOXY_SSH_HOST — commands run there over SSH)"))
+    _info_section("network & trust", net_rows)
+
     # auth STATUS only — values are never printed. When BOTH sources exist,
     # say which one WINS: RamaLama's precedence is HF_TOKEN env outright; the
     # cache file is ignored while HF_TOKEN is set (verified at its source).
@@ -101,7 +120,6 @@ def cmd_info(args: argparse.Namespace) -> int:
         note = source
     else:
         note = "not configured (export HF_TOKEN=... for gated repos)"
-    print(f"auth: HuggingFace token: {note}")
     if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
         s3 = "present (AWS_ACCESS_KEY_ID env)"
     elif os.environ.get("AWS_PROFILE"):
@@ -110,7 +128,7 @@ def cmd_info(args: argparse.Namespace) -> int:
         s3 = "present (~/.aws/credentials)"
     else:
         s3 = "not configured (needed to stage s3:// models)"
-    print(f"auth: S3 credentials: {s3}")
+    auth_rows = [("HuggingFace token", note), ("S3 credentials", s3)]
     endpoint = os.environ.get("S3_ENDPOINT_URL")
     if endpoint or os.environ.get("S3_BUCKET_NAME"):
         target = endpoint or "AWS S3"
@@ -119,8 +137,11 @@ def cmd_info(args: argparse.Namespace) -> int:
         loc = f"  bucket {bucket}/{path}" if bucket else ""
         backend = ("boto3" if _boto3_present() else "aws CLI" if shutil.which("aws") else
                    "NONE — pip install boto3 or install the aws CLI")
-        print(f"auth: S3 staging: endpoint {target}{loc}  (via {backend})")
+        auth_rows.append(("S3 staging", f"endpoint {target}{loc}  (via {backend})"))
+    _info_section("auth", auth_rows)
+
     if getattr(args, "net", False):
+        print()
         return _probe_registries()
     return 0
 

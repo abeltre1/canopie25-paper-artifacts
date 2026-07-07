@@ -68,7 +68,7 @@ def to_sky_task(
         f"#   sky launch {'-c ' + box.name + ' ' if not serve else ''}<this-file>",
     ]
     if serve:
-        lines.append(f"#   sky serve up <this-file>  # managed serving via SkyServe")
+        lines.append("#   sky serve up <this-file>  # managed serving via SkyServe")
     lines += [
         f"name: {_yaml_str(box.name)}",
         "",

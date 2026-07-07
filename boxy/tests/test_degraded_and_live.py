@@ -64,7 +64,7 @@ class TestDegradedWithoutRamalama:
     def test_info_reports_ramalama_not_installed(self):
         p = _run_isolated("from boxy.cli import main; import sys; sys.exit(main(['info']))")
         assert p.returncode == 0
-        assert "ramalama library: not installed" in p.stdout
+        assert "ramalama library:" in p.stdout and "not installed" in p.stdout
 
     def test_default_image_fallback_map_without_ramalama(self):
         p = _run_isolated("from boxy import ramalama_shim as s; print(s.default_image('vllm', 'rocm'))")

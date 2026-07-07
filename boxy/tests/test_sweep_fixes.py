@@ -689,9 +689,9 @@ def test_info_shows_policy_and_auth_status_never_values(monkeypatch, capsys):
     rc = main(["info"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "registries: allowed [hf, ollama]" in out and "ms" in out.split("blocked")[1]
-    assert "HuggingFace token: present" in out
-    assert "S3 credentials: present" in out
+    assert "allowed [hf, ollama]" in out and "ms" in out.split("blocked")[1]
+    assert "HuggingFace token:" in out and "present, using" in out
+    assert "S3 credentials:" in out and "present (AWS_ACCESS_KEY_ID env)" in out
     assert "SUPERSECRETVALUE" not in out and "AKIASECRETID" not in out and "S3CR3T" not in out
 
 
