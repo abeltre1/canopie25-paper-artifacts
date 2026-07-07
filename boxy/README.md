@@ -132,13 +132,14 @@ boxy serve model.gguf -- --ctx-size 4096
 # submits the batch job, re-resolves hardware ON the compute node, waits for
 # readiness over the shared FS, prints the endpoint, and detaches:
 boxy serve hf://org/model-GGUF/file.gguf --scheduler slurm --gpus 1 \
-    --slurm-partition=short --slurm-account=myacct --slurm-license=tscratch:1
+    --partition short --account myacct --sched-license=tscratch:1
 #   ### Submitted slurm job 12345  (boxy-file)
 #   ###   job 12345: PENDING ... RUNNING
 #   ### READY  http://cn042:8090/v1   (model: ..., slurm job 12345)
-# ANY scheduler flag passes through as --slurm-FLAG[=VALUE] / --flux-FLAG[=VALUE]
+# --partition/--account/--time are portable (translated per scheduler); ANY other
+# flag passes through as --sched-FLAG[=VALUE] — the active --scheduler applies it
 # — new site flags never require a boxy change. Ctrl-C detaches; job keeps going.
-boxy serve <model> --scheduler flux --gpus 4 --flux-queue=pbatch     # Flux: identical
+boxy serve <model> --scheduler flux --gpus 4 --partition pbatch      # Flux: identical
 
 # Launch MANY of the same model at once — each gets its own job, log, endpoint:
 boxy serve <model> --scheduler flux --gpus 4 --unique   # repeat freely, no name clash

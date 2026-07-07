@@ -211,10 +211,11 @@ idempotent rerun → `boxy stop` = scancel).
 # pre-stage once (login node has network; store is on shared $HOME):
 boxy pull hf://TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 
-# one command; ANY sbatch flag passes through as --slurm-FLAG[=VALUE]:
+# one command; --partition/--account/--time are portable, and ANY extra flag
+# passes through as --sched-FLAG[=VALUE] (the active --scheduler applies it):
 boxy serve hf://TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
   --scheduler slurm --gpus 1 \
-  --slurm-partition=short --slurm-account=fy260064 --slurm-license=tscratch:1
+  --partition short --account fy260064 --sched-license=tscratch:1
 # EXPECT:
 #   ### Submitted slurm job N  (boxy-tinyllama-...)
 #   ###   job N: PENDING ... RUNNING
@@ -224,8 +225,8 @@ boxy serve hf://TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.
 boxy list                          # job state + endpoint, plus containers
 boxy stop boxy-tinyllama-...       # scancel; the job step owns the server
 
-# Flux is identical; flags pass through as --flux-FLAG[=VALUE]:
-boxy serve <model> --scheduler flux --gpus 4 --flux-queue=pbatch --flux-bank=guests
+# Flux: the SAME flags — boxy renders them in flux's spelling (queue/bank/-t):
+boxy serve <model> --scheduler flux --gpus 4 --partition pbatch --account guests
 
 # Portable spellings if you prefer them: --partition/--account/--time translate
 # per scheduler (slurm --partition / flux --queue, etc). Site defaults belong

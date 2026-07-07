@@ -179,6 +179,23 @@ def test_dynamic_scheduler_flags_flow_into_the_script(gguf, jobs_dir, capsys):
     assert "ignoring --flux-queue" in captured.err        # other scheduler's flag: loud, not silent
 
 
+def test_sched_neutral_flags_follow_the_active_scheduler(gguf, jobs_dir, capsys):
+    """--sched-FLAG[=VALUE] is scheduler-NEUTRAL: the SAME command renders under
+    whichever --scheduler is active (the scheduler flag dictates what to do)."""
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--dryrun",
+               "--sched-license=tscratch:1", "--sched-exclusive"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "#SBATCH --license=tscratch:1" in out and "#SBATCH --exclusive" in out
+
+    rc = main(["serve", str(gguf), "--scheduler", "flux", "--dryrun",
+               "--sched-license=tscratch:1", "--sched-exclusive"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "# flux: --license=tscratch:1" in captured.out and "# flux: --exclusive" in captured.out
+    assert "ignoring" not in captured.err                  # neutral flags are never dropped
+
+
 def test_dynamic_flags_apply_to_attached_srun_too(gguf, capsys):
     rc = main(["serve", str(gguf), "--runtime", "podman", "--scheduler", "slurm",
                "--accelerator", "cuda", "--gpus", "1", "--foreground", "--dryrun",
@@ -192,7 +209,7 @@ def test_typos_still_rejected(gguf, capsys):
     assert main(["serve", str(gguf), "--dryrun", "--not-a-flag"]) == 2
     err = capsys.readouterr().err
     assert "unrecognized arguments: --not-a-flag" in err
-    assert "--slurm-FLAG" in err  # the pass-through convention is advertised
+    assert "--sched-FLAG" in err  # the neutral pass-through convention is advertised
 
 
 def test_endpoint_file_written_by_serving_side(gguf, jobs_dir, monkeypatch, tmp_path, capsys):

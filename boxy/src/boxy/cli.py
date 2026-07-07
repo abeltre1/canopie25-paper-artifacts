@@ -714,8 +714,8 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
             site_args.append(scheduler.site_directive(kind, value))
     site_args += list(args.scheduler_args or [])
     dynamic = getattr(args, "dynamic_flags", [])
-    site_args += [scheduler.dynamic_directive(k, v) for s, k, v in dynamic if s == scheduler_name]
-    ignored = [f"--{s}-{k}" for s, k, v in dynamic if s != scheduler_name]
+    site_args += [scheduler.dynamic_directive(k, v) for k, v in _dynamic_for(dynamic, scheduler_name)]
+    ignored = _dynamic_ignored(dynamic, scheduler_name)
     if ignored:
         print(f"warning: ignoring {' '.join(ignored)} (active scheduler is {scheduler_name})",
               file=sys.stderr)
@@ -975,7 +975,7 @@ def _serve_replicas(args, scheduler_name: str, profile, replicas: int, router_po
             site_args.append(scheduler.site_directive(kind, value))
     site_args += list(getattr(args, "scheduler_args", None) or [])
     dynamic = getattr(args, "dynamic_flags", [])
-    site_args += [scheduler.dynamic_directive(k, v) for s, k, v in dynamic if s == scheduler_name]
+    site_args += [scheduler.dynamic_directive(k, v) for k, v in _dynamic_for(dynamic, scheduler_name)]
 
     submitted_jobs: list[tuple[str, str]] = []
     failed = 0
@@ -1241,8 +1241,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 location.scheduler_args.append(sched_obj.site_directive(kind, value))
         location.scheduler_args.extend(raw_args)
         location.scheduler_args.extend(
-            sched_obj.dynamic_directive(k, v) for s, k, v in dynamic if s == location.scheduler)
-        ignored = [f"--{s}-{k}" for s, k, v in dynamic if s != location.scheduler]
+            sched_obj.dynamic_directive(k, v) for k, v in _dynamic_for(dynamic, location.scheduler))
+        ignored = _dynamic_ignored(dynamic, location.scheduler)
         if ignored:
             print(f"warning: ignoring {' '.join(ignored)} (active scheduler is {location.scheduler})",
                   file=sys.stderr)
@@ -2100,7 +2100,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-_DYNAMIC_FLAG = re.compile(r"^--(slurm|flux)-([A-Za-z0-9][A-Za-z0-9-]*)(?:=(.*))?$")
+# Scheduler-NEUTRAL pass-through: --sched-FLAG[=VALUE] hands FLAG to whatever
+# scheduler --scheduler selected (the scheduler flag dictates what to do).
+# --slurm-*/--flux-* remain as explicit, scheduler-pinned spellings.
+_DYNAMIC_FLAG = re.compile(r"^--(sched|slurm|flux)-([A-Za-z0-9][A-Za-z0-9-]*)(?:=(.*))?$")
+
+
+def _dynamic_for(dynamic: list, active: str) -> list:
+    """The pass-through (key, value) pairs that apply under the ACTIVE scheduler:
+    all --sched-* flags, plus --<active>-* pinned ones."""
+    return [(k, v) for s, k, v in dynamic if s in ("sched", active)]
+
+
+def _dynamic_ignored(dynamic: list, active: str) -> list[str]:
+    """Pinned flags for a DIFFERENT scheduler (never --sched-*: those always apply)."""
+    return [f"--{s}-{k}" for s, k, v in dynamic if s not in ("sched", active)]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2115,7 +2129,8 @@ def main(argv: list[str] | None = None) -> int:
         argv, extra = argv[:split], argv[split + 1:]
     args, unknown = build_parser().parse_known_args(argv)
     args._raw_argv = raw_argv
-    # Scheduler flag pass-through: any --slurm-FLAG[=VALUE] / --flux-FLAG[=VALUE]
+    # Scheduler flag pass-through: --sched-FLAG[=VALUE] (neutral; the active
+    # scheduler applies it) or the pinned --slurm-*/--flux-* spellings
     # flows into the job request untranslated except for spelling — new
     # scheduler flags never require a boxy change. Values need `=`.
     dynamic: list[tuple[str, str, str | None]] = []
@@ -2128,7 +2143,8 @@ def main(argv: list[str] | None = None) -> int:
             bad.append(token)
     if bad:
         print(f"boxy: error: unrecognized arguments: {' '.join(bad)}\n"
-              f"  (scheduler flags pass through as --slurm-FLAG[=VALUE] or --flux-FLAG[=VALUE])",
+              f"  (extra scheduler flags pass through as --sched-FLAG[=VALUE] — the active "
+              f"--scheduler decides how it's applied; --partition/--account/--time are portable)",
               file=sys.stderr)
         return 2
     args.dynamic_flags = dynamic
