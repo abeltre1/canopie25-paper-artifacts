@@ -211,11 +211,11 @@ idempotent rerun → `boxy stop` = scancel).
 # pre-stage once (login node has network; store is on shared $HOME):
 boxy pull hf://TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 
-# one command; --partition/--account/--time are portable, and ANY extra flag
-# passes through as --sched-FLAG[=VALUE] (the active --scheduler applies it):
+# one command; pass scheduler variables DIRECTLY — boxy maps the portable ones
+# (--partition/--account/--time) and hands anything else to the active scheduler:
 boxy serve hf://TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
   --scheduler slurm --gpus 1 \
-  --partition short --account fy260064 --sched-license=tscratch:1
+  --partition=short --account=fy260064 --license=tscratch:1
 # EXPECT:
 #   ### Submitted slurm job N  (boxy-tinyllama-...)
 #   ###   job N: PENDING ... RUNNING

@@ -205,11 +205,39 @@ def test_dynamic_flags_apply_to_attached_srun_too(gguf, capsys):
     assert "srun" in out and "--partition=short" in out and "-C gpu_h100" in out
 
 
-def test_typos_still_rejected(gguf, capsys):
-    assert main(["serve", str(gguf), "--dryrun", "--not-a-flag"]) == 2
+def test_bare_flags_pass_to_the_active_scheduler(gguf, jobs_dir, capsys):
+    """The user's spelling: NO prefix — any flag boxy doesn't own goes to the
+    active scheduler verbatim; the portable trio is translated internally."""
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--dryrun",
+               "--account=fy260064", "--partition=short,batch", "--license=tscratch:1",
+               "--time", "30:00", "--qos=long"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    for d in ("--partition=short,batch", "--account=fy260064", "--time=30:00",
+              "--license=tscratch:1", "--qos=long"):
+        assert f"#SBATCH {d}" in out
+
+    rc = main(["serve", str(gguf), "--scheduler", "flux", "--dryrun",
+               "--account=fy260064", "--partition=short,batch", "--license=tscratch:1"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    # SAME command; flux spellings chosen internally
+    assert "# flux: --queue=short,batch" in out and "# flux: --bank=fy260064" in out
+    assert "# flux: --license=tscratch:1" in out
+
+
+def test_typo_of_a_boxy_flag_errors_with_suggestion(gguf, capsys):
+    # a near-miss of a real boxy flag must NEVER silently become a scheduler flag
+    assert main(["serve", str(gguf), "--scheduler", "slurm", "--dryrun", "--replcias=3"]) == 2
     err = capsys.readouterr().err
-    assert "unrecognized arguments: --not-a-flag" in err
-    assert "--sched-FLAG" in err  # the neutral pass-through convention is advertised
+    assert "did you mean --replicas?" in err
+
+
+def test_unknown_flag_without_scheduler_warns_loudly(gguf, capsys):
+    rc = main(["serve", str(gguf), "--here", "--runtime", "docker",
+               "--accelerator", "none", "--dryrun", "--not-a-flag"])
+    assert rc == 0
+    assert "ignoring --not-a-flag" in capsys.readouterr().err  # loud, never silent
 
 
 def test_endpoint_file_written_by_serving_side(gguf, jobs_dir, monkeypatch, tmp_path, capsys):

@@ -132,12 +132,12 @@ boxy serve model.gguf -- --ctx-size 4096
 # submits the batch job, re-resolves hardware ON the compute node, waits for
 # readiness over the shared FS, prints the endpoint, and detaches:
 boxy serve hf://org/model-GGUF/file.gguf --scheduler slurm --gpus 1 \
-    --partition short --account myacct --sched-license=tscratch:1
+    --partition=short --account=myacct --license=tscratch:1
 #   ### Submitted slurm job 12345  (boxy-file)
 #   ###   job 12345: PENDING ... RUNNING
 #   ### READY  http://cn042:8090/v1   (model: ..., slurm job 12345)
-# --partition/--account/--time are portable (translated per scheduler); ANY other
-# flag passes through as --sched-FLAG[=VALUE] — the active --scheduler applies it
+# Scheduler variables are passed DIRECTLY: --partition/--account/--time are
+# translated per scheduler, and any other --FLAG=VALUE goes to the active one
 # — new site flags never require a boxy change. Ctrl-C detaches; job keeps going.
 boxy serve <model> --scheduler flux --gpus 4 --partition pbatch      # Flux: identical
 

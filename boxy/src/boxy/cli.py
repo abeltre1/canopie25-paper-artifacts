@@ -1248,7 +1248,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                   file=sys.stderr)
     else:
         ignored = [f"--{kind}" for kind, value in site_flags if value] + raw_args
-        ignored += [f"--{s}-{k}" for s, k, v in dynamic]
+        ignored += [f"--{k}" if s == "sched" else f"--{s}-{k}" for s, k, v in dynamic]
         if ignored:
             print(f"warning: ignoring {' '.join(ignored)} — no scheduler in play "
                   f"(scheduler is 'none'; add --scheduler slurm|flux)", file=sys.stderr)
@@ -2100,10 +2100,14 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# Scheduler-NEUTRAL pass-through: --sched-FLAG[=VALUE] hands FLAG to whatever
-# scheduler --scheduler selected (the scheduler flag dictates what to do).
-# --slurm-*/--flux-* remain as explicit, scheduler-pinned spellings.
+# Scheduler flag pass-through. ANY flag boxy doesn't own is handed to the
+# ACTIVE scheduler verbatim (boxy translates the portable trio internally), so
+#   boxy serve M --scheduler slurm --account=acct --license=tscratch:1
+# just works — and the same command under --scheduler flux renders in flux's
+# spelling. Prefixed forms remain: --sched-* (explicitly neutral) and
+# --slurm-*/--flux-* (pinned to one scheduler; warned when it isn't active).
 _DYNAMIC_FLAG = re.compile(r"^--(sched|slurm|flux)-([A-Za-z0-9][A-Za-z0-9-]*)(?:=(.*))?$")
+_BARE_FLAG = re.compile(r"^--([A-Za-z0-9][A-Za-z0-9-]*)(?:=(.*))?$")
 
 
 def _dynamic_for(dynamic: list, active: str) -> list:
@@ -2135,16 +2139,31 @@ def main(argv: list[str] | None = None) -> int:
     # scheduler flags never require a boxy change. Values need `=`.
     dynamic: list[tuple[str, str, str | None]] = []
     bad: list[str] = []
+    is_serve = getattr(args, "subcommand", "") == "serve"
+    # boxy's own flags for this subcommand — a near-miss typo of one of these
+    # must ERROR with a suggestion, never silently become a scheduler flag.
+    own_flags = {"--" + k.replace("_", "-") for k in vars(args)}
     for token in unknown:
         match = _DYNAMIC_FLAG.match(token)
-        if match and getattr(args, "subcommand", "") == "serve":
+        if match and is_serve:
             dynamic.append((match[1], match[2], match[3]))
-        else:
-            bad.append(token)
+            continue
+        bare = _BARE_FLAG.match(token)
+        if bare and is_serve:
+            import difflib
+
+            close = difflib.get_close_matches(f"--{bare[1]}", sorted(own_flags), n=1, cutoff=0.85)
+            if close:
+                print(f"boxy: error: unrecognized argument {token} — did you mean {close[0]}?",
+                      file=sys.stderr)
+                return 2
+            dynamic.append(("sched", bare[1], bare[2]))  # → the active scheduler, verbatim
+            continue
+        bad.append(token)
     if bad:
         print(f"boxy: error: unrecognized arguments: {' '.join(bad)}\n"
-              f"  (extra scheduler flags pass through as --sched-FLAG[=VALUE] — the active "
-              f"--scheduler decides how it's applied; --partition/--account/--time are portable)",
+              f"  (with --scheduler, any --FLAG[=VALUE] boxy doesn't own passes through to the "
+              f"scheduler; values need the = form)",
               file=sys.stderr)
         return 2
     args.dynamic_flags = dynamic
