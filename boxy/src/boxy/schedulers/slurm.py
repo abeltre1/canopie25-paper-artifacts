@@ -11,7 +11,6 @@ class SlurmScheduler(Scheduler):
     launcher = "srun"
 
     def launch_prefix(self, location: Location) -> list[str]:
-        import shlex
 
         prefix = [self.launcher, f"--nodes={location.resources.nodes}"]
         if location.resources.gpus_per_node:

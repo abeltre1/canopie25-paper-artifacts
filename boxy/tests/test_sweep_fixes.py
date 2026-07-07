@@ -9,7 +9,7 @@ import pytest
 from boxy import deploy, engines, ramalama_shim, readiness, resolve
 from boxy.box import Box
 from boxy.cli import main
-from boxy.location import Location, Resources
+from boxy.location import Location
 from tests.conftest import EXAMPLES
 
 
@@ -367,7 +367,6 @@ def test_trust_bundle_directory_and_unwritable_store(monkeypatch, tmp_path, caps
 
 
 def test_bad_loglevel_env_does_not_crash(monkeypatch):
-    import importlib
     import subprocess
     import sys
 

@@ -21,7 +21,6 @@ from boxy import ramalama_shim, version_string
 from boxy.backends import BACKENDS
 from boxy.box import TRANSPORT_SCHEMES, Box
 from boxy.location import ACCELERATORS, Location
-from boxy.schedulers import SCHEDULERS
 
 NOT_IN_MVP = "not implemented in the MVP — see SPEC.md §8 (roadmap) for the phase that adds it"
 
@@ -1408,7 +1407,6 @@ def cmd_stage(args: argparse.Namespace) -> int:
 
 
 def cmd_build(args: argparse.Namespace) -> int:
-    from boxy import deploy
     from boxy.backends import get_backend
 
     box, location = _load(args)

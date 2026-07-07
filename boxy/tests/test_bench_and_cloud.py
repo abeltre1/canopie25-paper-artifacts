@@ -114,7 +114,7 @@ def test_launch_writes_valid_yaml(tmp_path):
     box = Box(name="svc", image="img:1", model="m", ports=[8000])
     loc = Location(name="cloud", scheduler="none", accelerator="cuda", runtime="docker",
                    resources=Resources(nodes=1, gpus_per_node=2, accelerator_type="A100"))
-    path = cloud.write_task_yaml(box, loc, port=None, serve=True, output=str(tmp_path / "t.yaml"))
+    cloud.write_task_yaml(box, loc, port=None, serve=True, output=str(tmp_path / "t.yaml"))
     text = (tmp_path / "t.yaml").read_text()
     assert "accelerators: A100:2" in text and "service:" in text
 

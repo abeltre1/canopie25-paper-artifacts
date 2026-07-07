@@ -11,7 +11,6 @@ class FluxScheduler(Scheduler):
     launcher = "flux"
 
     def launch_prefix(self, location: Location) -> list[str]:
-        import shlex
 
         prefix = [self.launcher, "run", f"-N{location.resources.nodes}"]
         if location.resources.gpus_per_node:
