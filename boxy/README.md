@@ -94,6 +94,19 @@ remedy if you hit it.
 
 ## Quickstart
 
+**Same model, every platform** — a box (model) is portable; a location (platform) is
+swappable. Only the location/scheduler changes (smallest Llama, 3.2 1B GGUF, shown):
+
+```bash
+M="hf://hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF/llama-3.2-1b-instruct-q4_k_m.gguf"
+boxy serve $M                                             # 1) local desktop / baremetal (CPU)
+boxy serve $M --scheduler slurm --gpus 1                 # 2) Slurm  (submit + wait + detach)
+boxy serve $M --scheduler flux  --gpus 1                 # 3) Flux   (same UX)
+boxy launch --box examples/boxes/llama-3.2-1b.toml \
+            --location examples/locations/cloud-gpu.toml # 4) any other platform (cloud/SkyPilot,
+                                                         #    or write a --location <site>.toml)
+```
+
 ```bash
 # What does this host have?
 boxy info

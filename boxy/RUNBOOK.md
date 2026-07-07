@@ -39,6 +39,39 @@ capability moves to **E**.
 
 ---
 
+## 0.9 Deployment matrix — one model, every platform
+
+boxy is modular: a **box** (the model) is portable; a **location** (the platform) is
+swappable. The deploy command is the SAME `boxy serve <model>`; only the location or
+`--scheduler` changes — so a new platform is a new `--location <site>.toml`, never a
+code change. Proven on the smallest Llama (3.2 1B, Q4 GGUF → llama.cpp; runs on CPU
+*and* GPU):
+
+```bash
+M="hf://hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF/llama-3.2-1b-instruct-q4_k_m.gguf"
+# (or use the shipped box:  --box examples/boxes/llama-3.2-1b.toml)
+
+# 1) LOCAL / BAREMETAL desktop (no scheduler -> a container right here; CPU is auto)
+boxy serve $M                                   # add --here if the host looks like a login node
+
+# 2) SLURM  (submits an sbatch job, waits for READY, prints the endpoint, detaches)
+boxy serve $M --scheduler slurm --gpus 1 --partition short --account <acct> --time 30:00
+
+# 3) FLUX   (identical UX; # flux: directives + flux batch)
+boxy serve $M --scheduler flux  --gpus 1
+
+# 4) ANY OTHER PLATFORM
+#    a. cloud (AWS/GCP/Azure/K8s) via SkyPilot:
+boxy launch   --box examples/boxes/llama-3.2-1b.toml --location examples/locations/cloud-gpu.toml
+boxy generate sky --box examples/boxes/llama-3.2-1b.toml --location <loc> -o task.yaml   # then: sky launch task.yaml
+#    b. any on-prem site: write one location file and reuse every command above:
+boxy serve $M --location examples/locations/mysite.toml
+```
+All scale/serve flags (`--replicas`, `--nodes`, `--nodes-per-replica`, `--distributed`,
+`--router`, `boxy sweep`, `boxy bench`) compose on top of ANY row unchanged. For the
+official gated weights on vLLM instead of the GGUF: `hf://meta-llama/Llama-3.2-1B-Instruct`
+(needs an HF token). Verify a row without deploying: append `--dryrun`.
+
 ## 1. Any machine — install & self-test (5 min)
 
 ```bash
