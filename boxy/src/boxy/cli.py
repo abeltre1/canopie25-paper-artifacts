@@ -1112,7 +1112,30 @@ def _serve_distributed(args, box, location) -> int:
                 p.terminate()
 
 
+def _delegate_remote(args, tunnel_ready: bool = False) -> int | None:
+    """From-anywhere hook: when a remote target is configured (--ssh flag,
+    BOXY_SSH_HOST, or `remote=` in the --location profile) and we are NOT already
+    on the cluster, re-run this exact command there over one multiplexed SSH
+    session and (for serve) tunnel the READY endpoint back. Returns None to run
+    locally. Fully modular: only this hook knows remote exists."""
+    from boxy import remote
+
+    if os.environ.get(remote.ENV_ACTIVE):
+        return None  # we ARE the remote side
+    target = remote.resolve_target(args)
+    if not target:
+        return None
+    # already ON the target (profile with remote= used on the login node itself)?
+    target_short = target.split("@")[-1].split(".")[0]
+    if target_short and target_short == socket.gethostname().split(".")[0]:
+        return None
+    return remote.run_remote(target, getattr(args, "_raw_argv", []), tunnel_ready=tunnel_ready)
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
+    rc = _delegate_remote(args, tunnel_ready=True)
+    if rc is not None:
+        return rc
     from boxy import deploy, readiness
 
     # Seamless scheduler path: MODEL + slurm/flux (via flag or --location
@@ -1464,6 +1487,9 @@ def _run_or_print(cmd: list[str], dryrun: bool) -> int:
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
+    rc = _delegate_remote(args)
+    if rc is not None:
+        return rc
     from boxy import jobs
     from boxy.schedulers import get_scheduler
 
@@ -1502,6 +1528,9 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
+    rc = _delegate_remote(args)
+    if rc is not None:
+        return rc
     from boxy import jobs
     from boxy.schedulers import get_scheduler
 
@@ -1905,6 +1934,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--endpoint-file", default=None, help=argparse.SUPPRESS)
     p.add_argument("--save-profile", default=None, metavar="PREFIX",
                    help="write the resolved config to PREFIX.box.toml + PREFIX.location.toml")
+    p.add_argument("--ssh", default=None, metavar="USER@HOST",
+                   help="run this command ON that cluster's login node over SSH (from anywhere; "
+                        "OTP/YubiKey prompted once, session reused) and tunnel the endpoint back "
+                        "to localhost. Also: BOXY_SSH_HOST env, or `remote=` in a --location profile")
     p.add_argument("--dryrun", action="store_true", help="print the command instead of executing it")
     p.add_argument("args", nargs="*", help="extra engine args (put them after --)")
     p.set_defaults(func=cmd_serve)
@@ -1996,12 +2029,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--box", default=None, help="stop the container named by a box TOML profile")
     p.add_argument("--location", default=None)
     p.add_argument("--runtime", choices=["podman", "docker"], default=None)
+    p.add_argument("--ssh", default=None, metavar="USER@HOST",
+                   help="run on that cluster's login node over SSH (reuses the boxy SSH session)")
     p.add_argument("--dryrun", action="store_true")
     p.set_defaults(func=cmd_stop)
 
     p = sub.add_parser("list", help="list running boxy-launched containers")
     p.add_argument("--location", default=None)
     p.add_argument("--runtime", choices=["podman", "docker"], default=None)
+    p.add_argument("--ssh", default=None, metavar="USER@HOST",
+                   help="run on that cluster's login node over SSH (reuses the boxy SSH session)")
     p.add_argument("--dryrun", action="store_true")
     p.set_defaults(func=cmd_list)
 
@@ -2052,11 +2089,13 @@ def main(argv: list[str] | None = None) -> int:
     # cannot express this next to optional positionals (a `*` positional only
     # matches one contiguous chunk), so split before parsing.
     argv = list(sys.argv[1:] if argv is None else argv)
+    raw_argv = list(argv)  # verbatim command, for --ssh remote re-invocation
     extra: list[str] = []
     if "--" in argv:
         split = argv.index("--")
         argv, extra = argv[:split], argv[split + 1:]
     args, unknown = build_parser().parse_known_args(argv)
+    args._raw_argv = raw_argv
     # Scheduler flag pass-through: any --slurm-FLAG[=VALUE] / --flux-FLAG[=VALUE]
     # flows into the job request untranslated except for spelling — new
     # scheduler flags never require a boxy change. Values need `=`.

@@ -72,6 +72,41 @@ All scale/serve flags (`--replicas`, `--nodes`, `--nodes-per-replica`, `--distri
 official gated weights on vLLM instead of the GGUF: `hf://meta-llama/Llama-3.2-1B-Instruct`
 (needs an HF token). Verify a row without deploying: append `--dryrun`.
 
+## 0.95 Submit from ANYWHERE (laptop → cluster, OTP/YubiKey-safe)
+
+Type the same command on your laptop; boxy runs it on the cluster over SSH and
+tunnels the endpoint back:
+
+```bash
+# one-shot spelling:
+boxy serve <model> --scheduler slurm --gpus 4 --ssh ambelt@hops-login1.sandia.gov
+# set-and-forget spelling (then EVERY boxy command is remote, verbatim):
+export BOXY_SSH_HOST=ambelt@hops-login1.sandia.gov
+boxy serve <model> --scheduler slurm --gpus 4
+boxy list        # runs on the cluster
+boxy stop <name> # runs on the cluster
+# profile spelling: put `remote = "ambelt@hops-login1.sandia.gov"` in [location].
+```
+
+What happens behind the scenes:
+- **One login, many commands.** boxy opens an OpenSSH **ControlMaster** session:
+  your OTP prompt + YubiKey touch happen ONCE, on your terminal; the session
+  persists (~4h) and every boxy command multiplexes over it with no re-prompts.
+  (This is why boxy shells out to the system `ssh` — OpenSSH natively handles
+  keyboard-interactive OTP and FIDO2/YubiKey; Python SSH libraries don't. Your
+  ~/.ssh/config, ProxyJump/bastions included, is honored for free.)
+- **The endpoint comes to you.** When the remote serve prints `### READY
+  http://node:port/v1`, boxy adds a port forward ON the live session (no re-auth)
+  and prints `### LOCAL http://127.0.0.1:port/v1` — point your client there. The
+  tunnel lives on the SSH master, so it outlives the boxy command; close it with
+  the printed `ssh -O cancel ...` line.
+- **Nothing installed on the cluster** except boxy itself (`pip install` once, or
+  set BOXY_REMOTE_COMMAND='source ~/venv/bin/activate && boxy' if it lives in a
+  venv). No daemon, no agent — unlike VS Code Remote-SSH's server.
+- Prereqs: `ssh user@login` works from this machine (VPN up), and boxy is on the
+  login node. Everything else (scheduler flags, --replicas, --router, sweep)
+  composes unchanged — it simply runs over there.
+
 ## 1. Any machine — install & self-test (5 min)
 
 ```bash

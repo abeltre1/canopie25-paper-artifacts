@@ -107,6 +107,10 @@ boxy launch --box examples/boxes/llama-3.2-1b.toml \
                                                          #    or write a --location <site>.toml)
 ```
 
+**From anywhere:** add `--ssh user@login-node` (or `export BOXY_SSH_HOST=...` once) and the
+same commands run on the cluster over ONE multiplexed SSH session — OTP/YubiKey prompted
+once, endpoint auto-tunneled back to `http://127.0.0.1:<port>/v1` (RUNBOOK §0.95).
+
 ```bash
 # What does this host have?
 boxy info

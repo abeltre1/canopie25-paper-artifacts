@@ -39,6 +39,10 @@ class Location:
     runtime: str = ""      # "" => autodetect first available backend
     registry: str = ""
     offline: bool = False
+    # Run boxy against this cluster FROM ANYWHERE: "user@login-node". When set
+    # (and not already on the cluster), the CLI re-runs the same command on that
+    # host over ONE multiplexed SSH session (OTP/YubiKey prompted once; see remote.py).
+    remote: str = ""
     resources: Resources = field(default_factory=Resources)
     modules: list[str] = field(default_factory=list)
     staging: Staging = field(default_factory=Staging)
