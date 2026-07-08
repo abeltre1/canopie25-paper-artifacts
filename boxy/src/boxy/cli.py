@@ -157,19 +157,9 @@ def cmd_info(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_doctor(args: argparse.Namespace) -> int:
-    """Audit the environment for the issues that actually bite in the field
-    (SPEC §8b): proxy/CA/token, runtime, scheduler, accelerator, per-cluster
-    state, OOM'd containers, and (with --net) image-registry reach. Prints
-    OK/WARN/FAIL + a fix per check; exits non-zero if anything FAILed. `--ssh
-    user@login` runs the same audit ON the cluster."""
-    rc = _delegate_remote(args)
-    if rc is not None:
-        return rc
+def _print_doctor(results) -> int:
     from boxy import doctor
 
-    print(f"boxy {version_string()}")
-    results = doctor.run_checks(net=getattr(args, "net", False))
     rows = [(r.name, f"[{r.status}] {r.detail}") for r in results]
     _info_section("doctor", rows)
     fails = [r for r in results if r.status == doctor.FAIL]
@@ -186,6 +176,30 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         print("doctor: all checks OK")
     return 1 if fails else 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Audit the environment for the issues that actually bite in the field
+    (SPEC §8b): proxy/CA/token, runtime, scheduler, accelerator, per-cluster
+    state, OOM'd containers, and (with --net) image-registry reach. Prints
+    OK/WARN/FAIL + a fix per check; exits non-zero on FAIL. `--ssh user@login`
+    audits the CLUSTER over SSH with **no boxy needed there** — plain shell
+    probes — so you can check readiness before installing boxy on it."""
+    from boxy import doctor, remote
+
+    target = remote.resolve_target(args)
+    on_target = bool(target) and target.split("@")[-1].split(".")[0] == socket.gethostname().split(".")[0]
+    if target and not on_target and not os.environ.get(remote.ENV_ACTIVE):
+        if remote.ensure_master(target) != 0:
+            print(f"boxy: could not open an SSH session to {target} — check the host, VPN, and "
+                  f"that you completed the OTP/YubiKey prompt", file=sys.stderr)
+            return 1
+        print(f"boxy doctor — remote audit of {target} (no boxy required on the cluster)")
+        results = doctor.remote_checks(lambda cmd: remote.ssh_capture(target, cmd))
+        return _print_doctor(results)
+
+    print(f"boxy {version_string()}")
+    return _print_doctor(doctor.run_checks(net=getattr(args, "net", False)))
 
 
 def _probe_registries() -> int:

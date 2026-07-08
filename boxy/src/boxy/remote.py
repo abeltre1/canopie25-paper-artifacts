@@ -116,6 +116,20 @@ def ensure_master(host: str) -> int:
     return subprocess.run([ssh_bin(), *_base_opts(), host, "true"]).returncode
 
 
+def ssh_capture(host: str, remote_command: str, timeout: int = 20) -> tuple[int, str]:
+    """Run a shell command on `host` over the live multiplexed master, capturing
+    combined output. For the AGENTLESS auditors (e.g. `boxy doctor --ssh`) that
+    probe a cluster with NO boxy installed there — plain `command -v`/`curl`/`ls`.
+    ensure_master() must have succeeded first."""
+    try:
+        proc = subprocess.run(
+            [ssh_bin(), "-o", f"ControlPath={control_path()}", host, remote_command],
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
 def remote_argv(raw_argv: list[str]) -> list[str]:
     """The exact command the user typed, minus the remote-targeting flags (the
     remote side must run it LOCALLY: recursion is also belt-and-suspenders

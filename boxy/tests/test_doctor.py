@@ -96,3 +96,61 @@ def test_doctor_runtime_none_is_fail(monkeypatch):
     monkeypatch.setattr(doctor.shutil, "which", lambda b: None)
     r = doctor._check_runtime()
     assert r.status == doctor.FAIL and "none of" in r.detail
+
+
+# ---- agentless remote audit (boxy doctor --ssh: NO boxy on the cluster) --------
+
+
+def _fake_run(mapping):
+    """Return a run(cmd)->(rc,out) that keys off distinctive command substrings."""
+    def run(cmd):
+        for key, val in mapping.items():
+            if key in cmd:
+                return (0, val)
+        return (0, "")
+    return run
+
+
+def test_remote_checks_flag_ghcr_403_and_missing_runtime():
+    run = _fake_run({
+        "podman docker apptainer": "",             # no container runtime
+        "sbatch flux srun": "sbatch\nsrun\n",
+        "nvidia-smi": "cuda\n",
+        "https_proxy": "http://proxy.site.gov:80||\n",
+        "ghcr.io/v2": "403",                        # the field-reported blocker
+        "boxy/jobs": "",
+    })
+    r = {x.name: x for x in doctor.remote_checks(run)}
+    assert r["container runtime"].status == doctor.FAIL
+    assert r["scheduler"].status == doctor.OK and "sbatch" in r["scheduler"].detail
+    assert r["image registry ghcr.io"].status == doctor.FAIL and "403" in r["image registry ghcr.io"].detail
+    assert "pre-pull" in r["image registry ghcr.io"].fix.lower() or "--proxy" in r["image registry ghcr.io"].fix
+
+
+def test_remote_checks_healthy_cluster_all_ok():
+    run = _fake_run({
+        "podman docker apptainer": "podman\n",
+        "sbatch flux srun": "sbatch\nsrun\n",
+        "nvidia-smi": "cuda\n",
+        "https_proxy": "||\n",
+        "ghcr.io/v2": "401",                        # reachable (unauth front door)
+        "boxy/jobs": "/home/u/.local/share/boxy/jobs/hops/\n",
+    })
+    results = doctor.remote_checks(run)
+    assert all(x.status == doctor.OK for x in results)
+
+
+def test_cmd_doctor_remote_audit_no_cluster_boxy(monkeypatch, capsys):
+    from boxy import remote
+    from boxy.cli import main
+
+    monkeypatch.delenv(remote.ENV_ACTIVE, raising=False)
+    monkeypatch.setattr(remote, "resolve_target", lambda args: "ambelt@hops.sandia.gov")
+    monkeypatch.setattr(remote, "ensure_master", lambda h: 0)
+    monkeypatch.setattr(remote, "ssh_capture",
+                        lambda h, cmd, timeout=20: (0, "403" if "ghcr.io/v2" in cmd
+                                                    else "sbatch\n" if "sbatch flux" in cmd else ""))
+    rc = main(["doctor", "--ssh", "ambelt@hops.sandia.gov"])
+    out = capsys.readouterr().out
+    assert "remote audit of ambelt@hops.sandia.gov" in out and "no boxy required" in out
+    assert "403" in out and rc == 1                 # ghcr 403 (+ no runtime) -> FAIL exit

@@ -223,6 +223,67 @@ def _check_image_registries() -> list[Result]:
 # ---- driver -------------------------------------------------------------------
 
 
+def remote_checks(run) -> list[Result]:
+    """Audit a cluster over SSH with NO boxy installed there — `run(cmd)` returns
+    (rc, combined_output) from a plain shell command on the login node (a
+    `remote.ssh_capture` closure). This is the agentless auditor: it answers
+    'is this cluster ready to serve?' before you ever install boxy on it, and
+    catches the exact things that bite (no scheduler, no runtime, ghcr 403)."""
+    out: list[Result] = []
+
+    _, runtimes = run("for c in podman docker apptainer; do command -v $c >/dev/null && echo $c; done")
+    present = runtimes.split()
+    if not present:
+        out.append(Result("container runtime", FAIL, "none of podman/docker/apptainer on the cluster PATH",
+                          "`module load` the site's container runtime, or ask the admins"))
+    else:
+        out.append(Result("container runtime", OK, ", ".join(present)))
+
+    _, subs = run("for c in sbatch flux srun; do command -v $c >/dev/null && echo $c; done")
+    sub = subs.split()
+    if any(s in sub for s in ("sbatch", "flux")):
+        out.append(Result("scheduler", OK, ", ".join(sub)))
+    else:
+        out.append(Result("scheduler", WARN, "no sbatch/flux found on the login node",
+                          "confirm you're on a real login node; some sites gate the scheduler behind a module"))
+
+    _, accel = run("if command -v nvidia-smi >/dev/null; then echo cuda; "
+                   "elif command -v rocminfo >/dev/null; then echo rocm; else echo none; fi")
+    a = accel.strip() or "none"
+    note = "" if a != "none" else " (login nodes often have no GPU — pin --accelerator for the job)"
+    out.append(Result("accelerator (login node)", OK, f"{a}{note}"))
+
+    _, prox = run('echo "${https_proxy:-}|${http_proxy:-}|${no_proxy:-}"')
+    https, http, _no = (prox.strip().split("|") + ["", "", ""])[:3]
+    if https or http:
+        w = " (https_proxy empty — registries are https and will bypass it)" if http and not https else ""
+        out.append(Result("proxy (login node)", OK if not w else WARN, f"https={https or '-'} http={http or '-'}{w}",
+                          "" if not w else 'set https_proxy too (after http_proxy)'))
+    else:
+        out.append(Result("proxy (login node)", OK, "none set"))
+
+    # THE one that bit the user: can the cluster pull the container image?
+    rc, code = run("curl -s -o /dev/null -w '%{http_code}' --max-time 12 https://ghcr.io/v2/ 2>/dev/null || echo curlfail")
+    code = code.strip()
+    if code in ("200", "401", "404"):
+        out.append(Result("image registry ghcr.io", OK, f"reachable from the login node (HTTP {code})"))
+    elif code == "403":
+        out.append(Result("image registry ghcr.io", FAIL, "HTTP 403 — refused by a proxy/policy (Zscaler?)",
+                          "the compute node's `podman pull` will fail too. Pre-pull on THIS login node "
+                          "(shared $HOME store), pass --proxy, or use --registry a site mirror"))
+    else:
+        out.append(Result("image registry ghcr.io", WARN, f"could not probe ({code or 'no curl'})",
+                          "install curl or check the login node's egress; a pull may still work via the proxy"))
+
+    _, jobs_ls = run("ls -d ~/.local/share/boxy/jobs/*/ 2>/dev/null | tr '\\n' ' '")
+    if jobs_ls.strip():
+        out.append(Result("boxy state", OK, f"per-cluster jobs dir(s): {jobs_ls.strip()}"))
+    else:
+        out.append(Result("boxy state", OK, "no jobs dir yet (nothing served here)"))
+
+    return out
+
+
 def run_checks(net: bool = False) -> list[Result]:
     """Every check, in a sensible reading order. `net` adds the (slower)
     outbound registry probes."""

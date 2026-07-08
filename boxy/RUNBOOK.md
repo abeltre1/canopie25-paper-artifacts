@@ -187,10 +187,14 @@ per-cluster state, OOM'd containers). Each check is OK/WARN/FAIL + a fix:
 ```bash
 boxy doctor                 # local audit; exit non-zero if anything FAILs
 boxy doctor --net           # also probe ghcr.io/docker.io reachability (the 403 check)
-boxy doctor --ssh ambelt@hops.sandia.gov   # audit the cluster from your laptop
+boxy doctor --ssh ambelt@hops.sandia.gov   # audit the CLUSTER (no boxy needed there)
 ```
 
-The full catalog of issues + mitigations is `SPEC.md §8b`.
+`boxy doctor --ssh` probes the cluster over SSH with plain shell (`command -v`,
+`curl`, `ls`) — it needs **no boxy installed on the cluster**, so you can check a
+site's readiness (runtime, scheduler, GPU, proxy, and the ghcr.io-403 image
+block) *before* you ever set boxy up there. The full catalog of issues +
+mitigations is `SPEC.md §8b`.
 
 ### 0.99 Agentless — run a job with NO boxy on the cluster
 
