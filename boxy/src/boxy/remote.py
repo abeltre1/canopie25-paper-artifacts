@@ -231,20 +231,23 @@ def _short_name(alias: str) -> str:
     return host.split("/", 1)[0].split(".", 1)[0]
 
 
-def publish_url(name: str, lport: int, base_domain: str) -> tuple[list[str], str, str]:
+def publish_url(name: str, lport: int, base_domain: str,
+                https: bool = True) -> tuple[list[str], str, str]:
     """PURE: what publishing `name` (bound to 127.0.0.1:lport) over the tailnet
     looks like — the `tailscale serve` argv, the predicted MagicDNS URL, and a
     note. `base_domain` is the Headscale tailnet domain (e.g. 'boxy.ts.net'). This
     is Tier 2: unlike route_url's `.localhost` (loopback-only, one machine), a
     MagicDNS name resolves for EVERYONE enrolled in the tailnet, with no corporate
-    DNS. The serve still points at the loopback end of the SSH -L forward."""
+    DNS. The serve still points at the loopback end of the SSH -L forward. `https`
+    uses :443 (needs a MagicDNS cert); `https=False` uses :80 — no cert, and the
+    traffic is still encrypted inside WireGuard (the reliable path on Headscale)."""
     short = _short_name(name)
     fqdn = f"{short}.{base_domain}" if base_domain else short
-    # `tailscale serve` proxies the node's HTTPS (:443) root to the local tunnel.
-    cmd = [tailscale_bin(), "serve", "--bg", "--https=443", f"http://127.0.0.1:{lport}"]
-    note = (f"anyone enrolled in the tailnet resolves https://{fqdn}/ via Headscale MagicDNS "
-            f"(no corporate DNS); serve maps :443 -> the loopback tunnel on 127.0.0.1:{lport}")
-    return cmd, f"https://{fqdn}", note
+    scheme, flag, dport = ("https", "--https=443", 443) if https else ("http", "--http=80", 80)
+    cmd = [tailscale_bin(), "serve", "--bg", flag, f"http://127.0.0.1:{lport}"]
+    note = (f"anyone enrolled in the tailnet resolves {scheme}://{fqdn}/ via Headscale MagicDNS "
+            f"(no corporate DNS); serve maps :{dport} -> the loopback tunnel on 127.0.0.1:{lport}")
+    return cmd, f"{scheme}://{fqdn}", note
 
 
 def tailnet_domain() -> str:
@@ -279,11 +282,15 @@ def tailscale_publish(name: str, lport: int) -> tuple[str | None, str]:
     domain = tailnet_domain()
     if not domain:
         return None, "tailscale not enrolled (run `tailscale up --login-server <headscale-url> --authkey <key>`)"
-    cmd, url, note = publish_url(name, lport, domain)
-    rc = subprocess.run(cmd, capture_output=True, text=True).returncode
-    if rc != 0:
-        return None, "`tailscale serve` failed (need HTTPS/MagicDNS enabled on the tailnet, `tailscale cert` provisioned)"
-    return url, note
+    # Prefer HTTPS (:443); Headscale often has no MagicDNS cert, so fall back to
+    # HTTP (:80) — still encrypted inside WireGuard, and the reliable demo path.
+    for https in (True, False):
+        cmd, url, note = publish_url(name, lport, domain, https=https)
+        if subprocess.run(cmd, capture_output=True, text=True).returncode == 0:
+            if not https:
+                note += "  [HTTP: no MagicDNS cert for HTTPS — encrypted inside WireGuard]"
+            return url, note
+    return None, "`tailscale serve` failed for both https and http (check `tailscale serve` support / MagicDNS)"
 
 
 def add_forward(host: str, local_port: int, remote_host: str, remote_port: int) -> int:

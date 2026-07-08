@@ -59,8 +59,12 @@ def _config_yaml(server_url: str, base_domain: str, *, derp_udp: bool) -> str:
 
 
 def emit_values(server_url: str, base_domain: str, preauth_key: str = "",
-                *, image: str = DEFAULT_IMAGE, derp_udp: bool = False) -> str:
-    """values.yaml for the chart-headscale Helm chart."""
+                *, image: str = DEFAULT_IMAGE, derp_udp: bool = False,
+                termination: str = "edge") -> str:
+    """values.yaml for the chart-headscale Helm chart. Route TLS defaults to
+    `edge` — headscale serves plain HTTP on :8080, so edge (router terminates
+    TLS, forwards HTTP) works out of the box. `reencrypt` is stronger but needs
+    headscale to serve TLS internally (a service-serving cert + tls_* config)."""
     pk = preauth_key or '""'
     return (
         f"# Helm values for chart-headscale (Tier-2 naming authority on OpenShift).\n"
@@ -83,9 +87,8 @@ def emit_values(server_url: str, base_domain: str, preauth_key: str = "",
         f"route:\n"
         f"  enabled: true\n"
         f"  host: {_host_of(server_url)}\n"
-        f"  annotations:\n"
-        f"    route.openshift.io/termination: \"reencrypt\"\n"
-        f"    haproxy.router.openshift.io/timeout: \"{ROUTER_TIMEOUT}\"\n"
+        f"  termination: {termination}   # edge works with headscale's plain-HTTP :8080; reencrypt needs backend TLS\n"
+        f"  timeout: {ROUTER_TIMEOUT}\n"
         f"securityContext:\n"
         f"  runAsNonRoot: true\n"
     )
@@ -93,8 +96,10 @@ def emit_values(server_url: str, base_domain: str, preauth_key: str = "",
 
 def emit_manifest(server_url: str, base_domain: str, namespace: str = "headscale",
                   preauth_key: str = "", *, image: str = DEFAULT_IMAGE,
-                  derp_udp: bool = False) -> str:
-    """A self-contained multi-doc manifest for `oc apply -f -` (no Helm)."""
+                  derp_udp: bool = False, termination: str = "edge") -> str:
+    """A self-contained multi-doc manifest for `oc apply -f -` (no Helm). Route TLS
+    defaults to `edge` (works with headscale's plain-HTTP :8080); `reencrypt` needs
+    headscale serving TLS internally."""
     host = _host_of(server_url)
     cfg = _indent(_config_yaml(server_url, base_domain, derp_udp=derp_udp), 4)
     docs = [
@@ -179,7 +184,7 @@ spec:
   host: {host}
   to: {{kind: Service, name: headscale}}
   port: {{targetPort: http}}
-  tls: {{termination: reencrypt}}""",
+  tls: {{termination: {termination}}}""",
     ]
     if derp_udp:
         docs.append(

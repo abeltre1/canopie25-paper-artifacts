@@ -36,9 +36,11 @@ route:
   enabled: true
   # host defaults to the serverUrl host when left empty.
   host: ""
-  # reencrypt keeps server_url=https honest and the /ts2021 Noise stream encrypted
-  # on every hop; the long timeout keeps the persistent control connection alive.
-  termination: reencrypt
+  # edge works out of the box: headscale serves plain HTTP on :8080, so the router
+  # terminates TLS and forwards HTTP. reencrypt is stronger (encrypted on every hop)
+  # but needs headscale serving TLS internally (service-serving cert + tls_* config).
+  # The long timeout keeps the persistent Tailscale control connection alive.
+  termination: edge
   timeout: 3600s
 
 securityContext:

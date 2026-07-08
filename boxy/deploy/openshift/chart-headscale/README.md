@@ -24,11 +24,12 @@ boxy generate headscale --server-url https://headscale.apps.<cluster> \
 
 ## OpenShift design notes
 
-- **Route TLS = `reencrypt`** with `haproxy.router.openshift.io/timeout: 3600s`.
-  The control plane + the `/ts2021` Noise handshake are HTTP(S)/TCP, so a Route
-  carries them; reencrypt keeps `server_url=https` honest and the stream
-  encrypted on every hop, and the long timeout keeps the persistent control
-  connection alive (the 30s default kills it).
+- **Route TLS = `edge`** (default) with `haproxy.router.openshift.io/timeout: 3600s`.
+  headscale serves plain HTTP on :8080, so edge (router terminates TLS, forwards
+  HTTP) works out of the box; the long timeout keeps the persistent Tailscale
+  control connection alive (the 30s default kills it). `--set route.termination=reencrypt`
+  is stronger (encrypted on every hop) but needs headscale serving TLS internally
+  (a service-serving cert + `tls_*` config) — otherwise the Route health check fails.
 - **DERP over the :443 Route by default** (`derp.udp.enabled=false`): peers that
   can't form a direct path relay over HTTPS — no UDP ingress, no extra cluster
   privileges. Set `derp.udp.enabled=true` to also expose STUN/3478 via a

@@ -1720,11 +1720,12 @@ def _generate_headscale(args: argparse.Namespace) -> int:
         return 2
     if args.emit == "values":
         text = headscale.emit_values(args.server_url, args.base_domain, args.preauth_key,
-                                     derp_udp=args.derp_udp)
+                                     derp_udp=args.derp_udp, termination=args.tls_termination)
     else:
         text = headscale.emit_manifest(args.server_url, args.base_domain,
                                        args.namespace or "headscale",
-                                       args.preauth_key, derp_udp=args.derp_udp)
+                                       args.preauth_key, derp_udp=args.derp_udp,
+                                       termination=args.tls_termination)
     if args.output:
         with open(args.output, "w") as f:
             f.write(text)
@@ -2626,6 +2627,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--preauth-key", default="", help="headscale: reusable pre-auth key (prefer setting out-of-band)")
     p.add_argument("--derp-udp", action="store_true",
                    help="headscale: also emit a UDP LoadBalancer for STUN/3478 (default: relay over :443)")
+    p.add_argument("--tls-termination", choices=["edge", "reencrypt", "passthrough"], default="edge",
+                   help="headscale: OpenShift Route TLS termination (default edge — works with "
+                        "headscale's plain-HTTP :8080; reencrypt needs backend TLS)")
     p.add_argument("--emit", choices=["values", "manifest"], default="manifest",
                    help="headscale: Helm values.yaml or a self-contained oc-apply manifest (default)")
     p.add_argument("--serve", action="store_true", help="add a SkyServe service block (sky serve up)")

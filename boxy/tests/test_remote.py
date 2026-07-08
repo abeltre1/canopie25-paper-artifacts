@@ -108,10 +108,11 @@ def test_remote_argv_strips_publish_so_older_cluster_boxy_still_runs():
 
 TS_SHIM = r"""#!/bin/bash
 # fake tailscale: logs argv, answers `status --json`, accepts `serve`.
+# With TS_NO_HTTPS set, `serve --https=...` fails (mimics Headscale with no cert).
 echo "$*" >> "$TS_LOG"
 case "$1" in
   status) echo '{"Self":{"DNSName":"mylaptop.boxy.ts.net."}}' ;;
-  serve)  exit 0 ;;
+  serve)  if echo "$*" | grep -q -- "--https" && [ -n "$TS_NO_HTTPS" ]; then exit 1; fi; exit 0 ;;
 esac
 exit 0
 """
@@ -143,6 +144,16 @@ def test_tailscale_publish_serves_and_returns_url(ts_shim):
     url, note = remote.tailscale_publish("nemotron", 8090)
     assert url == "https://nemotron.boxy.ts.net"          # base_domain from shim `status`
     assert "serve --bg --https=443 http://127.0.0.1:8090" in ts_shim.read_text()
+
+
+def test_tailscale_publish_falls_back_to_http_without_cert(ts_shim, monkeypatch):
+    # Headscale with no MagicDNS cert: `serve --https` fails -> boxy retries --http=80.
+    monkeypatch.setenv("TS_NO_HTTPS", "1")
+    url, note = remote.tailscale_publish("nemotron", 8090)
+    assert url == "http://nemotron.boxy.ts.net"           # fell back to HTTP
+    assert "no MagicDNS cert" in note and "WireGuard" in note
+    log = ts_shim.read_text()
+    assert "--https=443" in log and "serve --bg --http=80 http://127.0.0.1:8090" in log
 
 
 def test_publish_over_ssh_prints_magicdns(shim, ts_shim, capfd, monkeypatch):

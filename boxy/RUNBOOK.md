@@ -240,9 +240,11 @@ SERVER_URL=https://headscale.apps.<cluster> deploy/openshift/chart-headscale/ins
 oc -n headscale exec deploy/headscale -- headscale preauthkeys create --reusable --user boxy
 tailscale up --login-server https://headscale.apps.<cluster> --authkey <key>
 ```
-Route TLS is **reencrypt** with a 3600s timeout (the Tailscale control connection
-is long-lived); DERP relays over that same :443 Route by default, so no UDP
-ingress or extra cluster privileges are needed. Details: `deploy/openshift/chart-headscale/README.md`.
+Route TLS defaults to **edge** with a 3600s timeout (the Tailscale control
+connection is long-lived) — edge works out of the box since headscale serves
+plain HTTP on :8080 (`reencrypt` needs backend TLS). DERP relays over that same
+:443 Route by default, so no UDP ingress or extra cluster privileges are needed.
+Details: `deploy/openshift/chart-headscale/README.md`.
 
 **2. Publish a served model under a shared MagicDNS name:**
 ```bash

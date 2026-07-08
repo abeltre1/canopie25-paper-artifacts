@@ -14,8 +14,8 @@ def test_emit_values_has_openshift_route_and_magicdns():
     v = headscale.emit_values(SERVER, "boxy.ts.net")
     assert f"serverUrl: {SERVER}" in v and "baseDomain: boxy.ts.net" in v
     assert "magicDns: true" in v
-    assert 'route.openshift.io/termination: "reencrypt"' in v      # SPEC §8d decision
-    assert 'haproxy.router.openshift.io/timeout: "3600s"' in v      # long-lived control conn
+    assert "termination: edge" in v                                 # works with headscale plain-HTTP :8080
+    assert "timeout: 3600s" in v                                    # long-lived control conn
     assert "runAsNonRoot: true" in v
     assert "accessMode: ReadWriteOnce" in v                         # small RWO PVC for SQLite
 
@@ -26,9 +26,13 @@ def test_emit_manifest_is_valid_multidoc_yaml_with_expected_kinds():
     assert [d["kind"] for d in docs] == \
         ["ConfigMap", "Secret", "PersistentVolumeClaim", "Deployment", "Service", "Route"]
     route = next(d for d in docs if d["kind"] == "Route")
-    assert route["spec"]["tls"]["termination"] == "reencrypt"
+    assert route["spec"]["tls"]["termination"] == "edge"            # default that actually works
     assert route["spec"]["host"] == "headscale.apps.ocp.example.com"
     assert route["metadata"]["annotations"]["haproxy.router.openshift.io/timeout"] == "3600s"
+    # reencrypt is still available for a TLS-serving backend
+    r2 = [d for d in yaml.safe_load_all(
+        headscale.emit_manifest(SERVER, "boxy.ts.net", termination="reencrypt")) if d]
+    assert next(d for d in r2 if d["kind"] == "Route")["spec"]["tls"]["termination"] == "reencrypt"
     dep = next(d for d in docs if d["kind"] == "Deployment")
     assert dep["spec"]["template"]["spec"]["securityContext"]["runAsNonRoot"] is True
     cfg = next(d for d in docs if d["kind"] == "ConfigMap")["data"]["config.yaml"]
@@ -50,7 +54,7 @@ def test_cli_generate_headscale_manifest_default(capsys):
     rc = main(["generate", "headscale", "--server-url", SERVER, "--base-domain", "boxy.ts.net"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "kind: Route" in out and "reencrypt" in out and "oc apply -f -" in out
+    assert "kind: Route" in out and "termination: edge" in out and "oc apply -f -" in out
 
 
 def test_cli_generate_headscale_requires_server_url(capsys):
