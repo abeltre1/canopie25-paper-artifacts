@@ -197,6 +197,29 @@ def _host_oom(m: "re.Match[str]", log: str) -> str:
     )
 
 
+def _image_pull_blocked(m: "re.Match[str]", log: str) -> str:
+    forbidden = "403" in log or "Zs" in log or "denied" in log.lower()
+    why = ("a 403 from a TLS-intercepting proxy (Zscaler) or an air-gapped node"
+           if forbidden else "the node cannot reach the registry")
+    return _fmt(
+        "the container IMAGE could not be pulled on the compute node (registry blocked)",
+        f"The node running the job cannot reach the image registry (ghcr.io/docker.io) — {why}.\n"
+        "The MODEL is fine (it is bind-mounted from the shared store); only the image pull\n"
+        "failed. Fix, in order:\n"
+        "  1. Pre-pull the image where the network works (the LOGIN node), so the shared $HOME\n"
+        "     podman store already has it when the job lands on a compute node:\n"
+        "       podman pull ghcr.io/ggml-org/llama.cpp:server-cuda      # on the login node\n"
+        "     (rootless podman stores under ~/.local/share/containers; compute nodes that share\n"
+        "      $HOME then reuse it with NO pull. Verify the store is shared: podman images on\n"
+        "      the compute node should list it.)\n"
+        "  2. Or point boxy at a registry the compute node CAN reach (a site mirror):\n"
+        "       boxy serve ... --registry registry.mysite.gov/mirror\n"
+        "     or [location.image_mirrors] in a --location profile (RUNBOOK §0.97).\n"
+        "  3. Or route the pull through your proxy INSIDE the job (only if it permits the\n"
+        "     registry):  export HTTPS_PROXY=http://proxy.mysite.gov:80 in the job env.",
+    )
+
+
 def _gguf_load_fail(m: "re.Match[str]", log: str) -> str:
     return _fmt(
         "llama.cpp could not load the GGUF model file",
@@ -219,6 +242,18 @@ RULES: list[Rule] = [
         re.compile(r"requires the following packages that were not found|"
                    r"ImportError:.*Run `pip install", re.IGNORECASE),
         _missing_python_package,
+    ),
+    Rule(
+        # the container IMAGE pull failed (registry blocked/403/air-gapped) —
+        # distinct from a MODEL problem. Must beat gguf-load-fail, whose log can
+        # carry 'GGUF' from the repo name (field report: hops compute node, ghcr
+        # 403 via Zscaler, misdiagnosed as a bad GGUF file).
+        "image-pull-blocked",
+        re.compile(r"pinging container registry|initializing source docker://|"
+                   r"error initializing source|unable to pull image|"
+                   r"reading manifest .* in .*: (?:manifest unknown|unauthorized|denied)",
+                   re.IGNORECASE),
+        _image_pull_blocked,
     ),
     Rule(
         "tls-cert-verify-failed",
@@ -276,8 +311,10 @@ RULES: list[Rule] = [
     ),
     Rule(
         "gguf-load-fail",
+        # NB: no bare 'GGUF' token — it matches the model REPO NAME (…-Q4_K_M-GGUF)
+        # and misfired on an image-pull 403 (field report). Match real load errors.
         re.compile(r"(?:failed to load model|unable to load model|llama_load_model_from_file|"
-                   r"invalid magic|GGUF|unknown model architecture)", re.IGNORECASE),
+                   r"invalid magic|unknown model architecture|error loading model)", re.IGNORECASE),
         _gguf_load_fail,
     ),
     # LAST: the generic vLLM wrapper. Only fires when nothing specific matched,

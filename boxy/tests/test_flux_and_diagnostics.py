@@ -266,6 +266,31 @@ def test_diagnose_rocm_hip_error():
     assert hint is not None and "gfx" in hint and "rocminfo" in hint
 
 
+def test_diagnose_image_pull_403_not_gguf(monkeypatch):
+    # The exact hops compute-node failure: ghcr.io 403 via Zscaler. The log's
+    # model repo name ends in '-GGUF', which must NOT trigger the gguf-load rule;
+    # boxy must diagnose the IMAGE pull block and point at pre-pull / --registry.
+    log = ("Trying to pull ghcr.io/ggml-org/llama.cpp:server-cuda...\n"
+           "Error: initializing source docker://ghcr.io/ggml-org/llama.cpp:server-cuda: "
+           "pinging container registry ghcr.io: StatusCode: 403, \"<html>...Zs...\"\n"
+           "  auto: model: hf://hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF/"
+           "llama-3.2-1b-instruct-q4_k_m.gguf")
+    hint = diagnostics.diagnose(log)
+    assert hint is not None
+    assert "IMAGE could not be pulled" in hint and "registry blocked" in hint
+    assert "podman pull ghcr.io/ggml-org/llama.cpp:server-cuda" in hint
+    assert "--registry" in hint
+    assert "could not load the GGUF" not in hint          # the old misdiagnosis is gone
+
+
+def test_diagnose_gguf_load_still_matches_real_load_error():
+    # a genuine llama.cpp load failure still gets the GGUF advice
+    hint = diagnostics.diagnose("llama_load_model_from_file: failed to load model")
+    assert hint is not None and "could not load the GGUF" in hint
+    # but a bare repo name mentioning GGUF with no load error does NOT
+    assert diagnostics.diagnose("pulling hugging-quants/...-Q4_K_M-GGUF ok") is None
+
+
 def test_diagnose_host_oom_exit_137():
     # a second local instance reaped by the podman/docker VM OOM killer: often
     # empty logs, so boxy synthesizes 'OOMKilled exit 137' from the exit code.
