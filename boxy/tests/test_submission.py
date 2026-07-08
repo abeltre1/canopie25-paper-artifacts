@@ -371,3 +371,28 @@ def test_list_labels_foreign_cluster_records(jobs_dir, monkeypatch, capsys):
     assert probed == ["77"]                           # the foreign job was NOT probed
     assert "shares this $HOME" in out                 # the explainer footnote
     assert jobs.read_record("boxy-eldo") is not None  # never reaped
+
+
+def test_boxy_logs_newest_named_and_diagnosed(jobs_dir, monkeypatch, capsys):
+    """boxy logs: newest log by default, NAME-prefix filter, crash diagnosis
+    appended — and it works after the record was reaped (files outlive jobs)."""
+    import time
+
+    from boxy import jobs
+
+    d = jobs._dir()
+    (d / "boxy-old-1.log").write_text("old noise\n")
+    time.sleep(0.01)
+    (d / "boxy-tiny-99.log").write_text(
+        "loading model\nRuntimeError: HIP error: no kernel image is available for execution\n")
+    rc = main(["logs"])                      # no name -> newest
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "boxy-tiny-99.log" in out and "HIP error" in out
+    assert "boxy diagnosis:" in out and "gfx" in out    # diagnosis appended
+    rc = main(["logs", "boxy-old"])          # prefix filter
+    out = capsys.readouterr().out
+    assert rc == 0 and "old noise" in out
+    rc = main(["logs", "nope"])              # helpful error
+    assert rc == 2
+    assert "boxy-tiny-99.log" in capsys.readouterr().err

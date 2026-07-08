@@ -1675,6 +1675,36 @@ def cmd_router(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_logs(args: argparse.Namespace) -> int:
+    """Show a job's log (newest first) + boxy's crash diagnosis. Works after the
+    record is reaped (log files outlive DONE jobs) and over --ssh."""
+    rc = _delegate_remote(args)
+    if rc is not None:
+        return rc
+    from boxy import diagnostics, jobs
+
+    d = jobs._dir()
+    pattern = f"{args.name}*.log" if args.name else "*.log"
+    cands = sorted(d.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not cands:
+        have = sorted({p.name for p in d.glob('*.log')})
+        raise UsageError(f"no logs matching {pattern!r} in {d}"
+                         + (f" — available: {', '.join(have)}" if have else " (no job logs yet)"))
+    path = cands[0]
+    if not args.name and len(cands) > 1:
+        print(f"### newest of {len(cands)} logs (pass a NAME for a specific job):")
+    text = path.read_text(errors="replace")
+    lines = text.splitlines()[-args.tail:]
+    print(f"### {path}  (last {len(lines)} lines)")
+    for line in lines:
+        print(f"    {line}")
+    hint = diagnostics.diagnose(text)
+    if hint:
+        print()
+        print(hint)
+    return 0
+
+
 def cmd_curl(args: argparse.Namespace) -> int:
     """Query a boxy-served model by NAME from wherever you are: resolve its
     endpoint from the job records, send one chat completion, print the reply.
@@ -2124,6 +2154,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="print JSON instead of a table")
     p.add_argument("--dryrun", action="store_true")
     p.set_defaults(func=cmd_bench)
+
+    p = sub.add_parser("logs", help="show a job's log + boxy's crash diagnosis (newest first)")
+    p.add_argument("name", nargs="?", default=None,
+                   help="job/instance name (prefix ok); default: the newest log")
+    p.add_argument("--tail", type=int, default=60, help="lines from the end (default 60)")
+    p.add_argument("--ssh", default=None, metavar="USER@HOST",
+                   help="read the logs on that cluster over SSH (reuses the boxy SSH session)")
+    p.set_defaults(func=cmd_logs, location=None)
 
     p = sub.add_parser("curl", help="query a served model: boxy curl [NAME] --prompt '...' "
                                     "(finds the endpoint from boxy's records; --ssh runs it cluster-side)")
