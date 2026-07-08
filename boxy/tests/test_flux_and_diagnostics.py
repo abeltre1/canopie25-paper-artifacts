@@ -474,3 +474,22 @@ def test_serve_fast_fails_on_incomplete_checkpoint(tmp_path, monkeypatch):
 def test_diagnose_unknown_returns_none():
     assert diagnostics.diagnose("Server started on port 8000. Ready.") is None
     assert diagnostics.diagnose("") is None
+
+
+def test_flux_time_converted_to_fsd():
+    """Field report: `--time 30:00` reached flux as `-t 30:00` -> 'invalid Flux
+    standard duration'. The portable --time converts formats, not just names."""
+    from boxy.schedulers.flux import _to_fsd
+
+    assert _to_fsd("30:00") == "1800s"        # MM:SS (the failing case)
+    assert _to_fsd("1:30:00") == "5400s"      # HH:MM:SS
+    assert _to_fsd("30") == "1800s"           # bare number = minutes (Slurm)
+    assert _to_fsd("2-12") == "216000s"       # D-HH
+    assert _to_fsd("2-12:30:15") == "217815s" # D-HH:MM:SS
+    assert _to_fsd("30m") == "30m"            # already FSD: untouched
+    assert _to_fsd("1.5h") == "1.5h"
+    assert _to_fsd("nonsense") == "nonsense"  # let flux produce its own error
+
+    from boxy.schedulers import get_scheduler
+    assert get_scheduler("flux").site_directive("time", "30:00") == "-t 1800s"
+    assert get_scheduler("slurm").site_directive("time", "30:00") == "--time=30:00"  # slurm untouched

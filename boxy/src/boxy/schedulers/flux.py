@@ -2,8 +2,35 @@
 
 from __future__ import annotations
 
+import re
+
 from boxy.location import Location
 from boxy.schedulers.base import Scheduler
+
+
+def _to_fsd(value: str) -> str:
+    """Slurm-style duration -> Flux Standard Duration. Flux's -t takes FSD
+    (`1800s`, `30m`, `1.5h`), NOT Slurm's colon notation — `-t 30:00` fails with
+    'invalid Flux standard duration' (field report). The portable --time flag
+    promises boxy converts formats, so: MM:SS / HH:MM:SS / D-HH[:MM[:SS]] and
+    bare minutes (Slurm semantics) become seconds; anything already FSD passes
+    through; anything unrecognized passes through for flux's own error."""
+    v = value.strip()
+    if re.fullmatch(r"\d+(\.\d+)?(ms|s|m|h|d)", v):
+        return v  # already FSD
+    m = re.fullmatch(r"(?:(\d+)-)?(\d+)(?::(\d+))?(?::(\d+))?", v)
+    if not m:
+        return v
+    days, a, b, c = m.groups()
+    if days is not None:  # D-HH[:MM[:SS]]
+        total = int(days) * 86400 + int(a) * 3600 + int(b or 0) * 60 + int(c or 0)
+    elif c is not None:   # HH:MM:SS
+        total = int(a) * 3600 + int(b) * 60 + int(c)
+    elif b is not None:   # MM:SS (Slurm)
+        total = int(a) * 60 + int(b)
+    else:                 # bare number = MINUTES in Slurm
+        total = int(a) * 60
+    return f"{total}s"
 
 
 class FluxScheduler(Scheduler):
@@ -59,10 +86,11 @@ class FluxScheduler(Scheduler):
 
     def site_directive(self, kind: str, value: str) -> str:
         # Flux spells the site knobs differently: queue not partition, bank
-        # (flux-accounting) not account, -t not --time.
+        # (flux-accounting) not account, -t (an FSD duration — converted from
+        # Slurm colon notation, see _to_fsd) not --time.
         return {"partition": f"--queue={value}",
                 "account": f"--bank={value}",
-                "time": f"-t {value}"}[kind]
+                "time": f"-t {_to_fsd(value)}"}[kind]
 
     def submit_command(self, script: str) -> list[str]:
         return ["flux", "batch", script]
