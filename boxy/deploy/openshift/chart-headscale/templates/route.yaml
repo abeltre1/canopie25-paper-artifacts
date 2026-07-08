@@ -1,0 +1,20 @@
+{{- if .Values.route.enabled }}
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: headscale
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "headscale.labels" . | nindent 4 }}
+  annotations:
+    haproxy.router.openshift.io/timeout: {{ .Values.route.timeout | quote }}
+spec:
+  host: {{ include "headscale.host" . }}
+  to:
+    kind: Service
+    name: headscale
+  port:
+    targetPort: http
+  tls:
+    termination: {{ .Values.route.termination }}
+{{- end }}

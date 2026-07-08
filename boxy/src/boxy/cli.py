@@ -1366,7 +1366,8 @@ def _delegate_remote(args, tunnel_ready: bool = False) -> int | None:
         return None
     return remote.run_remote(target, getattr(args, "_raw_argv", []), tunnel_ready=tunnel_ready,
                              local_port=getattr(args, "local_port", None),
-                             local_route=getattr(args, "route", "") or "")
+                             local_route=getattr(args, "route", "") or "",
+                             local_publish=getattr(args, "publish", "") or "")
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -1674,10 +1675,17 @@ def cmd_build(args: argparse.Namespace) -> int:
 def cmd_generate(args: argparse.Namespace) -> int:
     from boxy import sky_export
 
+    if args.format == "headscale":
+        return _generate_headscale(args)
+    if args.format == "flux-mcp":
+        return _generate_flux_mcp(args)
+    if not args.box or not args.location:
+        print(f"boxy generate {args.format}: --box and --location are required", file=sys.stderr)
+        return 2
     if args.format in ("slurm", "flux", "sbatch"):
         return _generate_agentless(args)
     if args.format != "sky":
-        print(f"boxy generate: unknown format {args.format!r} (available: sky, slurm, flux)",
+        print(f"boxy generate: unknown format {args.format!r} (available: sky, slurm, flux, headscale)",
               file=sys.stderr)
         return 1
     box, location = _load(args)
@@ -1697,6 +1705,52 @@ def cmd_generate(args: argparse.Namespace) -> int:
         print(f"wrote {args.output}  (launch: sky {'serve up' if args.serve else 'launch'} {args.output})")
     else:
         print(yaml_text, end="")
+    return 0
+
+
+def _generate_headscale(args: argparse.Namespace) -> int:
+    """Emit the Tier-2 naming authority (Headscale) for OpenShift: Helm values or a
+    self-contained oc-apply manifest. This is the DNS side of `boxy open --publish`
+    — it needs no box/location, only the control-plane URL + MagicDNS base domain."""
+    from boxy import headscale
+
+    if not args.server_url:
+        print("boxy generate headscale: --server-url is required (the OpenShift Route host, "
+              "e.g. https://headscale.apps.<cluster>)", file=sys.stderr)
+        return 2
+    if args.emit == "values":
+        text = headscale.emit_values(args.server_url, args.base_domain, args.preauth_key,
+                                     derp_udp=args.derp_udp)
+    else:
+        text = headscale.emit_manifest(args.server_url, args.base_domain,
+                                       args.namespace or "headscale",
+                                       args.preauth_key, derp_udp=args.derp_udp)
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(text)
+        print(f"wrote {args.output}")
+    else:
+        print(text, end="")
+    return 0
+
+
+def _generate_flux_mcp(args: argparse.Namespace) -> int:
+    """Emit the flux-mcp MCP server as a persistent OpenShift service."""
+    from boxy import mcp
+
+    if not args.host:
+        print("boxy generate flux-mcp: --host is required (the OpenShift Route hostname, "
+              "e.g. flux-mcp.apps.<cluster>)", file=sys.stderr)
+        return 2
+    text = mcp.emit_flux_mcp_manifest(args.host, args.namespace or "flux-mcp",
+                                      image=args.image or mcp.FLUX_MCP_IMAGE,
+                                      flux_uri=args.flux_uri)
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(text)
+        print(f"wrote {args.output}")
+    else:
+        print(text, end="")
     return 0
 
 
@@ -2149,7 +2203,15 @@ def cmd_open(args: argparse.Namespace) -> int:
     print(f"### READY  http://{host}:{port}/v1   (model: {name})")
     print(f"###   browser (llama.cpp web UI):  http://{host}:{port}/")
     route = getattr(args, "route", "") or ""
-    if route:
+    publish = getattr(args, "publish", "") or ""
+    if publish:
+        from boxy import remote
+        domain = remote.tailnet_domain() or "<tailnet>"
+        _, purl, _ = remote.publish_url(publish, lport, domain)
+        print(f"###   from a workstation (tailnet-enrolled):  ssh -L {lport}:{host}:{port} "
+              f"<this login node>  then `tailscale serve --bg --https=443 http://127.0.0.1:{lport}`")
+        print(f"###   -> teammates resolve {purl}/  via Headscale MagicDNS (no corporate DNS)")
+    elif route:
         from boxy import remote
         rurl, rnote = remote.route_url(route, lport)
         print(f"###   from a workstation:  ssh -L {lport}:{host}:{port} <this login node>  "
@@ -2515,6 +2577,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="run this command ON that cluster's login node over SSH (from anywhere; "
                         "OTP/YubiKey prompted once, session reused) and tunnel the endpoint back "
                         "to localhost. Also: BOXY_SSH_HOST env, or `remote=` in a --location profile")
+    p.add_argument("--route", default=None, metavar="NAME",
+                   help="with --ssh: print a friendly http://NAME.localhost:PORT/ tunnel URL (no DNS)")
+    p.add_argument("--publish", default=None, metavar="NAME",
+                   help="with --ssh: publish the tunnel on your Headscale tailnet as "
+                        "https://NAME.<tailnet>/ via `tailscale serve` (resolves for enrolled teammates)")
     p.add_argument("--dryrun", action="store_true", help="print the command instead of executing it")
     p.add_argument("args", nargs="*", help="extra engine args (put them after --)")
     p.set_defaults(func=cmd_serve)
@@ -2539,12 +2606,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_build)
 
     p = sub.add_parser("generate", help="transpile box+location to another orchestrator: "
-                                        "sky (SkyPilot YAML) or slurm|flux (self-contained, boxy-free job script)")
-    p.add_argument("format", choices=["sky", "slurm", "flux", "sbatch"],
-                   help="sky = SkyPilot task YAML; slurm|flux = agentless batch script (no boxy on the cluster)")
-    p.add_argument("--box", required=True)
-    p.add_argument("--location", required=True)
+                                        "sky (SkyPilot YAML), slurm|flux (boxy-free job script), or "
+                                        "headscale (OpenShift naming-authority manifest)")
+    p.add_argument("format", choices=["sky", "slurm", "flux", "sbatch", "headscale", "flux-mcp"],
+                   help="sky = SkyPilot task YAML; slurm|flux = agentless batch script (no boxy on the "
+                        "cluster); headscale = Tier-2 DNS authority for OpenShift; flux-mcp = the Flux "
+                        "MCP server as a persistent OpenShift service")
+    p.add_argument("--box", default=None)
+    p.add_argument("--location", default=None)
     p.add_argument("--port", type=int, default=None)
+    # headscale-only: the Tier-2 naming authority (no box/location needed)
+    p.add_argument("--server-url", default=None,
+                   help="headscale: public HTTPS URL of the control plane (the OpenShift Route host)")
+    p.add_argument("--base-domain", default="boxy.ts.net",
+                   help="headscale: MagicDNS base domain (default boxy.ts.net)")
+    p.add_argument("--namespace", default=None, help="headscale/flux-mcp: OpenShift namespace")
+    p.add_argument("--host", default=None, help="flux-mcp: the OpenShift Route hostname to expose the MCP server on")
+    p.add_argument("--flux-uri", default="", help="flux-mcp: FLUX_URI for reaching a remote Flux instance")
+    p.add_argument("--preauth-key", default="", help="headscale: reusable pre-auth key (prefer setting out-of-band)")
+    p.add_argument("--derp-udp", action="store_true",
+                   help="headscale: also emit a UDP LoadBalancer for STUN/3478 (default: relay over :443)")
+    p.add_argument("--emit", choices=["values", "manifest"], default="manifest",
+                   help="headscale: Helm values.yaml or a self-contained oc-apply manifest (default)")
     p.add_argument("--serve", action="store_true", help="add a SkyServe service block (sky serve up)")
     # agentless (slurm|flux) pins: hardware can't be detected off the compute node
     p.add_argument("--accelerator", default=None, help="agentless: pin the compute node's accelerator (cuda|rocm|…)")
@@ -2600,6 +2683,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="print a friendly http://NAME.localhost:PORT/ URL for the tunnel — "
                         "*.localhost resolves to 127.0.0.1 in every browser on macOS+Linux with "
                         "zero DNS setup (RFC 6761); a bare NAME gets '.localhost' appended")
+    p.add_argument("--publish", default=None, metavar="NAME",
+                   help="Tier 2: expose the tunnel on your Headscale tailnet via `tailscale serve` "
+                        "and print https://NAME.<tailnet>/ — a MagicDNS name that resolves for every "
+                        "enrolled teammate, no corporate DNS (falls back to --route if tailscale absent)")
     p.add_argument("--ssh", default=None, metavar="USER@HOST",
                    help="tunnel from that cluster's login node back to this machine over SSH")
     p.set_defaults(func=cmd_open, location=None)

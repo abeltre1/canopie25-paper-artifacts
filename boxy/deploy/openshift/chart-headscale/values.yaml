@@ -1,0 +1,45 @@
+# chart-headscale — Tier-2 naming authority on OpenShift.
+#   helm install headscale ./chart-headscale \
+#     --set serverUrl=https://headscale.apps.<cluster> \
+#     --set baseDomain=boxy.ts.net
+# then mint a pre-auth key:
+#   oc exec deploy/headscale -- headscale preauthkeys create --reusable --user boxy
+#
+# `boxy generate headscale --emit values` prints a ready-to-use copy of this file.
+
+image: docker.io/headscale/headscale:0.23.0
+
+# REQUIRED: public HTTPS URL of the control plane = the OpenShift Route host.
+serverUrl: ""
+# MagicDNS base domain — models publish as <name>.<baseDomain>.
+baseDomain: boxy.ts.net
+magicDns: true
+
+# Reusable pre-auth key. Prefer `--set preAuthKey=...` at install time over
+# committing it here.
+preAuthKey: ""
+
+persistence:
+  enabled: true
+  size: 1Gi
+  accessMode: ReadWriteOnce
+  # storageClassName: null  # cluster default
+
+derp:
+  udp:
+    # false: peers relay over the :443 Route (no UDP ingress, no extra privileges).
+    # true:  also expose STUN/3478 via a LoadBalancer for direct paths (needs a
+    #        routable UDP ingress; ask your cluster admin).
+    enabled: false
+
+route:
+  enabled: true
+  # host defaults to the serverUrl host when left empty.
+  host: ""
+  # reencrypt keeps server_url=https honest and the /ts2021 Noise stream encrypted
+  # on every hop; the long timeout keeps the persistent control connection alive.
+  termination: reencrypt
+  timeout: 3600s
+
+securityContext:
+  runAsNonRoot: true

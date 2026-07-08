@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: headscale
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "headscale.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: headscale
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+{{- if .Values.derp.udp.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: headscale-derp-udp
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "headscale.labels" . | nindent 4 }}
+spec:
+  type: LoadBalancer
+  selector:
+    app: headscale
+  ports:
+    - name: stun
+      port: 3478
+      targetPort: 3478
+      protocol: UDP
+{{- end }}

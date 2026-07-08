@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flux-mcp
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: flux-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flux-mcp
+  template:
+    metadata:
+      labels:
+        app: flux-mcp
+    spec:
+      securityContext:
+        runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+      containers:
+        - name: flux-mcp
+          image: {{ .Values.image }}
+          command: ["python3", "-m", "flux_mcp.server.fastmcp"]
+          ports:
+            - containerPort: {{ .Values.port }}
+              name: mcp
+          {{- if .Values.fluxUri }}
+          env:
+            - name: FLUX_URI
+              value: {{ .Values.fluxUri | quote }}
+          {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flux-mcp
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: flux-mcp
+spec:
+  selector:
+    app: flux-mcp
+  ports:
+    - name: mcp
+      port: {{ .Values.port }}
+      targetPort: {{ .Values.port }}
+{{- if .Values.route.enabled }}
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: flux-mcp
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    haproxy.router.openshift.io/timeout: {{ .Values.route.timeout | quote }}
+spec:
+  host: {{ required "host is required" .Values.host }}
+  to:
+    kind: Service
+    name: flux-mcp
+  port:
+    targetPort: mcp
+  tls:
+    termination: {{ .Values.route.termination }}
+{{- end }}
