@@ -441,3 +441,41 @@ def test_boxy_curl_nothing_serving(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
     assert cli_main(["curl"]) == 2
     assert "nothing is serving" in capsys.readouterr().err
+
+
+def test_boxy_curl_skips_foreign_cluster_endpoints(tmp_path, monkeypatch, capsys):
+    """Shared $HOME: another cluster's endpoint (a scheduler this host can't
+    speak) must never be auto-picked — its node hostname doesn't resolve here.
+    Field report: `boxy curl --ssh hops` grabbed an eldorado endpoint."""
+    from boxy.cli import main as cli_main
+
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
+    # a foreign flux job (this sandbox has no flux binary) with an endpoint
+    jobs.write_record("boxy-eldo", {"name": "boxy-eldo", "scheduler": "flux",
+                                    "job": "f2ag", "submitted_from": "eldorado-login2"})
+    (tmp_path / "boxy-eldo.endpoint.json").write_text(json.dumps(
+        {"name": "boxy-eldo", "host": "eldo1027", "port": 8090,
+         "url": "http://eldo1027:8090", "job": "f2ag"}))
+    # bare curl: nothing local -> explains where the foreign one lives
+    assert cli_main(["curl"]) == 2
+    err = capsys.readouterr().err
+    assert "nothing is serving on THIS cluster" in err and "boxy-eldo" in err and "--ssh" in err
+    # naming the foreign one: pointed at its own cluster, no DNS attempt
+    assert cli_main(["curl", "boxy-eldo"]) == 2
+    err = capsys.readouterr().err
+    assert "another cluster" in err and "eldorado-login2" in err
+    # a LOCAL (slurm) endpoint alongside: bare curl picks it, not the foreign one
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _ChatBackend)
+    srv.hits = 0
+    srv.tag = "chat"
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        port = srv.server_address[1]
+        jobs.write_record("boxy-here", {"name": "boxy-here", "scheduler": "slurm", "job": "9"})
+        (tmp_path / "boxy-here.endpoint.json").write_text(json.dumps(
+            {"name": "boxy-here", "host": "127.0.0.1", "port": port,
+             "url": f"http://127.0.0.1:{port}", "job": "9"}))
+        assert cli_main(["curl"]) == 0
+        assert "boxy endpoint OK" in capsys.readouterr().out
+    finally:
+        srv.shutdown()

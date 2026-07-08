@@ -1679,21 +1679,38 @@ def cmd_curl(args: argparse.Namespace) -> int:
     if args.url:
         url = args.url.rstrip("/").removesuffix("/v1")
     else:
-        endpoints = {r["name"]: ep for r in jobs.list_records()
-                     if (ep := jobs.read_endpoint(r["name"]))}
-        for r in jobs.list_records():  # replica groups: each replica has an endpoint
-            for rn in r.get("replicas", []):
-                if (ep := jobs.read_endpoint(rn)):
-                    endpoints[rn] = ep
+        from boxy.schedulers import get_scheduler
+
+        # Labs share $HOME across clusters, so the jobs dir holds OTHER clusters'
+        # endpoints too (their node hostnames don't resolve here). Only endpoints
+        # of jobs THIS cluster can speak are candidates; foreign ones get pointed
+        # at their own cluster. (Field report: `boxy curl --ssh hops` picked an
+        # eldorado endpoint and failed DNS on eldo1027.)
+        endpoints: dict[str, dict] = {}
+        foreign: dict[str, str] = {}  # name -> submitted_from
+        for r in jobs.list_records():
+            is_foreign = not shutil.which(get_scheduler(r["scheduler"]).state_command(r["job"])[0])
+            for n in [r["name"], *r.get("replicas", [])]:
+                ep = jobs.read_endpoint(n)
+                if ep and is_foreign:
+                    foreign[n] = r.get("submitted_from", "its own cluster")
+                elif ep:
+                    endpoints[n] = ep
         if args.name:
+            if args.name in foreign:
+                raise UsageError(f"{args.name} runs on another cluster (submitted from "
+                                 f"{foreign[args.name]}) — query it from there: "
+                                 f"boxy curl {args.name} --ssh <that login node>")
             ep = endpoints.get(args.name)
             if not ep:
-                raise UsageError(f"no endpoint for {args.name!r} — running ones: "
+                raise UsageError(f"no endpoint for {args.name!r} — running here: "
                                  f"{', '.join(sorted(endpoints)) or 'none'} (see boxy list)")
         elif len(endpoints) == 1:
             ep = next(iter(endpoints.values()))
         elif not endpoints:
-            raise UsageError("nothing is serving (no endpoint files) — see boxy list")
+            hint = (f" ({len(foreign)} foreign: {', '.join(sorted(foreign))} — query those via "
+                    f"--ssh on their own cluster)" if foreign else "")
+            raise UsageError(f"nothing is serving on THIS cluster{hint} — see boxy list")
         else:
             raise UsageError(f"several models are serving — pick one: boxy curl "
                              f"{' | '.join(sorted(endpoints))}")
