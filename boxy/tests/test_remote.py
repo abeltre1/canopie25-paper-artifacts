@@ -68,6 +68,26 @@ def test_remote_argv_strips_ssh_flag():
     assert remote.remote_argv(raw) == ["serve", "M", "--gpus", "4", "--dryrun"]
 
 
+def test_run_remote_filters_login_node_podman_noise(shim, capfd, monkeypatch):
+    # `boxy list --ssh` runs the CLUSTER's (possibly OLD) boxy; on a login node
+    # rootless podman spews runtime-dir noise. Filter it laptop-side so it's gone
+    # regardless of the remote boxy version — but keep the real output.
+    monkeypatch.setenv(
+        remote.ENV_REMOTE_CMD,
+        'printf \'%s\\n\' '
+        '\'time="2026-07-08T11:37:40-06:00" level=warning msg="Failed to get rootless '
+        'runtime dir for DefaultAPIAddress: lstat /run/user/140425: no such file or directory"\' '
+        '\'Error: creating events dirs: mkdir /run/user/140425: permission denied\' '
+        '\'scheduler jobs:\' '
+        '\'  boxy-x  flux job f2a  RUNNING  http://eldo1290:8090/v1\'')
+    rc = remote.run_remote("user@login1", ["list"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "Failed to get rootless runtime dir" not in out      # noise gone
+    assert "creating events dirs" not in out
+    assert "scheduler jobs:" in out and "RUNNING" in out         # real output kept
+
+
 def test_remote_argv_strips_route_so_older_cluster_boxy_still_runs():
     # `--route` is a LAPTOP-side tunnel name consumed by run_remote; the cluster's
     # `boxy open NAME` must never receive it (older installs don't know it).

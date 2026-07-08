@@ -61,6 +61,17 @@ READY_RE = re.compile(r"###\s+(?:READY|ALREADY SERVING)\s+http://([^:/\s]+):(\d+
 # eldorado` -> "invalid choice: 'logs'") — say so instead of a bare usage error.
 STALE_RE = re.compile(r"invalid choice: '[^']+'|unrecognized arguments:")
 
+# rootless podman on an HPC login node has no /run/user/$UID (no user systemd
+# session), so `podman ps` spews 'Failed to get rootless runtime dir' + 'creating
+# events dirs: ... permission denied' before failing. That noise is meaningless to
+# the user (the real instances are the scheduler jobs) — filter it from the SSH
+# stream on the LAPTOP side so it's gone regardless of the cluster's boxy version
+# (field report: boxy list --ssh eldorado). Kept tight so real errors still show.
+NOISE_RE = re.compile(
+    r"Failed to get rootless runtime dir"
+    r"|creating events dirs:.*(?:/run/user/|permission denied)"
+    r"|rootless.*(?:/run/user/\d+).*(?:no such file|permission denied)")
+
 
 def ssh_bin() -> str:
     return os.environ.get(ENV_SSH_BIN, "ssh")
@@ -236,6 +247,8 @@ def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False,
     stale = False
     assert proc.stdout is not None
     for line in proc.stdout:
+        if NOISE_RE.search(line):
+            continue  # drop login-node rootless-podman noise (see NOISE_RE)
         print(line, end="")
         stale = stale or bool(STALE_RE.search(line))
         if tunnel_ready:
