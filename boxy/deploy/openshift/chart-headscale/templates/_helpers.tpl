@@ -39,6 +39,10 @@ derp:
     enabled: true
     region_id: 999
     region_code: boxy
+    region_name: Boxy Embedded DERP
+    # required when the embedded DERP is enabled (headscale creates it on boot);
+    # omitting it is fatal. /var/lib/headscale is the writable PVC mount.
+    private_key_path: /var/lib/headscale/derp_server_private.key
     stun_listen_addr: 0.0.0.0:3478
   urls: []
   auto_update_enabled: false

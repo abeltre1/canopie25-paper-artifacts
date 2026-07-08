@@ -51,6 +51,11 @@ def _config_yaml(server_url: str, base_domain: str, *, derp_udp: bool) -> str:
         "    enabled: true\n"
         "    region_id: 999\n"
         "    region_code: boxy\n"
+        "    region_name: Boxy Embedded DERP\n"
+        # REQUIRED when the embedded DERP is enabled: headscale writes this key on
+        # first boot. Omitting it is fatal ('failed to save private key to disk at
+        # path ""'). The PVC mounts /var/lib/headscale, so it's writable.
+        "    private_key_path: /var/lib/headscale/derp_server_private.key\n"
         f"    stun_listen_addr: 0.0.0.0:3478\n"
         f"    # STUN/UDP {'exposed via a LoadBalancer' if derp_udp else 'not exposed; peers relay over the :443 Route'}\n"
         "  urls: []\n"

@@ -37,6 +37,9 @@ def test_emit_manifest_is_valid_multidoc_yaml_with_expected_kinds():
     assert dep["spec"]["template"]["spec"]["securityContext"]["runAsNonRoot"] is True
     cfg = next(d for d in docs if d["kind"] == "ConfigMap")["data"]["config.yaml"]
     assert "magic_dns: true" in cfg and "base_domain: boxy.ts.net" in cfg
+    # embedded DERP MUST declare a writable private_key_path or headscale dies on boot
+    assert "private_key_path: /var/lib/headscale/derp_server_private.key" in cfg
+    assert "noise_private.key" in cfg                    # both keys present, distinct paths
     assert all(ns == "hs" for ns in (d["metadata"]["namespace"] for d in docs))
 
 
