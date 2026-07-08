@@ -20,6 +20,8 @@ server_url: {{ required "serverUrl is required" .Values.serverUrl }}
 listen_addr: 0.0.0.0:8080
 metrics_listen_addr: 127.0.0.1:9090
 grpc_listen_addr: 127.0.0.1:50443
+# /var/run/headscale isn't writable under OpenShift's non-root SCC; use the PVC.
+unix_socket: /var/lib/headscale/headscale.sock
 noise:
   private_key_path: /var/lib/headscale/noise_private.key
 prefixes:

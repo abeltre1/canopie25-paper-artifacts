@@ -32,6 +32,9 @@ def _config_yaml(server_url: str, base_domain: str, *, derp_udp: bool) -> str:
         "listen_addr: 0.0.0.0:8080\n"
         "metrics_listen_addr: 127.0.0.1:9090\n"
         "grpc_listen_addr: 127.0.0.1:50443\n"
+        # default is /var/run/headscale, which OpenShift's non-root/arbitrary-UID
+        # SCC can't create — put the socket on the writable PVC instead.
+        "unix_socket: /var/lib/headscale/headscale.sock\n"
         "noise:\n"
         "  private_key_path: /var/lib/headscale/noise_private.key\n"
         "prefixes:\n"
