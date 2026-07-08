@@ -167,6 +167,40 @@ def test_open_pins_a_custom_local_port(shim, capfd, monkeypatch):
     assert "CTL forward -L 8080:eldo1003:8090" in shim.read_text()
 
 
+def test_route_url_bare_name_gets_localhost():
+    # SPEC §8b Tier 1: a bare name becomes <name>.localhost -> 127.0.0.1 in every
+    # browser with zero DNS setup (RFC 6761). The tunnel still binds loopback.
+    url, note = remote.route_url("nemotron", 8090)
+    assert url == "http://nemotron.localhost:8090/v1"
+    assert "localhost" in note and "RFC 6761" in note
+
+
+def test_route_url_strips_scheme_and_path_and_honors_default_ports():
+    assert remote.route_url("https://chat/foo", 443)[0] == "http://chat.localhost/v1"
+    assert remote.route_url("svc", 80)[0] == "http://svc.localhost/v1"
+
+
+def test_route_url_dotted_name_used_verbatim_with_hosts_note():
+    url, note = remote.route_url("chat.example.com", 8090)
+    assert url == "http://chat.example.com:8090/v1"
+    assert "/etc/hosts" in note
+
+
+def test_open_route_prints_friendly_localhost_url(shim, capfd, monkeypatch):
+    # `boxy open --route nemotron --ssh ...` forwards the endpoint AND prints a
+    # friendly http://nemotron.localhost:PORT/ URL (no DNS) alongside ### LOCAL.
+    monkeypatch.setattr(remote, "_local_port_free", lambda p: True)
+    monkeypatch.setenv(remote.ENV_REMOTE_CMD,
+                       'echo "### READY  http://eldo1003:8090/v1   (model: m)" ; :')
+    rc = remote.run_remote("user@login1", ["open", "m"], tunnel_ready=True,
+                           local_route="nemotron")
+    assert rc == 0
+    out = capfd.readouterr().out
+    assert "### LOCAL   http://127.0.0.1:8090/v1" in out
+    assert "### ROUTE   http://nemotron.localhost:8090/v1" in out
+    assert "browser UI: http://nemotron.localhost:8090/" in out
+
+
 def test_control_persist_defaults_to_12h_and_is_overridable(monkeypatch):
     monkeypatch.delenv(remote.ENV_PERSIST, raising=False)
     assert remote.control_persist() == "12h"

@@ -175,6 +175,30 @@ def _free_local_port() -> int:
         return s.getsockname()[1]
 
 
+def route_url(alias: str, port: int) -> tuple[str, str]:
+    """A friendly local URL for the tunnel — NO DNS server needed (SPEC §8b
+    'Tier 1'). A bare name gets '.localhost', which resolves to 127.0.0.1 in
+    every browser on every OS (RFC 6761, handled by the browser itself); a
+    dotted name is used verbatim. Returns (url, note). The tunnel still binds
+    127.0.0.1:port — only the printed name changes; the browser resolves the
+    name back to loopback and hits the tunnel."""
+    host = alias.strip().rstrip("/")
+    for pre in ("https://", "http://"):
+        if host.startswith(pre):
+            host = host[len(pre):]
+    host = host.split("/", 1)[0]
+    note = ""
+    if "." not in host:
+        host = f"{host}.localhost"
+        note = ("*.localhost -> 127.0.0.1 in browsers on macOS+Linux with zero setup (RFC 6761); "
+                "for CLI on Linux it needs systemd-resolved (default on Ubuntu/Fedora/Debian)")
+    elif not host.endswith(".localhost"):
+        note = (f"point {host} at the tunnel: add '127.0.0.1  {host}' to /etc/hosts per machine, "
+                "or (for a shared name with no company DNS) front it with Headscale + `tailscale serve`")
+    suffix = "" if port in (80, 443) else f":{port}"
+    return f"http://{host}{suffix}/v1", note
+
+
 def add_forward(host: str, local_port: int, remote_host: str, remote_port: int) -> int:
     """Add a port forward ON THE LIVE MASTER — no new connection, no re-auth.
     The forward persists as long as the master does (ControlPersist), so it
@@ -186,13 +210,14 @@ def add_forward(host: str, local_port: int, remote_host: str, remote_port: int) 
 
 
 def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False,
-               local_port: int | None = None) -> int:
+               local_port: int | None = None, local_route: str = "") -> int:
     """Run the user's boxy command on `host`, streaming output live. With
     `tunnel_ready`, watch for the '### READY http://node:port' banner and
     forward that endpoint back, then print the local URL — the model is reachable
     on the laptop as http://127.0.0.1:<port>/v1. `local_port` pins the LOCAL side
     (a stable URL, e.g. `boxy open --port 8080`); default reuses the remote port
-    when free, else picks any free port."""
+    when free, else picks any free port. `local_route` (e.g. `--route nemotron`)
+    also prints a friendly `http://<name>.localhost:<port>/` URL — no DNS."""
     rc = ensure_master(host)
     if rc != 0:
         print(f"boxy: could not open an SSH session to {host} (rc {rc}) — check the host, "
@@ -230,8 +255,14 @@ def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False,
                 if add_forward(host, lport, node, port) == 0:
                     print(f"### LOCAL   http://127.0.0.1:{lport}/v1   "
                           f"(tunnel over the SSH session; persists ~{control_persist()})")
-                    print(f"###   browser: open http://127.0.0.1:{lport}/   "
-                          f"(llama.cpp serves a web UI there; vLLM exposes only /v1)")
+                    if local_route:
+                        rurl, rnote = route_url(local_route, lport)
+                        print(f"### ROUTE   {rurl}   (browser UI: {rurl[:-2]})")
+                        if rnote:
+                            print(f"###   {rnote}")
+                    else:
+                        print(f"###   browser: open http://127.0.0.1:{lport}/   "
+                              f"(llama.cpp serves a web UI there; vLLM exposes only /v1)")
                     print(f"###   close: ssh -O cancel -L {lport}:{node}:{port} "
                           f"-o ControlPath={control_path()} {host}")
                 else:

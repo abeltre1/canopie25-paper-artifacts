@@ -1365,7 +1365,8 @@ def _delegate_remote(args, tunnel_ready: bool = False) -> int | None:
     if target_short and target_short == socket.gethostname().split(".")[0]:
         return None
     return remote.run_remote(target, getattr(args, "_raw_argv", []), tunnel_ready=tunnel_ready,
-                             local_port=getattr(args, "local_port", None))
+                             local_port=getattr(args, "local_port", None),
+                             local_route=getattr(args, "route", "") or "")
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -2121,8 +2122,17 @@ def cmd_open(args: argparse.Namespace) -> int:
     lport = getattr(args, "local_port", None) or port
     print(f"### READY  http://{host}:{port}/v1   (model: {name})")
     print(f"###   browser (llama.cpp web UI):  http://{host}:{port}/")
-    print(f"###   from a workstation:  ssh -L {lport}:{host}:{port} <this login node>  "
-          f"then open http://127.0.0.1:{lport}/")
+    route = getattr(args, "route", "") or ""
+    if route:
+        from boxy import remote
+        rurl, rnote = remote.route_url(route, lport)
+        print(f"###   from a workstation:  ssh -L {lport}:{host}:{port} <this login node>  "
+              f"then open {rurl[:-2]}  (API base: {rurl})")
+        if rnote:
+            print(f"###   {rnote}")
+    else:
+        print(f"###   from a workstation:  ssh -L {lport}:{host}:{port} <this login node>  "
+              f"then open http://127.0.0.1:{lport}/")
     return 0
 
 
@@ -2560,6 +2570,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", dest="local_port", type=int, default=None, metavar="N",
                    help="pin the LOCAL port for a stable URL (http://127.0.0.1:N/); "
                         "default reuses the remote port when free, else picks a free one")
+    p.add_argument("--route", default=None, metavar="NAME",
+                   help="print a friendly http://NAME.localhost:PORT/ URL for the tunnel — "
+                        "*.localhost resolves to 127.0.0.1 in every browser on macOS+Linux with "
+                        "zero DNS setup (RFC 6761); a bare NAME gets '.localhost' appended")
     p.add_argument("--ssh", default=None, metavar="USER@HOST",
                    help="tunnel from that cluster's login node back to this machine over SSH")
     p.set_defaults(func=cmd_open, location=None)

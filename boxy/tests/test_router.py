@@ -430,6 +430,26 @@ def test_boxy_open_reports_endpoint_and_browser_url(tmp_path, monkeypatch, capsy
     assert "several models are serving" in capsys.readouterr().err
 
 
+def test_boxy_open_route_prints_friendly_name(tmp_path, monkeypatch, capsys):
+    """`boxy open NAME --route foo` (cluster-side) folds a friendly
+    http://foo.localhost:PORT/ name into the workstation tunnel instructions —
+    no DNS needed (SPEC §8b Tier 1)."""
+    from boxy import cli
+    from boxy.cli import main as cli_main
+
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
+    monkeypatch.setattr(cli, "_scheduler_reachable", lambda s: True)
+    jobs.write_record("boxy-a", {"name": "boxy-a", "scheduler": "flux", "job": "boxy-a"})
+    (tmp_path / "boxy-a.endpoint.json").write_text(json.dumps(
+        {"name": "boxy-a", "host": "eldo1003", "port": 8090,
+         "url": "http://eldo1003:8090", "job": "boxy-a"}))
+    assert cli_main(["open", "boxy-a", "--route", "nemotron"]) == 0
+    out = capsys.readouterr().out
+    assert "ssh -L 8090:eldo1003:8090" in out                 # tunnel still by port
+    assert "http://nemotron.localhost:8090/" in out           # friendly browser name
+    assert "http://nemotron.localhost:8090/v1" in out         # friendly API base
+
+
 def test_boxy_curl_by_name_and_single_default(tmp_path, monkeypatch, capsys):
     from boxy import cli
     from boxy.cli import main as cli_main
