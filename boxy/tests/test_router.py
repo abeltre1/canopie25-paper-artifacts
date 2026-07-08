@@ -394,3 +394,50 @@ def test_router_fails_over_when_a_replica_dies(router_over_two_backends):
             json.load(resp)
     assert ok == 6                                             # all served via the survivor
     assert backends[1].hits >= 6
+
+
+# ---- boxy curl (endpoint query from the records) ------------------------------
+
+
+class _ChatBackend(_FakeBackend):
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        json.loads(self.rfile.read(n)) if n else {}
+        self._json({"choices": [{"message": {"role": "assistant", "content": "boxy endpoint OK"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 3}})
+
+
+def test_boxy_curl_by_name_and_single_default(tmp_path, monkeypatch, capsys):
+    from boxy.cli import main as cli_main
+
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _ChatBackend)
+    srv.hits = 0
+    srv.tag = "chat"
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    try:
+        jobs.write_record("boxy-tiny", {"name": "boxy-tiny", "scheduler": "slurm", "job": "1"})
+        (tmp_path / "boxy-tiny.endpoint.json").write_text(json.dumps(
+            {"name": "boxy-tiny", "host": "127.0.0.1", "port": port,
+             "url": f"http://127.0.0.1:{port}", "job": "1"}))
+        # by name
+        assert cli_main(["curl", "boxy-tiny"]) == 0
+        out = capsys.readouterr().out
+        assert "boxy endpoint OK" in out and "fake-model" in out
+        # single instance: name optional
+        assert cli_main(["curl"]) == 0
+        assert "boxy endpoint OK" in capsys.readouterr().out
+        # unknown name: helpful error listing what's up
+        assert cli_main(["curl", "nope"]) == 2
+        assert "boxy-tiny" in capsys.readouterr().err
+    finally:
+        srv.shutdown()
+
+
+def test_boxy_curl_nothing_serving(tmp_path, monkeypatch, capsys):
+    from boxy.cli import main as cli_main
+
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
+    assert cli_main(["curl"]) == 2
+    assert "nothing is serving" in capsys.readouterr().err

@@ -1648,6 +1648,60 @@ def cmd_router(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_curl(args: argparse.Namespace) -> int:
+    """Query a boxy-served model by NAME from wherever you are: resolve its
+    endpoint from the job records, send one chat completion, print the reply.
+    With --ssh (or BOXY_SSH_HOST) it runs ON the cluster, where the compute-node
+    hostname resolves — so `boxy curl --ssh user@login` works from a laptop."""
+    rc = _delegate_remote(args)
+    if rc is not None:
+        return rc
+    import urllib.error
+
+    from boxy import bench, jobs
+
+    if args.url:
+        url = args.url.rstrip("/").removesuffix("/v1")
+    else:
+        endpoints = {r["name"]: ep for r in jobs.list_records()
+                     if (ep := jobs.read_endpoint(r["name"]))}
+        for r in jobs.list_records():  # replica groups: each replica has an endpoint
+            for rn in r.get("replicas", []):
+                if (ep := jobs.read_endpoint(rn)):
+                    endpoints[rn] = ep
+        if args.name:
+            ep = endpoints.get(args.name)
+            if not ep:
+                raise UsageError(f"no endpoint for {args.name!r} — running ones: "
+                                 f"{', '.join(sorted(endpoints)) or 'none'} (see boxy list)")
+        elif len(endpoints) == 1:
+            ep = next(iter(endpoints.values()))
+        elif not endpoints:
+            raise UsageError("nothing is serving (no endpoint files) — see boxy list")
+        else:
+            raise UsageError(f"several models are serving — pick one: boxy curl "
+                             f"{' | '.join(sorted(endpoints))}")
+        url = ep["url"]
+    try:
+        model = bench.discover_model(url)
+        body = bench._http_json(f"{url}/v1/chat/completions", {
+            "model": model, "max_tokens": args.max_tokens,
+            "messages": [{"role": "user", "content": args.prompt}]})
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"cannot reach {url} ({getattr(e, 'reason', e)}) — is the job READY? "
+                           f"(boxy list). From a laptop, add --ssh user@login to query "
+                           f"from the cluster side.") from e
+    if args.json:
+        import json as _json
+
+        print(_json.dumps(body, indent=1))
+        return 0
+    reply = (body.get("choices") or [{}])[0].get("message", {}).get("content", "")
+    print(f"[{model} @ {url}]")
+    print(reply.strip() or "(empty reply)")
+    return 0
+
+
 def cmd_bench(args: argparse.Namespace) -> int:
     from boxy import bench
 
@@ -2022,6 +2076,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="print JSON instead of a table")
     p.add_argument("--dryrun", action="store_true")
     p.set_defaults(func=cmd_bench)
+
+    p = sub.add_parser("curl", help="query a served model: boxy curl [NAME] --prompt '...' "
+                                    "(finds the endpoint from boxy's records; --ssh runs it cluster-side)")
+    p.add_argument("name", nargs="?", default=None,
+                   help="instance name from the READY banner / boxy list (optional if only one is up)")
+    p.add_argument("--prompt", default="Reply with exactly: boxy endpoint OK",
+                   help="the user message to send (default: a one-line liveness probe)")
+    p.add_argument("--max-tokens", type=int, default=64)
+    p.add_argument("--url", default=None, help="query this endpoint directly instead of a NAME")
+    p.add_argument("--json", action="store_true", help="print the raw JSON response")
+    p.add_argument("--ssh", default=None, metavar="USER@HOST",
+                   help="run on that cluster's login node over SSH (compute-node hostnames "
+                        "resolve there; reuses the boxy SSH session)")
+    p.set_defaults(func=cmd_curl, location=None)
 
     p = sub.add_parser("sweep", help="scaling study: submit each rung (nodes or replicas in "
                                      "powers of 2), benchmark it, tear it down, print a comparison table")
