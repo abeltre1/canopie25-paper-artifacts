@@ -133,11 +133,13 @@ def test_remote_checks_healthy_cluster_all_ok():
         "sbatch flux srun": "sbatch\nsrun\n",
         "nvidia-smi": "cuda\n",
         "https_proxy": "||\n",
-        "ghcr.io/v2": "401",                        # reachable (unauth front door)
+        "ghcr.io/v2": "307",                        # a redirect (reachable) — the hops case
         "boxy/jobs": "/home/u/.local/share/boxy/jobs/hops/\n",
     })
     results = doctor.remote_checks(run)
     assert all(x.status == doctor.OK for x in results)
+    ghcr = next(x for x in results if x.name == "image registry ghcr.io")
+    assert "reachable" in ghcr.detail and "pre-pull" in ghcr.detail  # 307 -> reachable, not a WARN
 
 
 def test_cmd_doctor_remote_audit_no_cluster_boxy(monkeypatch, capsys):

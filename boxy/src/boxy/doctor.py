@@ -263,14 +263,20 @@ def remote_checks(run) -> list[Result]:
         out.append(Result("proxy (login node)", OK, "none set"))
 
     # THE one that bit the user: can the cluster pull the container image?
-    rc, code = run("curl -s -o /dev/null -w '%{http_code}' --max-time 12 https://ghcr.io/v2/ 2>/dev/null || echo curlfail")
+    # -L follows redirects (ghcr.io/v2/ 307 -> 401 is normal) so we report the
+    # TRUE final status; a 403 is the Zscaler/proxy block that dooms podman pull.
+    _, code = run("curl -sL --max-redirs 3 -o /dev/null -w '%{http_code}' --max-time 12 "
+                  "https://ghcr.io/v2/ 2>/dev/null || echo curlfail")
     code = code.strip()
-    if code in ("200", "401", "404"):
-        out.append(Result("image registry ghcr.io", OK, f"reachable from the login node (HTTP {code})"))
+    if code in ("200", "401", "404") or (len(code) == 3 and code[0] == "3"):
+        note = "reachable" if not code.startswith("3") else "reachable (redirect)"
+        out.append(Result("image registry ghcr.io", OK,
+                          f"{note} from the login node (HTTP {code}) — `podman pull` here should work; "
+                          "pre-pull so compute nodes reuse the shared $HOME store"))
     elif code == "403":
         out.append(Result("image registry ghcr.io", FAIL, "HTTP 403 — refused by a proxy/policy (Zscaler?)",
-                          "the compute node's `podman pull` will fail too. Pre-pull on THIS login node "
-                          "(shared $HOME store), pass --proxy, or use --registry a site mirror"))
+                          "a `podman pull` will fail here AND on the compute node. Pass --proxy, "
+                          "or --registry a site mirror (RUNBOOK §0.965/§0.97)"))
     else:
         out.append(Result("image registry ghcr.io", WARN, f"could not probe ({code or 'no curl'})",
                           "install curl or check the login node's egress; a pull may still work via the proxy"))
