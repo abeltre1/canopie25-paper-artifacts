@@ -68,6 +68,14 @@ def test_remote_argv_strips_ssh_flag():
     assert remote.remote_argv(raw) == ["serve", "M", "--gpus", "4", "--dryrun"]
 
 
+def test_remote_argv_strips_route_so_older_cluster_boxy_still_runs():
+    # `--route` is a LAPTOP-side tunnel name consumed by run_remote; the cluster's
+    # `boxy open NAME` must never receive it (older installs don't know it).
+    raw = ["open", "NAME", "--ssh", "u@h", "--route", "llama"]
+    assert remote.remote_argv(raw) == ["open", "NAME"]
+    assert remote.remote_argv(["open", "NAME", "--route=llama"]) == ["open", "NAME"]
+
+
 def test_resolve_target_precedence(tmp_path, monkeypatch):
     from types import SimpleNamespace
 

@@ -131,19 +131,22 @@ def ssh_capture(host: str, remote_command: str, timeout: int = 20) -> tuple[int,
 
 
 def remote_argv(raw_argv: list[str]) -> list[str]:
-    """The exact command the user typed, minus the remote-targeting flags (the
+    """The exact command the user typed, minus the LAPTOP-SIDE-ONLY flags (the
     remote side must run it LOCALLY: recursion is also belt-and-suspenders
-    blocked by BOXY_REMOTE_ACTIVE)."""
+    blocked by BOXY_REMOTE_ACTIVE). `--ssh` targets the remote; `--route` names
+    the local tunnel URL — both are consumed here on the laptop and the cluster's
+    boxy never sees them, so a bare `boxy open NAME` runs there even when the
+    CLUSTER's install is older and doesn't know `--route` (field report)."""
     out: list[str] = []
     skip = False
     for tok in raw_argv:
         if skip:
             skip = False
             continue
-        if tok == "--ssh":
+        if tok in ("--ssh", "--route"):
             skip = True
             continue
-        if tok.startswith("--ssh="):
+        if tok.startswith("--ssh=") or tok.startswith("--route="):
             continue
         out.append(tok)
     return out
