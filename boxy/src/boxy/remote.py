@@ -149,6 +149,9 @@ def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False) -> in
               f"your VPN, and that you completed the OTP/YubiKey prompt", file=sys.stderr)
         return rc
     argv = remote_argv(raw_argv)
+    # label what follows: everything below runs the CLUSTER's boxy install (keep
+    # it as current as the local one: git pull + pip install -e on the login node).
+    print(f"### Remote  {host}  $ boxy {shlex.join(argv)}")
     cmd = [ssh_bin(), "-o", f"ControlPath={control_path()}", host, _remote_command(argv)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     tunneled: set[tuple[str, int]] = set()

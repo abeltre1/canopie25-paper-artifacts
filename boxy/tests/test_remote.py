@@ -96,6 +96,7 @@ def test_serve_delegates_over_ssh_and_streams(shim, capfd):
                "--scheduler", "slurm", "--gpus", "1", "--dryrun"])
     assert rc == 0
     out = capfd.readouterr().out
+    assert "### Remote  user@login1  $ boxy serve" in out   # remote output is labeled
     assert "### Batch script" in out          # the REMOTE boxy's dryrun output
     assert "#SBATCH --gpus-per-node=1" in out
     log = shim.read_text()
