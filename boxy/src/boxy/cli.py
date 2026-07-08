@@ -971,8 +971,9 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
         box, _aloc, _dec = _resolve_or_load(args)
         aloc = dc_replace(location, accelerator=(args.accelerator or location.accelerator),
                           runtime=(args.runtime or location.runtime))
-        if args.image:
-            box = dc_replace(box, image=args.image)
+        # the container --name/label must match the job/record/endpoint name so
+        # boxy list/stop find it (the box's model-slug name would diverge).
+        box = dc_replace(box, name=name, image=args.image or box.image)
         try:
             script_text = deploy.render_agentless_script(
                 box, aloc, scheduler_name, name, str(jobs.endpoint_path(name)),

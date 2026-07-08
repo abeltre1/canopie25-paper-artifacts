@@ -4,7 +4,28 @@ import pytest
 
 from boxy import engines, sky_export
 from boxy.box import Box
+from boxy.cli import main
 from boxy.location import Location, Resources
+from tests.conftest import EXAMPLES
+
+
+def test_generate_sky_smallest_llama_is_valid_yaml(capsys):
+    """Cloud row (verified by construction; a live cloud run needs credentials):
+    `boxy generate sky` for the smallest-Llama GGUF box must emit a SkyPilot task
+    that PARSES as YAML and carries the llama.cpp image + the in-task GGUF fetch."""
+    yaml = pytest.importorskip("yaml")
+    rc = main(["generate", "sky", "--box", str(EXAMPLES / "boxes" / "llama-3.2-1b.toml"),
+               "--location", str(EXAMPLES / "locations" / "cloud-gpu.toml")])
+    out = capsys.readouterr().out
+    assert rc == 0
+    task = yaml.safe_load(out)                                   # must be valid YAML
+    assert task["name"] == "llama-3.2-1b"
+    assert task["resources"]["image_id"] == "docker:ghcr.io/ggml-org/llama.cpp:server-cuda"
+    assert task["resources"]["accelerators"] == "H100:4"
+    assert task["resources"]["ports"] == [8090]
+    # the GGUF is fetched by the engine on the cloud VM (--hf-repo/--hf-file)
+    assert "--hf-repo hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF" in task["run"]
+    assert "--hf-file llama-3.2-1b-instruct-q4_k_m.gguf" in task["run"]
 
 
 @pytest.fixture

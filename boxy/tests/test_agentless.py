@@ -98,3 +98,43 @@ def test_serve_agentless_refuses_transport_uri(jobs_dir, capsys):
     err = capsys.readouterr().err
     assert rc == 2
     assert "PRE-STAGED" in err and "RamaLama" in err
+
+
+def test_serve_agentless_live_submit_reaches_ready(staged_gguf, jobs_dir, monkeypatch, capsys):
+    """End-to-end (no real cluster): submit the self-contained script via a fake
+    sbatch, simulate the compute node publishing the endpoint on RUNNING, and
+    confirm boxy follows it to READY. Guards the live agentless path."""
+    import boxy.cli as cli
+    from boxy import jobs, readiness
+
+    states = ["PENDING\n", "RUNNING\n"]
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        out, rc = "", 0
+        if cmd[0] == "sbatch":
+            out = "4242\n"
+            seen["script"] = jobs.script_path("boxy-al").read_text()  # what was submitted
+        elif cmd[0] == "squeue":
+            out = states.pop(0) if len(states) > 1 else states[0]
+            if "RUNNING" in out and not jobs.read_endpoint("boxy-al"):
+                jobs.write_endpoint("boxy-al", 8090, job_id="4242")  # the bash script's job
+        return type("R", (), {"returncode": rc, "stdout": out, "stderr": ""})()
+
+    real_which = cli.shutil.which
+    monkeypatch.setattr(cli.shutil, "which",
+                        lambda b: "/usr/bin/x" if b in ("sbatch", "squeue", "scancel", "podman")
+                        else real_which(b))
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setattr(readiness, "wait_ready",
+                        lambda url, **kw: "llama" if jobs.read_endpoint("boxy-al") else None)
+
+    rc = main(["serve", str(staged_gguf), "--scheduler", "slurm", "--gpus", "1",
+               "--agentless", "--accelerator", "cuda", "--name", "boxy-al"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "### Submitted slurm job 4242" in out and "### READY" in out and ":8090/v1" in out
+    # the submitted script was boxy-free and named the container after the job
+    assert "boxy serve" not in seen["script"] and "--name=boxy-al" in seen["script"]
+    assert jobs.read_record("boxy-al")["job"] == "4242"
