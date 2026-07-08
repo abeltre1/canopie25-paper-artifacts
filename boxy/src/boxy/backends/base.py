@@ -39,4 +39,8 @@ class RuntimeBackend(ABC):
         """Full host argv that runs `inner_cmd` inside the box's container."""
 
     def image_ref(self, box: Box, location: Location) -> str:
-        return f"{location.registry}{box.image}" if location.registry else box.image
+        """Every image reference resolves through registries.py (site mirrors,
+        --registry, localhost) — swap registries there, never per-backend."""
+        from boxy import registries
+
+        return registries.resolve_image(box.image, location.registry, location.image_mirrors)

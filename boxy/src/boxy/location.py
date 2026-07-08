@@ -37,7 +37,10 @@ class Location:
     scheduler: str = "none"
     accelerator: str = ""  # "" => autodetect via ramalama get_accel()
     runtime: str = ""      # "" => autodetect first available backend
-    registry: str = ""
+    registry: str = ""  # send ALL images to this registry (see registries.py)
+    # per-registry rewrite map ("docker.io" -> "registry.site.gov/dockerhub",
+    # "*" catch-all) for site mirrors / air-gapped pulls; wins over `registry`.
+    image_mirrors: dict[str, str] = field(default_factory=dict)
     offline: bool = False
     # Run boxy against this cluster FROM ANYWHERE: "user@login-node". When set
     # (and not already on the cluster), the CLI re-runs the same command on that

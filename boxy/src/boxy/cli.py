@@ -648,6 +648,7 @@ def _inner_serve_command(args, model: str, name: str, *, port: int | None = None
     if getattr(args, "trust_remote_code", False):
         inner += ["--trust-remote-code"]  # re-applied engine-aware on the compute node
     for flag, value in (("--engine", args.engine), ("--image", args.image),
+                        ("--registry", getattr(args, "registry", None)),
                         ("--runtime", args.runtime), ("--accelerator", args.accelerator)):
         if value:
             inner += [flag, value]
@@ -664,6 +665,11 @@ def _submission_hint(stderr: str) -> str:
     """Plain-language next step for the sbatch/flux-batch rejections users
     actually hit. Empty string when the error isn't recognized."""
     low = stderr.lower()
+    if "flux batch" in low or "flux-batch" in low:
+        return ("boxy hint: you asked for --scheduler slurm, but this cluster's `sbatch` is a\n"
+                "  FLUX compatibility wrapper — this is a Flux system (eldorado-class). Rerun with\n"
+                "  --scheduler flux (same portable flags: --partition/--account/--time translate).\n"
+                "  Tip: keep a --location profile per cluster so the scheduler is pinned correctly.")
     if "invalid account or account/partition combination" in low:
         return ("boxy hint: the scheduler rejected the ACCOUNT+PARTITION pairing, not the job.\n"
                 "  - check which accounts you may use on which partitions:\n"
@@ -1239,6 +1245,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
         location = _replace(location, staging=_replace(location.staging, models_dir=mdir))
         print(f"  auto: download dir: {os.path.abspath(mdir)} (--models-dir)")
+    if getattr(args, "registry", None):
+        from dataclasses import replace as _replace
+
+        location = _replace(location, registry=args.registry)
+        print(f"  auto: image registry: {args.registry} (--registry — images rewritten to it)")
     if getattr(args, "unique", False) and args.model and not args.box:
         # container edition of --unique: a fresh name (and thus container name +
         # label) per launch, so `boxy serve MODEL --unique` x N coexist. Ports
@@ -2002,6 +2013,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--accelerator", choices=list(ACCELERATORS), default=None,
                    help="pin the accelerator (needed when submitting GPU jobs from GPU-less login nodes)")
     p.add_argument("--image", default=None, help="container image (default: per engine+accelerator)")
+    p.add_argument("--registry", default=None, metavar="HOST[/PATH]",
+                   help="pull images from this registry instead (site mirror / local registry): "
+                        "replaces the image's registry component. Per-registry rewrites go in "
+                        "[location.image_mirrors]")
     p.add_argument("--port", type=int, default=None, help="serving port (default: engine default, next free)")
     p.add_argument("--gpus", type=int, default=None, help="GPUs per node for the --scheduler job request")
     p.add_argument("--nodes", type=int, default=None,
