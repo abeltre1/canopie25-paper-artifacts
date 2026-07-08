@@ -127,6 +127,18 @@ def test_ready_line_triggers_port_forward(shim, capfd, monkeypatch):
     assert "CTL forward -L 8090:cn042:8090" in shim.read_text()
 
 
+def test_already_serving_banner_also_tunnels(shim, capfd, monkeypatch):
+    # Rerunning the same model reconnects to the live job: the ALREADY SERVING
+    # banner must open the tunnel exactly like a fresh READY.
+    monkeypatch.setenv(remote.ENV_REMOTE_CMD,
+                       'echo "### ALREADY SERVING  http://cn042:8090/v1   (model: m, slurm job 7)" ; :')
+    rc = remote.run_remote("user@login1", ["serve", "m.gguf"], tunnel_ready=True)
+    assert rc == 0
+    out = capfd.readouterr().out
+    assert "### LOCAL   http://127.0.0.1:8090/v1" in out
+    assert "CTL forward -L 8090:cn042:8090" in shim.read_text()
+
+
 def test_recursion_guard_runs_locally(shim, capfd, monkeypatch):
     # On the remote side (BOXY_REMOTE_ACTIVE set) the --ssh flag is inert.
     monkeypatch.setenv(remote.ENV_ACTIVE, "1")

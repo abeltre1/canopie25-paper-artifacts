@@ -43,7 +43,9 @@ ENV_REMOTE_CMD = "BOXY_REMOTE_COMMAND"  # remote boxy spelling (default: "boxy")
 
 CONTROL_PERSIST = "4h"  # one OTP+touch buys this much multiplexed access
 
-READY_RE = re.compile(r"###\s+READY\s+http://([^:/\s]+):(\d+)")
+# tunnel-worthy endpoint banners from the remote serve: a fresh READY, or an
+# ALREADY SERVING reconnect (rerunning the same model finds the live job).
+READY_RE = re.compile(r"###\s+(?:READY|ALREADY SERVING)\s+http://([^:/\s]+):(\d+)")
 
 
 def ssh_bin() -> str:
