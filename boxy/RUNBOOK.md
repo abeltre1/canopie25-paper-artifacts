@@ -220,6 +220,14 @@ boxy info --net
 #     it saw — append that root CA to SSL_CERT_FILE (the merge above keeps public CAs).
 #   - auth proxies: export https_proxy=http://user:pass@host:port (407/"Tunnel
 #     connection failed" means credentials or policy).
+# LAPTOP BLOCKED BUT THE LOGIN NODE WORKS? (typical: HPC login nodes carry a
+# complete site proxy setup — http_proxy + https_proxy + no_proxy=.yoursite.gov —
+# while the laptop's path is policy-blocked.) You don't need laptop-side registry
+# access at all: every boxy command takes --ssh user@login and runs THERE, pulls
+# included — `boxy serve MODEL --scheduler slurm --gpus 4 --ssh user@login` pulls
+# on the cluster and tunnels the endpoint back (§0.95). Only replicate the login
+# node's proxy exports on the laptop if you truly need LOCAL pulls (VPN up, so
+# the site proxy resolves; keep .yoursite.gov in no_proxy so ssh stays direct).
 # NO NETWORK AT ALL? A local file serves with zero network: download the GGUF
 # elsewhere, copy it over, then `boxy serve /path/to/model.gguf`.
 
