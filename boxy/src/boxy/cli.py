@@ -1577,10 +1577,22 @@ def cmd_list(args: argparse.Namespace) -> int:
     from boxy.schedulers import get_scheduler
 
     records = jobs.list_records()
+    foreign_seen = False
     if records:
         print("scheduler jobs:")
         for record in records:
-            state = _job_state(get_scheduler(record["scheduler"]), record["job"])
+            scheduler_obj = get_scheduler(record["scheduler"])
+            state_bin = scheduler_obj.state_command(record["job"])[0]
+            if shutil.which(state_bin):
+                state = _job_state(scheduler_obj, record["job"])
+            else:
+                # Labs share $HOME across clusters, so this jobs dir holds OTHER
+                # clusters' records too (field report: an eldorado flux job listed
+                # on hops as UNKNOWN). No point probing — this cluster can't even
+                # speak that scheduler; say what it IS instead of UNKNOWN.
+                origin = record.get("submitted_from", "another cluster")
+                state = f"FOREIGN({origin})"
+                foreign_seen = True
             replicas = record.get("replicas")
             if replicas:
                 # a replica group job: one job, several co-located servers
@@ -1597,6 +1609,10 @@ def cmd_list(args: argparse.Namespace) -> int:
                 for rn in replicas or []:
                     jobs.endpoint_path(rn).unlink(missing_ok=True)
                 jobs.remove(record["name"])  # reap finished jobs from the list
+        if foreign_seen:
+            print("  (FOREIGN = submitted on another cluster that shares this $HOME; manage it "
+                  "there, e.g. boxy list --ssh <that-login>. Separate the views with a "
+                  "per-cluster BOXY_JOBS_DIR.)")
     location = Location.from_toml(args.location) if args.location else None
     try:
         runtime = args.runtime or _container_runtime(location)

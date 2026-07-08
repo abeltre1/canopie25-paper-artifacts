@@ -350,3 +350,24 @@ def test_r2_dryrun_does_not_reap_job_state(gguf, jobs_dir, monkeypatch, capsys):
     assert jobs.read_record("boxy-m") is not None        # untouched by dryrun
     rc = main(["list", "--dryrun", "--runtime", "docker"])
     assert jobs.read_record("boxy-m") is not None
+
+
+def test_list_labels_foreign_cluster_records(jobs_dir, monkeypatch, capsys):
+    """Shared $HOME: another cluster's record (a scheduler this host can't even
+    speak) must list as FOREIGN(origin), not UNKNOWN — and must not be probed.
+    Field report: an eldorado flux job listed on hops as UNKNOWN."""
+    from boxy import cli, jobs
+
+    jobs.write_record("boxy-eldo", {"name": "boxy-eldo", "scheduler": "flux",
+                                    "job": "f2agHnM4psaw", "submitted_from": "eldorado-login2"})
+    jobs.write_record("boxy-here", {"name": "boxy-here", "scheduler": "slurm", "job": "77"})
+    probed = []
+    monkeypatch.setattr(cli, "_job_state", lambda s, j: probed.append(j) or "RUNNING")
+    rc = main(["list", "--runtime", "docker", "--dryrun"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "FOREIGN(eldorado-login2)" in out          # labeled with its origin
+    assert "boxy-here" in out and "RUNNING" in out    # local record still probed
+    assert probed == ["77"]                           # the foreign job was NOT probed
+    assert "shares this $HOME" in out                 # the explainer footnote
+    assert jobs.read_record("boxy-eldo") is not None  # never reaped
