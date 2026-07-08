@@ -160,26 +160,27 @@ class _ReclaimHarness:
         monkeypatch.setattr(readiness, "wait_ready", fake_wait)
 
 
-def test_serve_rerun_is_idempotent_when_already_ready(gguf, monkeypatch, capsys):
-    """Field finding 14: rerunning `boxy serve MODEL` while it is already
-    serving must report the endpoint (exit 0), not error — and must probe the
-    CONTAINER's port, not the fresh resolution's (which scans past the busy
-    port the running instance itself occupies)."""
-    h = _ReclaimHarness(monkeypatch, exists=[BASE], running=True,
-                        ready_id="granite3-moe", container_port=7777)
+def test_serve_rerun_replaces_running_instance(gguf, monkeypatch, capsys):
+    """User request (2026-07): without --unique the name is a per-model
+    singleton, so rerunning `boxy serve MODEL` REPLACES the running instance
+    (rm -f + relaunch fresh) and points at --unique for a second one — it does
+    NOT leave a duplicate and does NOT just report idempotently."""
+    h = _ReclaimHarness(monkeypatch, exists=[BASE], running=True, ready_id="m")
     rc = main(["serve", str(gguf), "--runtime", "docker", "--image", "demo:1"])
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
     assert rc == 0
-    assert "ALREADY SERVING" in out and ":7777/v1" in out and "boxy stop" in out
-    assert h.ready_urls == ["http://127.0.0.1:7777"]
-    assert "### Running Command" not in out  # nothing was launched
+    assert "### READY" in captured.out                       # a fresh instance launched
+    assert "replacing the running instance" in captured.err and "--unique" in captured.err
+    assert ["docker", "rm", "-f", BASE] in h.commands        # the duplicate was force-removed
 
 
-def test_serve_rerun_while_still_loading_reports_and_exits_1(gguf, monkeypatch, capsys):
-    _ReclaimHarness(monkeypatch, exists=[BASE], running=True, ready_id=None)
-    rc = main(["serve", str(gguf), "--runtime", "docker", "--image", "demo:1"])
-    assert rc == 1
-    assert "not answering yet" in capsys.readouterr().err
+def test_serve_rerun_replaces_even_if_old_not_ready_yet(gguf, monkeypatch, capsys):
+    # a running instance is replaced without first probing it — boxy no longer
+    # branches on whether the OLD one was answering; it just redeploys.
+    h = _ReclaimHarness(monkeypatch, exists=[BASE], running=True, ready_id=None)
+    main(["serve", str(gguf), "--runtime", "docker", "--image", "demo:1"])
+    assert ["docker", "rm", "-f", BASE] in h.commands          # old one replaced
+    assert "### Running Command" in capsys.readouterr().out    # fresh launch attempted
 
 
 def test_serve_reclaims_exited_leftover_and_relaunches(gguf, monkeypatch, capsys):
@@ -204,16 +205,18 @@ def test_serve_suffixes_when_name_owned_by_foreign_container(gguf, monkeypatch, 
     assert f"boxy stop {BASE}-2" in out           # hints use the real name
 
 
-def test_serve_rerun_finds_our_suffixed_instance(gguf, monkeypatch, capsys):
-    """After a suffixed launch, a rerun must reclaim boxy's -2 instance
-    (idempotent), not stack a -3 duplicate."""
-    _ReclaimHarness(monkeypatch, exists=[BASE, f"{BASE}-2"], ours=[f"{BASE}-2"],
-                    running=True, ready_id="m", container_port=8090)
+def test_serve_rerun_replaces_our_suffixed_instance(gguf, monkeypatch, capsys):
+    """When BASE is foreign-owned, boxy uses its own -2 instance; a rerun then
+    REPLACES that -2 (still a per-name singleton), it does not stack a -3."""
+    h = _ReclaimHarness(monkeypatch, exists=[BASE, f"{BASE}-2"], ours=[f"{BASE}-2"],
+                        running=True, ready_id="m")
     rc = main(["serve", str(gguf), "--runtime", "docker", "--image", "demo:1"])
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
     assert rc == 0
-    assert "ALREADY SERVING" in out and f"boxy stop {BASE}-2" in out
-    assert "### Running Command" not in out
+    assert "### READY" in captured.out
+    assert ["docker", "rm", "-f", f"{BASE}-2"] in h.commands   # our -2 replaced
+    assert f"--name={BASE}-2" in captured.out                  # relaunched under the same -2 name
+    assert f"--name={BASE}-3" not in captured.out              # not stacked
 
 
 def test_stop_by_positional_name(capsys):

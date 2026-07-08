@@ -537,24 +537,26 @@ def _container_port(runtime: str, name: str) -> int | None:
 
 
 def _reclaim_or_report(runtime: str, name: str, url: str) -> tuple[int | None, str]:
-    """Name-collision policy (field finding #14, 2026-07):
+    """Name-collision policy for LOCAL container serves.
 
-      * name held by OUR container, answering  -> report the endpoint, exit 0
-        (rerunning `boxy serve MODEL` is idempotent — a suffix here would
-        silently double-serve the model and its memory);
-      * ours, running but not answering        -> say it's still loading;
-      * ours, exited                           -> dump its logs, remove, relaunch;
-      * NOT created by boxy                    -> auto-suffix (-2, -3, ...) and
+    The name is deterministic (from the model), so without --unique it is a
+    per-model singleton: rerunning `boxy serve MODEL` REDEPLOYS — the existing
+    instance of the same name is a duplicate and is replaced with a fresh one
+    (user request, 2026-07). To run a SECOND instance alongside, use --unique
+    (a timestamped name + auto-incremented port; this function isn't reached
+    because that name doesn't exist yet).
+
+      * name held by OUR container, running  -> replace it (stop+rm, relaunch);
+      * ours, exited                         -> dump its logs, remove, relaunch;
+      * NOT created by boxy                  -> auto-suffix (-2, -3, ...) and
         proceed — someone else owns that name, colliding is pure friction.
 
     Returns (exit code | None to launch, final container name)."""
-    from boxy import readiness
-
     if not _container_exists(runtime, name):
         return None, name
     if _container_label(runtime, name) != name:
-        # foreign owner: walk the suffixes — reclaim OUR suffixed instance if
-        # one exists (keeps reruns idempotent), else take the first free name.
+        # foreign owner: walk the suffixes — reuse OUR suffixed instance's name
+        # if one exists (so we replace it, not a stranger's), else first free.
         for i in range(2, 10):
             candidate = f"{name}-{i}"
             if not _container_exists(runtime, candidate):
@@ -564,21 +566,12 @@ def _reclaim_or_report(runtime: str, name: str, url: str) -> tuple[int | None, s
                 return _reclaim_or_report(runtime, candidate, url)
         raise RuntimeError(f"container names {name} and {name}-2..-9 are all taken; pass --name")
     if _container_running(runtime, name):
-        # ask the CONTAINER for its port: the fresh resolution's port is wrong
-        # by construction (the running instance made it look "busy").
-        actual_port = _container_port(runtime, name)
-        if actual_port:
-            url = f"http://127.0.0.1:{actual_port}"
-        model_id = readiness.wait_ready(url, timeout_s=2, interval_s=0.5)
-        if model_id:
-            print(f"### ALREADY SERVING  {url}/v1   (model: {model_id})")
-            print(f"###   try:  curl -s {url}/v1/models")
-            print(f"###   stop: boxy stop {name}")
-            return 0, name
-        print(f"boxy: {name} is already running but not answering yet (model still loading?)\n"
-              f"  follow: {runtime} logs -f {name}\n"
-              f"  stop:   boxy stop {name}", file=sys.stderr)
-        return 1, name
+        # a duplicate of a per-model singleton: replace it. `rm -f` kills + removes
+        # in one step (no 10s SIGTERM wait). Tell the user how to run a 2nd instead.
+        print(f"boxy: replacing the running instance {name} — rerun without --unique redeploys it. "
+              f"To run a SECOND instance alongside, use: boxy serve MODEL --unique", file=sys.stderr)
+        subprocess.run([runtime, "rm", "-f", name], capture_output=True)
+        return None, name
     print("boxy: found an exited container from a previous attempt; its last log lines:", file=sys.stderr)
     _dump_logs(runtime, name)
     _diagnose_container(runtime, name)
@@ -622,7 +615,18 @@ def _diagnose_container(runtime: str, name: str, scan_tail: int = 400) -> None:
     above' wrapper, and the actual exception can be dozens of lines earlier."""
     result = subprocess.run([runtime, "logs", "--tail", str(scan_tail), name],
                             capture_output=True, text=True)
-    _print_diagnosis((result.stdout or "") + "\n" + (result.stderr or ""))
+    log_text = (result.stdout or "") + "\n" + (result.stderr or "")
+    # An OOM-killed container often leaves EMPTY logs (SIGKILL, no final line).
+    # Inspect the exit code so the host-OOM diagnosis still fires: 137 = 128+9
+    # (SIGKILL), and podman/docker set OOMKilled=true when the cgroup reaped it.
+    inspect = subprocess.run(
+        [runtime, "inspect", "--format", "{{.State.ExitCode}} {{.State.OOMKilled}}", name],
+        capture_output=True, text=True)
+    if inspect.returncode == 0 and inspect.stdout.split():
+        code, _, ooms = inspect.stdout.strip().partition(" ")
+        if code == "137" or ooms.strip().lower() == "true":
+            log_text += "\nOOMKilled exit 137"  # synthetic signal for the host-oom rule
+    _print_diagnosis(log_text)
 
 
 def _diagnose_file(path, scan_tail: int = 400) -> None:

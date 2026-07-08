@@ -266,6 +266,22 @@ def test_diagnose_rocm_hip_error():
     assert hint is not None and "gfx" in hint and "rocminfo" in hint
 
 
+def test_diagnose_host_oom_exit_137():
+    # a second local instance reaped by the podman/docker VM OOM killer: often
+    # empty logs, so boxy synthesizes 'OOMKilled exit 137' from the exit code.
+    hint = diagnostics.diagnose("some early load lines\nOOMKilled exit 137")
+    assert hint is not None and "HOST/VM memory" in hint
+    assert "podman machine set --memory" in hint and "--unique" in hint
+
+
+def test_diagnose_host_oom_beats_nothing_but_not_gpu_oom():
+    # host-OOM matches 'Killed'/alloc-failure signatures...
+    assert "HOST/VM memory" in (diagnostics.diagnose("llama_model_load: Killed") or "")
+    # ...but a GPU OOM still gets the GPU-specific advice (cuda-oom is earlier)
+    gpu = diagnostics.diagnose("torch.cuda.OutOfMemoryError: CUDA out of memory")
+    assert gpu is not None and "--gpu-memory-utilization" in gpu
+
+
 def test_diagnose_engine_core_wrapper_alone_points_up():
     """The outer 'Engine core initialization failed' wrapper with no recognised
     root cause tells the user the real error is higher in the log."""

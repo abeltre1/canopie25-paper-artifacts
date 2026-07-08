@@ -181,6 +181,22 @@ def _trust_remote_code(m: "re.Match[str]", log: str) -> str:
     )
 
 
+def _host_oom(m: "re.Match[str]", log: str) -> str:
+    return _fmt(
+        "the container was KILLED for running out of HOST/VM memory (not GPU memory)",
+        "The process got SIGKILL (exit 137 / OOMKilled) — the machine (or, on macOS/\n"
+        "Windows, the podman/docker VM) ran out of RAM. This commonly hits when you\n"
+        "launch a SECOND instance: two model servers together exceed the limit and the\n"
+        "kernel reaps one. It is NOT boxy removing the container (boxy never touches\n"
+        "another instance) and NOT --gpu memory.\n"
+        "  On macOS/Windows the VM default is small (often ~2 GB). Raise it:\n"
+        "     podman machine stop && podman machine set --memory 8192 --cpus 4 && podman machine start\n"
+        "     (docker: Docker Desktop > Settings > Resources > Memory)\n"
+        "  Then relaunch your instances — each with its own id:  boxy serve MODEL --unique\n"
+        "  Or run fewer/smaller instances, or a smaller quant, so they fit the limit.",
+    )
+
+
 def _gguf_load_fail(m: "re.Match[str]", log: str) -> str:
     return _fmt(
         "llama.cpp could not load the GGUF model file",
@@ -231,6 +247,18 @@ RULES: list[Rule] = [
         re.compile(r"(?:CUDA out of memory|torch\.(?:cuda\.)?OutOfMemoryError|HIP out of memory|"
                    r"No available memory for the cache blocks)", re.IGNORECASE),
         _cuda_oom,
+    ),
+    Rule(
+        # host/VM OOM — SIGKILL, exit 137, or the cgroup/ggml alloc signatures.
+        # AFTER cuda-oom so GPU OOM keeps its GPU-specific advice; this is the
+        # "second local instance got reaped" case.
+        "host-oom",
+        re.compile(r"OOMKilled|exit(?:ed)?\s*(?:code\s*)?137|"
+                   r"signal\s*9\b|received\s+SIGKILL|\bKilled\b|"
+                   r"Cannot allocate memory|out of memory: killed|oom-kill|"
+                   r"ggml_backend_cpu_buffer_type_alloc_buffer:\s*failed to allocate|"
+                   r"failed to allocate (?:compute|CPU) buffer"),
+        _host_oom,
     ),
     Rule(
         "vllm-unknown-load-strategy",
