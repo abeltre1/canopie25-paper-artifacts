@@ -1716,7 +1716,42 @@ def cmd_list(args: argparse.Namespace) -> int:
         if records:
             return 0  # jobs listed; no container runtime on this host is fine
         raise
-    return _run_or_print([runtime, "ps", "--filter", "label=boxy.box"], args.dryrun)
+    rc = _run_or_print([runtime, "ps", "--filter", "label=boxy.box"], args.dryrun)
+    if not args.dryrun:
+        _report_exited_containers(runtime)
+    return rc
+
+
+def _report_exited_containers(runtime: str) -> None:
+    """Surface boxy containers that EXITED — plain `ps` shows only RUNNING ones,
+    so a server that died seconds after READY (crash, or an OOM kill by the
+    podman/docker VM) silently vanishes from view. List them with exit code and
+    a targeted note (field report: `--unique` instances kept 'disappearing')."""
+    result = subprocess.run(
+        [runtime, "ps", "-a", "--filter", "label=boxy.box", "--filter", "status=exited",
+         "--format", "{{.Names}}\t{{.Status}}"],
+        capture_output=True, text=True)
+    if result.returncode != 0 or not result.stdout.strip():
+        return
+    print("exited boxy containers (crashed or were killed — NOT running):")
+    oom_seen = False
+    for line in result.stdout.strip().splitlines():
+        name, _, status = line.partition("\t")
+        fields = subprocess.run(
+            [runtime, "inspect", "--format", "{{.State.ExitCode}} {{.State.OOMKilled}}", name],
+            capture_output=True, text=True).stdout.split()
+        exit_code = fields[0] if fields else "?"
+        oom = len(fields) > 1 and fields[1].lower() == "true"
+        note = ""
+        if exit_code == "137" or oom:
+            note = "  <- OOM/SIGKILL: the runtime VM ran out of RAM"
+            oom_seen = True
+        print(f"  {name}  ({status}, exit {exit_code}){note}")
+    if oom_seen:
+        print("  fix OOM: podman machine stop && podman machine set --memory 8192 --cpus 4 "
+              "&& podman machine start")
+    print(f"  why did one die:  {runtime} logs <name>    "
+          f"clear them:  {runtime} rm $({runtime} ps -aq --filter label=boxy.box --filter status=exited)")
 
 
 def cmd_router(args: argparse.Namespace) -> int:

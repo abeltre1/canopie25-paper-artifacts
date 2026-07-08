@@ -166,6 +166,29 @@ def test_list_shows_scheduler_jobs(jobs_dir, monkeypatch, capsys):
     assert "boxy-m" in out and "slurm job 99" in out and "RUNNING" in out and ":9291/v1" in out
 
 
+def test_list_reveals_exited_containers_with_oom_note(monkeypatch, capsys):
+    """Field report: `--unique` instances kept 'disappearing'. Plain `ps` hides
+    EXITED containers, so a server killed seconds after READY vanished from view.
+    `boxy list` must surface them with exit code + an OOM note when exit==137."""
+    import boxy.cli as cli
+
+    def fake_run(cmd, **kw):
+        out = ""
+        if cmd[1:3] == ["ps", "-a"]:
+            out = "boxy-a-0707\tExited (137) 2 minutes ago\nboxy-b-0707\tExited (0) 1 minute ago\n"
+        elif cmd[1] == "inspect":
+            out = "137 true" if "boxy-a-0707" in cmd else "0 false"
+        return type("R", (), {"returncode": 0, "stdout": out, "stderr": ""})()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    cli._report_exited_containers("podman")
+    out = capsys.readouterr().out
+    assert "boxy-a-0707" in out and "exit 137" in out and "OOM/SIGKILL" in out
+    assert "boxy-b-0707" in out and "exit 0" in out
+    assert "podman machine set --memory" in out          # OOM fix shown (137 present)
+    assert "podman logs <name>" in out
+
+
 def test_dynamic_scheduler_flags_flow_into_the_script(gguf, jobs_dir, capsys):
     """User request: pass ANY scheduler flag without boxy needing to know it.
     --slurm-FLAG[=VALUE] / --flux-FLAG[=VALUE] translate 1:1 into directives."""
