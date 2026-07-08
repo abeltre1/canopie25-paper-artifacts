@@ -755,6 +755,35 @@ def test_proxy_credentials_are_masked():
     assert "S3CR3T" not in masked and masked == "http://<credentials>@proxy.site.gov:3128"
 
 
+def test_raw_proxy_env_pickup_and_override(monkeypatch):
+    for v in ("http_proxy", "https_proxy", "all_proxy", "no_proxy",
+              "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(v, raising=False)
+    assert ramalama_shim.raw_proxy_env() == {}
+    monkeypatch.setenv("https_proxy", "http://p:80")
+    monkeypatch.setenv("no_proxy", "localhost,.sandia.gov")
+    env = ramalama_shim.raw_proxy_env()
+    assert env["https_proxy"] == "http://p:80" and env["HTTPS_PROXY"] == "http://p:80"
+    assert env["no_proxy"] == "localhost,.sandia.gov"
+    # override sets http+https, preserves no_proxy so intra-cluster stays direct
+    ov = ramalama_shim.raw_proxy_env("http://proxy.gov:3128")
+    assert ov["http_proxy"] == ov["https_proxy"] == "http://proxy.gov:3128"
+    assert ov["no_proxy"] == "localhost,.sandia.gov"
+
+
+def test_propagate_proxy_into_container_env(monkeypatch):
+    from boxy import deploy
+
+    monkeypatch.delenv("http_proxy", raising=False)
+    monkeypatch.setenv("https_proxy", "http://p:80")
+    env = {}
+    deploy._propagate_proxy(env)
+    assert env["https_proxy"] == "http://p:80" and env["HTTPS_PROXY"] == "http://p:80"
+    box_env = {"https_proxy": "http://mine:1"}                # box.env wins
+    deploy._propagate_proxy(box_env)
+    assert box_env["https_proxy"] == "http://mine:1"
+
+
 def test_info_net_dns_failure_blames_proxy_not_certs(monkeypatch, capsys):
     """With a proxy configured, the TARGET's DNS is resolved BY the proxy — so a
     local gaierror means the PROXY host didn't resolve. The hint must say that

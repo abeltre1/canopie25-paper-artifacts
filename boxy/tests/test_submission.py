@@ -195,6 +195,29 @@ def test_list_reveals_exited_containers_with_oom_note(monkeypatch, capsys):
     assert "podman logs <name>" in out
 
 
+def test_proxy_flag_injected_into_batch_job(gguf, jobs_dir, monkeypatch, capsys):
+    """--proxy carries the corporate proxy into the COMPUTE-NODE command so its
+    host-side `podman pull` egresses through it (the ghcr.io-403 fix)."""
+    for v in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.delenv(v, raising=False)
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--gpus", "1", "--dryrun",
+               "--proxy", "http://proxy.sandia.gov:80"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "exec env " in out                                        # env-prefixed inner command
+    assert "https_proxy=http://proxy.sandia.gov:80" in out
+    assert "HTTPS_PROXY=http://proxy.sandia.gov:80" in out           # both cases for host tools
+
+
+def test_no_proxy_configured_means_no_env_prefix(gguf, jobs_dir, monkeypatch, capsys):
+    for v in ("http_proxy", "https_proxy", "all_proxy", "no_proxy",
+              "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(v, raising=False)
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--gpus", "1", "--dryrun"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "exec env " not in out                        # no proxy -> plain exec
+
+
 def test_serve_scheduler_without_binary_guides_to_ssh(gguf, jobs_dir, monkeypatch, capsys):
     """--scheduler slurm on a host with no sbatch (e.g. a laptop, no --ssh) must
     give a clear 'add --ssh / drop --scheduler', not a bare Errno 2 (field report)."""

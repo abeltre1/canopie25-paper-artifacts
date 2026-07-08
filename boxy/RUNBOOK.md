@@ -132,6 +132,27 @@ Note: upgrading to the partitioned layout, any pre-existing logs in the old flat
 `~/.local/share/boxy/jobs/` stay there (boxy does not move your files); `boxy
 logs` points at them if it finds no cluster-local match.
 
+### 0.965 Compute node behind a corporate proxy (ghcr.io 403 / Zscaler)
+
+A compute node often can't egress to a public registry directly — the pull dies
+with `ghcr.io: StatusCode: 403 ...Zs...` (a Zscaler/proxy *policy* block; note it's
+a 403, not a cert error — boxy already mounts your merged CA into the container).
+Give the node your proxy and boxy carries it into the job's `podman pull` AND the
+container's in-container downloads:
+
+```bash
+# provide it explicitly:
+boxy serve <model> --scheduler slurm --gpus 1 --ssh user@login \
+    --proxy http://proxy.mysite.gov:80 --account <acct> --time 30:00
+# or just have http_proxy/https_proxy exported on the login node — boxy auto-uses them.
+```
+
+boxy prefixes the compute-node command with `env http_proxy=… https_proxy=…
+no_proxy=…` (both cases; `no_proxy` preserved so intra-cluster/localhost stays
+direct). If the compute nodes can't reach the proxy at all (fully air-gapped),
+fall back to pre-pulling on the login node (shared `$HOME` podman store) or a
+site mirror — see §0.97.
+
 ### 0.97 Pull images from YOUR registry (site mirrors, air-gap, localhost)
 
 Every image reference resolves through one module (`registries.py`) — swap

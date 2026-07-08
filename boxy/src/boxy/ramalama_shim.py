@@ -411,6 +411,28 @@ def active_proxies() -> dict[str, str]:
             if scheme in ("http", "https", "all", "no")}
 
 
+def raw_proxy_env(override: str = "") -> dict[str, str]:
+    """The ACTUAL proxy vars to PROPAGATE into a job/container (unmasked, for
+    real use — unlike active_proxies which masks for display). `override` (a
+    single proxy URL, e.g. from --proxy) sets http+https; otherwise the current
+    environment's proxy vars are captured. Emitted in BOTH cases so host tools
+    (podman/curl read lower- or upper-case) and Python all see them; no_proxy is
+    carried through so intra-cluster/localhost traffic stays direct."""
+    out: dict[str, str] = {}
+    if override:
+        for name in ("http_proxy", "https_proxy"):
+            out[name] = out[name.upper()] = override
+        no = os.environ.get("no_proxy") or os.environ.get("NO_PROXY")
+        if no:
+            out["no_proxy"] = out["NO_PROXY"] = no
+        return out
+    for name in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        val = os.environ.get(name) or os.environ.get(name.upper())
+        if val:
+            out[name] = out[name.upper()] = val
+    return out
+
+
 def net_failure_kind(reason: object) -> str:
     """Classify a transport failure: 'dns' | 'proxy' | 'conn' | 'tls' | ''.
     The distinction matters because DNS is UPSTREAM of TLS — no certificate can

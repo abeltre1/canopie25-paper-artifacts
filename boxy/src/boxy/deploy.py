@@ -211,6 +211,18 @@ def _propagate_ca_bundle(env: dict, mounts: list) -> None:
         env.setdefault(var, CA_CONTAINER_PATH)  # box.env still wins (already merged)
 
 
+def _propagate_proxy(env: dict) -> None:
+    """Carry the host's proxy vars INTO the container so in-container downloads
+    (vLLM fetching remote code/weights at load) reach the corporate proxy — the
+    same idea as the CA bundle. The IMAGE pull happens host-side, so it's fed
+    separately (boxy prefixes the compute-node command with the proxy env at
+    submit). box.env still wins."""
+    from boxy import ramalama_shim
+
+    for var, val in ramalama_shim.raw_proxy_env().items():
+        env.setdefault(var, val)
+
+
 def _plan(
     box: Box,
     location: Location,
@@ -228,6 +240,7 @@ def _plan(
         env.update(extra_env)
     mounts = resolve_mounts(box, location) + extra_mounts
     _propagate_ca_bundle(env, mounts)
+    _propagate_proxy(env)
     warnings: list[str] = []
     # Podman (unlike Docker) refuses to start when the workdir doesn't exist
     # in the image; a workdir no volume provides is usually a box bug.

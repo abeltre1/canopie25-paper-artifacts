@@ -747,6 +747,19 @@ def _inner_serve_command(args, model: str, name: str, *, port: int | None = None
     return shlex.join(inner)
 
 
+def _proxy_prefix(args) -> str:
+    """`env VAR=val ...` prefix for the COMPUTE-NODE command, so its host-side
+    `podman pull` (and the inner boxy) reach the corporate proxy — the usual fix
+    for a ghcr.io 403 on an isolated compute node. `--proxy URL` wins; otherwise
+    the submitter's proxy env is carried over. '' when nothing is configured."""
+    from boxy import ramalama_shim
+
+    proxies = ramalama_shim.raw_proxy_env(getattr(args, "proxy", "") or "")
+    if not proxies:
+        return ""
+    return "env " + " ".join(f"{k}={shlex.quote(v)}" for k, v in proxies.items()) + " "
+
+
 def _require_scheduler_binary(binary: str, scheduler_name: str) -> None:
     """Fail early and CLEARLY when the scheduler's submit tool isn't on this
     host — otherwise subprocess raises a bare '[Errno 2] ... sbatch'. The usual
@@ -904,7 +917,7 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
         elif not args.dryrun:
             jobs.remove(name)  # stale record from a finished job (S6: dryrun must not mutate)
 
-    inner = _inner_serve_command(args, model, name)
+    inner = _proxy_prefix(args) + _inner_serve_command(args, model, name)
     # request one task per node when the job will serve distributed (Ray needs a
     # launcher per node). Engine isn't resolved login-side, but a multi-node
     # vllm-shaped request means distributed unless --no-distributed; the harmless
@@ -1114,10 +1127,11 @@ def _serve_replicas(args, scheduler_name: str, profile, replicas: int, router_po
         job_name = base_name if nodes == 1 else f"{base_name}-n{n}"
         loc = dc_replace(base_loc, resources=Resources(
             nodes=1, gpus_per_node=m * r, accelerator_type=base_loc.resources.accelerator_type))
+        proxy_prefix = _proxy_prefix(args)
         inner_cmds = []
         for slot, i in enumerate(members):
             ids = ",".join(str(g) for g in range(slot * r, slot * r + r))
-            inner_cmds.append(_inner_serve_command(
+            inner_cmds.append(proxy_prefix + _inner_serve_command(
                 args, args.model, replica_names[i], port=8000 + slot, visible_gpus=ids,
                 gpus=r, forward_geometry=False, extra_engine_args=tp_args))
         output_log = str(jobs.log_path(job_name, scheduler.output_token) if scheduler.output_token
@@ -2257,6 +2271,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="pull images from this registry instead (site mirror / local registry): "
                         "replaces the image's registry component. Per-registry rewrites go in "
                         "[location.image_mirrors]")
+    p.add_argument("--proxy", default=None, metavar="URL",
+                   help="corporate proxy for the COMPUTE NODE's image pull + in-container downloads "
+                        "(e.g. http://proxy.mysite.gov:80): boxy carries it into the job and container. "
+                        "Omit to auto-use your http_proxy/https_proxy env. Fixes ghcr.io 403 on nodes "
+                        "that must egress through a proxy")
     p.add_argument("--port", type=int, default=None, help="serving port (default: engine default, next free)")
     p.add_argument("--gpus", type=int, default=None, help="GPUs per node for the --scheduler job request")
     p.add_argument("--nodes", type=int, default=None,
