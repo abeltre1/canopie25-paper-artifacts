@@ -102,6 +102,17 @@ def cmd_info(args: argparse.Namespace) -> int:
                   + ("" if os.environ.get("BOXY_ALLOW_TRANSPORTS") else "   (default policy)"))
     remote = os.environ.get("BOXY_SSH_HOST")
     net_rows = [("tls", tls), ("registries", registries)]
+    proxies = ramalama_shim.active_proxies()
+    if proxies:
+        net_rows.append(("proxy", "  ".join(f"{k}: {v}" for k, v in proxies.items())
+                         + "   (all registry traffic follows these)"))
+        if "http" in proxies and "https" not in proxies:
+            # the classic ordering bug: `export https_proxy="${http_proxy}"` ran
+            # BEFORE http_proxy was set, exporting an EMPTY string (which urllib
+            # ignores) — so https traffic (ALL registries) silently goes direct.
+            net_rows.append(("proxy WARNING", "http_proxy is set but https_proxy is NOT — registries "
+                             "are all https and will bypass the proxy. If your profile does "
+                             'https_proxy="${http_proxy}", it must come AFTER http_proxy is set.'))
     if remote:
         net_rows.append(("remote", f"{remote} (BOXY_SSH_HOST — commands run there over SSH)"))
     _info_section("network & trust", net_rows)
@@ -158,7 +169,12 @@ def _probe_registries() -> int:
     from boxy import policy
 
     ramalama_shim.ensure_trust_bundle()
+    proxies = ramalama_shim.active_proxies()
+    if proxies:
+        print("net: proxy      " + "  ".join(f"{k}: {v}" for k, v in proxies.items())
+              + "   (probes below go THROUGH this)")
     failures = 0
+    kinds_seen: set[str] = set()
     token, source = ramalama_shim.effective_hf_token()
     if token:
         # the definitive "did my token take effect" answer: ask HF who the
@@ -192,6 +208,7 @@ def _probe_registries() -> int:
         except Exception as e:
             reason = getattr(e, "reason", e)
             print(f"net: {scheme:10s} {url}  FAIL ({reason})")
+            kinds_seen.add(ramalama_shim.net_failure_kind(reason))
             host = urllib.parse.urlsplit(url).hostname or ""
             if "CERTIFICATE_VERIFY_FAILED" in str(reason) and host:
                 issuer = _tls_issuer(host)
@@ -202,8 +219,12 @@ def _probe_registries() -> int:
                           " Interceptors often bypass some hosts, which is why other registries pass.")
             failures += 1
     if failures:
-        print("net: FAILing registries cannot be pulled from this shell — "
-              "if the reason is CERTIFICATE_VERIFY_FAILED, see the SSL_CERT_FILE notes in RUNBOOK §2.1")
+        # explain each KIND of failure actually observed — DNS/proxy/conn get
+        # network guidance, never the cert remedy (DNS is upstream of TLS).
+        for kind in sorted(k for k in kinds_seen if k):
+            print(f"net: {kind}: {ramalama_shim.network_remedy(kind)}")
+        print("net: FAILing registries cannot be pulled from this shell "
+              "(certificate + proxy + offline notes: RUNBOOK §2.1)")
     return 1 if failures else 0
 
 

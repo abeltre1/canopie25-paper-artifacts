@@ -392,6 +392,85 @@ def pull_model(model_uri: str, dryrun: bool = False, quiet: bool = False, force:
     return transport._get_entry_model_path(False, False, dryrun)
 
 
+def _mask_credentials(url: str) -> str:
+    import re
+
+    return re.sub(r"//[^/@]+@", "//<credentials>@", url)
+
+
+def active_proxies() -> dict[str, str]:
+    """The proxy map urllib ACTUALLY uses for every pull/probe (env vars; on
+    macOS also the system proxy settings), credentials masked for display.
+    Empty exports (the `https_proxy="${http_proxy}"`-before-http_proxy-is-set
+    ordering bug) vanish here — so showing this map exposes them. Only the
+    schemes OUR requests use (getproxies also surfaces docker_https_proxy-style
+    vars from other tools)."""
+    import urllib.request
+
+    return {scheme: _mask_credentials(url) for scheme, url in sorted(urllib.request.getproxies().items())
+            if scheme in ("http", "https", "all", "no")}
+
+
+def net_failure_kind(reason: object) -> str:
+    """Classify a transport failure: 'dns' | 'proxy' | 'conn' | 'tls' | ''.
+    The distinction matters because DNS is UPSTREAM of TLS — no certificate can
+    fix a name that never resolved — and with a proxy configured a LOCAL
+    dns/conn error is about the PROXY host (the proxy, not this machine,
+    resolves and reaches the target)."""
+    text = str(reason)
+    if "CERTIFICATE_VERIFY_FAILED" in text:
+        return "tls"
+    if any(sig in text for sig in ("nodename nor servname", "Name or service not known",
+                                   "Temporary failure in name resolution", "getaddrinfo failed",
+                                   "No address associated with hostname")):
+        return "dns"
+    if "Tunnel connection failed" in text or "Proxy Authentication Required" in text:
+        return "proxy"
+    if any(sig in text for sig in ("Connection refused", "timed out", "Network is unreachable",
+                                   "Connection reset by peer")):
+        return "conn"
+    return ""
+
+
+_OFFLINE_ESCAPE = ("no-network escape: a LOCAL model file needs none of this — download the GGUF "
+                   "on a machine that can, copy it over, then: boxy serve /path/to/model.gguf")
+
+
+def network_remedy(kind: str) -> str:
+    """One tailored remedy per net_failure_kind, shared by `boxy info --net`
+    and the pull-failure path so both explain a failure the SAME way."""
+    proxies = active_proxies()
+    proxy_line = "  ".join(f"{k}={v}" for k, v in proxies.items())
+    if kind == "dns":
+        if proxies:
+            return ("DNS failed WITH a proxy configured — the PROXY host itself did not resolve "
+                    "(the proxy, not this machine, resolves the target). Check the value for a typo, "
+                    f"and whether that host only resolves on the corporate network/VPN: {proxy_line}. "
+                    + _OFFLINE_ESCAPE)
+        return ("DNS failed and NO proxy is configured: this shell cannot resolve the registry at all "
+                "(VPN down, or a corporate network that REQUIRES a proxy — export "
+                "https_proxy/http_proxy=http://<proxy-host>:<port>, https_proxy is the one registries "
+                "use). A cert in SSL_CERT_FILE cannot fix this — DNS happens before TLS. "
+                + _OFFLINE_ESCAPE)
+    if kind == "proxy":
+        return ("the proxy REFUSED the tunnel (CONNECT): it requires authentication or blocks this "
+                f"destination by policy. Active: {proxy_line or 'none'}. Credentials go in the URL: "
+                "export https_proxy=http://user:pass@host:port. " + _OFFLINE_ESCAPE)
+    if kind == "conn":
+        if proxies:
+            return (f"the TCP connection to the PROXY was refused/timed out (active: {proxy_line}) — "
+                    "wrong port, or a proxy that is only reachable from inside the corporate "
+                    "network/VPN. Unset the proxy vars when off-network. " + _OFFLINE_ESCAPE)
+        return ("the TCP connection to the registry was refused/timed out — firewall, captive portal, "
+                "or a network that requires a proxy (export https_proxy=...). " + _OFFLINE_ESCAPE)
+    if kind == "tls":
+        return ("TLS verification failed: the issuer of the certificate this shell SEES is not in your "
+                "bundle. Interceptors (Zscaler, proxies) swap the chain per-host — and routing THROUGH "
+                "a proxy can intercept hosts that were clean when direct. Append the interceptor's "
+                "root CA to SSL_CERT_FILE (boxy merges it with certifi's public CAs; RUNBOOK §2.1).")
+    return ""
+
+
 def _pull_failure_message(model_uri: str, error: Exception, logged: list[str] | None = None) -> str:
     """Actionable message with the ROOT cause. RamaLama's repo-pull fallback
     masks the original URL error behind 'cli download not available'
@@ -436,6 +515,9 @@ def _pull_failure_message(model_uri: str, error: Exception, logged: list[str] | 
                 " or your venv's bin/activate"
                 "\n  Diagnose per registry: boxy info --net"
             )
+    kind = net_failure_kind(combined)
+    if kind and kind != "tls":  # tls has the richer SSL_CERT_FILE remedy above
+        msg += "\n  remedy: " + network_remedy(kind)
     if "401" in combined and model_uri.startswith(("hf://", "huggingface://")):
         msg += _hf_401_diagnosis(model_uri)
     elif "404" in combined and model_uri.startswith(("hf://", "huggingface://")):

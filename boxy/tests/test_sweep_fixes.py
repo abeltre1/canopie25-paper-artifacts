@@ -734,6 +734,84 @@ def test_info_net_names_the_unknown_tls_issuer(monkeypatch, capsys):
     assert "append ITS root to SSL_CERT_FILE" in out
 
 
+# ---- network failure classification (field report: proxies set -> everything FAILs,
+# ---- boxy blamed certificates; DNS/proxy problems are UPSTREAM of TLS) --------------
+
+
+def test_net_failure_kind_classification():
+    kinds = ramalama_shim.net_failure_kind
+    assert kinds("[Errno 8] nodename nor servname provided, or not known") == "dns"
+    assert kinds("[Errno -2] Name or service not known") == "dns"
+    assert kinds("Temporary failure in name resolution") == "dns"
+    assert kinds("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed") == "tls"
+    assert kinds("Tunnel connection failed: 407 Proxy Authentication Required") == "proxy"
+    assert kinds("[Errno 61] Connection refused") == "conn"
+    assert kinds("timed out") == "conn"
+    assert kinds("HTTP Error 500") == ""
+
+
+def test_proxy_credentials_are_masked():
+    masked = ramalama_shim._mask_credentials("http://ambelt:S3CR3T@proxy.site.gov:3128")
+    assert "S3CR3T" not in masked and masked == "http://<credentials>@proxy.site.gov:3128"
+
+
+def test_info_net_dns_failure_blames_proxy_not_certs(monkeypatch, capsys):
+    """With a proxy configured, the TARGET's DNS is resolved BY the proxy — so a
+    local gaierror means the PROXY host didn't resolve. The hint must say that
+    (and offer the offline escape), never the certificate remedy."""
+    import socket as socket_mod
+    import urllib.error
+    import urllib.request
+
+    from boxy import cli
+
+    monkeypatch.setattr(ramalama_shim, "ensure_trust_bundle", lambda: None)
+    monkeypatch.setattr(ramalama_shim, "effective_hf_token", lambda: ("", ""))
+
+    def boom(url, timeout=0):
+        raise urllib.error.URLError(
+            socket_mod.gaierror(8, "nodename nor servname provided, or not known"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    monkeypatch.setattr(ramalama_shim, "active_proxies",
+                        lambda: {"https": "http://proxy.sandia.gov:80"})
+    rc = cli._probe_registries()
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "PROXY host itself did not resolve" in out and "proxy.sandia.gov" in out
+    assert "model.gguf" in out                       # the offline escape
+    assert "SSL_CERT_FILE" not in out.split("dns:")[1]  # dns remedy is not cert advice
+
+    # NO proxy: VPN / needs-a-proxy guidance instead
+    monkeypatch.setattr(ramalama_shim, "active_proxies", lambda: {})
+    rc = cli._probe_registries()
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "NO proxy is configured" in out and "DNS happens before TLS" in out
+
+
+def test_info_shows_proxy_map_and_ordering_warning(monkeypatch, capsys):
+    """boxy info prints the EFFECTIVE proxy map (masked) and warns on the classic
+    export-order bug: http_proxy set but https_proxy empty/missing — registries
+    are all https, so everything silently bypasses the proxy."""
+    monkeypatch.setattr(ramalama_shim, "active_proxies",
+                        lambda: {"http": "http://<credentials>@proxy.site.gov:3128"})
+    rc = main(["info"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "proxy" in out and "proxy.site.gov:3128" in out
+    assert "https_proxy is NOT" in out and "AFTER http_proxy" in out
+
+
+def test_pull_failure_message_explains_dns(monkeypatch):
+    monkeypatch.setattr(ramalama_shim, "active_proxies", lambda: {})
+    msg = ramalama_shim._pull_failure_message(
+        "hf://org/model.gguf",
+        ConnectionError("[Errno -2] Name or service not known"))
+    assert "remedy:" in msg and "DNS" in msg and "model.gguf" in msg
+    assert "CERTIFICATE" not in msg
+
+
 # ---- HF token precedence + validation (field report: 'HF_TOKEN did not take effect') ----
 
 def test_effective_hf_token_env_wins_outright(monkeypatch, tmp_path):

@@ -205,6 +205,23 @@ boxy info --net
 # EXPECT: "net: hf:// ... OK", "net: ollama:// ... OK" — any FAIL line names the registry
 # you cannot pull from and why. `boxy info` alone shows the TLS state offline
 # (and flags a missing cert file).
+#
+# PROXIES (corporate networks). boxy honors http_proxy/https_proxy (any case) for
+# every pull and probe; `boxy info` prints the EFFECTIVE proxy map (credentials
+# masked). Facts that bite:
+#   - registries are all https, so https_proxy is the variable that matters. An
+#     empty export is IGNORED — the classic bug is `export https_proxy="${http_proxy}"`
+#     placed BEFORE http_proxy is set; boxy warns when it sees http-but-not-https.
+#   - with a proxy set, DNS/connect errors are about the PROXY host (the proxy
+#     resolves the target, not your machine): "nodename nor servname" = the proxy
+#     hostname didn't resolve (typo, or on-network-only — unset the vars off-network).
+#   - proxies commonly TLS-intercept: a registry that verified fine DIRECT can fail
+#     CERTIFICATE_VERIFY_FAILED THROUGH the proxy. `boxy info --net` names the issuer
+#     it saw — append that root CA to SSL_CERT_FILE (the merge above keeps public CAs).
+#   - auth proxies: export https_proxy=http://user:pass@host:port (407/"Tunnel
+#     connection failed" means credentials or policy).
+# NO NETWORK AT ALL? A local file serves with zero network: download the GGUF
+# elsewhere, copy it over, then `boxy serve /path/to/model.gguf`.
 
 # 2.2 Pull a real model (single-file GGUF: no HF CLI needed, ~400 MB)
 boxy pull hf://Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf
