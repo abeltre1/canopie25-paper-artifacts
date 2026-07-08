@@ -30,9 +30,10 @@ def cluster_id(host: str) -> str:
     'eldorado-login1.sandia.gov', 'eldorado' -> 'eldorado'; 'hops42',
     'hops-login5' -> 'hops'. Sites with unusual naming set BOXY_CLUSTER."""
     short = host.split(".", 1)[0].lower()
-    short = re.sub(r"\d+$", "", short)
-    short = re.sub(r"[-_]?login$", "", short)
-    return short.rstrip("-_") or host
+    trimmed = re.sub(r"[-_]?login$", "", re.sub(r"\d+$", "", short)).rstrip("-_")
+    # a laptop asset tag like 's1088597' trims to 's' — a meaningless bucket; keep
+    # the full short name when trimming leaves too little to be a real cluster.
+    return trimmed if len(trimmed) >= 2 else (short or host)
 
 
 def local_cluster() -> str:

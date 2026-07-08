@@ -747,6 +747,19 @@ def _inner_serve_command(args, model: str, name: str, *, port: int | None = None
     return shlex.join(inner)
 
 
+def _require_scheduler_binary(binary: str, scheduler_name: str) -> None:
+    """Fail early and CLEARLY when the scheduler's submit tool isn't on this
+    host — otherwise subprocess raises a bare '[Errno 2] ... sbatch'. The usual
+    cause: `--scheduler slurm` run on a laptop without --ssh (field report)."""
+    if shutil.which(binary):
+        return
+    raise UsageError(
+        f"'{binary}' is not on this host — it has no {scheduler_name} scheduler. Either:\n"
+        f"  • submit to a remote cluster FROM here:  add --ssh user@login  (boxy runs it there\n"
+        f"    and tunnels the endpoint back), or\n"
+        f"  • run locally with no scheduler:  drop --scheduler (and --gpus/--time/--account).")
+
+
 def _submission_hint(stderr: str) -> str:
     """Plain-language next step for the sbatch/flux-batch rejections users
     actually hit. Empty string when the error isn't recognized."""
@@ -910,6 +923,7 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
     print(f"### Submit Command:\n    {shlex.join(submit)}")
     if args.dryrun:
         return 0
+    _require_scheduler_binary(submit[0], scheduler_name)
 
     jobs.script_path(name).write_text(script_text)
     jobs.endpoint_path(name).unlink(missing_ok=True)
@@ -1118,6 +1132,7 @@ def _serve_replicas(args, scheduler_name: str, profile, replicas: int, router_po
         print(f"### Submit Command:\n    {shlex.join(submit)}")
         if args.dryrun:
             continue
+        _require_scheduler_binary(submit[0], scheduler_name)
         jobs.script_path(job_name).write_text(script_text)
         for i in members:
             jobs.endpoint_path(replica_names[i]).unlink(missing_ok=True)

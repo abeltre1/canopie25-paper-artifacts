@@ -189,6 +189,23 @@ def test_list_reveals_exited_containers_with_oom_note(monkeypatch, capsys):
     assert "podman logs <name>" in out
 
 
+def test_serve_scheduler_without_binary_guides_to_ssh(gguf, jobs_dir, monkeypatch, capsys):
+    """--scheduler slurm on a host with no sbatch (e.g. a laptop, no --ssh) must
+    give a clear 'add --ssh / drop --scheduler', not a bare Errno 2 (field report)."""
+    import boxy.cli as cli
+
+    real_which = cli.shutil.which
+    monkeypatch.setattr(cli.shutil, "which",
+                        lambda b: None if b in ("sbatch", "flux") else real_which(b))
+    ran = []
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: ran.append(a))
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--gpus", "1"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "not on this host" in err and "--ssh user@login" in err and "drop --scheduler" in err
+    assert ran == []                                          # never tried to exec sbatch
+
+
 def test_dynamic_scheduler_flags_flow_into_the_script(gguf, jobs_dir, capsys):
     """User request: pass ANY scheduler flag without boxy needing to know it.
     --slurm-FLAG[=VALUE] / --flux-FLAG[=VALUE] translate 1:1 into directives."""
@@ -442,6 +459,7 @@ def test_cluster_identity_and_fallback(monkeypatch):
     assert cli._cluster_id("eldorado-login1.sandia.gov") == "eldorado"
     assert cli._cluster_id("hops12") == "hops"
     assert cli._cluster_id("HOPS-LOGIN5") == "hops"
+    assert cli._cluster_id("s1088597") == "s1088597"   # a laptop asset tag must NOT collapse to 's'
     monkeypatch.setenv("BOXY_CLUSTER", "hops")   # this host "is" hops
     foreign, origin = cli._record_is_foreign({"scheduler": "flux", "submitted_from": "eldorado-login2"})
     assert foreign and origin == "eldorado-login2"
