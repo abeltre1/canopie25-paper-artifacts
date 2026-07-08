@@ -876,3 +876,38 @@ def test_info_net_validates_effective_token(monkeypatch, capsys):
     assert "INVALID (HTTP 401)" in out and "re-export HF_TOKEN" in out
     assert "hf_SOMETOKEN" not in out                  # never printed
     assert rc == 1                                    # invalid token counts as a failure
+
+
+def test_info_net_403_blames_network_not_token(monkeypatch, capsys):
+    """Field report: Zscaler 403'd huggingface.co for BOTH the token'd whoami
+    AND the anonymous probe, and boxy said the token was INVALID. When the
+    anonymous request is refused too, it's the network; when only whoami 403s,
+    it's the token's permissions; 401 alone means invalid (test above)."""
+    import urllib.error
+    import urllib.request
+
+    monkeypatch.setenv("HF_TOKEN", "hf_SOMETOKEN")
+    monkeypatch.setattr(ramalama_shim, "ensure_trust_bundle", lambda: None)
+    monkeypatch.delenv("BOXY_ALLOW_TRANSPORTS", raising=False)
+
+    def refuse(anon_code, whoami_code):
+        def fake(req, timeout=0):
+            url = req if isinstance(req, str) else req.full_url
+            code = whoami_code if "whoami" in url else anon_code
+            raise urllib.error.HTTPError(url, code, "x", None, None)
+        return fake
+
+    # 403 with AND without the token: the network refuses this client
+    monkeypatch.setattr(urllib.request, "urlopen", refuse(403, 403))
+    rc = main(["info", "--net"])
+    out = capsys.readouterr().out
+    assert rc == 1                                   # blocked registries still fail the check
+    assert "BLOCKED" in out and "refusing this CLIENT" in out
+    assert "Generate a fresh token" not in out and "REJECTED" not in out
+
+    # anonymous fine (404), whoami 403: the token exists but lacks permission
+    monkeypatch.setattr(urllib.request, "urlopen", refuse(404, 403))
+    rc = main(["info", "--net"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "REJECTED (HTTP 403)" in out and "'read' scope" in out and "BLOCKED" not in out

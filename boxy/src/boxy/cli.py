@@ -160,8 +160,9 @@ def cmd_info(args: argparse.Namespace) -> int:
 def _probe_registries() -> int:
     """`boxy info --net`: try each ALLOWED model registry with the CURRENT
     trust store (after boxy's certifi merge, like a real pull). Registries
-    outside the policy allowlist are not even probed. Any HTTP response —
-    even 401/404 — proves TLS worked; only transport errors are failures."""
+    outside the policy allowlist are not even probed. Any HTTP response proves
+    TLS worked; 401/404 are fine, but a 403 on an anonymous front-door GET
+    means the network/site refuses this client — flagged as BLOCKED."""
     import urllib.error
     import urllib.parse
     import urllib.request
@@ -175,38 +176,27 @@ def _probe_registries() -> int:
               + "   (probes below go THROUGH this)")
     failures = 0
     kinds_seen: set[str] = set()
-    token, source = ramalama_shim.effective_hf_token()
-    if token:
-        # the definitive "did my token take effect" answer: ask HF who the
-        # EFFECTIVE token belongs to (same resolution as the pull itself)
-        request = urllib.request.Request("https://huggingface.co/api/whoami-v2",
-                                         headers={"Authorization": f"Bearer {token}",
-                                                  "User-Agent": "boxy"})
-        try:
-            import json as _json
-
-            with urllib.request.urlopen(request, timeout=8) as resp:
-                who = _json.load(resp)
-            print(f"net: hf-auth    whoami OK — token from {source} is VALID "
-                  f"(user: {who.get('name', '?')})")
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                print(f"net: hf-auth    token from {source} is INVALID (HTTP {e.code}) — "
-                      f"HF rejects it; gated/private pulls WILL fail. Generate a fresh token at "
-                      f"https://huggingface.co/settings/tokens and re-export HF_TOKEN.")
-                failures += 1
-            else:
-                print(f"net: hf-auth    could not validate (HTTP {e.code})")
-        except Exception as e:
-            print(f"net: hf-auth    could not validate ({getattr(e, 'reason', e)})")
+    probe_status: dict[str, object] = {}  # scheme -> HTTP code or error string
     for scheme, url in policy.registry_probes():
         try:
             with urllib.request.urlopen(url, timeout=8) as resp:
+                probe_status[scheme] = resp.status
                 print(f"net: {scheme:10s} {url}  OK (HTTP {resp.status})")
         except urllib.error.HTTPError as e:
-            print(f"net: {scheme:10s} {url}  OK (TLS fine; HTTP {e.code})")
+            probe_status[scheme] = e.code
+            if e.code == 403:
+                # an UNAUTHENTICATED GET of the registry front door never
+                # legitimately 403s — the network path (proxy policy, IP block)
+                # is refusing this client. Not certificates, not tokens.
+                print(f"net: {scheme:10s} {url}  BLOCKED (TLS fine; HTTP 403 — this network or the "
+                      f"site refuses the request: proxy/Zscaler policy or an IP-level block. "
+                      f"Try on/off VPN or another network.)")
+                failures += 1
+            else:
+                print(f"net: {scheme:10s} {url}  OK (TLS fine; HTTP {e.code})")
         except Exception as e:
             reason = getattr(e, "reason", e)
+            probe_status[scheme] = str(reason)
             print(f"net: {scheme:10s} {url}  FAIL ({reason})")
             kinds_seen.add(ramalama_shim.net_failure_kind(reason))
             host = urllib.parse.urlsplit(url).hostname or ""
@@ -218,6 +208,43 @@ def _probe_registries() -> int:
                           " corporate interceptor (Zscaler etc.), append ITS root to SSL_CERT_FILE."
                           " Interceptors often bypass some hosts, which is why other registries pass.")
             failures += 1
+    token, source = ramalama_shim.effective_hf_token()
+    if token:
+        # the definitive "did my token take effect" answer: ask HF who the
+        # EFFECTIVE token belongs to (same resolution as the pull itself).
+        # Runs AFTER the anonymous probes so a 403 can be attributed correctly:
+        # if the UNAUTHENTICATED probe was also refused, it's the network, not
+        # the token (field report: a good token blamed while Zscaler 403'd HF).
+        request = urllib.request.Request("https://huggingface.co/api/whoami-v2",
+                                         headers={"Authorization": f"Bearer {token}",
+                                                  "User-Agent": "boxy"})
+        try:
+            import json as _json
+
+            with urllib.request.urlopen(request, timeout=8) as resp:
+                who = _json.load(resp)
+            print(f"net: hf-auth    whoami OK — token from {source} is VALID "
+                  f"(user: {who.get('name', '?')})")
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                print(f"net: hf-auth    token from {source} is INVALID (HTTP 401) — "
+                      f"HF rejects it; gated/private pulls WILL fail. Generate a fresh token at "
+                      f"https://huggingface.co/settings/tokens and re-export HF_TOKEN.")
+                failures += 1
+            elif e.code == 403 and probe_status.get("hf://") == 403:
+                print(f"net: hf-auth    whoami got HTTP 403 — but so did the UNAUTHENTICATED hf:// "
+                      f"probe above, so huggingface.co is refusing this CLIENT (network/proxy policy), "
+                      f"not the token from {source}. The token is probably fine; fix the network first.")
+            elif e.code == 403:
+                print(f"net: hf-auth    token from {source} is REJECTED (HTTP 403) — HF answers "
+                      f"anonymous requests fine, so the token exists but lacks permission. Regenerate "
+                      f"it with 'read' scope at https://huggingface.co/settings/tokens and re-export "
+                      f"HF_TOKEN.")
+                failures += 1
+            else:
+                print(f"net: hf-auth    could not validate (HTTP {e.code})")
+        except Exception as e:
+            print(f"net: hf-auth    could not validate ({getattr(e, 'reason', e)})")
     if failures:
         # explain each KIND of failure actually observed — DNS/proxy/conn get
         # network guidance, never the cert remedy (DNS is upstream of TLS).

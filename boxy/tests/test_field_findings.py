@@ -153,7 +153,9 @@ def test_finding13c_info_net_probes_registries(monkeypatch, capsys):
 
     def fake_urlopen(url, timeout=0):
         if "ollama" in url:
-            raise urllib.error.HTTPError(url, 403, "Forbidden", None, None)
+            # 404, not 403: an ordinary HTTP response proves TLS worked, but a
+            # 403 on the anonymous front door now means BLOCKED (network refusal).
+            raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
         return FakeResp()
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
@@ -163,7 +165,7 @@ def test_finding13c_info_net_probes_registries(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 0  # HTTP errors still prove TLS; nothing actually failed
     assert "hf://" in out and "OK (HTTP 200)" in out
-    assert "OK (TLS fine; HTTP 403)" in out
+    assert "OK (TLS fine; HTTP 404)" in out
     assert "modelscope" not in out                   # blocked registries are not probed
 
 
