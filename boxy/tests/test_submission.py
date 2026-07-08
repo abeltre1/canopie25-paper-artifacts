@@ -205,6 +205,16 @@ def test_dynamic_flags_apply_to_attached_srun_too(gguf, capsys):
     assert "srun" in out and "--partition=short" in out and "-C gpu_h100" in out
 
 
+def test_submission_hint_for_account_partition_rejection():
+    from boxy.cli import _submission_hint
+
+    hint = _submission_hint("sbatch: error: Batch job submission failed: "
+                            "Invalid account or account/partition combination specified")
+    assert "sacctmgr show assoc" in hint and "sinfo -s" in hint
+    assert "single partition" in hint
+    assert _submission_hint("some other failure") == ""
+
+
 def test_bare_flags_pass_to_the_active_scheduler(gguf, jobs_dir, capsys):
     """The user's spelling: NO prefix — any flag boxy doesn't own goes to the
     active scheduler verbatim; the portable trio is translated internally."""

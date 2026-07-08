@@ -660,6 +660,25 @@ def _inner_serve_command(args, model: str, name: str, *, port: int | None = None
     return shlex.join(inner)
 
 
+def _submission_hint(stderr: str) -> str:
+    """Plain-language next step for the sbatch/flux-batch rejections users
+    actually hit. Empty string when the error isn't recognized."""
+    low = stderr.lower()
+    if "invalid account or account/partition combination" in low:
+        return ("boxy hint: the scheduler rejected the ACCOUNT+PARTITION pairing, not the job.\n"
+                "  - check which accounts you may use on which partitions:\n"
+                "      sacctmgr show assoc user=$USER format=account%20,partition%20,qos%30\n"
+                "  - list this cluster's partitions:  sinfo -s\n"
+                "  - if you passed several partitions (--partition=a,b), every one must accept\n"
+                "    the account — retry with the single partition you know works.")
+    if "invalid partition" in low:
+        return "boxy hint: that partition doesn't exist here — list them with: sinfo -s"
+    if "invalid qos" in low:
+        return ("boxy hint: that QOS isn't available to this account — see yours with:\n"
+                "      sacctmgr show assoc user=$USER format=account%20,qos%40")
+    return ""
+
+
 def _serve_submission(args, scheduler_name: str, profile, name_override: str | None = None,
                       follow: bool = True) -> int:
     """The seamless scheduler path: generate a batch script, submit it, follow
@@ -804,7 +823,11 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
     jobs.endpoint_path(name).unlink(missing_ok=True)
     result = subprocess.run(submit, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"boxy: submission failed: {result.stderr.strip() or result.stdout.strip()}", file=sys.stderr)
+        err = result.stderr.strip() or result.stdout.strip()
+        print(f"boxy: submission failed: {err}", file=sys.stderr)
+        hint = _submission_hint(err)
+        if hint:
+            print(hint, file=sys.stderr)
         return result.returncode
     job_id = scheduler.parse_job_id(result.stdout)
     expected_log = jobs.log_path(name, job_id)  # where the scheduler should write it
