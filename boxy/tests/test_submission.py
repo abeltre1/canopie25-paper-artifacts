@@ -90,6 +90,12 @@ class _FakeSlurm:
 
         monkeypatch.setattr(cli.subprocess, "run", fake_run)
         monkeypatch.setattr("time.sleep", lambda s: None)
+        # CI runners have no real sbatch on PATH; make the scheduler binary appear
+        # present so the pre-submit guard doesn't short-circuit the fake.
+        real_which = cli.shutil.which
+        monkeypatch.setattr(cli.shutil, "which",
+                            lambda b: "/usr/bin/sbatch" if b in ("sbatch", "squeue", "scancel")
+                            else real_which(b))
 
 
 def test_submission_reaches_ready(gguf, jobs_dir, monkeypatch, capsys):
