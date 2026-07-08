@@ -172,6 +172,36 @@ def test_list_shows_scheduler_jobs(jobs_dir, monkeypatch, capsys):
     assert "boxy-m" in out and "slurm job 99" in out and "RUNNING" in out and ":9291/v1" in out
 
 
+def test_list_swallows_rootless_podman_noise_on_login_node(jobs_dir, monkeypatch, capsys):
+    """Field report: on an HPC login node `podman ps` fails with 'Failed to get
+    rootless runtime dir' / 'creating events dirs: permission denied' because
+    there is no /run/user/$UID. With scheduler jobs already listed, boxy must NOT
+    dump that noise — the instances live on the compute nodes."""
+    import boxy.cli as cli
+
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "flux", "job": "f2aowVYm"})
+    jobs.write_endpoint("boxy-m", 8090, job_id="f2aowVYm")
+    monkeypatch.setattr(cli, "_scheduler_reachable", lambda s: True)
+    monkeypatch.setattr(cli, "_job_state", lambda s, j: "RUNNING")
+    monkeypatch.setattr(cli, "_container_runtime", lambda loc: "podman")
+
+    def fake_run(cmd, **kw):
+        if cmd[1:3] == ["ps", "--filter"]:               # the local `podman ps`
+            return type("R", (), {"returncode": 125, "stdout": "",
+                                  "stderr": 'Error: creating events dirs: mkdir '
+                                            '/run/user/140425: permission denied\n'})()
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()   # ps -a: no exited
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    rc = main(["list"])
+    cap = capsys.readouterr()
+    assert rc == 0
+    assert "boxy-m" in cap.out and "RUNNING" in cap.out           # jobs still shown
+    assert "creating events dirs" not in cap.out                 # podman noise suppressed
+    assert "creating events dirs" not in cap.err                 # ...and not leaked to stderr
+    assert "no local podman containers" in cap.out               # honest one-liner instead
+
+
 def test_list_reveals_exited_containers_with_oom_note(monkeypatch, capsys):
     """Field report: `--unique` instances kept 'disappearing'. Plain `ps` hides
     EXITED containers, so a server killed seconds after READY vanished from view.

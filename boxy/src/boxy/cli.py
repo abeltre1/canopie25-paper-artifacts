@@ -1874,10 +1874,36 @@ def cmd_list(args: argparse.Namespace) -> int:
         if records:
             return 0  # jobs listed; no container runtime on this host is fine
         raise
-    rc = _run_or_print([runtime, "ps", "--filter", "label=boxy.box"], args.dryrun)
+    rc = _list_local_containers(runtime, args.dryrun, have_records=bool(records))
     if not args.dryrun:
         _report_exited_containers(runtime)
     return rc
+
+
+def _list_local_containers(runtime: str, dryrun: bool, have_records: bool) -> int:
+    """List boxy's LOCAL containers, quietly. On an HPC login node rootless podman
+    has no /run/user/$UID (no user systemd session), so `podman ps` fails with
+    'Failed to get rootless runtime dir' + 'creating events dirs: permission
+    denied' noise — but the real instances run on the compute nodes (already
+    listed as scheduler jobs). Capture podman's output so that noise never reaches
+    the user: print the table on success; when it fails and jobs were listed,
+    skip silently; only surface the raw error when there's nothing else to show."""
+    print(f"### Running Command:\n    {shlex.join([runtime, 'ps', '--filter', 'label=boxy.box'])}")
+    if dryrun:
+        return 0
+    proc = subprocess.run([runtime, "ps", "--filter", "label=boxy.box"],
+                          capture_output=True, text=True)
+    if proc.returncode == 0:
+        if proc.stdout:
+            print(proc.stdout, end="")
+        return 0
+    if have_records:
+        # login node with no local runtime: the jobs above ARE the answer.
+        print(f"  (no local {runtime} containers on this host — instances run on the "
+              f"compute nodes listed above)")
+        return 0
+    sys.stderr.write(proc.stderr)                       # nothing else to show — be honest
+    return proc.returncode
 
 
 def _report_exited_containers(runtime: str) -> None:
