@@ -106,6 +106,47 @@ What happens behind the scenes:
 - Prereqs: `ssh user@login` works from this machine (VPN up), and boxy is on the
   login node. Everything else (scheduler flags, --replicas, --router, sweep)
   composes unchanged — it simply runs over there.
+- **Keep the cluster's boxy current.** `--ssh` runs the CLUSTER's install, not
+  your laptop's. If the remote rejects a subcommand your laptop knows
+  (`invalid choice: 'logs'`), boxy prints a *stale install* hint — fix it with
+  `git pull && pip install -e .` in the checkout on that login node.
+
+### 0.96 Several clusters, one $HOME (hops + eldorado)
+
+Lab clusters often share your home directory, so `~/.local/share/boxy/jobs`
+holds BOTH clusters' records. boxy tells them apart by the **cluster identity**
+of the submitting host (`eldorado-login2` → `eldorado`): `boxy list` shows the
+other cluster's jobs as `FOREIGN(origin)`, and `boxy curl` never auto-picks a
+foreign endpoint (its compute-node hostname wouldn't resolve here) — it points
+you at `boxy curl NAME --ssh <that cluster's login>` instead. If your site's
+hostnames don't encode the cluster name, set `BOXY_CLUSTER=<name>` per cluster
+(shell profile), or separate the views entirely with a per-cluster
+`BOXY_JOBS_DIR`.
+
+### 0.97 Pull images from YOUR registry (site mirrors, air-gap, localhost)
+
+Every image reference resolves through one module (`registries.py`) — swap
+registries with data, never code:
+
+```bash
+# blanket: send EVERY image to one registry (replaces docker.io/ghcr.io/...)
+boxy serve <model> --registry registry.mysite.gov/mirror ...
+# an image you built yourself, no registry at all:
+boxy serve <model> --image localhost/my-vllm:dev ...
+```
+
+Per-registry rewrite map in a location profile (mirrors win over `--registry`):
+
+```toml
+[location.image_mirrors]
+"docker.io" = "registry.mysite.gov/dockerhub"
+"ghcr.io"   = "registry.mysite.gov/ghcr"
+"*"         = "registry.mysite.gov/mirror"   # catch-all; omit to leave others alone
+```
+
+Bare names (`vllm/vllm-openai`) count as docker.io. `localhost/...` images stay
+local unless explicitly mirrored. The rewrite applies uniformly: podman/docker
+run, apptainer's OCI→SIF build (`docker://<rewritten>`), and the SkyPilot export.
 
 ## 1. Any machine — install & self-test (5 min)
 

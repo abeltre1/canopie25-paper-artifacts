@@ -408,9 +408,11 @@ class _ChatBackend(_FakeBackend):
 
 
 def test_boxy_curl_by_name_and_single_default(tmp_path, monkeypatch, capsys):
+    from boxy import cli
     from boxy.cli import main as cli_main
 
     monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
+    monkeypatch.setattr(cli, "_scheduler_reachable", lambda s: True)  # CI runners have no squeue
     srv = ThreadingHTTPServer(("127.0.0.1", 0), _ChatBackend)
     srv.hits = 0
     srv.tag = "chat"
@@ -450,7 +452,10 @@ def test_boxy_curl_skips_foreign_cluster_endpoints(tmp_path, monkeypatch, capsys
     from boxy.cli import main as cli_main
 
     monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
-    # a foreign flux job (this sandbox has no flux binary) with an endpoint
+    # cluster identity decides (deterministic on any host, incl. CI runners):
+    # this host "is" hops, so the eldorado-submitted record is the foreign one
+    monkeypatch.setenv("BOXY_CLUSTER", "hops")
+    # a foreign flux job with an endpoint
     jobs.write_record("boxy-eldo", {"name": "boxy-eldo", "scheduler": "flux",
                                     "job": "f2ag", "submitted_from": "eldorado-login2"})
     (tmp_path / "boxy-eldo.endpoint.json").write_text(json.dumps(
@@ -471,7 +476,8 @@ def test_boxy_curl_skips_foreign_cluster_endpoints(tmp_path, monkeypatch, capsys
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         port = srv.server_address[1]
-        jobs.write_record("boxy-here", {"name": "boxy-here", "scheduler": "slurm", "job": "9"})
+        jobs.write_record("boxy-here", {"name": "boxy-here", "scheduler": "slurm", "job": "9",
+                                        "submitted_from": "hops-login1"})
         (tmp_path / "boxy-here.endpoint.json").write_text(json.dumps(
             {"name": "boxy-here", "host": "127.0.0.1", "port": port,
              "url": f"http://127.0.0.1:{port}", "job": "9"}))

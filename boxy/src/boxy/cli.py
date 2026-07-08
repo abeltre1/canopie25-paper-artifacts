@@ -152,6 +152,7 @@ def _probe_registries() -> int:
     outside the policy allowlist are not even probed. Any HTTP response —
     even 401/404 — proves TLS worked; only transport errors are failures."""
     import urllib.error
+    import urllib.parse
     import urllib.request
 
     from boxy import policy
@@ -191,11 +192,44 @@ def _probe_registries() -> int:
         except Exception as e:
             reason = getattr(e, "reason", e)
             print(f"net: {scheme:10s} {url}  FAIL ({reason})")
+            host = urllib.parse.urlsplit(url).hostname or ""
+            if "CERTIFICATE_VERIFY_FAILED" in str(reason) and host:
+                issuer = _tls_issuer(host)
+                if issuer:
+                    print(f"net:            the cert this shell SEES for {host} was issued by: {issuer}")
+                    print("net:            that issuer's root CA is NOT in your trust bundle — if it's your"
+                          " corporate interceptor (Zscaler etc.), append ITS root to SSL_CERT_FILE."
+                          " Interceptors often bypass some hosts, which is why other registries pass.")
             failures += 1
     if failures:
         print("net: FAILing registries cannot be pulled from this shell — "
               "if the reason is CERTIFICATE_VERIFY_FAILED, see the SSL_CERT_FILE notes in RUNBOOK §2.1")
     return 1 if failures else 0
+
+
+def _tls_issuer(host: str, port: int = 443) -> str:
+    """Who signed the certificate this shell actually SEES for `host`? (best
+    effort; '' on any failure). Corporate TLS interception (Zscaler) swaps
+    chains per-host — some hosts bypassed, some intercepted — so one registry
+    can verify while another fails with the SAME bundle. Naming the issuer
+    turns a bare CERTIFICATE_VERIFY_FAILED into 'your bundle lacks THIS root'."""
+    import ssl
+
+    ctx = ssl._create_unverified_context()  # look, don't trust: report-only handshake
+    try:
+        with socket.create_connection((host, port), timeout=6) as raw:
+            with ctx.wrap_socket(raw, server_hostname=host) as tls:
+                der = tls.getpeercert(binary_form=True)
+        if not der:
+            return ""
+        result = subprocess.run(["openssl", "x509", "-noout", "-issuer"],
+                                input=ssl.DER_cert_to_PEM_cert(der),
+                                capture_output=True, text=True, timeout=6)
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip().removeprefix("issuer=").strip()
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return ""
 
 
 def _resolve_or_load(args: argparse.Namespace):
@@ -1593,15 +1627,14 @@ def cmd_list(args: argparse.Namespace) -> int:
         print("scheduler jobs:")
         for record in records:
             scheduler_obj = get_scheduler(record["scheduler"])
-            state_bin = scheduler_obj.state_command(record["job"])[0]
-            if shutil.which(state_bin):
+            is_foreign, origin = _record_is_foreign(record)
+            if not is_foreign:
                 state = _job_state(scheduler_obj, record["job"])
             else:
                 # Labs share $HOME across clusters, so this jobs dir holds OTHER
                 # clusters' records too (field report: an eldorado flux job listed
-                # on hops as UNKNOWN). No point probing — this cluster can't even
-                # speak that scheduler; say what it IS instead of UNKNOWN.
-                origin = record.get("submitted_from", "another cluster")
+                # on hops as UNKNOWN). No point probing — the job lives elsewhere;
+                # say where it IS instead of UNKNOWN.
                 state = f"FOREIGN({origin})"
                 foreign_seen = True
             replicas = record.get("replicas")
@@ -1675,6 +1708,42 @@ def cmd_router(args: argparse.Namespace) -> int:
     return 0
 
 
+def _scheduler_reachable(scheduler_obj) -> bool:
+    """Can THIS host speak that scheduler? (its state binary is on PATH). Only a
+    FALLBACK for legacy records without an origin — clusters often ship other
+    schedulers' binaries too (field report: hops has `flux` on PATH, so an
+    eldorado flux record passed this check and boxy curl chased eldo1025)."""
+    return shutil.which(scheduler_obj.state_command("x")[0]) is not None
+
+
+def _cluster_id(host: str) -> str:
+    """Best-effort cluster identity from a hostname: 'eldorado-login2',
+    'eldorado-login1.sandia.gov', and 'eldorado' all -> 'eldorado'; 'hops12'
+    and 'hops-login5' -> 'hops'. Sites with unusual naming set BOXY_CLUSTER."""
+    short = host.split(".", 1)[0].lower()
+    short = re.sub(r"\d+$", "", short)
+    short = re.sub(r"[-_]?login$", "", short)
+    return short.rstrip("-_") or host
+
+
+def _local_cluster() -> str:
+    return os.environ.get("BOXY_CLUSTER") or _cluster_id(socket.gethostname())
+
+
+def _record_is_foreign(record: dict) -> tuple[bool, str]:
+    """Does this record belong to ANOTHER cluster sharing this $HOME? The seam
+    for local-vs-FOREIGN classification — one place, test-injectable. Primary
+    signal: the record's submit-host cluster identity vs this host's (scheduler-
+    binary presence is unreliable — see _scheduler_reachable). Returns
+    (foreign, origin-host)."""
+    from boxy.schedulers import get_scheduler
+
+    origin = record.get("submitted_from", "")
+    if origin:
+        return _cluster_id(origin) != _local_cluster(), origin
+    return not _scheduler_reachable(get_scheduler(record["scheduler"])), "another cluster"
+
+
 def cmd_logs(args: argparse.Namespace) -> int:
     """Show a job's log (newest first) + boxy's crash diagnosis. Works after the
     record is reaped (log files outlive DONE jobs) and over --ssh."""
@@ -1720,21 +1789,19 @@ def cmd_curl(args: argparse.Namespace) -> int:
     if args.url:
         url = args.url.rstrip("/").removesuffix("/v1")
     else:
-        from boxy.schedulers import get_scheduler
-
         # Labs share $HOME across clusters, so the jobs dir holds OTHER clusters'
         # endpoints too (their node hostnames don't resolve here). Only endpoints
-        # of jobs THIS cluster can speak are candidates; foreign ones get pointed
-        # at their own cluster. (Field report: `boxy curl --ssh hops` picked an
-        # eldorado endpoint and failed DNS on eldo1027.)
+        # of jobs submitted from THIS cluster are candidates; foreign ones get
+        # pointed at their own cluster. (Field report: `boxy curl --ssh hops`
+        # picked an eldorado endpoint and failed DNS on eldo1027.)
         endpoints: dict[str, dict] = {}
         foreign: dict[str, str] = {}  # name -> submitted_from
         for r in jobs.list_records():
-            is_foreign = not shutil.which(get_scheduler(r["scheduler"]).state_command(r["job"])[0])
+            is_foreign, origin = _record_is_foreign(r)
             for n in [r["name"], *r.get("replicas", [])]:
                 ep = jobs.read_endpoint(n)
                 if ep and is_foreign:
-                    foreign[n] = r.get("submitted_from", "its own cluster")
+                    foreign[n] = origin
                 elif ep:
                     endpoints[n] = ep
         if args.name:

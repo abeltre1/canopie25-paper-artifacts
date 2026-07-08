@@ -47,6 +47,11 @@ CONTROL_PERSIST = "4h"  # one OTP+touch buys this much multiplexed access
 # ALREADY SERVING reconnect (rerunning the same model finds the live job).
 READY_RE = re.compile(r"###\s+(?:READY|ALREADY SERVING)\s+http://([^:/\s]+):(\d+)")
 
+# the remote boxy rejecting a subcommand/flag the local one just sent means the
+# CLUSTER's install is older than the laptop's (field report: `boxy logs --ssh
+# eldorado` -> "invalid choice: 'logs'") — say so instead of a bare usage error.
+STALE_RE = re.compile(r"invalid choice: '[^']+'|unrecognized arguments:")
+
 
 def ssh_bin() -> str:
     return os.environ.get(ENV_SSH_BIN, "ssh")
@@ -157,9 +162,11 @@ def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False) -> in
     cmd = [ssh_bin(), "-o", f"ControlPath={control_path()}", host, _remote_command(argv)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     tunneled: set[tuple[str, int]] = set()
+    stale = False
     assert proc.stdout is not None
     for line in proc.stdout:
         print(line, end="")
+        stale = stale or bool(STALE_RE.search(line))
         if tunnel_ready:
             m = READY_RE.search(line)
             if m and (m.group(1), int(m.group(2))) not in tunneled:
@@ -173,4 +180,9 @@ def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False) -> in
                 else:
                     print(f"warning: could not forward local port {port} (in use?) — "
                           f"tunnel manually: ssh -L {port}:{node}:{port} {host}", file=sys.stderr)
-    return proc.wait()
+    rc = proc.wait()
+    if rc != 0 and stale:
+        print(f"boxy: hint: {host} rejected a command this boxy knows — the CLUSTER's boxy "
+              f"install is older than yours. Update it there (git pull in the boxy checkout, "
+              f"then pip install -e .) and rerun.", file=sys.stderr)
+    return rc

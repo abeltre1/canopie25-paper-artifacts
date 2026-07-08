@@ -172,6 +172,19 @@ def test_remote_failure_rc_propagates(shim, capfd, monkeypatch):
     assert rc == 3
 
 
+def test_stale_remote_boxy_gets_update_hint(shim, capfd, monkeypatch):
+    # A cluster whose boxy predates a subcommand (field report: `boxy logs --ssh
+    # eldorado` -> "invalid choice: 'logs'") must be called out as STALE — the
+    # bare usage error reads like a boxy bug instead of an outdated install.
+    monkeypatch.setenv(remote.ENV_REMOTE_CMD,
+                       "echo \"boxy: error: argument subcommand: invalid choice: 'logs'\" ; exit 2 ; :")
+    rc = remote.run_remote("user@login1", ["logs"])
+    assert rc == 2
+    captured = capfd.readouterr()
+    assert "invalid choice" in captured.out                # remote error streamed through
+    assert "older" in captured.err and "git pull" in captured.err
+
+
 def test_master_auth_failure_is_explained(tmp_path, capfd, monkeypatch):
     # ssh that always fails (wrong host / user aborted the OTP prompt)
     bad = tmp_path / "ssh"

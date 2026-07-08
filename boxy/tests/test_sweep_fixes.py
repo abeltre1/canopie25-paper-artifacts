@@ -709,6 +709,31 @@ def test_info_net_never_probes_blocked_registries(monkeypatch):
     assert any("huggingface.co" in u for u in urls) and any("ollama" in u for u in urls)
 
 
+def test_info_net_names_the_unknown_tls_issuer(monkeypatch, capsys):
+    """Field report: hf verified but ollama failed CERTIFICATE_VERIFY_FAILED with
+    the SAME merged bundle (interceptors bypass some hosts and swap chains on
+    others). The probe must name the issuer it actually SAW, so the user knows
+    which root their SSL_CERT_FILE is missing — not just 'see the cert notes'."""
+    import urllib.error
+    import urllib.request
+
+    from boxy import cli, ramalama_shim
+
+    monkeypatch.setattr(ramalama_shim, "ensure_trust_bundle", lambda: None)
+    monkeypatch.setattr(ramalama_shim, "effective_hf_token", lambda: ("", ""))
+
+    def boom(url, timeout=0):
+        raise urllib.error.URLError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    monkeypatch.setattr(cli, "_tls_issuer", lambda host: "CN=Zscaler Root CA, O=Zscaler Inc.")
+    rc = cli._probe_registries()
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "issued by: CN=Zscaler Root CA" in out
+    assert "append ITS root to SSL_CERT_FILE" in out
+
+
 # ---- HF token precedence + validation (field report: 'HF_TOKEN did not take effect') ----
 
 def test_effective_hf_token_env_wins_outright(monkeypatch, tmp_path):

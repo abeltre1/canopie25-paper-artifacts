@@ -157,6 +157,7 @@ def test_list_shows_scheduler_jobs(jobs_dir, monkeypatch, capsys):
 
     jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "99"})
     jobs.write_endpoint("boxy-m", 9291, job_id="99")
+    monkeypatch.setattr(cli, "_scheduler_reachable", lambda s: True)  # CI runners have no squeue
     monkeypatch.setattr(cli, "_job_state", lambda s, j: "RUNNING")
     monkeypatch.setattr(cli, "_container_runtime", lambda loc: (_ for _ in ()).throw(RuntimeError("none")))
     rc = main(["list"])
@@ -360,8 +361,12 @@ def test_list_labels_foreign_cluster_records(jobs_dir, monkeypatch, capsys):
 
     jobs.write_record("boxy-eldo", {"name": "boxy-eldo", "scheduler": "flux",
                                     "job": "f2agHnM4psaw", "submitted_from": "eldorado-login2"})
-    jobs.write_record("boxy-here", {"name": "boxy-here", "scheduler": "slurm", "job": "77"})
+    jobs.write_record("boxy-here", {"name": "boxy-here", "scheduler": "slurm", "job": "77",
+                                    "submitted_from": "hops-login1"})
     probed = []
+    # cluster identity decides (deterministic on any host, incl. CI runners):
+    # this host "is" hops, so the eldorado-submitted record is the foreign one
+    monkeypatch.setenv("BOXY_CLUSTER", "hops")
     monkeypatch.setattr(cli, "_job_state", lambda s, j: probed.append(j) or "RUNNING")
     rc = main(["list", "--runtime", "docker", "--dryrun"])
     out = capsys.readouterr().out
@@ -371,6 +376,28 @@ def test_list_labels_foreign_cluster_records(jobs_dir, monkeypatch, capsys):
     assert probed == ["77"]                           # the foreign job was NOT probed
     assert "shares this $HOME" in out                 # the explainer footnote
     assert jobs.read_record("boxy-eldo") is not None  # never reaped
+
+
+def test_cluster_identity_and_fallback(monkeypatch):
+    """FOREIGN classification keys on WHERE the record was submitted, not on
+    which scheduler binaries happen to be on PATH (field report: hops ships
+    `flux` too, so an eldorado flux record passed the binary check and boxy
+    curl chased eldo1025). Legacy records keep the binary fallback."""
+    from boxy import cli
+
+    assert cli._cluster_id("eldorado-login2") == "eldorado"
+    assert cli._cluster_id("eldorado-login1.sandia.gov") == "eldorado"
+    assert cli._cluster_id("hops12") == "hops"
+    assert cli._cluster_id("HOPS-LOGIN5") == "hops"
+    monkeypatch.setenv("BOXY_CLUSTER", "hops")   # this host "is" hops
+    foreign, origin = cli._record_is_foreign({"scheduler": "flux", "submitted_from": "eldorado-login2"})
+    assert foreign and origin == "eldorado-login2"
+    foreign, _ = cli._record_is_foreign({"scheduler": "slurm", "submitted_from": "hops-login1"})
+    assert not foreign
+    # legacy record without an origin: binary-presence fallback still applies
+    monkeypatch.setattr(cli, "_scheduler_reachable", lambda s: False)
+    foreign, origin = cli._record_is_foreign({"scheduler": "slurm"})
+    assert foreign and origin == "another cluster"
 
 
 def test_boxy_logs_newest_named_and_diagnosed(jobs_dir, monkeypatch, capsys):
