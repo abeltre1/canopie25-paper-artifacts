@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
 
@@ -135,6 +136,23 @@ def _remote_command(argv: list[str]) -> str:
     return f"bash -lc {shlex.quote(inner)}"
 
 
+def _local_port_free(port: int) -> bool:
+    """Can ssh -L bind this local port? (bind-test — matches what ssh does, so a
+    leftover forward/gvproxy holding the port is correctly seen as taken)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _free_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 def add_forward(host: str, local_port: int, remote_host: str, remote_port: int) -> int:
     """Add a port forward ON THE LIVE MASTER — no new connection, no re-auth.
     The forward persists as long as the master does (ControlPersist), so it
@@ -172,14 +190,20 @@ def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False) -> in
             if m and (m.group(1), int(m.group(2))) not in tunneled:
                 node, port = m.group(1), int(m.group(2))
                 tunneled.add((node, port))
-                if add_forward(host, port, node, port) == 0:
-                    print(f"### LOCAL   http://127.0.0.1:{port}/v1   "
+                # keep the same local port when it's free (predictable URL); else
+                # pick a free one so a leftover forward on that port (field report:
+                # stale podman gvproxy on 8090) never blocks the tunnel.
+                lport = port if _local_port_free(port) else _free_local_port()
+                if add_forward(host, lport, node, port) == 0:
+                    print(f"### LOCAL   http://127.0.0.1:{lport}/v1   "
                           f"(tunnel over the SSH session; persists ~{CONTROL_PERSIST})")
-                    print(f"###   close: ssh -O cancel -L {port}:{node}:{port} "
+                    print(f"###   browser: open http://127.0.0.1:{lport}/   "
+                          f"(llama.cpp serves a web UI there; vLLM exposes only /v1)")
+                    print(f"###   close: ssh -O cancel -L {lport}:{node}:{port} "
                           f"-o ControlPath={control_path()} {host}")
                 else:
-                    print(f"warning: could not forward local port {port} (in use?) — "
-                          f"tunnel manually: ssh -L {port}:{node}:{port} {host}", file=sys.stderr)
+                    print(f"warning: could not forward local port {lport} (in use?) — "
+                          f"tunnel manually: ssh -L {lport}:{node}:{port} {host}", file=sys.stderr)
     rc = proc.wait()
     if rc != 0 and stale:
         print(f"boxy: hint: {host} rejected a command this boxy knows — the CLUSTER's boxy "

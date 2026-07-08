@@ -426,6 +426,23 @@ boxy router <base> --emit nginx   > boxy.conf      # or --emit haproxy | litellm
 # (See the scaling note below: the built-in router is right for benchmark scale; the
 #  GPUs, not the proxy, are the bottleneck. Beyond that, run the emitted nginx/haproxy/litellm.)
 
+# --- B''''. N instances: unique URLs, or ONE route -----------------------------
+# Running N servers on a cluster, you address them ONE of two ways:
+#   (a) UNIQUE URL per instance — different models, or you want each individually.
+#       Every instance has its own name -> its own endpoint (compute-node:port).
+#       `boxy list` shows all their URLs; target one by name:
+boxy serve <modelA> --scheduler flux --gpus 1 --unique      # -> name-A on nodeX:8090
+boxy serve <modelB> --scheduler flux --gpus 1 --unique      # -> name-B on nodeY:8090
+boxy list  --ssh user@login                                 # every instance + its URL
+boxy curl  name-A --ssh user@login                          # query a specific one
+boxy open  name-A --ssh user@login                          # browser: tunnels name-A to a FREE local port
+boxy open  name-B --ssh user@login                          # a DIFFERENT free local port -> both in the browser at once
+#   (b) ONE route for N of the SAME model — use --replicas + the router (B'):
+#       all K replicas behind a single load-balanced URL; the client sees one endpoint.
+boxy serve <model> --scheduler flux --gpus 4 --replicas 4 --router
+# `boxy open` picks a fresh local port each call, so opening several instances never
+# collides (field report: a stale forward on 8090 blocked the browser).
+
 # --- C. Scaling SWEEP (the paper's study) --------------------------------------
 # Step one axis in powers of two; each rung is submitted, waited-to-READY,
 # benchmarked, and torn down; a comparison table is printed at the end.

@@ -407,6 +407,29 @@ class _ChatBackend(_FakeBackend):
                     "usage": {"prompt_tokens": 1, "completion_tokens": 3}})
 
 
+def test_boxy_open_reports_endpoint_and_browser_url(tmp_path, monkeypatch, capsys):
+    """`boxy open NAME` (cluster-side, no --ssh) prints the endpoint READY banner
+    (the laptop watches for it to tunnel) + the llama.cpp web-UI root URL + the
+    ssh -L a workstation needs. N instances each address by their own name."""
+    from boxy import cli
+    from boxy.cli import main as cli_main
+
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
+    monkeypatch.setattr(cli, "_scheduler_reachable", lambda s: True)
+    for nm, host, port in [("boxy-a", "eldo1003", 8090), ("boxy-b", "eldo1004", 8090)]:
+        jobs.write_record(nm, {"name": nm, "scheduler": "flux", "job": nm})
+        (tmp_path / f"{nm}.endpoint.json").write_text(json.dumps(
+            {"name": nm, "host": host, "port": port, "url": f"http://{host}:{port}", "job": nm}))
+    assert cli_main(["open", "boxy-b"]) == 0
+    out = capsys.readouterr().out
+    assert "### READY  http://eldo1004:8090/v1" in out           # tunnel banner
+    assert "http://eldo1004:8090/" in out                        # browser (web UI) URL
+    assert "ssh -L 8090:eldo1004:8090" in out                    # workstation tunnel
+    # ambiguous with N up: must name one
+    assert cli_main(["open"]) == 2
+    assert "several models are serving" in capsys.readouterr().err
+
+
 def test_boxy_curl_by_name_and_single_default(tmp_path, monkeypatch, capsys):
     from boxy import cli
     from boxy.cli import main as cli_main

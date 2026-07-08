@@ -1861,6 +1861,42 @@ def cmd_logs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _select_endpoint(name: str | None, verb: str = "curl") -> tuple[str, dict]:
+    """Foreign-aware endpoint selection shared by curl/open. Returns (name, ep).
+    Labs share $HOME across clusters, so the jobs dir holds OTHER clusters'
+    endpoints too (their node hostnames don't resolve here); those are excluded
+    and, if named, pointed at their own cluster. Raises UsageError on
+    ambiguity / missing / foreign."""
+    from boxy import jobs
+
+    endpoints: dict[str, dict] = {}
+    foreign: dict[str, str] = {}  # name -> submitted_from
+    for r in jobs.list_records():
+        is_foreign, origin = _record_is_foreign(r)
+        for n in [r["name"], *r.get("replicas", [])]:
+            ep = jobs.read_endpoint(n)
+            if ep and is_foreign:
+                foreign[n] = origin
+            elif ep:
+                endpoints[n] = ep
+    if name:
+        if name in foreign:
+            raise UsageError(f"{name} runs on another cluster (submitted from {foreign[name]}) — "
+                             f"use it from there: boxy {verb} {name} --ssh <that login node>")
+        ep = endpoints.get(name)
+        if not ep:
+            raise UsageError(f"no endpoint for {name!r} — running here: "
+                             f"{', '.join(sorted(endpoints)) or 'none'} (see boxy list)")
+        return name, ep
+    if len(endpoints) == 1:
+        return next(iter(endpoints.items()))
+    if not endpoints:
+        hint = (f" ({len(foreign)} foreign: {', '.join(sorted(foreign))} — use --ssh on their own "
+                f"cluster)" if foreign else "")
+        raise UsageError(f"nothing is serving on THIS cluster{hint} — see boxy list")
+    raise UsageError(f"several models are serving — pick one: boxy {verb} {' | '.join(sorted(endpoints))}")
+
+
 def cmd_curl(args: argparse.Namespace) -> int:
     """Query a boxy-served model by NAME from wherever you are: resolve its
     endpoint from the job records, send one chat completion, print the reply.
@@ -1871,44 +1907,12 @@ def cmd_curl(args: argparse.Namespace) -> int:
         return rc
     import urllib.error
 
-    from boxy import bench, jobs
+    from boxy import bench
 
     if args.url:
         url = args.url.rstrip("/").removesuffix("/v1")
     else:
-        # Labs share $HOME across clusters, so the jobs dir holds OTHER clusters'
-        # endpoints too (their node hostnames don't resolve here). Only endpoints
-        # of jobs submitted from THIS cluster are candidates; foreign ones get
-        # pointed at their own cluster. (Field report: `boxy curl --ssh hops`
-        # picked an eldorado endpoint and failed DNS on eldo1027.)
-        endpoints: dict[str, dict] = {}
-        foreign: dict[str, str] = {}  # name -> submitted_from
-        for r in jobs.list_records():
-            is_foreign, origin = _record_is_foreign(r)
-            for n in [r["name"], *r.get("replicas", [])]:
-                ep = jobs.read_endpoint(n)
-                if ep and is_foreign:
-                    foreign[n] = origin
-                elif ep:
-                    endpoints[n] = ep
-        if args.name:
-            if args.name in foreign:
-                raise UsageError(f"{args.name} runs on another cluster (submitted from "
-                                 f"{foreign[args.name]}) — query it from there: "
-                                 f"boxy curl {args.name} --ssh <that login node>")
-            ep = endpoints.get(args.name)
-            if not ep:
-                raise UsageError(f"no endpoint for {args.name!r} — running here: "
-                                 f"{', '.join(sorted(endpoints)) or 'none'} (see boxy list)")
-        elif len(endpoints) == 1:
-            ep = next(iter(endpoints.values()))
-        elif not endpoints:
-            hint = (f" ({len(foreign)} foreign: {', '.join(sorted(foreign))} — query those via "
-                    f"--ssh on their own cluster)" if foreign else "")
-            raise UsageError(f"nothing is serving on THIS cluster{hint} — see boxy list")
-        else:
-            raise UsageError(f"several models are serving — pick one: boxy curl "
-                             f"{' | '.join(sorted(endpoints))}")
+        _name, ep = _select_endpoint(args.name, "curl")
         url = ep["url"]
     try:
         model = bench.discover_model(url)
@@ -1927,6 +1931,30 @@ def cmd_curl(args: argparse.Namespace) -> int:
     reply = (body.get("choices") or [{}])[0].get("message", {}).get("content", "")
     print(f"[{model} @ {url}]")
     print(reply.strip() or "(empty reply)")
+    return 0
+
+
+def cmd_open(args: argparse.Namespace) -> int:
+    """Open a served model in your browser. With --ssh it forwards the compute
+    node's endpoint back to a FREE local port over the one SSH session (no
+    re-auth) and prints the local URL — llama.cpp serves a web chat UI at the
+    root path. Run ON the cluster (no --ssh) it prints the endpoint + the exact
+    `ssh -L` a workstation needs. One step for the browser access that used to
+    take a manual tunnel (field report, 2026-07)."""
+    rc = _delegate_remote(args, tunnel_ready=True)
+    if rc is not None:
+        return rc
+    name, ep = _select_endpoint(args.name, "open")
+    host, port = ep["host"], ep["port"]
+    # The '### READY http://host:port' banner is what the laptop side watches
+    # for: when delegated via --ssh, run_remote(tunnel_ready=True) forwards this
+    # endpoint to a free local port and prints the browsable LOCAL url. Run here
+    # on the cluster it is informational — a login shell has no browser, so hand
+    # the user the ssh -L their workstation needs.
+    print(f"### READY  http://{host}:{port}/v1   (model: {name})")
+    print(f"###   browser (llama.cpp web UI):  http://{host}:{port}/")
+    print(f"###   from a workstation:  ssh -L {port}:{host}:{port} <this login node>  "
+          f"then open http://127.0.0.1:{port}/")
     return 0
 
 
@@ -2330,6 +2358,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="run on that cluster's login node over SSH (compute-node hostnames "
                         "resolve there; reuses the boxy SSH session)")
     p.set_defaults(func=cmd_curl, location=None)
+
+    p = sub.add_parser("open", help="open a served model in your browser: boxy open [NAME] --ssh "
+                                    "user@login (tunnels the endpoint to a free local port)")
+    p.add_argument("name", nargs="?", default=None,
+                   help="instance name from boxy list (optional if only one is up)")
+    p.add_argument("--ssh", default=None, metavar="USER@HOST",
+                   help="tunnel from that cluster's login node back to this machine over SSH")
+    p.set_defaults(func=cmd_open, location=None)
 
     p = sub.add_parser("sweep", help="scaling study: submit each rung (nodes or replicas in "
                                      "powers of 2), benchmark it, tear it down, print a comparison table")

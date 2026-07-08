@@ -139,6 +139,22 @@ def test_already_serving_banner_also_tunnels(shim, capfd, monkeypatch):
     assert "CTL forward -L 8090:cn042:8090" in shim.read_text()
 
 
+def test_open_tunnels_to_a_free_local_port(shim, capfd, monkeypatch):
+    # `boxy open` prints a READY banner cluster-side; the laptop forwards it to a
+    # FREE local port (so a leftover forward on the model's port never blocks it)
+    # and prints the browser URL.
+    monkeypatch.setattr(remote, "_local_port_free", lambda p: False)   # 8090 "taken"
+    monkeypatch.setattr(remote, "_free_local_port", lambda: 54321)
+    monkeypatch.setenv(remote.ENV_REMOTE_CMD,
+                       'echo "### READY  http://eldo1003:8090/v1   (model: m)" ; :')
+    rc = remote.run_remote("user@login1", ["open", "m"], tunnel_ready=True)
+    assert rc == 0
+    out = capfd.readouterr().out
+    assert "### LOCAL   http://127.0.0.1:54321/v1" in out        # remapped, not 8090
+    assert "browser: open http://127.0.0.1:54321/" in out       # browser hint
+    assert "CTL forward -L 54321:eldo1003:8090" in shim.read_text()
+
+
 def test_recursion_guard_runs_locally(shim, capfd, monkeypatch):
     # On the remote side (BOXY_REMOTE_ACTIVE set) the --ssh flag is inert.
     monkeypatch.setenv(remote.ENV_ACTIVE, "1")
