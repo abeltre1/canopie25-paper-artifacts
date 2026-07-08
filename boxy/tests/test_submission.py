@@ -397,8 +397,38 @@ def test_list_labels_foreign_cluster_records(jobs_dir, monkeypatch, capsys):
     assert "FOREIGN(eldorado-login2)" in out          # labeled with its origin
     assert "boxy-here" in out and "RUNNING" in out    # local record still probed
     assert probed == ["77"]                           # the foreign job was NOT probed
-    assert "shares this $HOME" in out                 # the explainer footnote
+    assert "another cluster" in out                   # the explainer footnote
     assert jobs.read_record("boxy-eldo") is not None  # never reaped
+
+
+def test_jobs_dir_partitions_by_cluster(tmp_path, monkeypatch):
+    """Shared $HOME: the jobs dir is partitioned per cluster by default, so hops
+    and eldorado never write into a common directory (field report: `boxy logs`
+    on hops surfaced an eldorado log)."""
+    from boxy import jobs
+
+    monkeypatch.delenv("BOXY_JOBS_DIR", raising=False)          # exact-dir override OFF
+    monkeypatch.setenv("BOXY_JOBS_ROOT", str(tmp_path))
+    monkeypatch.setenv("BOXY_CLUSTER", "hops")
+    d_hops = jobs._dir()
+    assert d_hops == tmp_path / "hops"
+    monkeypatch.setenv("BOXY_CLUSTER", "eldorado")
+    d_eldo = jobs._dir()
+    assert d_eldo == tmp_path / "eldorado" and d_eldo != d_hops
+    # a record written on eldorado is invisible from hops (separate dirs)
+    jobs.write_record("boxy-e", {"name": "boxy-e", "scheduler": "flux", "job": "1"})
+    monkeypatch.setenv("BOXY_CLUSTER", "hops")
+    assert jobs.read_record("boxy-e") is None
+    assert [r["name"] for r in jobs.list_records()] == []
+
+
+def test_jobs_dir_exact_override_is_flat(tmp_path, monkeypatch):
+    # BOXY_JOBS_DIR pins an EXACT dir (no per-cluster nesting) — the escape hatch.
+    from boxy import jobs
+
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "flat"))
+    monkeypatch.setenv("BOXY_CLUSTER", "hops")
+    assert jobs._dir() == tmp_path / "flat"
 
 
 def test_cluster_identity_and_fallback(monkeypatch):

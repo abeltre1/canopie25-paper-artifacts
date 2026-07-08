@@ -1707,9 +1707,10 @@ def cmd_list(args: argparse.Namespace) -> int:
                     jobs.endpoint_path(rn).unlink(missing_ok=True)
                 jobs.remove(record["name"])  # reap finished jobs from the list
         if foreign_seen:
-            print("  (FOREIGN = submitted on another cluster that shares this $HOME; manage it "
-                  "there, e.g. boxy list --ssh <that-login>. Separate the views with a "
-                  "per-cluster BOXY_JOBS_DIR.)")
+            print("  (FOREIGN = submitted on another cluster; manage it there, e.g. "
+                  "boxy list --ssh <that-login>. boxy separates clusters automatically now "
+                  "(<jobs-root>/<cluster>/); FOREIGN only appears when BOXY_JOBS_DIR pins one "
+                  "shared dir, or from legacy records.)")
     location = Location.from_toml(args.location) if args.location else None
     try:
         runtime = args.runtime or _container_runtime(location)
@@ -1805,17 +1806,17 @@ def _scheduler_reachable(scheduler_obj) -> bool:
 
 
 def _cluster_id(host: str) -> str:
-    """Best-effort cluster identity from a hostname: 'eldorado-login2',
-    'eldorado-login1.sandia.gov', and 'eldorado' all -> 'eldorado'; 'hops12'
-    and 'hops-login5' -> 'hops'. Sites with unusual naming set BOXY_CLUSTER."""
-    short = host.split(".", 1)[0].lower()
-    short = re.sub(r"\d+$", "", short)
-    short = re.sub(r"[-_]?login$", "", short)
-    return short.rstrip("-_") or host
+    """Cluster identity from a hostname (one source of truth: jobs.cluster_id,
+    which also drives the per-cluster jobs dir)."""
+    from boxy import jobs
+
+    return jobs.cluster_id(host)
 
 
 def _local_cluster() -> str:
-    return os.environ.get("BOXY_CLUSTER") or _cluster_id(socket.gethostname())
+    from boxy import jobs
+
+    return jobs.local_cluster()
 
 
 def _record_is_foreign(record: dict) -> tuple[bool, str]:
@@ -1845,8 +1846,18 @@ def cmd_logs(args: argparse.Namespace) -> int:
     cands = sorted(d.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
     if not cands:
         have = sorted({p.name for p in d.glob('*.log')})
+        # this cluster's dir is now separate (d = <root>/<cluster>/); if the OLD
+        # flat root still holds unattributable logs, point at them rather than
+        # silently mixing another cluster's in.
+        legacy = ""
+        if d.parent != d and not os.environ.get("BOXY_JOBS_DIR"):
+            orphans = sorted(p.name for p in d.parent.glob("*.log"))
+            if orphans:
+                legacy = (f"\n  {len(orphans)} pre-separation log(s) remain in the shared root "
+                          f"{d.parent} (not attributed to a cluster); inspect directly if needed.")
         raise UsageError(f"no logs matching {pattern!r} in {d}"
-                         + (f" — available: {', '.join(have)}" if have else " (no job logs yet)"))
+                         + (f" — available: {', '.join(have)}" if have else " (no job logs yet)")
+                         + legacy)
     path = cands[0]
     if not args.name and len(cands) > 1:
         print(f"### newest of {len(cands)} logs (pass a NAME for a specific job):")

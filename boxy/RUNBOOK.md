@@ -113,15 +113,24 @@ What happens behind the scenes:
 
 ### 0.96 Several clusters, one $HOME (hops + eldorado)
 
-Lab clusters often share your home directory, so `~/.local/share/boxy/jobs`
-holds BOTH clusters' records. boxy tells them apart by the **cluster identity**
-of the submitting host (`eldorado-login2` → `eldorado`): `boxy list` shows the
-other cluster's jobs as `FOREIGN(origin)`, and `boxy curl` never auto-picks a
-foreign endpoint (its compute-node hostname wouldn't resolve here) — it points
-you at `boxy curl NAME --ssh <that cluster's login>` instead. If your site's
-hostnames don't encode the cluster name, set `BOXY_CLUSTER=<name>` per cluster
-(shell profile), or separate the views entirely with a per-cluster
-`BOXY_JOBS_DIR`.
+Lab clusters often share your home directory. boxy therefore **partitions its
+job state per cluster automatically**: records/endpoints/scripts/logs live in
+`~/.local/share/boxy/jobs/<cluster>/` (`hops`, `eldorado`, …), so `boxy list`,
+`boxy logs`, and `boxy curl` on one cluster never surface another's — no mixing,
+no confusion. The cluster name comes from the host (`eldorado-login2` →
+`eldorado`, `hops42` → `hops`); if your site's hostnames don't encode it, set
+`BOXY_CLUSTER=<name>` per cluster (shell profile).
+
+Knobs (rarely needed):
+- `BOXY_JOBS_ROOT` — change the base that gets the `<cluster>/` subdirs.
+- `BOXY_JOBS_DIR` — pin an EXACT directory (no per-cluster nesting); the escape
+  hatch if you want a single shared view. With it set, cross-cluster records DO
+  co-exist, and boxy falls back to `FOREIGN(origin)` labels + foreign-endpoint
+  exclusion (by the submit host's cluster identity) to keep them straight.
+
+Note: upgrading to the partitioned layout, any pre-existing logs in the old flat
+`~/.local/share/boxy/jobs/` stay there (boxy does not move your files); `boxy
+logs` points at them if it finds no cluster-local match.
 
 ### 0.97 Pull images from YOUR registry (site mirrors, air-gap, localhost)
 
@@ -462,9 +471,9 @@ boxy sweep <model> --scheduler slurm --gpus 4 --sweep-nodes 1,2,4,8 -o scaling.c
 Prereqs for A/C: the model must sit on a within-cluster shared FS reachable by all
 allocated nodes (the store or `--models-dir`); the checkpoint-completeness guard
 catches a partial copy before the long load. Each cluster is self-contained — run
-the same command on each login node; state lives in that cluster's `BOXY_JOBS_DIR`
-(default `~/.local/share/boxy/jobs`). Set a cluster-local `BOXY_JOBS_DIR` if `$HOME`
-is shared across sites.
+the same command on each login node; state lives in that cluster's own dir
+(`~/.local/share/boxy/jobs/<cluster>/`, partitioned automatically even when `$HOME`
+is shared across sites — see §0.96).
 
 ## 5. Cloud (SkyPilot delegation; optional)
 

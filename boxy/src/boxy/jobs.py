@@ -18,14 +18,41 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 from pathlib import Path
 
-JOBS_DIR = os.path.expanduser(os.environ.get("BOXY_JOBS_DIR", "~/.local/share/boxy/jobs"))
+DEFAULT_ROOT = "~/.local/share/boxy/jobs"
+
+
+def cluster_id(host: str) -> str:
+    """Best-effort cluster identity from a hostname: 'eldorado-login2',
+    'eldorado-login1.sandia.gov', 'eldorado' -> 'eldorado'; 'hops42',
+    'hops-login5' -> 'hops'. Sites with unusual naming set BOXY_CLUSTER."""
+    short = host.split(".", 1)[0].lower()
+    short = re.sub(r"\d+$", "", short)
+    short = re.sub(r"[-_]?login$", "", short)
+    return short.rstrip("-_") or host
+
+
+def local_cluster() -> str:
+    return os.environ.get("BOXY_CLUSTER") or cluster_id(socket.gethostname())
 
 
 def _dir() -> Path:
-    path = Path(os.path.expanduser(os.environ.get("BOXY_JOBS_DIR", JOBS_DIR)))
+    """Where job state (records/endpoints/scripts/logs) lives. Labs share $HOME
+    across clusters, so BY DEFAULT this is partitioned per cluster —
+    <root>/<cluster>/ — so `boxy logs/list/curl` on hops never surface an
+    eldorado job (field report). BOXY_JOBS_DIR pins an EXACT dir (no
+    partitioning: the explicit escape hatch, and what tests use); BOXY_JOBS_ROOT
+    overrides only the partitioned base."""
+    exact = os.environ.get("BOXY_JOBS_DIR")
+    if exact:
+        path = Path(os.path.expanduser(exact))
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    root = Path(os.path.expanduser(os.environ.get("BOXY_JOBS_ROOT", DEFAULT_ROOT)))
+    path = root / local_cluster()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
