@@ -1264,7 +1264,8 @@ def _delegate_remote(args, tunnel_ready: bool = False) -> int | None:
     target_short = target.split("@")[-1].split(".")[0]
     if target_short and target_short == socket.gethostname().split(".")[0]:
         return None
-    return remote.run_remote(target, getattr(args, "_raw_argv", []), tunnel_ready=tunnel_ready)
+    return remote.run_remote(target, getattr(args, "_raw_argv", []), tunnel_ready=tunnel_ready,
+                             local_port=getattr(args, "local_port", None))
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -1948,13 +1949,14 @@ def cmd_open(args: argparse.Namespace) -> int:
     host, port = ep["host"], ep["port"]
     # The '### READY http://host:port' banner is what the laptop side watches
     # for: when delegated via --ssh, run_remote(tunnel_ready=True) forwards this
-    # endpoint to a free local port and prints the browsable LOCAL url. Run here
-    # on the cluster it is informational — a login shell has no browser, so hand
-    # the user the ssh -L their workstation needs.
+    # endpoint to a local port and prints the browsable LOCAL url. Run here on the
+    # cluster it is informational — a login shell has no browser, so hand the user
+    # the ssh -L their workstation needs (honoring --port for a stable local URL).
+    lport = getattr(args, "local_port", None) or port
     print(f"### READY  http://{host}:{port}/v1   (model: {name})")
     print(f"###   browser (llama.cpp web UI):  http://{host}:{port}/")
-    print(f"###   from a workstation:  ssh -L {port}:{host}:{port} <this login node>  "
-          f"then open http://127.0.0.1:{port}/")
+    print(f"###   from a workstation:  ssh -L {lport}:{host}:{port} <this login node>  "
+          f"then open http://127.0.0.1:{lport}/")
     return 0
 
 
@@ -2360,9 +2362,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_curl, location=None)
 
     p = sub.add_parser("open", help="open a served model in your browser: boxy open [NAME] --ssh "
-                                    "user@login (tunnels the endpoint to a free local port)")
+                                    "user@login (tunnels the endpoint to a local port)")
     p.add_argument("name", nargs="?", default=None,
                    help="instance name from boxy list (optional if only one is up)")
+    p.add_argument("--port", dest="local_port", type=int, default=None, metavar="N",
+                   help="pin the LOCAL port for a stable URL (http://127.0.0.1:N/); "
+                        "default reuses the remote port when free, else picks a free one")
     p.add_argument("--ssh", default=None, metavar="USER@HOST",
                    help="tunnel from that cluster's login node back to this machine over SSH")
     p.set_defaults(func=cmd_open, location=None)

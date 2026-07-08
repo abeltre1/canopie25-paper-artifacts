@@ -41,8 +41,16 @@ ENV_HOST = "BOXY_SSH_HOST"          # set once in your shell profile -> "from an
 ENV_ACTIVE = "BOXY_REMOTE_ACTIVE"   # recursion guard: set on the remote side
 ENV_SSH_BIN = "BOXY_SSH"            # override the ssh binary (tests: a local shim)
 ENV_REMOTE_CMD = "BOXY_REMOTE_COMMAND"  # remote boxy spelling (default: "boxy")
+ENV_PERSIST = "BOXY_SSH_PERSIST"    # how long the master + its tunnels live idle
 
-CONTROL_PERSIST = "4h"  # one OTP+touch buys this much multiplexed access
+DEFAULT_PERSIST = "12h"  # one OTP+touch buys this much multiplexed access
+
+
+def control_persist() -> str:
+    """Idle lifetime of the multiplexed SSH master (and every tunnel riding it),
+    so one OTP+YubiKey keeps working for a full workday. Override per your site's
+    session cap: BOXY_SSH_PERSIST=8h (accepts OpenSSH time formats: 30m, 12h, ...)."""
+    return os.environ.get(ENV_PERSIST, DEFAULT_PERSIST)
 
 # tunnel-worthy endpoint banners from the remote serve: a fresh READY, or an
 # ALREADY SERVING reconnect (rerunning the same model finds the live job).
@@ -68,7 +76,7 @@ def _base_opts() -> list[str]:
     return [
         "-o", "ControlMaster=auto",
         "-o", f"ControlPath={control_path()}",
-        "-o", f"ControlPersist={CONTROL_PERSIST}",
+        "-o", f"ControlPersist={control_persist()}",
         "-o", "ServerAliveInterval=30",
     ]
 
@@ -103,7 +111,7 @@ def ensure_master(host: str) -> int:
     if check.returncode == 0:
         return 0
     print(f"### Connecting to {host} (one-time login — OTP/YubiKey prompts appear below; "
-          f"the session is then reused for {CONTROL_PERSIST} with no re-prompts)")
+          f"the session is then reused for {control_persist()} with no re-prompts)")
     # NO capture: the OTP prompt and the YubiKey touch notification need the TTY.
     return subprocess.run([ssh_bin(), *_base_opts(), host, "true"]).returncode
 
@@ -163,11 +171,14 @@ def add_forward(host: str, local_port: int, remote_host: str, remote_port: int) 
                           capture_output=True, text=True).returncode
 
 
-def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False) -> int:
+def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False,
+               local_port: int | None = None) -> int:
     """Run the user's boxy command on `host`, streaming output live. With
     `tunnel_ready`, watch for the '### READY http://node:port' banner and
-    auto-forward that endpoint to the same local port, then print the local URL
-    — the model is reachable on the laptop as http://127.0.0.1:<port>/v1."""
+    forward that endpoint back, then print the local URL — the model is reachable
+    on the laptop as http://127.0.0.1:<port>/v1. `local_port` pins the LOCAL side
+    (a stable URL, e.g. `boxy open --port 8080`); default reuses the remote port
+    when free, else picks any free port."""
     rc = ensure_master(host)
     if rc != 0:
         print(f"boxy: could not open an SSH session to {host} (rc {rc}) — check the host, "
@@ -190,13 +201,21 @@ def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False) -> in
             if m and (m.group(1), int(m.group(2))) not in tunneled:
                 node, port = m.group(1), int(m.group(2))
                 tunneled.add((node, port))
-                # keep the same local port when it's free (predictable URL); else
-                # pick a free one so a leftover forward on that port (field report:
-                # stale podman gvproxy on 8090) never blocks the tunnel.
-                lport = port if _local_port_free(port) else _free_local_port()
+                # a user-pinned --port wins (stable URL); else reuse the remote
+                # port when free, else pick any free one so a leftover forward on
+                # that port (field report: stale podman gvproxy on 8090) never
+                # blocks the tunnel.
+                want = local_port or port
+                if _local_port_free(want):
+                    lport = want
+                else:
+                    lport = _free_local_port()
+                    if local_port:
+                        print(f"warning: local port {local_port} is in use — using {lport} instead",
+                              file=sys.stderr)
                 if add_forward(host, lport, node, port) == 0:
                     print(f"### LOCAL   http://127.0.0.1:{lport}/v1   "
-                          f"(tunnel over the SSH session; persists ~{CONTROL_PERSIST})")
+                          f"(tunnel over the SSH session; persists ~{control_persist()})")
                     print(f"###   browser: open http://127.0.0.1:{lport}/   "
                           f"(llama.cpp serves a web UI there; vLLM exposes only /v1)")
                     print(f"###   close: ssh -O cancel -L {lport}:{node}:{port} "

@@ -155,6 +155,27 @@ def test_open_tunnels_to_a_free_local_port(shim, capfd, monkeypatch):
     assert "CTL forward -L 54321:eldo1003:8090" in shim.read_text()
 
 
+def test_open_pins_a_custom_local_port(shim, capfd, monkeypatch):
+    # --port gives a STABLE URL: run_remote forwards the user's chosen local port.
+    monkeypatch.setattr(remote, "_local_port_free", lambda p: True)
+    monkeypatch.setenv(remote.ENV_REMOTE_CMD,
+                       'echo "### READY  http://eldo1003:8090/v1   (model: m)" ; :')
+    rc = remote.run_remote("user@login1", ["open", "m"], tunnel_ready=True, local_port=8080)
+    assert rc == 0
+    out = capfd.readouterr().out
+    assert "### LOCAL   http://127.0.0.1:8080/v1" in out
+    assert "CTL forward -L 8080:eldo1003:8090" in shim.read_text()
+
+
+def test_control_persist_defaults_to_12h_and_is_overridable(monkeypatch):
+    monkeypatch.delenv(remote.ENV_PERSIST, raising=False)
+    assert remote.control_persist() == "12h"
+    assert "ControlPersist=12h" in remote._base_opts()
+    monkeypatch.setenv(remote.ENV_PERSIST, "8h")
+    assert remote.control_persist() == "8h"
+    assert "ControlPersist=8h" in remote._base_opts()
+
+
 def test_recursion_guard_runs_locally(shim, capfd, monkeypatch):
     # On the remote side (BOXY_REMOTE_ACTIVE set) the --ssh flag is inert.
     monkeypatch.setenv(remote.ENV_ACTIVE, "1")

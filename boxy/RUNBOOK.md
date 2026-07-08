@@ -437,6 +437,11 @@ boxy list  --ssh user@login                                 # every instance + i
 boxy curl  name-A --ssh user@login                          # query a specific one
 boxy open  name-A --ssh user@login                          # browser: tunnels name-A to a FREE local port
 boxy open  name-B --ssh user@login                          # a DIFFERENT free local port -> both in the browser at once
+boxy open  name-A --ssh user@login --port 8080              # PIN the local port -> stable URL http://127.0.0.1:8080/
+# Custom URL/domain: boxy binds loopback; for a name like http://mymodel.local:8080/
+# add `127.0.0.1  mymodel.local` to /etc/hosts, then --port 8080. Tunnel lifetime is
+# the SSH master's: default 12h idle, override per your site's session cap:
+#   export BOXY_SSH_PERSIST=8h   (OpenSSH formats: 30m, 12h, ...; one OTP+touch covers it)
 #   (b) ONE route for N of the SAME model — use --replicas + the router (B'):
 #       all K replicas behind a single load-balanced URL; the client sees one endpoint.
 boxy serve <model> --scheduler flux --gpus 4 --replicas 4 --router
