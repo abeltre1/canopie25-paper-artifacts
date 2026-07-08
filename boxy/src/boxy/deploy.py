@@ -7,6 +7,7 @@ Pipeline:  resolve accel/runtime -> env merge -> model & mounts ->
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
@@ -178,6 +179,55 @@ def _plan_distributed(box, location, model_path, extra_mounts, accelerator,
     head.port = engines.serving_port(vllm_argv, box)
     head.worker_command = worker.command
     return head
+
+
+class AgentlessError(RuntimeError):
+    """Agentless mode can't proceed: the model isn't staged, or accel/image
+    aren't pinned so the podman command can't be resolved off the compute node."""
+
+
+def render_agentless_script(box: Box, location: Location, scheduler_name: str, name: str,
+                            endpoint_file: str, log_file: str, site_args: list[str],
+                            proxy_prefix: str = "", port: int | None = None) -> str:
+    """A FULLY SELF-CONTAINED batch script — no boxy/Python/RamaLama on the
+    cluster. The compute node runs only `podman run` (resolved HERE) plus a
+    bash endpoint-write to the shared FS; the laptop submits it and polls that
+    file. Requires the two agentless boundaries (SPEC §8c): the model must be a
+    staged shared-FS path (transport-URI pulls need RamaLama), and the
+    accelerator/image must be pinned (resolution can't run on the compute node).
+
+    The container command is resolved with a scheduler='none' overlay so it is
+    the plain foreground `podman run` (no srun); the REAL scheduler supplies
+    only the batch directives."""
+    if box.model_is_transport_uri or box.model_is_s3:
+        raise AgentlessError(
+            f"agentless needs a PRE-STAGED model on the shared filesystem, not {box.model!r} — "
+            "a transport-URI/s3 pull requires RamaLama on the cluster. Stage it first "
+            "(boxy pull / copy the GGUF over) and pass the shared-FS path.")
+    # scheduler='none' -> plain foreground podman (no srun); runtime lives on the
+    # cluster, so never probe this host — default to podman when unpinned.
+    local = replace(location, scheduler="none", runtime=(location.runtime or "podman"))
+    if not local.accelerator:
+        raise AgentlessError(
+            "agentless can't detect hardware on the compute node — pin --accelerator "
+            "(cuda|rocm|…) so the podman command is fully resolved here.")
+    deployment = plan_serve(box, local, port=port, dryrun=True)  # dryrun: no pull, no verify
+    podman = shlex.join(deployment.command)
+    resolved_port = deployment.port or port or 0
+    scheduler = get_scheduler(scheduler_name)
+    # atomic endpoint publish + foreground container; $(hostname) is the compute node.
+    body = (
+        'set -e\n'
+        '_H="$(hostname)"\n'
+        f'_EP={shlex.quote(endpoint_file)}\n'
+        'cat > "${_EP}.tmp" <<EOF_BOXY_EP\n'
+        f'{{"name": "{name}", "host": "${{_H}}", "port": {resolved_port}, '
+        f'"url": "http://${{_H}}:{resolved_port}", "job": "${{SLURM_JOB_ID:-${{FLUX_JOB_ID:-}}}}"}}\n'
+        'EOF_BOXY_EP\n'
+        'mv -f "${_EP}.tmp" "${_EP}"\n'
+        f'exec {proxy_prefix}{podman}'
+    )
+    return scheduler.batch_script("", location, name, log_file, site_args, body=body)
 
 
 def plan_run(box: Box, location: Location, user_args: list[str], dryrun: bool = False) -> Deployment:

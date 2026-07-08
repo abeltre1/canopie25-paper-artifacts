@@ -56,10 +56,14 @@ class Scheduler(ABC):
         return f"--{key}={value}" if value is not None else f"--{key}"
 
     def batch_script(self, inner_command: str, location: Location, name: str,
-                     log_file: str, site_args: list[str], distributed: bool = False) -> str:
+                     log_file: str, site_args: list[str], distributed: bool = False,
+                     body: str | None = None) -> str:
         """A complete batch script: directives + module loads + exec inner.
         `site_args` are raw scheduler flags in this scheduler's spelling
-        (e.g. --license=tscratch:1)."""
+        (e.g. --license=tscratch:1). `body`, when given, REPLACES the
+        `exec {inner_command}` tail with verbatim script lines — used by the
+        agentless (zero-install) path to emit `podman run` + an endpoint-write
+        directly, with no boxy on the compute node."""
         lines = ["#!/bin/bash"]
         lines.append(f"{self.directive_prefix} --job-name={name}")
         lines += self.resource_directives(location, distributed)
@@ -74,7 +78,7 @@ class Scheduler(ABC):
         lines.append("")
         for module in location.modules:
             lines.append(f"module load {module}")
-        lines.append(f"exec {inner_command}")
+        lines.append(body if body is not None else f"exec {inner_command}")
         return "\n".join(lines) + "\n"
 
     def group_batch_script(self, inner_commands: list[str], location: Location, name: str,

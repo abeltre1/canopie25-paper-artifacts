@@ -259,6 +259,19 @@ vs. verified-by-construction), and a troubleshooting table covering every
 failure observed in real-user testing (SSL/CA bundles, macOS podman prompts,
 amd64-on-ARM, Podman workdir strictness).
 
+**`boxy doctor`** audits the environment for the known field issues (proxy/CA/
+token, container runtime, scheduler, accelerator, per-cluster state, OOM'd
+containers; `--net` also probes image-registry reachability) and prints
+OK/WARN/FAIL + a fix for each — run it before serving, or `boxy doctor --ssh
+user@login` to audit a cluster. The full catalog of issues, severities, and
+mitigations is `SPEC.md §8b`.
+
+**Agentless (zero-install).** `boxy generate slurm|flux -o job.sh` and `boxy
+serve --agentless --accelerator cuda --image …` emit a **self-contained** batch
+script — a plain `podman run` + a shared-FS endpoint write, **no boxy on the
+compute node** (needs only a scheduler + container runtime + shared FS). The
+model must be pre-staged and the hardware pinned; see `SPEC.md §8c`.
+
 ## Tests
 
 ```bash
@@ -271,11 +284,12 @@ pytest          # 291 tests: golden-argv vs the prototype, one regression test
                 # where Docker or the demo image is absent
 ```
 
-## Not yet implemented (see SPEC.md §8)
+## Not yet implemented (see SPEC.md §8 roadmap; known issues in §8b)
 
 `boxy run MODEL` as an interactive chat REPL (RamaLama parity; `run` is
 reserved for it), engine choice by artifact sniffing after pull (GGUF magic
-bytes instead of URI text), `--pull=never|missing|always`, deferred
-re-resolution on the compute node for `--scheduler` submissions, `boxy alloc`
+bytes instead of URI text), `--pull=never|missing|always`, `boxy alloc`
 (interactive allocation), `boxy stage` (S3/shared-FS sync), Enroot/Pyxis +
-Slurm `scrun` backends, and sbatch/detached job serving.
+Slurm `scrun` backends, apptainer detached serving, bash-probe hardware
+auto-detection for the agentless path, and laptop-side `list/curl/logs` over the
+shared FS without a cluster boxy.

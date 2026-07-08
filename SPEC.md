@@ -663,6 +663,125 @@ SkyPilot are implementation details it can swap out.
   (box+location → SkyPilot task YAML, validated by SkyPilot 0.12.3's own
   parser; hf:// models map to bare repo ids fetched in-task). Remaining:
   boxy invoking `sky launch`/`sky serve up` directly as an optional extra.
+- **Phase 6 — Field hardening & reliability. ◐ current.** After exhaustive
+  live testing across the deployment matrix (local desktop, Flux on Eldorado,
+  Slurm on HOPS), a durable **known-issues registry** (§8b) plus a `boxy
+  doctor` command that audits the environment for those issues *before* a job
+  fails on the compute node. Shipped: a data-driven diagnostics engine, CA +
+  proxy auto-propagation into jobs/containers, per-cluster state isolation, the
+  login-node/transport guardrails, and OOM/image-pull/network classification.
+- **Phase 7 — Agentless (zero-install) execution. ◐ started.** Run a workload
+  on a cluster that has **no boxy/Python/RamaLama installed** — only a
+  scheduler, a container runtime, SSH, and a shared FS (§8c). Shipped: `boxy
+  generate slurm|flux` and `boxy serve --agentless` emit a self-contained batch
+  script (a verbatim `podman run` + a bash endpoint-write, no boxy on the node).
+  Remaining: laptop-side `list/curl/logs` over the shared FS without a cluster
+  boxy; optional bash-probe hardware auto-detection.
+
+---
+
+## 8b. Known Issues & User Awareness (field registry)
+
+The post-testing catalog: what actually breaks in the field, why, and how boxy
+mitigates it. The per-symptom fixes live in `boxy/RUNBOOK.md §6`; the runtime
+failure catalog is `boxy/src/boxy/diagnostics.py` (each rule below); the
+**executable** form is `boxy doctor`, which checks these *before* you serve.
+
+**Mitigation philosophy (the invariants that ARE the mitigation).**
+1. **Diagnose, don't guess** — `diagnostics.diagnose()` returns `None` rather
+   than a wrong guess; the generic vLLM-wrapper rule fires last so a specific
+   signature always wins (e.g. an image-pull 403 is never misread as a bad GGUF).
+2. **Print every automatic choice, and make it overridable** — the `auto:` lines
+   (accel/engine/image/port/name) plus a flag/env for each.
+3. **Auto-propagate the environment into jobs & containers** — the merged CA
+   bundle (`deploy._propagate_ca_bundle`) and the corporate proxy
+   (`_propagate_proxy` + the submit-time `env …` prefix) travel with the job so
+   the compute node inherits them.
+4. **Guardrails** — the login-node serve guard; the transport allowlist
+   (China/ModelScope blocked by default, env-only opt-in).
+5. **Isolate state** — per-cluster jobs dir (`~/.local/share/boxy/jobs/<cluster>/`)
+   so a shared `$HOME` never mixes clusters.
+6. **Fail with a next step** — every error names the fix (missing `sbatch` →
+   "add `--ssh`"; ghcr 403 → pre-pull / `--proxy` / mirror).
+
+**Severity:** ▲ high (blocks a serve) · ◆ medium (degrades / confuses) · ▽ low.
+**Status:** ✅ mitigated-in-code · 📖 documented · ○ open (see limitations).
+
+| Class | What the user sees | Root cause | Sev | boxy mitigation | Status |
+| --- | --- | --- | --- | --- | --- |
+| Network/trust | `ghcr.io 403 …Zs…` on the compute node | Zscaler/proxy **policy** block of the image registry (a 403 — TLS is fine) | ▲ | `image-pull-blocked` diagnosis; `--proxy` carried into the pull; `--registry` mirror; pre-pull on login (shared store) | ✅ |
+| Network/trust | every registry `FAIL [Errno 8]` / hangs | DNS/proxy, not TLS — DNS is upstream of TLS; with a proxy the *proxy* host must resolve | ▲ | `net_failure_kind`/`network_remedy` (dns/proxy/conn/tls); `boxy info --net`/`doctor` name the kind + offline escape | ✅ |
+| Network/trust | HF `403`/`401` on pull | token invalid (401) vs network-refused (403 both authed+anon) vs token-lacks-scope (403 anon-ok) | ◆ | `boxy info --net` whoami probe correlates the two → the right verdict | ✅ |
+| Network/trust | `CERTIFICATE_VERIFY_FAILED`, or hf works but ollama fails | `SSL_CERT_FILE` *replaces* the store; a site-CA-only file breaks non-intercepted hosts; missing path silently ignored | ▲ | boxy merges site CA + certifi (`ensure_trust_bundle`); names the cert issuer it saw; `doctor` flags a missing path | ✅ |
+| Network/trust | proxy set but registries bypass it | `export https_proxy="${http_proxy}"` ran before `http_proxy` set → empty (ignored) | ◆ | `boxy info`/`doctor` print the effective proxy map + warn on http-without-https | ✅ |
+| Container image | job dies right after start | compute node can't pull the image (air-gapped/proxied) | ▲ | as ghcr-403 above; agentless pre-stage story (§8c) | ✅ |
+| Container image | `no space left on device` pulling vLLM (~20 GB) | small podman-machine disk | ◆ | RUNBOOK: `podman system prune`, grow the VM disk, or pull on the cluster | 📖 |
+| Container image | `platform linux/amd64 != arm64` / HIP `no kernel image` | image ↔ host/GPU-arch mismatch | ◆ | `rocm-arch-mismatch` diagnosis (gfx check); use GGUF locally on Apple Silicon | ✅ |
+| Resource | 2nd local instance kills the 1st (`Exited (137)`) | the podman/docker **VM** OOM-killed one — NOT boxy | ▲ | `host-oom` diagnosis + `boxy list`/`doctor` surface exit-137 + `podman machine set --memory` | ✅ |
+| Resource | `CUDA out of memory` at load | model+KV > VRAM | ◆ | `cuda-oom` diagnosis (util/max-len/TP/quant advice) | ✅ |
+| Multi-cluster | hops shows an eldorado job; `boxy logs` returns the wrong cluster's | shared `$HOME` → one flat jobs dir | ▲ | per-cluster jobs dir (`jobs.local_cluster`); `FOREIGN(origin)` labels; foreign-endpoint exclusion in curl | ✅ |
+| Multi-cluster | `--ssh` → `invalid choice: 'logs'` | the CLUSTER's boxy is older than the laptop's | ◆ | stale-install hint; **agentless (§8c) removes cluster boxy entirely** | ✅ |
+| Scheduler | Flux `-t 30:00` → "invalid standard duration"; `#FLUX` ignored → no GPUs | Flux wants FSD + lowercase `# flux:` | ▲ | `_to_fsd` conversion; correct sentinel casing | ✅ |
+| Scheduler | `--scheduler slurm` on eldorado → `flux batch` usage errors | eldorado's `sbatch` is a Flux wrapper | ◆ | `_submission_hint` → "use `--scheduler flux`" | ✅ |
+| Scheduler | `[Errno 2] … sbatch` on a laptop | `--scheduler` with no scheduler + no `--ssh` | ◆ | pre-submit guard → "add `--ssh user@login`, or drop `--scheduler`" | ✅ |
+| Scheduler | a live job reaped / duplicate submitted | squeue connect-failure misread as DONE | ▲ | scheduler-unreachable ⇒ `UNKNOWN` (never DONE), never resubmit | ✅ |
+| Model load | `weights were not initialized` | vLLM ≥0.24 NFS/Lustre prefetch mis-loads shards, or a partial checkpoint | ◆ | eager loader default (`BOXY_NO_VLLM_EAGER=1` off), checkpoint-completeness guard | ✅ |
+| Model load | `trust_remote_code=True` / arch unsupported / missing pip pkg | model ships custom code / new arch / extra dep | ◆ | `trust-remote-code`, `unsupported-arch`, `missing-python-package` diagnoses (+ derived-image recipe) | ✅ |
+| Lifecycle | rerun replaced my instance; port changed | per-model singleton redeploys on rerun; port auto-advances when busy | ▽ | documented; `--unique` for a 2nd instance; `auto: port:` line | 📖 |
+| Security | can't pull `ms://…` | ModelScope (China) blocked by default | — | transport allowlist; env-only opt-in so a repo TOML can't widen it | ✅ |
+
+**Known limitations / still-open (○).**
+- Apptainer serving is **foreground-only** in the MVP (`boxy alloc` is a stub).
+- Agentless can't do RamaLama-based multi-file/`ollama://`/`oci://` **pulls**
+  (needs Python on the cluster) — the model must be pre-staged (§8c).
+- `--proxy` only helps if the **compute node can reach the proxy**; a fully
+  air-gapped node still needs a pre-pulled image or a site mirror.
+- Flux writes its `--output` log under a job-id spelling that differs from the
+  F58 id `boxy list` shows — use `boxy logs <name>` (globs), not a hand-built
+  path.
+- Real-GPU test provenance: CUDA-vLLM and ROCm/Apptainer paths are golden-tested
+  but not executed on GPU hardware in-repo (RUNBOOK §0).
+
+**Mitigation roadmap (next hardening).** Bash-probe hardware auto-detection for
+agentless; laptop-side `list/curl/logs` over the shared FS (no cluster boxy); a
+`boxy doctor --fix` that applies the safe remedies; a curl-based single-file
+GGUF fetch so a lone `hf://…gguf` is agentless-stageable.
+
+## 8c. Agentless (zero-install) execution — design
+
+**Can boxy run a workload on a cluster with no boxy installed there? Yes**, with
+two boundaries. The cluster needs only a **scheduler** (`sbatch`/`flux`), a
+**container runtime** (`podman`/`apptainer`), **SSH**, and a **shared FS** — no
+boxy, Python, or RamaLama on the node running the workload.
+
+**Why it already almost works.** boxy's cluster-side machinery is boxy-*agnostic*
+by construction — the SSH/ControlMaster tunnel (`remote.py` shells out to system
+`ssh`), the batch-script skeleton (`schedulers/base.py:batch_script`), the
+container command (`deploy.execute` runs a plain `podman run …` argv), the
+endpoint rendezvous (`jobs.write_endpoint_file` is just JSON on the shared FS),
+the readiness poll (an HTTP GET + `squeue`), and the router `--emit` (a config
+file). Only **two** things force boxy onto the cluster today:
+1. **Compute-node hardware re-resolution** (accel→image→port, via
+   `ramalama_shim.detect_accel`) — removed by pinning `--accelerator`/`--image`
+   laptop-side (an HPC user knows the partition's hardware); the podman argv is
+   then fully resolved off-node.
+2. **RamaLama for transport-URI pulls** (`ramalama_shim.pull_model`) — removed by
+   a **pre-staged shared-FS model path** (`deploy.resolve_model`'s local branch
+   bind-mounts, no pull). Agentless refuses a bare `hf://…` with guidance.
+
+**What ships.** `deploy.render_agentless_script()` renders the resolved `podman
+run` argv (foreground, `scheduler='none'` overlay so no `srun`) + an atomic bash
+endpoint-write (`host=$(hostname)`, pinned port) into the scheduler's directive
+skeleton — **no `boxy` token in the script**. Exposed as `boxy generate
+slurm|flux -o job.sh` (inspect/submit by hand) and `boxy serve --agentless`
+(boxy on the login node still orchestrates submit + poll + tunnel, reusing the
+existing path; only the *workload node* is boxy-free). This directly retires the
+stale-remote-boxy issue class from §8b.
+
+**Trade-off vs. the default path.** Agentless trades boxy's smart compute-node
+resolution for explicit pins (`--accelerator`/`--image`) and a pre-staged model
+— so it's opt-in; the default (boxy-on-cluster) keeps the zero-config
+autodetection.
 
 ---
 

@@ -178,6 +178,45 @@ Bare names (`vllm/vllm-openai`) count as docker.io. `localhost/...` images stay
 local unless explicitly mirrored. The rewrite applies uniformly: podman/docker
 run, apptainer's OCI→SIF build (`docker://<rewritten>`), and the SkyPilot export.
 
+### 0.98 Check the environment first — `boxy doctor`
+
+Before a job fails on the compute node, audit the environment for the known
+field issues (proxy/CA/token, container runtime, scheduler, accelerator,
+per-cluster state, OOM'd containers). Each check is OK/WARN/FAIL + a fix:
+
+```bash
+boxy doctor                 # local audit; exit non-zero if anything FAILs
+boxy doctor --net           # also probe ghcr.io/docker.io reachability (the 403 check)
+boxy doctor --ssh ambelt@hops.sandia.gov   # audit the cluster from your laptop
+```
+
+The full catalog of issues + mitigations is `SPEC.md §8b`.
+
+### 0.99 Agentless — run a job with NO boxy on the cluster
+
+If you can't (or don't want to) install/keep boxy current on a cluster, emit a
+**self-contained** batch script — a plain `podman run` + a shared-FS endpoint
+write. The compute node needs only a scheduler + a container runtime + a shared
+FS. Two requirements: the **model is pre-staged** on the shared FS (a path, not
+`hf://…`) and the **hardware is pinned** (`--accelerator`, and `--image` if you
+don't want the engine default):
+
+```bash
+# 1. Inspect / hand-submit the script (zero boxy on the cluster):
+boxy generate slurm --box mybox.toml --location hops.toml \
+     --accelerator cuda --account fy260064 --time 30:00 -o job.sh
+#    -> job.sh has #SBATCH + `podman run …` + an endpoint write; NO boxy token.
+#    submit it yourself:  ssh hops 'sbatch job.sh'
+
+# 2. Or let boxy submit + follow it (boxy on the LOGIN node orchestrates; the
+#    WORKLOAD node stays boxy-free):
+boxy serve /shared/models/llama-3.2-1b.q4.gguf --scheduler slurm --gpus 1 \
+     --agentless --accelerator cuda --account fy260064 --time 30:00 --ssh ambelt@hops.sandia.gov
+```
+
+Design + boundaries: `SPEC.md §8c`. A transport URI (`hf://…`) is refused — it
+needs RamaLama on the cluster; stage the model first.
+
 ## 1. Any machine — install & self-test (5 min)
 
 ```bash

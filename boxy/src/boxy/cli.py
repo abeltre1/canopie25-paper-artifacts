@@ -157,6 +157,37 @@ def cmd_info(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Audit the environment for the issues that actually bite in the field
+    (SPEC §8b): proxy/CA/token, runtime, scheduler, accelerator, per-cluster
+    state, OOM'd containers, and (with --net) image-registry reach. Prints
+    OK/WARN/FAIL + a fix per check; exits non-zero if anything FAILed. `--ssh
+    user@login` runs the same audit ON the cluster."""
+    rc = _delegate_remote(args)
+    if rc is not None:
+        return rc
+    from boxy import doctor
+
+    print(f"boxy {version_string()}")
+    results = doctor.run_checks(net=getattr(args, "net", False))
+    rows = [(r.name, f"[{r.status}] {r.detail}") for r in results]
+    _info_section("doctor", rows)
+    fails = [r for r in results if r.status == doctor.FAIL]
+    warns = [r for r in results if r.status == doctor.WARN]
+    if fails or warns:
+        print()
+        for r in fails + warns:
+            print(f"  {r.status} {r.name}: {r.fix}" if r.fix else f"  {r.status} {r.name}")
+    print()
+    if fails:
+        print(f"doctor: {len(fails)} FAIL, {len(warns)} WARN — fix the FAILs above before serving")
+    elif warns:
+        print(f"doctor: all critical checks OK ({len(warns)} warning(s) to review)")
+    else:
+        print("doctor: all checks OK")
+    return 1 if fails else 0
+
+
 def _probe_registries() -> int:
     """`boxy info --net`: try each ALLOWED model registry with the CURRENT
     trust store (after boxy's certifi merge, like a real pull). Registries
@@ -927,8 +958,33 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
     # (%j / {{id}}) so repeated submissions never overwrite each other's logs.
     output_log = str(jobs.log_path(name, scheduler.output_token) if scheduler.output_token
                      else jobs.log_path(name))
-    script_text = scheduler.batch_script(inner, location, name, output_log, site_args,
-                                         distributed=want_distributed)
+    if getattr(args, "agentless", False):
+        # zero-install: the compute node runs pure `podman run` + a bash
+        # endpoint-write; NO boxy on the node running the workload (SPEC §8c).
+        from dataclasses import replace as dc_replace
+
+        from boxy import deploy
+
+        # the runtime lives on the CLUSTER, not this host — never probe locally;
+        # pin podman as the HPC default (override with --runtime / a --location).
+        args.runtime = args.runtime or "podman"
+        box, _aloc, _dec = _resolve_or_load(args)
+        aloc = dc_replace(location, accelerator=(args.accelerator or location.accelerator),
+                          runtime=(args.runtime or location.runtime))
+        if args.image:
+            box = dc_replace(box, image=args.image)
+        try:
+            script_text = deploy.render_agentless_script(
+                box, aloc, scheduler_name, name, str(jobs.endpoint_path(name)),
+                output_log, site_args, proxy_prefix=_proxy_prefix(args), port=args.port)
+        except deploy.AgentlessError as e:
+            print(f"boxy: agentless: {e}", file=sys.stderr)
+            return 2
+        print("### Agentless (no boxy on the compute node): the batch script below runs only "
+              "podman + a shared-FS endpoint write.")
+    else:
+        script_text = scheduler.batch_script(inner, location, name, output_log, site_args,
+                                             distributed=want_distributed)
     submit = scheduler.submit_command(str(jobs.script_path(name)))
     print(f"### Batch script ({jobs.script_path(name)}):")
     for line in script_text.rstrip().splitlines():
@@ -1602,8 +1658,11 @@ def cmd_build(args: argparse.Namespace) -> int:
 def cmd_generate(args: argparse.Namespace) -> int:
     from boxy import sky_export
 
+    if args.format in ("slurm", "flux", "sbatch"):
+        return _generate_agentless(args)
     if args.format != "sky":
-        print(f"boxy generate: unknown format {args.format!r} (available: sky)", file=sys.stderr)
+        print(f"boxy generate: unknown format {args.format!r} (available: sky, slurm, flux)",
+              file=sys.stderr)
         return 1
     box, location = _load(args)
     from boxy.deploy import _apply_defaults
@@ -1622,6 +1681,58 @@ def cmd_generate(args: argparse.Namespace) -> int:
         print(f"wrote {args.output}  (launch: sky {'serve up' if args.serve else 'launch'} {args.output})")
     else:
         print(yaml_text, end="")
+    return 0
+
+
+def _agentless_script(box: Box, location: Location, scheduler_name: str, name: str,
+                      args, endpoint_file: str | None = None) -> str:
+    """Render the self-contained (no-boxy-on-cluster) batch script for box+location,
+    reusing the account/partition/time site flags and the --proxy prefix. Raises
+    deploy.AgentlessError on the agentless boundaries (unstaged model / unpinned
+    hardware)."""
+    from dataclasses import replace as dc_replace
+
+    from boxy import deploy, jobs
+    from boxy.schedulers import get_scheduler
+
+    if getattr(args, "accelerator", None):
+        location = dc_replace(location, accelerator=args.accelerator)
+    if getattr(args, "image", None):
+        box = dc_replace(box, image=args.image)
+    scheduler = get_scheduler(scheduler_name)
+    site_args = [scheduler.site_directive(k, v) for k, v in
+                 (("partition", getattr(args, "partition", None)),
+                  ("account", getattr(args, "account", None)),
+                  ("time", getattr(args, "time", None))) if v]
+    log_file = str(jobs.log_path(name, scheduler.output_token) if scheduler.output_token
+                   else jobs.log_path(name))
+    ep = endpoint_file or str(jobs.endpoint_path(name))
+    return deploy.render_agentless_script(box, location, scheduler_name, name, ep, log_file,
+                                          site_args, proxy_prefix=_proxy_prefix(args), port=args.port)
+
+
+def _generate_agentless(args: argparse.Namespace) -> int:
+    from boxy import deploy
+
+    box, location = _load(args)
+    scheduler_name = args.format if args.format in ("slurm", "flux") else location.scheduler
+    if scheduler_name not in ("slurm", "flux"):
+        print(f"boxy generate {args.format}: the location has scheduler={location.scheduler!r}; "
+              "pass `generate slurm` or `generate flux` explicitly", file=sys.stderr)
+        return 1
+    try:
+        script = _agentless_script(box, location, scheduler_name, box.name, args)
+    except deploy.AgentlessError as e:
+        print(f"boxy generate: {e}", file=sys.stderr)
+        return 1
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(script)
+        print(f"wrote {args.output}  (submit on the cluster: "
+              f"{'sbatch' if scheduler_name == 'slurm' else 'flux batch'} {args.output})")
+        print("### zero-install: this script needs only a scheduler + podman + a shared FS — no boxy")
+    else:
+        print(script, end="")
     return 0
 
 
@@ -2250,6 +2361,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also probe each model registry with the current trust store")
     p.set_defaults(func=cmd_info)
 
+    p = sub.add_parser("doctor", help="audit the environment for known field issues "
+                                      "(proxy/CA/runtime/scheduler/OOM/…); OK/WARN/FAIL + a fix each")
+    p.add_argument("--net", action="store_true",
+                   help="also probe outbound image-registry reachability (ghcr.io/docker.io 403 check)")
+    p.add_argument("--ssh", default=None, metavar="USER@HOST",
+                   help="run the audit ON that cluster's login node over SSH")
+    p.set_defaults(func=cmd_doctor, location=None)
+
     p = sub.add_parser(
         "serve",
         help="serve MODEL as an OpenAI-compatible endpoint (engine/image/runtime/port auto-resolved)",
@@ -2276,6 +2395,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "(e.g. http://proxy.mysite.gov:80): boxy carries it into the job and container. "
                         "Omit to auto-use your http_proxy/https_proxy env. Fixes ghcr.io 403 on nodes "
                         "that must egress through a proxy")
+    p.add_argument("--agentless", action="store_true",
+                   help="emit a SELF-CONTAINED batch script (podman + a shared-FS endpoint write, no boxy "
+                        "on the compute node). Requires --accelerator/--image (hardware can't be detected "
+                        "off-node) and a pre-staged shared-FS model (transport-URI pulls need RamaLama)")
     p.add_argument("--port", type=int, default=None, help="serving port (default: engine default, next free)")
     p.add_argument("--gpus", type=int, default=None, help="GPUs per node for the --scheduler job request")
     p.add_argument("--nodes", type=int, default=None,
@@ -2364,13 +2487,22 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p)
     p.set_defaults(func=cmd_build)
 
-    p = sub.add_parser("generate", help="transpile box+location to another orchestrator (cloud path)")
-    p.add_argument("format", choices=["sky"], help="output format (sky = SkyPilot task YAML)")
+    p = sub.add_parser("generate", help="transpile box+location to another orchestrator: "
+                                        "sky (SkyPilot YAML) or slurm|flux (self-contained, boxy-free job script)")
+    p.add_argument("format", choices=["sky", "slurm", "flux", "sbatch"],
+                   help="sky = SkyPilot task YAML; slurm|flux = agentless batch script (no boxy on the cluster)")
     p.add_argument("--box", required=True)
     p.add_argument("--location", required=True)
     p.add_argument("--port", type=int, default=None)
     p.add_argument("--serve", action="store_true", help="add a SkyServe service block (sky serve up)")
-    p.add_argument("-o", "--output", default=None, help="write YAML to file instead of stdout")
+    # agentless (slurm|flux) pins: hardware can't be detected off the compute node
+    p.add_argument("--accelerator", default=None, help="agentless: pin the compute node's accelerator (cuda|rocm|…)")
+    p.add_argument("--image", default=None, help="agentless: pin the container image (else the engine+accel default)")
+    p.add_argument("--partition", default=None)
+    p.add_argument("--account", default=None)
+    p.add_argument("--time", default=None)
+    p.add_argument("--proxy", default=None, help="corporate proxy carried into the job's podman pull")
+    p.add_argument("-o", "--output", default=None, help="write to file instead of stdout")
     p.set_defaults(func=cmd_generate)
 
     p = sub.add_parser("bench", help="throughput/latency sweep against a served box (paper's step 5)")
