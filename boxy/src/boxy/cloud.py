@@ -22,9 +22,12 @@ def sky_available() -> bool:
     return shutil.which("sky") is not None
 
 
-def write_task_yaml(box: Box, location: Location, port: int | None, serve: bool, output: str | None = None) -> str:
-    """Write the generated SkyPilot task YAML; returns its path."""
-    yaml_text = sky_export.to_sky_task(box, location, port=port, serve=serve)
+def write_task_yaml(box: Box, location: Location, port: int | None, serve: bool, output: str | None = None,
+                    proxy: str | None = None, ca_bundle: str | None = None) -> str:
+    """Write the generated SkyPilot task YAML; returns its path. `proxy`/`ca_bundle`
+    carry the corporate network env onto the task (see sky_export._network_env)."""
+    yaml_text = sky_export.to_sky_task(box, location, port=port, serve=serve,
+                                       proxy=proxy, ca_bundle=ca_bundle)
     if output is None:
         fd, output = tempfile.mkstemp(prefix=f"boxy-{box.name}-", suffix=".sky.yaml")
         with os.fdopen(fd, "w") as f:

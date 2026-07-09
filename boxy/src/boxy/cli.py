@@ -1702,7 +1702,12 @@ def cmd_generate(args: argparse.Namespace) -> int:
             "path targets cloud/K8s — boxy serves Slurm/Flux natively (use `boxy serve`)",
             file=sys.stderr,
         )
-    yaml_text = sky_export.to_sky_task(box, location, port=args.port, serve=args.serve)
+    # --proxy = "this task runs on-net behind the corporate proxy": carry the proxy
+    # env AND the merged trust bundle onto the task (cloud is explicit-opt-in,
+    # unlike the auto-propagating on-net scheduler paths — see sky_export).
+    ca = ramalama_shim.ensure_trust_bundle() if args.proxy else None
+    yaml_text = sky_export.to_sky_task(box, location, port=args.port, serve=args.serve,
+                                       proxy=args.proxy, ca_bundle=ca)
     if args.output:
         with open(args.output, "w") as f:
             f.write(yaml_text)
@@ -2464,7 +2469,9 @@ def cmd_launch(args: argparse.Namespace) -> int:
     if args.down:
         cmd = cloud.launch_command(box, "", serve=args.serve, down=True)
     else:
-        yaml_path = cloud.write_task_yaml(box, location, args.port, args.serve, output=args.output)
+        ca = ramalama_shim.ensure_trust_bundle() if args.proxy else None
+        yaml_path = cloud.write_task_yaml(box, location, args.port, args.serve, output=args.output,
+                                          proxy=args.proxy, ca_bundle=ca)
         print(f"### Task YAML: {yaml_path}")
         cmd = cloud.launch_command(box, yaml_path, serve=args.serve)
     print(f"### Running Command:\n    {shlex.join(cmd)}")
@@ -2751,6 +2758,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--location", required=True)
     p.add_argument("--port", type=int, default=None)
     p.add_argument("--serve", action="store_true", help="managed serving via SkyServe (sky serve up)")
+    p.add_argument("--proxy", default=None,
+                   help="the task runs ON-NET behind this corporate proxy: carry the proxy env "
+                        "AND the merged CA bundle onto the task (omit for off-net cloud VMs)")
     p.add_argument("--down", action="store_true", help="tear down instead of launching")
     p.add_argument("-o", "--output", default=None, help="also keep the task YAML at this path")
     p.add_argument("--dryrun", action="store_true")

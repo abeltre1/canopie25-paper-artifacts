@@ -97,3 +97,85 @@ def test_sky_export_no_accel_type_omits_accelerators(vllm_box):
     loc = Location(name="cpu", scheduler="none", runtime="docker")
     yaml_text = sky_export.to_sky_task(vllm_box, loc)
     assert "accelerators:" not in yaml_text
+
+
+# ---- corporate proxy + CA carriage on the cloud path (serving-matrix audit) ----
+
+
+def test_sky_proxy_and_ca_carriage(vllm_box, cloud_gpu, monkeypatch, tmp_path):
+    """--proxy = "this task runs on-net": the sky YAML must carry the proxy env
+    (both cases, no_proxy preserved) AND ship the merged trust bundle via
+    file_mounts with SSL_CERT_FILE/REQUESTS_CA_BUNDLE pointing at it. Validated
+    once against the real skypilot parser (10/10 boxes, sky 0.12.3)."""
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1,.sandia.gov")
+    ca = tmp_path / "merged-ca.crt"
+    ca.write_text("x")
+    text = sky_export.to_sky_task(vllm_box, cloud_gpu,
+                                  proxy="http://proxy.sandia.gov:80", ca_bundle=str(ca))
+    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        assert f'{var}: "http://proxy.sandia.gov:80"' in text   # URL has ":" -> quoted
+    assert "NO_PROXY: " in text and "no_proxy: " in text          # intra-VM stays direct
+    assert f"SSL_CERT_FILE: {sky_export.CA_MOUNT}" in text
+    assert f"REQUESTS_CA_BUNDLE: {sky_export.CA_MOUNT}" in text
+    assert "file_mounts:" in text and f"{sky_export.CA_MOUNT}: {ca}" in text
+
+
+def test_sky_no_network_env_by_default(vllm_box, cloud_gpu):
+    # off-net cloud VM: injecting a corporate proxy blindly would break egress
+    text = sky_export.to_sky_task(vllm_box, cloud_gpu)
+    assert "PROXY" not in text and "file_mounts:" not in text and "SSL_CERT_FILE" not in text
+
+
+def test_sky_empty_image_is_a_loud_error(cloud_gpu):
+    # finding 41 re-caught by the first real sky.Task.from_yaml validation:
+    # an unresolved image emitted `image_id: docker:` — invalid YAML sky rejects.
+    box = Box(name="noimg", engine="vllm", model="m", ports=[8000])
+    with pytest.raises(ValueError, match="has no image"):
+        sky_export.to_sky_task(box, cloud_gpu)
+
+
+def test_cli_generate_sky_proxy_carries_network_env(capsys, monkeypatch, tmp_path):
+    from boxy import cli
+
+    ca = tmp_path / "ca.crt"
+    ca.write_text("x")
+    monkeypatch.setattr(cli.ramalama_shim, "ensure_trust_bundle", lambda: str(ca))
+    rc = main(["generate", "sky", "--box", str(EXAMPLES / "boxes" / "llama-3.2-1b.toml"),
+               "--location", str(EXAMPLES / "locations" / "cloud-gpu.toml"),
+               "--proxy", "http://proxy.sandia.gov:80"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert 'HTTPS_PROXY: "http://proxy.sandia.gov:80"' in out
+    assert f"{sky_export.CA_MOUNT}: {ca}" in out
+
+
+def test_cli_launch_dryrun_proxy_writes_network_env(capsys, monkeypatch, tmp_path):
+    from boxy import cli
+
+    ca = tmp_path / "ca.crt"
+    ca.write_text("x")
+    monkeypatch.setattr(cli.ramalama_shim, "ensure_trust_bundle", lambda: str(ca))
+    out_yaml = tmp_path / "task.sky.yaml"
+    rc = main(["launch", "--box", str(EXAMPLES / "boxes" / "llama-3.2-1b.toml"),
+               "--location", str(EXAMPLES / "locations" / "cloud-gpu.toml"),
+               "--proxy", "http://proxy.sandia.gov:80", "-o", str(out_yaml), "--dryrun"])
+    assert rc == 0
+    text = out_yaml.read_text()
+    assert 'https_proxy: "http://proxy.sandia.gov:80"' in text
+    assert f"SSL_CERT_FILE: {sky_export.CA_MOUNT}" in text
+    assert "sky launch -c llama-3.2-1b" in capsys.readouterr().out
+
+
+def test_sky_yaml_accepted_by_real_skypilot(vllm_box, cloud_gpu, tmp_path):
+    """When skypilot is installed (sandbox validation; skipped on CI), the
+    generated YAML must parse through sky's OWN Task.from_yaml — this is what
+    caught the empty-image bug that pyyaml-level tests missed."""
+    sky = pytest.importorskip("sky")
+    p = tmp_path / "t.yaml"
+    ca = tmp_path / "ca.crt"
+    ca.write_text("x")
+    p.write_text(sky_export.to_sky_task(vllm_box, cloud_gpu,
+                                        proxy="http://p:80", ca_bundle=str(ca)))
+    task = sky.Task.from_yaml(str(p))
+    assert task.envs["HTTPS_PROXY"] == "http://p:80"
+    assert task.file_mounts[sky_export.CA_MOUNT] == str(ca)

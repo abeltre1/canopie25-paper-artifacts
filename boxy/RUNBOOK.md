@@ -660,7 +660,27 @@ boxy launch --box examples/boxes/vllm-hf.toml \
      --location examples/locations/cloud-gpu.toml --serve
 # EXPECT: task YAML path, then "sky serve up -n vllm-hf ... --yes" output
 boxy launch --box ... --location ... --serve --down     # teardown
+# ON-NET tasks (corporate k8s / connected enclave): --proxy carries the proxy env
+# (both cases, no_proxy preserved) AND ships the merged CA bundle onto the task
+# (file_mounts + SSL_CERT_FILE/REQUESTS_CA_BUNDLE). Omit for off-net cloud VMs —
+# a corporate proxy is unreachable there and would break the VM's egress.
+boxy generate sky --box ... --location ... --proxy http://proxy.<site>:80
+boxy launch      --box ... --location ... --proxy http://proxy.<site>:80 --serve
 ```
+
+Every generated task was validated through skypilot's own parser (`sky.Task
+.from_yaml`, sky 0.12.3): all example boxes × {plain, --proxy+CA}. That pass
+also caught + fixed a silent bug: an unresolved default image emitted invalid
+`image_id: docker:` — now a loud error instead.
+
+### 5.1 Corporate proxy + CA carriage matrix (audited 2026-07)
+
+| Serve path | Proxy | CA bundle |
+|---|---|---|
+| baremetal (none) × podman/docker/apptainer | auto (`_propagate_proxy`) | auto (env + bundle mount) |
+| slurm / flux (normal submit) | auto + `--proxy` pull prefix | auto |
+| slurm / flux (`--agentless` / `generate`) | `--proxy` env prefix + inherited | via `plan_serve` (bundle path must be shared-FS-visible — generate on the login node) |
+| sky (`generate sky` / `launch`) | explicit `--proxy` (on-net opt-in) | shipped via `file_mounts` when `--proxy` set |
 
 ## 6. Troubleshooting (every failure observed so far, with its fix)
 
