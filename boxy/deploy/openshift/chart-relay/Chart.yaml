@@ -1,0 +1,8 @@
+apiVersion: v2
+name: chart-relay
+description: boxy relay (chisel reverse-tunnel server) on OpenShift — the everyone-URL ingress behind `boxy open --share`.
+type: application
+version: 0.0.1
+appVersion: "1.10"
+maintainers:
+  - name: boxy

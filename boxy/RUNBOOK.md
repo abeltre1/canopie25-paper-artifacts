@@ -226,7 +226,76 @@ needs RamaLama on the cluster; stage the model first.
 `--route NAME` gives you `http://NAME.localhost:PORT/` for a tunnel with zero
 setup — `.localhost` resolves to 127.0.0.1 in every browser on macOS + Linux (RFC
 6761), no `/etc/hosts`, no DNS server. See §4.5 for the full example. This resolves
-on *your* machine only; there is no shared-teammate-name path in boxy today.
+on *your* machine only; to hand teammates a URL, use `--share` (§0.993).
+
+### 0.993 Share with the TEAM — `--share` (OpenShift relay, zero teammate setup)
+
+Turn the laptop-only tunnel into a URL **anyone on the corporate network can open
+with nothing installed**. It rides the cluster's EXISTING wildcard DNS
+(`*.apps.<cluster>` already resolves everywhere) — no nameserver, no client
+software, no enrollment (the lessons of the reverted Headscale tier). A tiny
+**relay** pod (chisel) on OpenShift accepts an OUTBOUND reverse-websocket tunnel
+that boxy dials from your laptop; a per-name Route points the public hostname at it.
+
+**Pluggable:** `--exposer relay` (default) is one member of `boxy/exposers/`; the
+`hosts` member is a local-only /etc/hosts name. New exposers drop into that
+registry without touching the tunnel code.
+
+**One-time admin (deploy the relay once per cluster):**
+```bash
+helm install boxy-relay deploy/openshift/chart-relay --namespace boxy-relay \
+  --create-namespace --set host=relay-boxy.apps.<cluster> \
+  --set auth="boxy:$(openssl rand -hex 16)" --set keySeed="$(openssl rand -hex 16)"
+# no-Helm equivalent:
+#   boxy generate relay --host relay-boxy.apps.<cluster> --auth boxy:<pw> | oc apply -f -
+brew install chisel          # laptop, once (go install github.com/jpillora/chisel@latest works too)
+```
+
+**Everyday — share a model:**
+```bash
+boxy open <inst> --ssh ambelt@eldorado --port 8090 --share nemotron
+#   ### LOCAL   http://127.0.0.1:8090/v1
+#   ### SHARE   https://nemotron-boxy.apps.<cluster>/v1   (reachable by ANYONE on the corporate network)
+boxy list                    # shows the share + LIVE/DEAD
+boxy unshare nemotron        # kill the relay client + delete its Route/Service
+```
+A teammate, zero setup: `curl https://nemotron-boxy.apps.<cluster>/v1/models`.
+
+**Survival:** the relay client is detached (like the SSH ControlPersist forward) —
+the share survives boxy exiting and the terminal closing. Laptop **sleep** is a
+self-healing outage (chisel reconnects on wake). Laptop **shutdown** kills the
+share (fix: the login-node bridge, below). If the underlying `ssh -L` lapses
+(ControlPersist ~12h) the URL 502s — rerun `boxy open --port N --share X` (the
+public URL is stable). boxy takes the LOCAL end of a tunnel, so `--share` needs
+`--ssh` (or the bridge); `--share` alone errors.
+
+**Credential & config:** boxy fetches the tunnel credential from the `boxy-relay`
+Secret via your logged-in `oc` (override `BOXY_RELAY_AUTH=user:pass`); the relay URL
+auto-discovers from the Route (override `BOXY_RELAY_URL`). If `oc` is unavailable,
+boxy prints the Service+Route YAML to apply by hand and keeps the tunnel up. Behind
+an explicit proxy / custom CA: `BOXY_CHISEL_ARGS="--proxy http://... --tls-ca <bundle>"`.
+
+**Security:** the relay credential gates who may CREATE tunnels, not who may USE the
+URL — anything on the corporate network reaches the model unauthenticated (same
+trust model as sharing an `ssh -L`, just wider). Lock a specific model with the
+engine's own `--api-key` (vLLM/llama.cpp) if needed. No credentials at rest on HPC;
+nothing SSHes from a pod.
+
+**Upgrade (removes the laptop from the data path):** run the chisel client on the
+HPC login node instead — start it over boxy's existing SSH master, reverse-mapping
+`R:<port>:<compute-node>:<model-port>` straight to the node. Requires login-node →
+`*.apps.<cluster>` reachability and a staged linux/amd64 chisel binary; the share
+then outlives your laptop entirely.
+
+### 0.992 Deploy persistent services & MCP servers (flux-mcp)
+
+Beyond model inference, boxy emits OpenShift manifests for standing services —
+e.g. **flux-mcp** (agentic MCP control of Flux jobs, HTTP/SSE on :8089):
+```bash
+boxy generate flux-mcp --host flux-mcp.apps.<cluster> \
+     --flux-uri ssh://eldorado/run/flux/local | oc apply -f -
+# or the Helm chart: deploy/openshift/chart-flux-mcp (helm install flux-mcp ... --set host=...)
+# agents then connect to the MCP endpoint at https://flux-mcp.apps.<cluster>/
 
 ### 0.992 Deploy persistent services & MCP servers (flux-mcp)
 

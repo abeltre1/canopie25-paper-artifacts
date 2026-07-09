@@ -1366,13 +1366,18 @@ def _delegate_remote(args, tunnel_ready: bool = False) -> int | None:
         return None
     return remote.run_remote(target, getattr(args, "_raw_argv", []), tunnel_ready=tunnel_ready,
                              local_port=getattr(args, "local_port", None),
-                             local_route=getattr(args, "route", "") or "")
+                             local_route=getattr(args, "route", "") or "",
+                             share=getattr(args, "share", "") or "",
+                             exposer_name=getattr(args, "exposer", None) or "relay")
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
     rc = _delegate_remote(args, tunnel_ready=True)
     if rc is not None:
         return rc
+    if getattr(args, "share", None):
+        raise UsageError("--share needs the laptop tunnel (`boxy serve ... --ssh user@login "
+                         "--share NAME`) — it publishes the LOCAL end of the forward")
     from boxy import deploy, readiness
 
     # Seamless scheduler path: MODEL + slurm/flux (via flag or --location
@@ -1676,6 +1681,8 @@ def cmd_generate(args: argparse.Namespace) -> int:
 
     if args.format == "flux-mcp":
         return _generate_flux_mcp(args)
+    if args.format == "relay":
+        return _generate_relay(args)
     if not args.box or not args.location:
         print(f"boxy generate {args.format}: --box and --location are required", file=sys.stderr)
         return 2
@@ -1702,6 +1709,27 @@ def cmd_generate(args: argparse.Namespace) -> int:
         print(f"wrote {args.output}  (launch: sky {'serve up' if args.serve else 'launch'} {args.output})")
     else:
         print(yaml_text, end="")
+    return 0
+
+
+def _generate_relay(args: argparse.Namespace) -> int:
+    """Emit the boxy relay (chisel server) for OpenShift — the everyone-URL
+    ingress behind `boxy open --share`. Deployed once per cluster; per-share
+    Routes are created at share time by the relay exposer."""
+    from boxy.exposers import relay
+
+    if not args.host:
+        print("boxy generate relay: --host is required (the relay's Route host, "
+              "e.g. relay-boxy.apps.<cluster>)", file=sys.stderr)
+        return 2
+    text = relay.emit_relay_manifest(args.host, args.namespace or relay.DEFAULT_NAMESPACE,
+                                     auth=args.auth, key_seed=args.key_seed)
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(text)
+        print(f"wrote {args.output}")
+    else:
+        print(text, end="")
     return 0
 
 
@@ -1807,6 +1835,22 @@ def _run_or_print(cmd: list[str], dryrun: bool) -> int:
     return subprocess.run(cmd).returncode
 
 
+def cmd_unshare(args: argparse.Namespace) -> int:
+    """Tear down an everyone-URL share: kill the detached relay client and
+    delete the per-alias Route/Service on the cluster (local state always
+    cleared, even when oc is unreachable — the manual command is printed)."""
+    from boxy import jobs
+    from boxy.exposers import get_exposer
+
+    record = jobs.read_share(args.alias)
+    if not record:
+        print(f"boxy: no share named {args.alias!r} (see `boxy list`)", file=sys.stderr)
+        return 1
+    get_exposer(getattr(args, "exposer", None) or "relay").unexpose(args.alias)
+    print(f"unshared {args.alias}  ({record['url']} is gone)")
+    return 0
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     rc = _delegate_remote(args)
     if rc is not None:
@@ -1892,6 +1936,14 @@ def cmd_list(args: argparse.Namespace) -> int:
                   "boxy list --ssh <that-login>. boxy separates clusters automatically now "
                   "(<jobs-root>/<cluster>/); FOREIGN only appears when BOXY_JOBS_DIR pins one "
                   "shared dir, or from legacy records.)")
+    shares = jobs.list_shares()
+    if shares:
+        from boxy.exposers import relay as relay_exposer
+        print("shares (everyone-URLs via the OpenShift relay):")
+        for s in shares:
+            state = ("LIVE" if relay_exposer.share_is_live(s)
+                     else "DEAD (relay client gone — rerun with --share, or boxy unshare)")
+            print(f"  {s['alias']}  {s['url']}/v1  {state}")
     location = Location.from_toml(args.location) if args.location else None
     try:
         runtime = args.runtime or _container_runtime(location)
@@ -2163,6 +2215,10 @@ def cmd_open(args: argparse.Namespace) -> int:
     rc = _delegate_remote(args, tunnel_ready=True)
     if rc is not None:
         return rc
+    if getattr(args, "share", None):
+        raise UsageError("--share needs the laptop tunnel (`boxy open NAME --ssh user@login "
+                         "--share NAME`) — it publishes the LOCAL end of the forward; see "
+                         "RUNBOOK §0.993 for the login-node bridge")
     name, ep = _select_endpoint(args.name, "open")
     host, port = ep["host"], ep["port"]
     # The '### READY http://host:port' banner is what the laptop side watches
@@ -2542,6 +2598,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "to localhost. Also: BOXY_SSH_HOST env, or `remote=` in a --location profile")
     p.add_argument("--route", default=None, metavar="NAME",
                    help="with --ssh: print a friendly http://NAME.localhost:PORT/ tunnel URL (no DNS)")
+    p.add_argument("--share", default=None, metavar="NAME",
+                   help="with --ssh: publish the tunnel as https://NAME-boxy.apps.<cluster>/ via the "
+                        "OpenShift relay (everyone-URL, zero teammate setup); stop: boxy unshare NAME")
+    p.add_argument("--exposer", choices=["relay", "hosts"], default="relay",
+                   help="which pluggable exposer --share uses (default relay)")
     p.add_argument("--dryrun", action="store_true", help="print the command instead of executing it")
     p.add_argument("args", nargs="*", help="extra engine args (put them after --)")
     p.set_defaults(func=cmd_serve)
@@ -2566,18 +2627,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_build)
 
     p = sub.add_parser("generate", help="transpile box+location to another orchestrator: "
-                                        "sky (SkyPilot YAML), slurm|flux (boxy-free job script), or "
-                                        "flux-mcp (persistent OpenShift MCP service)")
-    p.add_argument("format", choices=["sky", "slurm", "flux", "sbatch", "flux-mcp"],
+                                        "sky (SkyPilot YAML), slurm|flux (boxy-free job script), "
+                                        "flux-mcp (persistent OpenShift MCP service), or "
+                                        "relay (the everyone-URL share ingress on OpenShift)")
+    p.add_argument("format", choices=["sky", "slurm", "flux", "sbatch", "flux-mcp", "relay"],
                    help="sky = SkyPilot task YAML; slurm|flux = agentless batch script (no boxy on the "
-                        "cluster); flux-mcp = the Flux MCP server as a persistent OpenShift service")
+                        "cluster); flux-mcp = the Flux MCP server as a persistent OpenShift service; "
+                        "relay = the chisel relay behind `boxy open --share` (deploy once)")
     p.add_argument("--box", default=None)
     p.add_argument("--location", default=None)
     p.add_argument("--port", type=int, default=None)
-    # flux-mcp: persistent MCP service on OpenShift (no box/location needed)
-    p.add_argument("--namespace", default=None, help="flux-mcp: OpenShift namespace")
-    p.add_argument("--host", default=None, help="flux-mcp: the OpenShift Route hostname to expose the MCP server on")
+    # flux-mcp / relay: persistent OpenShift services (no box/location needed)
+    p.add_argument("--namespace", default=None, help="flux-mcp/relay: OpenShift namespace")
+    p.add_argument("--host", default=None,
+                   help="flux-mcp/relay: the OpenShift Route hostname (e.g. relay-boxy.apps.<cluster>)")
     p.add_argument("--flux-uri", default="", help="flux-mcp: FLUX_URI for reaching a remote Flux instance")
+    p.add_argument("--auth", default="", help="relay: user:pass tunnel credential (else a REPLACE_ME "
+                                              "placeholder + `oc create secret` hint)")
+    p.add_argument("--key-seed", default="", help="relay: seed keeping the chisel host key stable across "
+                                                  "pod restarts (else REPLACE_ME)")
     p.add_argument("--serve", action="store_true", help="add a SkyServe service block (sky serve up)")
     # agentless (slurm|flux) pins: hardware can't be detected off the compute node
     p.add_argument("--accelerator", default=None, help="agentless: pin the compute node's accelerator (cuda|rocm|…)")
@@ -2633,6 +2701,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="print a friendly http://NAME.localhost:PORT/ URL for the tunnel — "
                         "*.localhost resolves to 127.0.0.1 in every browser on macOS+Linux with "
                         "zero DNS setup (RFC 6761); a bare NAME gets '.localhost' appended")
+    p.add_argument("--share", default=None, metavar="NAME",
+                   help="publish the tunnel as https://NAME-boxy.apps.<cluster>/ via the OpenShift "
+                        "relay — reachable by ANYONE on the corporate network, teammates install "
+                        "nothing (deploy the relay once: boxy generate relay). Stop: boxy unshare NAME")
+    p.add_argument("--exposer", choices=["relay", "hosts"], default="relay",
+                   help="which pluggable exposer --share uses (default relay)")
     p.add_argument("--ssh", default=None, metavar="USER@HOST",
                    help="tunnel from that cluster's login node back to this machine over SSH")
     p.set_defaults(func=cmd_open, location=None)
@@ -2697,6 +2771,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="run on that cluster's login node over SSH (reuses the boxy SSH session)")
     p.add_argument("--dryrun", action="store_true")
     p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("unshare", help="tear down an everyone-URL share: kill the relay client "
+                                       "and delete its Route/Service (see `boxy list`)")
+    p.add_argument("alias", help="the --share name to tear down")
+    p.add_argument("--exposer", choices=["relay", "hosts"], default="relay")
+    p.set_defaults(func=cmd_unshare, location=None)
 
     p = sub.add_parser("router",
                        help="front a --replicas set (<base>-r*) with ONE OpenAI URL (load-balanced)")

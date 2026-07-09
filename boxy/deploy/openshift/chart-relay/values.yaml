@@ -1,0 +1,32 @@
+# chart-relay — the boxy share ingress (chisel reverse-tunnel server), deploy ONCE:
+#   helm install boxy-relay ./chart-relay --namespace boxy-relay --create-namespace \
+#     --set host=relay-boxy.apps.<cluster> \
+#     --set auth="boxy:$(openssl rand -hex 16)" --set keySeed="$(openssl rand -hex 16)"
+# `boxy generate relay --host ... | oc apply -f -` is the equivalent no-Helm path.
+#
+# Shared names then ride the cluster's EXISTING wildcard DNS: `boxy open <inst>
+# --ssh <login> --share nemotron` -> https://nemotron-boxy.apps.<cluster>/ —
+# teammates need NOTHING installed.
+
+image: docker.io/jpillora/chisel:1.10
+port: 8080
+
+# REQUIRED: the relay's own Route hostname (must live under *.apps.<cluster>).
+host: ""
+
+# user:pass gating who may CREATE tunnels (boxy fetches it from this Secret at
+# share time). Prefer --set at install over committing a value here.
+auth: ""
+# Seed keeping the chisel host key stable across pod restarts (no PVC needed).
+keySeed: ""
+
+route:
+  enabled: true
+  termination: edge
+  # both matter for the long-lived websocket: `timeout` pre-upgrade,
+  # `timeout-tunnel` after the upgrade. --keepalive 25s keeps it non-idle.
+  timeout: 3600s
+  timeoutTunnel: 3600s
+
+securityContext:
+  runAsNonRoot: true

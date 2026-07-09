@@ -145,19 +145,20 @@ def remote_argv(raw_argv: list[str]) -> list[str]:
     """The exact command the user typed, minus the LAPTOP-SIDE-ONLY flags (the
     remote side must run it LOCALLY: recursion is also belt-and-suspenders
     blocked by BOXY_REMOTE_ACTIVE). `--ssh` targets the remote; `--route` names
-    the local tunnel URL — both consumed here on the laptop, and the cluster's
-    boxy never sees them, so a bare `boxy open NAME` runs there even when the
-    CLUSTER's install is older and doesn't know `--route` (field report)."""
+    the local tunnel URL; `--share`/`--exposer` publish it via the OpenShift
+    relay — all consumed here on the laptop, and the cluster's boxy never sees
+    them, so a bare `boxy open NAME` runs there even when the CLUSTER's install
+    is older and doesn't know these flags (field report)."""
     out: list[str] = []
     skip = False
     for tok in raw_argv:
         if skip:
             skip = False
             continue
-        if tok in ("--ssh", "--route"):
+        if tok in ("--ssh", "--route", "--share", "--exposer"):
             skip = True
             continue
-        if tok.startswith(("--ssh=", "--route=")):
+        if tok.startswith(("--ssh=", "--route=", "--share=", "--exposer=")):
             continue
         out.append(tok)
     return out
@@ -223,14 +224,18 @@ def add_forward(host: str, local_port: int, remote_host: str, remote_port: int) 
 
 
 def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False,
-               local_port: int | None = None, local_route: str = "") -> int:
+               local_port: int | None = None, local_route: str = "",
+               share: str = "", exposer_name: str = "relay") -> int:
     """Run the user's boxy command on `host`, streaming output live. With
     `tunnel_ready`, watch for the '### READY http://node:port' banner and
     forward that endpoint back, then print the local URL — the model is reachable
     on the laptop as http://127.0.0.1:<port>/v1. `local_port` pins the LOCAL side
     (a stable URL, e.g. `boxy open --port 8080`); default reuses the remote port
     when free, else picks any free port. `local_route` (e.g. `--route nemotron`)
-    also prints a friendly `http://<name>.localhost:<port>/` URL — no DNS."""
+    also prints a friendly `http://<name>.localhost:<port>/` URL — no DNS.
+    `share` (e.g. `--share nemotron`) hands the live tunnel to the pluggable
+    exposer (default: the OpenShift relay) and prints an everyone-URL; a share
+    failure NEVER takes the tunnel down (degrades to the Tier-1 route print)."""
     rc = ensure_master(host)
     if rc != 0:
         print(f"boxy: could not open an SSH session to {host} (rc {rc}) — check the host, "
@@ -275,9 +280,20 @@ def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False,
                         print(f"### ROUTE   {rurl}   (browser UI: {rurl[:-2]})")
                         if rnote:
                             print(f"###   {rnote}")
-                    else:
+                    elif not share:
                         print(f"###   browser: open http://127.0.0.1:{lport}/   "
                               f"(llama.cpp serves a web UI there; vLLM exposes only /v1)")
+                    if share:
+                        try:
+                            from boxy.exposers import get_exposer
+                            surl, snote = get_exposer(exposer_name).expose(share, lport)
+                            print(f"### SHARE   {surl}   (browser UI: {surl[:-2]})")
+                            if snote:
+                                print(f"###   {snote}")
+                        except Exception as e:  # the tunnel must never die because the share failed
+                            print(f"warning: share failed — {e}", file=sys.stderr)
+                            rurl, _ = route_url(share, lport)
+                            print(f"### ROUTE   {rurl}   (local-only fallback)")
                     print(f"###   close: ssh -O cancel -L {lport}:{node}:{port} "
                           f"-o ControlPath={control_path()} {host}")
                 else:

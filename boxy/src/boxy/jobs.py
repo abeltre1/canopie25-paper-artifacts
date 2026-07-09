@@ -142,6 +142,52 @@ def read_endpoint(name: str) -> dict | None:
     return None
 
 
+def share_path(name: str) -> Path:
+    return _dir() / f"{name}.share.json"
+
+
+def share_log_path(name: str) -> Path:
+    return _dir() / f"{name}.share.log"
+
+
+def write_share(name: str, data: dict) -> Path:
+    """Atomic like write_endpoint_file — the record is what `boxy unshare` and
+    `boxy list` trust, so it must never be seen torn. Contains NO credential."""
+    path = share_path(name)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, path)
+    return path
+
+
+def read_share(name: str) -> dict | None:
+    path = share_path(name)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except ValueError:
+        return None
+    # same shape-guard philosophy as read_endpoint: junk must not KeyError later
+    if isinstance(data, dict) and all(k in data for k in ("alias", "url", "relay_port")):
+        return data
+    return None
+
+
+def remove_share(name: str) -> None:
+    share_path(name).unlink(missing_ok=True)
+
+
+def list_shares() -> list[dict]:
+    suffix = ".share.json"
+    out = []
+    for path in sorted(_dir().glob(f"*{suffix}")):
+        share = read_share(path.name[: -len(suffix)])
+        if share:
+            out.append(share)
+    return out
+
+
 def list_endpoints(base: str) -> list[dict]:
     """Every published endpoint for a replica set: the `<base>-r*` endpoint files
     (as written by `boxy serve --replicas K`), returned as read_endpoint dicts.
