@@ -1720,12 +1720,13 @@ def _generate_headscale(args: argparse.Namespace) -> int:
         return 2
     if args.emit == "values":
         text = headscale.emit_values(args.server_url, args.base_domain, args.preauth_key,
-                                     derp_udp=args.derp_udp, termination=args.tls_termination)
+                                     derp_udp=args.derp_udp, termination=args.tls_termination,
+                                     log_level=args.log_level)
     else:
         text = headscale.emit_manifest(args.server_url, args.base_domain,
                                        args.namespace or "headscale",
                                        args.preauth_key, derp_udp=args.derp_udp,
-                                       termination=args.tls_termination)
+                                       termination=args.tls_termination, log_level=args.log_level)
     if args.output:
         with open(args.output, "w") as f:
             f.write(text)
@@ -2630,6 +2631,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tls-termination", choices=["edge", "reencrypt", "passthrough"], default="edge",
                    help="headscale: OpenShift Route TLS termination (default edge — works with "
                         "headscale's plain-HTTP :8080; reencrypt needs backend TLS)")
+    p.add_argument("--log-level", choices=["info", "debug", "trace"], default="info",
+                   help="headscale: log verbosity (debug/trace logs every HTTP request)")
     p.add_argument("--emit", choices=["values", "manifest"], default="manifest",
                    help="headscale: Helm values.yaml or a self-contained oc-apply manifest (default)")
     p.add_argument("--serve", action="store_true", help="add a SkyServe service block (sky serve up)")

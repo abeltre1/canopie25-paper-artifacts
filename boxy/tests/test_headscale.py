@@ -42,7 +42,16 @@ def test_emit_manifest_is_valid_multidoc_yaml_with_expected_kinds():
     assert "noise_private.key" in cfg                    # both keys present, distinct paths
     # unix socket must live on the writable PVC, not the default /var/run (SCC-blocked)
     assert "unix_socket: /var/lib/headscale/headscale.sock" in cfg
+    assert "level: info" in cfg                          # default log level
     assert all(ns == "hs" for ns in (d["metadata"]["namespace"] for d in docs))
+
+
+def test_emit_manifest_log_level_debug():
+    yaml = pytest.importorskip("yaml")
+    docs = [d for d in yaml.safe_load_all(
+        headscale.emit_manifest(SERVER, "boxy.ts.net", log_level="debug")) if d]
+    cfg = next(d for d in docs if d["kind"] == "ConfigMap")["data"]["config.yaml"]
+    assert "level: debug" in cfg                         # every HTTP request logged
 
 
 def test_emit_manifest_derp_udp_adds_loadbalancer():

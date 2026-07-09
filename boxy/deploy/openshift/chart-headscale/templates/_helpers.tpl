@@ -17,6 +17,9 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{/* headscale config.yaml (rendered into the ConfigMap). */}}
 {{- define "headscale.config" -}}
 server_url: {{ required "serverUrl is required" .Values.serverUrl }}
+log:
+  level: {{ .Values.logLevel | default "info" }}
+  format: text
 listen_addr: 0.0.0.0:8080
 metrics_listen_addr: 127.0.0.1:9090
 grpc_listen_addr: 127.0.0.1:50443

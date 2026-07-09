@@ -14,6 +14,8 @@ serverUrl: ""
 # MagicDNS base domain — models publish as <name>.<baseDomain>.
 baseDomain: boxy.ts.net
 magicDns: true
+# info | debug | trace — debug/trace logs every HTTP request (enrollment, /ts2021).
+logLevel: info
 
 # Reusable pre-auth key. Prefer `--set preAuthKey=...` at install time over
 # committing it here.

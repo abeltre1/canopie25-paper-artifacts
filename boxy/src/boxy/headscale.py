@@ -25,10 +25,16 @@ DEFAULT_IMAGE = "docker.io/headscale/headscale:0.23.0"
 ROUTER_TIMEOUT = "3600s"  # the tailnet control connection is long-lived
 
 
-def _config_yaml(server_url: str, base_domain: str, *, derp_udp: bool) -> str:
+def _config_yaml(server_url: str, base_domain: str, *, derp_udp: bool,
+                 log_level: str = "info") -> str:
     """headscale config.yaml — the bit that makes it a MagicDNS authority."""
     return (
         f"server_url: {server_url}\n"
+        # debug/trace log each HTTP request (enrollment, /ts2021) — useful to prove
+        # a client is (or isn't) reaching the Route.
+        "log:\n"
+        f"  level: {log_level}\n"
+        "  format: text\n"
         "listen_addr: 0.0.0.0:8080\n"
         "metrics_listen_addr: 127.0.0.1:9090\n"
         "grpc_listen_addr: 127.0.0.1:50443\n"
@@ -68,7 +74,7 @@ def _config_yaml(server_url: str, base_domain: str, *, derp_udp: bool) -> str:
 
 def emit_values(server_url: str, base_domain: str, preauth_key: str = "",
                 *, image: str = DEFAULT_IMAGE, derp_udp: bool = False,
-                termination: str = "edge") -> str:
+                termination: str = "edge", log_level: str = "info") -> str:
     """values.yaml for the chart-headscale Helm chart. Route TLS defaults to
     `edge` — headscale serves plain HTTP on :8080, so edge (router terminates
     TLS, forwards HTTP) works out of the box. `reencrypt` is stronger but needs
@@ -82,6 +88,7 @@ def emit_values(server_url: str, base_domain: str, preauth_key: str = "",
         f"serverUrl: {server_url}\n"
         f"baseDomain: {base_domain}\n"
         f"magicDns: true\n"
+        f"logLevel: {log_level}   # debug/trace logs every HTTP request (enrollment, /ts2021)\n"
         f"# reusable pre-auth key (headscale preauthkeys create --reusable --user boxy); "
         f"prefer --set over committing it\n"
         f"preAuthKey: {pk}\n"
@@ -104,12 +111,13 @@ def emit_values(server_url: str, base_domain: str, preauth_key: str = "",
 
 def emit_manifest(server_url: str, base_domain: str, namespace: str = "headscale",
                   preauth_key: str = "", *, image: str = DEFAULT_IMAGE,
-                  derp_udp: bool = False, termination: str = "edge") -> str:
+                  derp_udp: bool = False, termination: str = "edge",
+                  log_level: str = "info") -> str:
     """A self-contained multi-doc manifest for `oc apply -f -` (no Helm). Route TLS
     defaults to `edge` (works with headscale's plain-HTTP :8080); `reencrypt` needs
-    headscale serving TLS internally."""
+    headscale serving TLS internally. `log_level=debug` logs every HTTP request."""
     host = _host_of(server_url)
-    cfg = _indent(_config_yaml(server_url, base_domain, derp_udp=derp_udp), 4)
+    cfg = _indent(_config_yaml(server_url, base_domain, derp_udp=derp_udp, log_level=log_level), 4)
     docs = [
         # ConfigMap: the headscale config.yaml
         f"""apiVersion: v1
