@@ -1723,6 +1723,7 @@ def _generate_relay(args: argparse.Namespace) -> int:
               "e.g. relay-boxy.apps.<cluster>)", file=sys.stderr)
         return 2
     text = relay.emit_relay_manifest(args.host, args.namespace or relay.DEFAULT_NAMESPACE,
+                                     image=args.image or relay.RELAY_IMAGE,
                                      auth=args.auth, key_seed=args.key_seed)
     if args.output:
         with open(args.output, "w") as f:
@@ -2649,7 +2650,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--serve", action="store_true", help="add a SkyServe service block (sky serve up)")
     # agentless (slurm|flux) pins: hardware can't be detected off the compute node
     p.add_argument("--accelerator", default=None, help="agentless: pin the compute node's accelerator (cuda|rocm|…)")
-    p.add_argument("--image", default=None, help="agentless: pin the container image (else the engine+accel default)")
+    p.add_argument("--image", default=None,
+                   help="agentless: pin the container image (else the engine+accel default); "
+                        "relay: the chisel image (point at a mirror if Docker Hub is blocked)")
     p.add_argument("--partition", default=None)
     p.add_argument("--account", default=None)
     p.add_argument("--time", default=None)

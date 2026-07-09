@@ -124,3 +124,13 @@ def test_cli_generate_relay_requires_host(capsys):
     rc = main(["generate", "relay"])
     assert rc == 2
     assert "--host is required" in capsys.readouterr().err
+
+
+def test_cli_generate_relay_image_override_for_mirror(capsys):
+    # Docker Hub blocked by Zscaler -> point the relay at a mirrored image.
+    mirror = "image-registry.openshift-image-registry.svc:5000/boxy-relay/chisel:1.10"
+    rc = main(["generate", "relay", "--host", "relay-boxy.apps.x.y", "--image", mirror])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"image: {mirror}" in out
+    assert "docker.io/jpillora/chisel" not in out            # default fully replaced

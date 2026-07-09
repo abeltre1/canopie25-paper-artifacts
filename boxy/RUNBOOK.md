@@ -269,6 +269,21 @@ share (fix: the login-node bridge, below). If the underlying `ssh -L` lapses
 public URL is stable). boxy takes the LOCAL end of a tunnel, so `--share` needs
 `--ssh` (or the bridge); `--share` alone errors.
 
+**If the relay pod ImagePullBackOffs (Zscaler 403 on Docker Hub):** the cluster
+egress to `docker.io` is blocked (a `<!--# ... -->` Zscaler page, same class as the
+ghcr compute-node block). Mirror chisel into the cluster's OWN registry from your
+laptop (which reaches Docker Hub through the corporate proxy), then repoint:
+```bash
+oc patch configs.imageregistry.operator.openshift.io/cluster --type merge -p '{"spec":{"defaultRoute":true}}'
+REG=$(oc get route default-route -n openshift-image-registry -o jsonpath='{.spec.host}')
+oc image mirror docker.io/jpillora/chisel:1.10 "$REG/boxy-relay/chisel:1.10" --insecure
+helm upgrade boxy-relay deploy/openshift/chart-relay -n boxy-relay --reuse-values \
+  --set image=image-registry.openshift-image-registry.svc:5000/boxy-relay/chisel:1.10
+# no-Helm: boxy generate relay --host ... --image image-registry.openshift-image-registry.svc:5000/boxy-relay/chisel:1.10 | oc apply -f -
+```
+(If `oc image mirror` also can't reach Docker Hub, `podman pull` then `podman push`
+to `$REG` — see the fallback in this section's chat history.)
+
 **Credential & config:** boxy fetches the tunnel credential from the `boxy-relay`
 Secret via your logged-in `oc` (override `BOXY_RELAY_AUTH=user:pass`); the relay URL
 auto-discovers from the Route (override `BOXY_RELAY_URL`). If `oc` is unavailable,
