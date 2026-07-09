@@ -4,10 +4,10 @@ https://github.com/converged-computing/flux-mcp). flux-mcp serves MCP over
 HTTP/SSE on :8089 and needs to reach a Flux instance (FLUX_URI); the OpenShift
 manifest here runs the published image and exposes it behind a Route.
 
-Pure string builders, mirroring boxy.headscale — no I/O, no pyyaml dependency.
+Pure string builders (like router.emit_nginx) — no I/O, no pyyaml dependency.
 On HPC (where Flux actually lives) run it as a normal container via the scheduler
-and reach it with `boxy open --publish` (SPEC §8d); this manifest is the OpenShift
-persistent-service form for a cluster that can reach a Flux endpoint over FLUX_URI.
+and reach it with a tunnel (`boxy open … --ssh <login>`); this manifest is the
+OpenShift persistent-service form for a cluster that can reach Flux over FLUX_URI.
 """
 
 from __future__ import annotations

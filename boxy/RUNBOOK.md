@@ -221,46 +221,12 @@ boxy serve /shared/models/llama-3.2-1b.q4.gguf --scheduler slurm --gpus 1 \
 Design + boundaries: `SPEC.md §8c`. A transport URI (`hf://…`) is refused — it
 needs RamaLama on the cluster; stage the model first.
 
-### 0.991 Tier 2 — a SHARED name your teammates can resolve (Headscale on OpenShift)
+### 0.991 A friendly browser URL for the tunnel — `--route` (Tier 1, no DNS)
 
-`--route NAME` (§4.5) gives *you* `http://NAME.localhost:PORT/` with zero setup,
-but it only resolves on your own machine. To hand a teammate a URL that resolves
-on **their** machine — with no corporate DNS request — stand up a self-hosted
-**Headscale** (open-source Tailscale control server) as the naming authority, and
-publish with `--publish`.
-
-**1. Deploy the naming authority on OpenShift (once):**
-```bash
-# generate + apply the manifest (no Helm needed):
-boxy generate headscale --server-url https://headscale.apps.<cluster> \
-     --base-domain boxy.ts.net --emit manifest | oc apply -f -
-# or use the Helm chart:
-SERVER_URL=https://headscale.apps.<cluster> deploy/openshift/chart-headscale/install.sh
-# mint a reusable pre-auth key + enroll each machine (laptops, login hosts):
-oc -n headscale exec deploy/headscale -- headscale preauthkeys create --reusable --user boxy
-tailscale up --login-server https://headscale.apps.<cluster> --authkey <key>
-```
-Route TLS defaults to **edge** with a 3600s timeout (the Tailscale control
-connection is long-lived) — edge works out of the box since headscale serves
-plain HTTP on :8080 (`reencrypt` needs backend TLS). DERP relays over that same
-:443 Route by default, so no UDP ingress or extra cluster privileges are needed.
-Details: `deploy/openshift/chart-headscale/README.md`.
-
-**2. Publish a served model under a shared MagicDNS name:**
-```bash
-boxy open <name> --ssh ambelt@eldorado --publish nemotron
-# ### LOCAL   http://127.0.0.1:8090/v1
-# ### PUBLISH https://nemotron.boxy.ts.net/v1   (tailnet MagicDNS via Headscale)
-```
-Any teammate enrolled in the tailnet opens `https://nemotron.boxy.ts.net/`. If
-`tailscale` isn't installed/enrolled on your machine, `--publish` degrades to the
-Tier-1 `--route` URL (rc 0) — so it never blocks the tunnel.
-
-Publisher = the machine running boxy (Fork A: zero infra; the name is up while
-that machine's tunnel is). For a name that outlives any laptop, a dedicated
-gateway pod in OpenShift is the Fork-B upgrade (SPEC §8d; gated on a security
-review). Once models themselves move to OpenShift (future work) they get native
-Routes and don't need Headscale — its value is naming HPC/laptop endpoints.
+`--route NAME` gives you `http://NAME.localhost:PORT/` for a tunnel with zero
+setup — `.localhost` resolves to 127.0.0.1 in every browser on macOS + Linux (RFC
+6761), no `/etc/hosts`, no DNS server. See §4.5 for the full example. This resolves
+on *your* machine only; there is no shared-teammate-name path in boxy today.
 
 ### 0.992 Deploy persistent services & MCP servers (flux-mcp)
 
@@ -273,8 +239,8 @@ boxy generate flux-mcp --host flux-mcp.apps.<cluster> \
 # agents then connect to the MCP endpoint at https://flux-mcp.apps.<cluster>/
 ```
 flux-mcp needs to reach a Flux instance (`--flux-uri` → `FLUX_URI`). On HPC where
-Flux runs natively, serve it as a container via the scheduler and expose it with
-`boxy open --publish` (§0.991) instead.
+Flux runs natively, serve it as a container via the scheduler and reach it with a
+tunnel (`boxy open … --ssh <login>`).
 
 ## 1. Any machine — install & self-test (5 min)
 

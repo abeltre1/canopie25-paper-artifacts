@@ -30,11 +30,9 @@ cluster does everything else exactly as if the user had typed it there.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shlex
-import shutil
 import socket
 import subprocess
 import sys
@@ -44,8 +42,6 @@ ENV_ACTIVE = "BOXY_REMOTE_ACTIVE"   # recursion guard: set on the remote side
 ENV_SSH_BIN = "BOXY_SSH"            # override the ssh binary (tests: a local shim)
 ENV_REMOTE_CMD = "BOXY_REMOTE_COMMAND"  # remote boxy spelling (default: "boxy")
 ENV_PERSIST = "BOXY_SSH_PERSIST"    # how long the master + its tunnels live idle
-ENV_TAILSCALE_BIN = "BOXY_TAILSCALE"    # override the tailscale binary (tests: a local shim)
-ENV_TAILNET_DOMAIN = "BOXY_TAILNET_DOMAIN"  # MagicDNS base domain override (skip `tailscale status`)
 
 DEFAULT_PERSIST = "12h"  # one OTP+touch buys this much multiplexed access
 
@@ -149,20 +145,19 @@ def remote_argv(raw_argv: list[str]) -> list[str]:
     """The exact command the user typed, minus the LAPTOP-SIDE-ONLY flags (the
     remote side must run it LOCALLY: recursion is also belt-and-suspenders
     blocked by BOXY_REMOTE_ACTIVE). `--ssh` targets the remote; `--route` names
-    the local tunnel URL; `--publish` names it on the tailnet — all consumed here
-    on the laptop, and the cluster's boxy never sees them, so a bare `boxy open
-    NAME` runs there even when the CLUSTER's install is older and doesn't know
-    `--route`/`--publish` (field report)."""
+    the local tunnel URL — both consumed here on the laptop, and the cluster's
+    boxy never sees them, so a bare `boxy open NAME` runs there even when the
+    CLUSTER's install is older and doesn't know `--route` (field report)."""
     out: list[str] = []
     skip = False
     for tok in raw_argv:
         if skip:
             skip = False
             continue
-        if tok in ("--ssh", "--route", "--publish"):
+        if tok in ("--ssh", "--route"):
             skip = True
             continue
-        if tok.startswith(("--ssh=", "--route=", "--publish=")):
+        if tok.startswith(("--ssh=", "--route=")):
             continue
         out.append(tok)
     return out
@@ -212,85 +207,9 @@ def route_url(alias: str, port: int) -> tuple[str, str]:
         note = ("*.localhost -> 127.0.0.1 in browsers on macOS+Linux with zero setup (RFC 6761); "
                 "for CLI on Linux it needs systemd-resolved (default on Ubuntu/Fedora/Debian)")
     elif not host.endswith(".localhost"):
-        note = (f"point {host} at the tunnel: add '127.0.0.1  {host}' to /etc/hosts per machine, "
-                "or (for a shared name with no company DNS) front it with Headscale + `tailscale serve`")
+        note = (f"point {host} at the tunnel: add '127.0.0.1  {host}' to /etc/hosts per machine")
     suffix = "" if port in (80, 443) else f":{port}"
     return f"http://{host}{suffix}/v1", note
-
-
-def tailscale_bin() -> str:
-    return os.environ.get(ENV_TAILSCALE_BIN, "tailscale")
-
-
-def _short_name(alias: str) -> str:
-    """A DNS-label-safe short name from a user alias (strip scheme/path/dots)."""
-    host = alias.strip().rstrip("/")
-    for pre in ("https://", "http://"):
-        if host.startswith(pre):
-            host = host[len(pre):]
-    return host.split("/", 1)[0].split(".", 1)[0]
-
-
-def publish_url(name: str, lport: int, base_domain: str,
-                https: bool = True) -> tuple[list[str], str, str]:
-    """PURE: what publishing `name` (bound to 127.0.0.1:lport) over the tailnet
-    looks like — the `tailscale serve` argv, the predicted MagicDNS URL, and a
-    note. `base_domain` is the Headscale tailnet domain (e.g. 'boxy.ts.net'). This
-    is Tier 2: unlike route_url's `.localhost` (loopback-only, one machine), a
-    MagicDNS name resolves for EVERYONE enrolled in the tailnet, with no corporate
-    DNS. The serve still points at the loopback end of the SSH -L forward. `https`
-    uses :443 (needs a MagicDNS cert); `https=False` uses :80 — no cert, and the
-    traffic is still encrypted inside WireGuard (the reliable path on Headscale)."""
-    short = _short_name(name)
-    fqdn = f"{short}.{base_domain}" if base_domain else short
-    scheme, flag, dport = ("https", "--https=443", 443) if https else ("http", "--http=80", 80)
-    cmd = [tailscale_bin(), "serve", "--bg", flag, f"http://127.0.0.1:{lport}"]
-    note = (f"anyone enrolled in the tailnet resolves {scheme}://{fqdn}/ via Headscale MagicDNS "
-            f"(no corporate DNS); serve maps :{dport} -> the loopback tunnel on 127.0.0.1:{lport}")
-    return cmd, f"{scheme}://{fqdn}", note
-
-
-def tailnet_domain() -> str:
-    """The tailnet's MagicDNS base domain, from $BOXY_TAILNET_DOMAIN or
-    `tailscale status --json` (self.DNSName minus the leading host label).
-    Empty string when tailscale is absent / not enrolled."""
-    env = os.environ.get(ENV_TAILNET_DOMAIN, "").strip()
-    if env:
-        return env
-    if not shutil.which(tailscale_bin()) and ENV_TAILSCALE_BIN not in os.environ:
-        return ""
-    try:
-        out = subprocess.run([tailscale_bin(), "status", "--json"],
-                             capture_output=True, text=True, timeout=10)
-        if out.returncode != 0 or not out.stdout.strip():
-            return ""
-        dns = (json.loads(out.stdout).get("Self", {}) or {}).get("DNSName", "").strip(".")
-        # DNSName is '<host>.<base_domain>'; drop the host label to get the base.
-        return dns.split(".", 1)[1] if "." in dns else ""
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return ""
-
-
-def tailscale_publish(name: str, lport: int) -> tuple[str | None, str]:
-    """Expose the live loopback tunnel (127.0.0.1:lport) on the tailnet under
-    `name` via `tailscale serve`, returning (magicdns_url, note). Returns
-    (None, hint) — the caller then degrades to the Tier-1 route_url path — when
-    tailscale is missing or this machine isn't enrolled. Best-effort and never
-    raises: publishing is a convenience layered on top of a working tunnel."""
-    if not shutil.which(tailscale_bin()) and ENV_TAILSCALE_BIN not in os.environ:
-        return None, "tailscale not installed (Tier 2 needs the Tailscale client enrolled in your Headscale tailnet)"
-    domain = tailnet_domain()
-    if not domain:
-        return None, "tailscale not enrolled (run `tailscale up --login-server <headscale-url> --authkey <key>`)"
-    # Prefer HTTPS (:443); Headscale often has no MagicDNS cert, so fall back to
-    # HTTP (:80) — still encrypted inside WireGuard, and the reliable demo path.
-    for https in (True, False):
-        cmd, url, note = publish_url(name, lport, domain, https=https)
-        if subprocess.run(cmd, capture_output=True, text=True).returncode == 0:
-            if not https:
-                note += "  [HTTP: no MagicDNS cert for HTTPS — encrypted inside WireGuard]"
-            return url, note
-    return None, "`tailscale serve` failed for both https and http (check `tailscale serve` support / MagicDNS)"
 
 
 def add_forward(host: str, local_port: int, remote_host: str, remote_port: int) -> int:
@@ -304,18 +223,14 @@ def add_forward(host: str, local_port: int, remote_host: str, remote_port: int) 
 
 
 def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False,
-               local_port: int | None = None, local_route: str = "",
-               local_publish: str = "") -> int:
+               local_port: int | None = None, local_route: str = "") -> int:
     """Run the user's boxy command on `host`, streaming output live. With
     `tunnel_ready`, watch for the '### READY http://node:port' banner and
     forward that endpoint back, then print the local URL — the model is reachable
     on the laptop as http://127.0.0.1:<port>/v1. `local_port` pins the LOCAL side
     (a stable URL, e.g. `boxy open --port 8080`); default reuses the remote port
     when free, else picks any free port. `local_route` (e.g. `--route nemotron`)
-    also prints a friendly `http://<name>.localhost:<port>/` URL — no DNS.
-    `local_publish` (e.g. `--publish nemotron`) exposes the tunnel on the
-    Headscale tailnet via `tailscale serve` and prints a MagicDNS URL that
-    resolves for every enrolled teammate (Tier 2); degrades to the route note."""
+    also prints a friendly `http://<name>.localhost:<port>/` URL — no DNS."""
     rc = ensure_master(host)
     if rc != 0:
         print(f"boxy: could not open an SSH session to {host} (rc {rc}) — check the host, "
@@ -355,16 +270,7 @@ def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False,
                 if add_forward(host, lport, node, port) == 0:
                     print(f"### LOCAL   http://127.0.0.1:{lport}/v1   "
                           f"(tunnel over the SSH session; persists ~{control_persist()})")
-                    if local_publish:
-                        purl, pnote = tailscale_publish(local_publish, lport)
-                        if purl:
-                            print(f"### PUBLISH {purl}/v1   (tailnet MagicDNS via Headscale)")
-                            print(f"###   {pnote}")
-                        else:
-                            # Tier 2 unavailable -> fall back to the Tier-1 route URL.
-                            rurl, _ = route_url(local_publish, lport)
-                            print(f"### ROUTE   {rurl}   (tailscale unavailable — {pnote})")
-                    elif local_route:
+                    if local_route:
                         rurl, rnote = route_url(local_route, lport)
                         print(f"### ROUTE   {rurl}   (browser UI: {rurl[:-2]})")
                         if rnote:

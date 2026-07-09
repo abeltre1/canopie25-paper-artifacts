@@ -1,6 +1,6 @@
 """Persistent MCP services: `boxy generate flux-mcp` emits the Flux MCP server
 (https://github.com/converged-computing/flux-mcp) as an OpenShift Deployment +
-Service + Route. Pure emitter, mirroring tests/test_headscale.py."""
+Service + Route. Pure emitter, mirroring tests/test_router.py."""
 
 import pytest
 
