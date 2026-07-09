@@ -248,7 +248,9 @@ helm install boxy-relay deploy/openshift/chart-relay --namespace boxy-relay \
   --set auth="boxy:$(openssl rand -hex 16)" --set keySeed="$(openssl rand -hex 16)"
 # no-Helm equivalent:
 #   boxy generate relay --host relay-boxy.apps.<cluster> --auth boxy:<pw> | oc apply -f -
-brew install chisel          # laptop, once (go install github.com/jpillora/chisel@latest works too)
+brew install chisel-tunnel   # laptop, once — jpillora/chisel. NOT `brew install chisel`
+                             # (that's Facebook's LLDB tool). Installs the `chisel` binary.
+                             # (go install github.com/jpillora/chisel@latest works too)
 ```
 
 **Everyday — share a model:**

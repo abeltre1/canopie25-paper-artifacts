@@ -176,7 +176,7 @@ spec:
     header = (f"# boxy relay (chisel server) on OpenShift — the everyone-URL ingress for boxy shares.\n"
               f"# apply:  oc new-project {namespace} 2>/dev/null; "
               f"boxy generate relay --host {host} | oc apply -f -\n" + hint +
-              "# then on the laptop:  brew install chisel;  boxy open <inst> --ssh <login> --share <name>\n")
+              "# then on the laptop:  brew install chisel-tunnel;  boxy open <inst> --ssh <login> --share <name>\n")
     return header + "\n---\n".join(docs) + "\n"
 
 
@@ -308,8 +308,9 @@ class RelayExposer(Exposer):
         from boxy import jobs
 
         if not self.available():
-            raise ExposeError("chisel not installed — `brew install chisel` "
-                              "(or: go install github.com/jpillora/chisel@latest)")
+            raise ExposeError("chisel not installed — `brew install chisel-tunnel` "
+                              "(NOT `brew install chisel`, which is Facebook's LLDB tool; "
+                              "or: go install github.com/jpillora/chisel@latest)")
         relay_url = self._relay_url()
         host = share_host(alias, apps_domain_from_url(relay_url))
         url = f"https://{host}"
