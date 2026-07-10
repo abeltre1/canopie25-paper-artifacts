@@ -805,6 +805,19 @@ def _proxy_prefix(args) -> str:
     return "env " + " ".join(f"{k}={shlex.quote(v)}" for k, v in proxies.items()) + " "
 
 
+def _apply_proxy_env(args) -> None:
+    """Export `--proxy` into THIS process's env so the LOGIN-NODE model download
+    (RamaLama / huggingface_hub, run in-process during resolve_model) reaches the
+    corporate proxy too — not just the compute-node command (_proxy_prefix).
+    Field gap: `serve --proxy` proxied the ghcr image pull on the compute node
+    but NOT the HF model pull on the login node. Idempotent; no-op without --proxy."""
+    proxy = getattr(args, "proxy", "") or ""
+    if not proxy:
+        return
+    for key, val in ramalama_shim.raw_proxy_env(proxy).items():
+        os.environ[key] = val
+
+
 def _require_scheduler_binary(binary: str, scheduler_name: str) -> None:
     """Fail early and CLEARLY when the scheduler's submit tool isn't on this
     host — otherwise subprocess raises a bare '[Errno 2] ... sbatch'. The usual
@@ -1375,6 +1388,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     rc = _delegate_remote(args, tunnel_ready=True)
     if rc is not None:
         return rc
+    _apply_proxy_env(args)  # --proxy reaches the login-node model pull, not just the job
     if getattr(args, "share", None):
         raise UsageError("--share needs the laptop tunnel (`boxy serve ... --ssh user@login "
                          "--share NAME`) — it publishes the LOCAL end of the forward")
@@ -1603,6 +1617,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_pull(args: argparse.Namespace) -> int:
     """Pre-stage a model (login-node flow: pull where the network is, serve
     where the GPUs are — the store defaults to shared $HOME)."""
+    rc = _delegate_remote(args)
+    if rc is not None:
+        return rc
+    _apply_proxy_env(args)  # --proxy: reach HF through the corporate proxy
     model = args.model
     if not model and args.box:
         box = Box.from_toml(args.box)
@@ -2531,10 +2549,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "replaces the image's registry component. Per-registry rewrites go in "
                         "[location.image_mirrors]")
     p.add_argument("--proxy", default=None, metavar="URL",
-                   help="corporate proxy for the COMPUTE NODE's image pull + in-container downloads "
-                        "(e.g. http://proxy.mysite.gov:80): boxy carries it into the job and container. "
-                        "Omit to auto-use your http_proxy/https_proxy env. Fixes ghcr.io 403 on nodes "
-                        "that must egress through a proxy")
+                   help="corporate proxy (e.g. http://proxy.mysite.gov:80) applied to BOTH the "
+                        "login-node model download (Hugging Face) AND the compute node's image pull + "
+                        "in-container downloads. Omit to auto-use your http_proxy/https_proxy env. "
+                        "Fixes ghcr.io/huggingface.co 403 on nodes that must egress through a proxy")
     p.add_argument("--agentless", action="store_true",
                    help="emit a SELF-CONTAINED batch script (podman + a shared-FS endpoint write, no boxy "
                         "on the compute node). Requires --accelerator/--image (hardware can't be detected "
@@ -2627,8 +2645,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true",
                    help="remove any cached copy and re-pull clean (fixes a partial/corrupt "
                         "download from an interrupted pull)")
+    p.add_argument("--proxy", default=None, metavar="URL",
+                   help="reach Hugging Face through this corporate proxy (e.g. http://proxy.site:80)")
+    p.add_argument("--ssh", default=None, metavar="USER@HOST",
+                   help="run the pull ON that cluster's login node over SSH (where the network is)")
     p.add_argument("--dryrun", action="store_true")
-    p.set_defaults(func=cmd_pull)
+    p.set_defaults(func=cmd_pull, location=None)
 
     p = sub.add_parser("build", help="build/convert the image for the location's runtime (OCI->SIF)")
     _add_common(p)

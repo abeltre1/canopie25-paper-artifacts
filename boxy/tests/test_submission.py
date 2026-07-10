@@ -3,6 +3,7 @@ Drives the full login-side state machine against a fake scheduler; the same
 flow runs live against real Slurm in the E2E environment (see RUNBOOK §0)."""
 
 import json
+import os
 
 import pytest
 
@@ -246,6 +247,39 @@ def test_no_proxy_configured_means_no_env_prefix(gguf, jobs_dir, monkeypatch, ca
     rc = main(["serve", str(gguf), "--scheduler", "slurm", "--gpus", "1", "--dryrun"])
     out = capsys.readouterr().out
     assert rc == 0 and "exec env " not in out                        # no proxy -> plain exec
+
+
+def test_apply_proxy_env_exports_into_process(monkeypatch):
+    """`_apply_proxy_env` exports --proxy into THIS process so the IN-PROCESS model
+    pull (local/baremetal serve + standalone `boxy pull`) egresses through the
+    corporate proxy — the slurm/flux compute-node pull is already covered by the
+    _proxy_prefix env wrapper (test_proxy_flag_injected_into_batch_job)."""
+    from types import SimpleNamespace
+
+    from boxy import cli
+    for v in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1,.sandia.gov")
+    cli._apply_proxy_env(SimpleNamespace(proxy="http://proxy.sandia.gov:80"))
+    assert os.environ["HTTPS_PROXY"] == os.environ["https_proxy"] == "http://proxy.sandia.gov:80"
+    assert os.environ["HTTP_PROXY"] == "http://proxy.sandia.gov:80"
+    assert os.environ["NO_PROXY"] == "localhost,127.0.0.1,.sandia.gov"   # preserved
+    # no --proxy -> no mutation
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    cli._apply_proxy_env(SimpleNamespace(proxy=None))
+    assert "HTTPS_PROXY" not in os.environ
+
+
+def test_pull_proxy_applies_before_download(monkeypatch, tmp_path):
+    import boxy.ramalama_shim as rs
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
+    for v in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+        monkeypatch.delenv(v, raising=False)
+    seen = {}
+    monkeypatch.setattr(rs, "pull_model",
+                        lambda uri, **kw: seen.update(p=os.environ.get("HTTPS_PROXY")) or "/store/m.gguf")
+    rc = main(["pull", "hf://org/model.gguf", "--proxy", "http://proxy.sandia.gov:80"])
+    assert rc == 0 and seen.get("p") == "http://proxy.sandia.gov:80"
 
 
 def test_serve_scheduler_without_binary_guides_to_ssh(gguf, jobs_dir, monkeypatch, capsys):
