@@ -1,0 +1,8 @@
+apiVersion: v2
+name: chart-gateway
+description: boxy OpenSSH gateway prerequisites on OpenShift — the everyone-URL ingress behind `boxy open --share --exposer gateway`, using only OpenSSH (no third-party tunnel binary).
+type: application
+version: 0.0.1
+appVersion: "1"
+maintainers:
+  - name: boxy

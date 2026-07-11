@@ -285,8 +285,9 @@ def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False,
                               f"(llama.cpp serves a web UI there; vLLM exposes only /v1)")
                     if share:
                         try:
-                            from boxy.exposers import get_exposer
-                            surl, snote = get_exposer(exposer_name).expose(share, lport)
+                            from boxy.exposers import ShareContext, get_exposer
+                            ctx = ShareContext(ssh_host=host, node=node, remote_port=port)
+                            surl, snote = get_exposer(exposer_name).expose(share, lport, ctx)
                             print(f"### SHARE   {surl}   (browser UI: {surl[:-2]})")
                             if snote:
                                 print(f"###   {snote}")

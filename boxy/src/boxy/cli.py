@@ -1701,6 +1701,8 @@ def cmd_generate(args: argparse.Namespace) -> int:
         return _generate_flux_mcp(args)
     if args.format == "relay":
         return _generate_relay(args)
+    if args.format == "gateway":
+        return _generate_gateway(args)
     if not args.box or not args.location:
         print(f"boxy generate {args.format}: --box and --location are required", file=sys.stderr)
         return 2
@@ -1748,6 +1750,29 @@ def _generate_relay(args: argparse.Namespace) -> int:
     text = relay.emit_relay_manifest(args.host, args.namespace or relay.DEFAULT_NAMESPACE,
                                      image=args.image or relay.RELAY_IMAGE,
                                      auth=args.auth, key_seed=args.key_seed)
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(text)
+        print(f"wrote {args.output}")
+    else:
+        print(text, end="")
+    return 0
+
+
+def _generate_gateway(args: argparse.Namespace) -> int:
+    """Emit the ONE-TIME OpenSSH gateway prerequisites for OpenShift (the key
+    Secret placeholder + egress NetworkPolicy + the image-build / authorized_keys
+    steps in the header). Per-share Deployment/Service/Route are created at share
+    time by the gateway exposer — no persistent server to deploy."""
+    from boxy.exposers import gateway
+
+    if not args.login:
+        print("boxy generate gateway: --login is required (the pod's ssh target, "
+              "e.g. boxy-svc@hops.sandia.gov)", file=sys.stderr)
+        return 2
+    text = gateway.emit_setup_manifest(args.login, namespace=args.namespace or gateway.DEFAULT_NAMESPACE,
+                                       secret=args.secret or gateway.DEFAULT_SECRET,
+                                       image=args.image or gateway.DEFAULT_IMAGE)
     if args.output:
         with open(args.output, "w") as f:
             f.write(text)
@@ -1870,7 +1895,10 @@ def cmd_unshare(args: argparse.Namespace) -> int:
     if not record:
         print(f"boxy: no share named {args.alias!r} (see `boxy list`)", file=sys.stderr)
         return 1
-    get_exposer(getattr(args, "exposer", None) or "relay").unexpose(args.alias)
+    # the record knows which exposer created it; an explicit --exposer overrides
+    # (legacy records predate the field and default to relay).
+    exposer = getattr(args, "exposer", None) or record.get("exposer") or "relay"
+    get_exposer(exposer).unexpose(args.alias)
     print(f"unshared {args.alias}  ({record['url']} is gone)")
     return 0
 
@@ -1962,12 +1990,13 @@ def cmd_list(args: argparse.Namespace) -> int:
                   "shared dir, or from legacy records.)")
     shares = jobs.list_shares()
     if shares:
-        from boxy.exposers import relay as relay_exposer
-        print("shares (everyone-URLs via the OpenShift relay):")
+        from boxy.exposers import get_exposer
+        print("shares (everyone-URLs on OpenShift):")
         for s in shares:
-            state = ("LIVE" if relay_exposer.share_is_live(s)
-                     else "DEAD (relay client gone — rerun with --share, or boxy unshare)")
-            print(f"  {s['alias']}  {s['url']}/v1  {state}")
+            exposer = s.get("exposer", "relay")
+            live = get_exposer(exposer).is_live(s)
+            state = "LIVE" if live else "DEAD (rerun with --share, or boxy unshare)"
+            print(f"  {s['alias']}  {s['url']}/v1  [{exposer}]  {state}")
     location = Location.from_toml(args.location) if args.location else None
     try:
         runtime = args.runtime or _container_runtime(location)
@@ -2625,10 +2654,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--route", default=None, metavar="NAME",
                    help="with --ssh: print a friendly http://NAME.localhost:PORT/ tunnel URL (no DNS)")
     p.add_argument("--share", default=None, metavar="NAME",
-                   help="with --ssh: publish the tunnel as https://NAME-boxy.apps.<cluster>/ via the "
-                        "OpenShift relay (everyone-URL, zero teammate setup); stop: boxy unshare NAME")
-    p.add_argument("--exposer", choices=["relay", "hosts"], default="relay",
-                   help="which pluggable exposer --share uses (default relay)")
+                   help="with --ssh: publish the tunnel as https://NAME-boxy.apps.<cluster>/ on OpenShift "
+                        "(everyone-URL, zero teammate setup; --exposer picks how); stop: boxy unshare NAME")
+    p.add_argument("--exposer", choices=["gateway", "relay", "hosts"], default="gateway",
+                   help="which pluggable exposer --share uses (default gateway: OpenSSH-only pod, "
+                        "no third-party tunnel binary; relay: chisel; hosts: local /etc/hosts)")
     p.add_argument("--dryrun", action="store_true", help="print the command instead of executing it")
     p.add_argument("args", nargs="*", help="extra engine args (put them after --)")
     p.set_defaults(func=cmd_serve)
@@ -2658,12 +2688,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("generate", help="transpile box+location to another orchestrator: "
                                         "sky (SkyPilot YAML), slurm|flux (boxy-free job script), "
-                                        "flux-mcp (persistent OpenShift MCP service), or "
-                                        "relay (the everyone-URL share ingress on OpenShift)")
-    p.add_argument("format", choices=["sky", "slurm", "flux", "sbatch", "flux-mcp", "relay"],
+                                        "flux-mcp (persistent OpenShift MCP service), gateway "
+                                        "(OpenSSH everyone-URL setup), or relay (chisel share ingress)")
+    p.add_argument("format", choices=["sky", "slurm", "flux", "sbatch", "flux-mcp", "gateway", "relay"],
                    help="sky = SkyPilot task YAML; slurm|flux = agentless batch script (no boxy on the "
                         "cluster); flux-mcp = the Flux MCP server as a persistent OpenShift service; "
-                        "relay = the chisel relay behind `boxy open --share` (deploy once)")
+                        "gateway = one-time OpenSSH share prerequisites (Secret + NetworkPolicy, no "
+                        "tunnel binary); relay = the chisel relay behind `boxy open --share` (deploy once)")
     p.add_argument("--box", default=None)
     p.add_argument("--location", default=None)
     p.add_argument("--port", type=int, default=None)
@@ -2672,6 +2703,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default=None,
                    help="flux-mcp/relay: the OpenShift Route hostname (e.g. relay-boxy.apps.<cluster>)")
     p.add_argument("--flux-uri", default="", help="flux-mcp: FLUX_URI for reaching a remote Flux instance")
+    p.add_argument("--login", default=None,
+                   help="gateway: the pod's ssh target for the login node (e.g. boxy-svc@hops.sandia.gov)")
+    p.add_argument("--secret", default=None, help="gateway: name of the login-node key Secret "
+                                                  "(default boxy-gw-ssh)")
     p.add_argument("--auth", default="", help="relay: user:pass tunnel credential (else a REPLACE_ME "
                                               "placeholder + `oc create secret` hint)")
     p.add_argument("--key-seed", default="", help="relay: seed keeping the chisel host key stable across "
@@ -2737,8 +2772,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="publish the tunnel as https://NAME-boxy.apps.<cluster>/ via the OpenShift "
                         "relay — reachable by ANYONE on the corporate network, teammates install "
                         "nothing (deploy the relay once: boxy generate relay). Stop: boxy unshare NAME")
-    p.add_argument("--exposer", choices=["relay", "hosts"], default="relay",
-                   help="which pluggable exposer --share uses (default relay)")
+    p.add_argument("--exposer", choices=["gateway", "relay", "hosts"], default="gateway",
+                   help="which pluggable exposer --share uses (default gateway: OpenSSH-only pod, "
+                        "no third-party tunnel binary; relay: chisel; hosts: local /etc/hosts)")
     p.add_argument("--ssh", default=None, metavar="USER@HOST",
                    help="tunnel from that cluster's login node back to this machine over SSH")
     p.set_defaults(func=cmd_open, location=None)
@@ -2810,7 +2846,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("unshare", help="tear down an everyone-URL share: kill the relay client "
                                        "and delete its Route/Service (see `boxy list`)")
     p.add_argument("alias", help="the --share name to tear down")
-    p.add_argument("--exposer", choices=["relay", "hosts"], default="relay")
+    p.add_argument("--exposer", choices=["gateway", "relay", "hosts"], default=None,
+                   help="override the exposer used to tear down (default: whatever created the share)")
     p.set_defaults(func=cmd_unshare, location=None)
 
     p = sub.add_parser("router",

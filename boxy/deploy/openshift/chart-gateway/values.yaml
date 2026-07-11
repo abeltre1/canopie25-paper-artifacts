@@ -1,0 +1,41 @@
+# chart-gateway — the boxy OpenSSH share prerequisites, deploy ONCE (admin):
+#
+#   # 1) build the ssh-client image (native pull, no Docker Hub) into the internal registry
+#   oc new-project boxy-gw; oc registry login
+#   podman build -t image-registry.openshift-image-registry.svc:5000/boxy-gw/boxy-gw:1 \
+#     -f Dockerfile.gateway .
+#   podman push image-registry.openshift-image-registry.svc:5000/boxy-gw/boxy-gw:1
+#
+#   # 2) install this chart (Secret + egress NetworkPolicy)
+#   ssh-keygen -t ed25519 -N '' -f ./gw_key -C boxy-gw
+#   helm install boxy-gw ./chart-gateway --namespace boxy-gw --create-namespace \
+#     --set loginHost=hops.sandia.gov \
+#     --set-file idEd25519=./gw_key \
+#     --set-file knownHosts=<(ssh-keyscan hops.sandia.gov)
+#
+#   # 3) authorize the key on the login node, locked to ONE forward, OTP-exempt:
+#   #   command="",restrict,permitopen="hops*:8090" ssh-ed25519 <gw_key.pub>
+#
+# `boxy generate gateway --login boxy-svc@hops.sandia.gov | oc apply -f -` is the
+# equivalent no-Helm path (emits the Secret placeholder + NetworkPolicy + these steps).
+#
+# Then, per model — nothing to pre-deploy, boxy stamps the Deployment/Service/Route:
+#   boxy serve MODEL --ssh you@hops --share nemotron --exposer gateway
+#   -> https://nemotron-boxy.apps.<cluster>/v1  (teammates need NOTHING installed)
+
+# The service account the pod SSHes to the login node as (user@host). The host
+# is echoed into the egress-policy documentation; auth is the mounted key below.
+loginHost: ""
+
+# The login-node key the pod uses (private half) + the pinned host key. Prefer
+# --set-file at install over committing these.
+idEd25519: ""
+knownHosts: ""
+
+secretName: boxy-gw-ssh
+
+networkPolicy:
+  # restrict pod egress to the login node's SSH port (defense in depth; harmless
+  # if the namespace has no default-deny).
+  enabled: true
+  port: 22

@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.secretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: boxy-gw
+type: Opaque
+stringData:
+  id_ed25519: {{ required "idEd25519 is required (--set-file idEd25519=./gw_key)" .Values.idEd25519 | quote }}
+  known_hosts: {{ required "knownHosts is required (--set-file knownHosts=<(ssh-keyscan <login>))" .Values.knownHosts | quote }}
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: boxy-gw-egress-login
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: boxy-gw
+spec:
+  # applies to every per-share gateway pod (they all carry app: boxy-gw)
+  podSelector:
+    matchLabels:
+      app: boxy-gw
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.port }}
+{{- end }}
