@@ -28,7 +28,7 @@ import subprocess
 import sys
 import time
 
-from boxy.exposers.base import ExposeError, Exposer, ShareContext
+from boxy.exposers.base import ExposeError, Exposer
 
 RELAY_IMAGE = "docker.io/jpillora/chisel:1.10"
 RELAY_PORT_RANGE = range(31000, 32000)  # per-share reverse ports; ACL-able as R:31[0-9]{3}
@@ -304,10 +304,7 @@ class RelayExposer(Exposer):
 
     # -- the exposer contract --------------------------------------------------
 
-    def is_live(self, record: dict) -> bool:
-        return share_is_live(record)
-
-    def expose(self, alias: str, lport: int, ctx: ShareContext | None = None) -> tuple[str, str]:
+    def expose(self, alias: str, lport: int) -> tuple[str, str]:
         from boxy import jobs
 
         if not self.available():
@@ -356,7 +353,7 @@ class RelayExposer(Exposer):
                 _terminate(pid)
                 raise ExposeError(f"share name {alias!r} is taken on this cluster — pick another --share name")
 
-        jobs.write_share(alias, {"alias": alias, "exposer": "relay", "url": url, "host": host,
+        jobs.write_share(alias, {"alias": alias, "url": url, "host": host,
                                  "relay_port": relay_port, "lport": lport,
                                  "namespace": ns, "pid": pid,
                                  "chisel_argv": self._client_argv(relay_url, relay_port, lport),

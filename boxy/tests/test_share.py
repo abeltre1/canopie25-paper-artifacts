@@ -218,7 +218,7 @@ def test_open_share_prints_everyone_url(share_env, monkeypatch, capfd):
     monkeypatch.setenv(remote.ENV_REMOTE_CMD,
                        'echo "### READY  http://eldo1290:8090/v1   (model: m)" ; :')
     monkeypatch.setattr(remote, "_local_port_free", lambda p: True)
-    rc = main(["open", "m", "--ssh", "user@login1", "--share", "nemo", "--exposer", "relay"])
+    rc = main(["open", "m", "--ssh", "user@login1", "--share", "nemo"])
     out = capfd.readouterr().out
     assert rc == 0
     assert "### LOCAL   http://127.0.0.1:8090/v1" in out
@@ -243,7 +243,7 @@ def test_open_share_degrades_when_relay_missing(share_env, monkeypatch, capfd):
                        'echo "### READY  http://eldo1290:8090/v1   (model: m)" ; :')
     monkeypatch.setattr(remote, "_local_port_free", lambda p: True)
     monkeypatch.setenv(relay_mod.ENV_CHISEL, "/nonexistent/chisel")
-    rc = main(["open", "m", "--ssh", "user@login1", "--share", "nemo", "--exposer", "relay"])
+    rc = main(["open", "m", "--ssh", "user@login1", "--share", "nemo"])
     cap = capfd.readouterr()
     assert rc == 0                                            # tunnel survives the failed share
     assert "### LOCAL   http://127.0.0.1:8090/v1" in cap.out
@@ -274,7 +274,7 @@ def test_list_shows_share_liveness(share_env, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "shares (everyone-URLs" in out
-    assert "nemo  https://nemo-boxy.apps.x.y/v1  [relay]  LIVE" in out
+    assert "nemo  https://nemo-boxy.apps.x.y/v1  LIVE" in out
     # kill the client -> DEAD with a next step
     os.kill(rec["pid"], 15)
     _wait_dead(rec["pid"])

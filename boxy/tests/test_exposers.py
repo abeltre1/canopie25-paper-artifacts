@@ -18,14 +18,13 @@ RELAY_URL = "https://relay-boxy.apps.goodall.sandia.gov"
 
 
 def test_registry_members_and_factory():
-    assert set(EXPOSERS) == {"gateway", "relay", "hosts"}
-    assert get_exposer("gateway").name == "gateway"
+    assert set(EXPOSERS) == {"relay", "hosts"}
     assert get_exposer("relay").name == "relay"
     assert get_exposer("hosts").name == "hosts"
 
 
 def test_registry_unknown_name_error_shape():
-    with pytest.raises(ValueError, match=r"unknown exposer 'nope' \(available: gateway, relay, hosts\)"):
+    with pytest.raises(ValueError, match=r"unknown exposer 'nope' \(available: relay, hosts\)"):
         get_exposer("nope")
 
 

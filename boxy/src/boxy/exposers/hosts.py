@@ -4,14 +4,14 @@ as the honest floor of the family: everything above it buys wider reach)."""
 
 from __future__ import annotations
 
-from boxy.exposers.base import Exposer, ShareContext
+from boxy.exposers.base import Exposer
 
 
 class HostsExposer(Exposer):
     name = "hosts"
     binary = ""  # nothing external — always available
 
-    def expose(self, alias: str, lport: int, ctx: ShareContext | None = None) -> tuple[str, str]:
+    def expose(self, alias: str, lport: int) -> tuple[str, str]:
         return (f"http://{alias}:{lport}/v1",
                 f"add '127.0.0.1  {alias}' to /etc/hosts on THIS machine "
                 f"(local-only; for a URL teammates can open use --exposer relay)")

@@ -168,10 +168,8 @@ def read_share(name: str) -> dict | None:
         data = json.loads(path.read_text())
     except ValueError:
         return None
-    # same shape-guard philosophy as read_endpoint: junk must not KeyError later.
-    # only the universal keys are required — exposer-specific fields (relay_port
-    # for relay, node/login for gateway) vary by the record's "exposer".
-    if isinstance(data, dict) and all(k in data for k in ("alias", "url")):
+    # same shape-guard philosophy as read_endpoint: junk must not KeyError later
+    if isinstance(data, dict) and all(k in data for k in ("alias", "url", "relay_port")):
         return data
     return None
 

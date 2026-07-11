@@ -226,72 +226,9 @@ needs RamaLama on the cluster; stage the model first.
 `--route NAME` gives you `http://NAME.localhost:PORT/` for a tunnel with zero
 setup — `.localhost` resolves to 127.0.0.1 in every browser on macOS + Linux (RFC
 6761), no `/etc/hosts`, no DNS server. See §4.5 for the full example. This resolves
-on *your* machine only; to hand teammates a URL, use `--share` (§0.994 default, §0.993 chisel).
+on *your* machine only; to hand teammates a URL, use `--share` (§0.993).
 
-### 0.994 Share with the TEAM — `--share --exposer gateway` (OpenSSH, no tunnel binary — DEFAULT)
-
-The **default** everyone-URL, with **no third-party tunnel binary** — built for a
-site where cybersecurity won't allow chisel (§0.993). It uses only **OpenSSH** (in
-a Red Hat UBI pod) plus native OpenShift Route/Service. A pod dials **outbound** to
-the HPC login node — the same front door your laptop uses — and forwards the model
-port; the laptop drops out of the data path, so the share survives the laptop
-sleeping or shutting down.
-
-Data path: teammate → HTTPS Route → Service → gateway pod → `ssh -L` → login node →
-compute node:port → the model. The URL rides the cluster's EXISTING `*.apps.<cluster>`
-wildcard DNS, so teammates need **nothing installed**.
-
-**Does it apply?** One gate: OpenShift nodes must be able to reach the login node on
-port 22 (`nc -vz hops.sandia.gov 22` from a goodall debug pod). If they can't, use a
-different exposer.
-
-**One-time cluster setup (admin):**
-```bash
-# 1) ssh-client image, native pull (no Docker Hub):
-oc new-project boxy-gw; oc registry login
-podman build -t image-registry.openshift-image-registry.svc:5000/boxy-gw/boxy-gw:1 \
-  -f deploy/openshift/chart-gateway/Dockerfile.gateway .
-podman push image-registry.openshift-image-registry.svc:5000/boxy-gw/boxy-gw:1
-# 2) the login-node key Secret + egress policy (Helm, or `boxy generate gateway ... | oc apply -f -`):
-ssh-keygen -t ed25519 -N '' -f ./gw_key -C boxy-gw
-helm install boxy-gw deploy/openshift/chart-gateway -n boxy-gw --create-namespace \
-  --set loginHost=hops.sandia.gov \
-  --set-file idEd25519=./gw_key --set-file knownHosts=<(ssh-keyscan hops.sandia.gov)
-```
-**One-time login-node setup (HPC admin):** add `gw_key.pub` to a functional account's
-`authorized_keys`, locked to one forward and OTP-exempt:
-```
-command="",restrict,permitopen="hops*:8090" ssh-ed25519 <gw_key.pub>
-```
-`restrict` = no shell/PTY/agent; `permitopen` = that one host:port only. This
-OTP-exempt service key is the single approval the design hinges on — the trade you
-put to cyber is "plain OpenSSH + one tightly-scoped forced-command key" instead of
-an unfamiliar tunnel binary.
-
-**Everyday — share a model (gateway is the default, so `--exposer` is optional):**
-```bash
-export BOXY_GW_APPS_DOMAIN=apps.goodall.sandia.gov     # the wildcard the URL rides
-export BOXY_GW_LOGIN=boxy-svc@hops.sandia.gov          # the pod's ssh target (service acct)
-boxy serve MODEL --scheduler slurm --ssh you@hops --share nemotron
-#   ### SHARE   https://nemotron-boxy.apps.goodall.sandia.gov/v1   (served from a pod; laptop can disconnect)
-boxy list                    # shows the share + [gateway] + LIVE/DEAD (via oc get deploy)
-boxy unshare nemotron        # deletes the Deployment/Service/Route on the cluster
-```
-Teammate, zero setup: `curl https://nemotron-boxy.apps.goodall.sandia.gov/v1/models`.
-
-**Config (env overrides, all optional except the two above):** `BOXY_GW_NAMESPACE`
-(default `boxy-gw`), `BOXY_GW_USER` (service user when `BOXY_GW_LOGIN` unset, default
-`boxy`), `BOXY_GW_IMAGE`, `BOXY_GW_SECRET`, `BOXY_OC` (oc binary). boxy uses your
-logged-in `oc` to create the objects; if `oc` fails it prints the manifest to apply
-by hand.
-
-**Security:** as with `--share` generally, the URL is reachable unauthenticated by
-anything on the corporate network (same trust model as sharing an `ssh -L`, wider).
-Lock a specific model with the engine's own `--api-key`. No credentials at rest on
-HPC; the only secret is the login-node key, which lives in a K8s Secret mounted
-read-only and never appears in any pod's argv.
-
-### 0.993 Share with the TEAM — `--share --exposer relay` (OpenShift chisel relay)
+### 0.993 Share with the TEAM — `--share` (OpenShift relay, zero teammate setup)
 
 Turn the laptop-only tunnel into a URL **anyone on the corporate network can open
 with nothing installed**. It rides the cluster's EXISTING wildcard DNS
