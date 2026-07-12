@@ -188,6 +188,129 @@ def test_expose_without_chisel_raises_install_hint(share_env, monkeypatch):
         RelayExposer().expose("nochisel", 8090)
 
 
+# ---- zero-install CONTAINER client mode (chisel in a container, nothing installed) --
+
+PODMAN_SHIM = r"""#!/bin/bash
+# fake podman/docker: logs argv; proves AUTH arrived via ENV (never argv); answers
+# `run -d` (a container id), `inspect` (State.Status), `logs`, and `rm`.
+echo "$*" >> "$PODMAN_LOG"
+case "$1" in
+  run)
+    [ -n "$AUTH" ] && echo "AUTH_ENV=$AUTH" >> "$PODMAN_LOG"   # credential came via env
+    echo "deadbeefcafe0123"                                    # container id, like `run -d`
+    ;;
+  inspect)
+    # bind-conflict fail-once: report exited the first time, running thereafter
+    if [ -n "$FAKE_PODMAN_FAIL_ONCE" ] && [ ! -f "$FAKE_PODMAN_FAIL_ONCE" ]; then
+      touch "$FAKE_PODMAN_FAIL_ONCE"; echo -n "exited"
+    else
+      echo -n "${FAKE_STATE:-running}"
+    fi
+    ;;
+  logs) echo -n "${FAKE_LOGS:-Connected (Latency 1ms)}" ;;
+  rm) ;;
+esac
+exit 0
+"""
+
+
+@pytest.fixture
+def podman_share_env(share_env, monkeypatch):
+    """share_env + a fake `podman` on PATH and NO host chisel — so auto mode runs
+    the chisel client in a CONTAINER (the zero-install path)."""
+    podman = share_env / "podman"
+    podman.write_text(PODMAN_SHIM)
+    podman.chmod(0o755)
+    (share_env / "podman.log").write_text("")
+    monkeypatch.setenv("PATH", f"{share_env}:{os.environ['PATH']}")  # shutil.which finds it
+    monkeypatch.setenv("PODMAN_LOG", str(share_env / "podman.log"))
+    monkeypatch.setenv(relay_mod.ENV_CHISEL, "/nonexistent/chisel")  # no host binary
+    return share_env
+
+
+def test_container_mode_full_lifecycle(podman_share_env):
+    from boxy import jobs
+
+    url, note = RelayExposer().expose("nemo", 8090)
+    assert url == "https://nemo-boxy.apps.x.y/v1"
+    log = (podman_share_env / "podman.log").read_text()
+    run_line = [ln for ln in log.splitlines() if ln.startswith("run ")][0]
+    # detached, per-alias name, host networking (Linux), AUTH BY NAME (not value)
+    assert "run -d --name boxy-chisel-nemo" in log
+    assert "--network=host" in run_line
+    assert "--env AUTH docker.io/jpillora/chisel:1.10 client" in run_line
+    assert "R:0.0.0.0:31" in run_line and ":127.0.0.1:8090" in run_line   # Linux host-loop
+    assert "boxy:pw" not in run_line                                       # credential never in argv
+    assert "AUTH_ENV=boxy:pw" in log                                       # it rode the env instead
+    # record is container-tracked, no pid, live via inspect
+    rec = jobs.read_share("nemo")
+    assert rec["client"] == "podman" and rec["container"] == "boxy-chisel-nemo"
+    assert rec["client_mode"] == "container" and "pid" not in rec
+    assert relay_mod.share_is_live(rec) is True
+    # teardown removes the container
+    RelayExposer().unexpose("nemo")
+    assert "rm -f boxy-chisel-nemo" in (podman_share_env / "podman.log").read_text()
+    assert jobs.read_share("nemo") is None
+
+
+def test_container_mode_darwin_uses_host_internal(podman_share_env, monkeypatch):
+    # macOS: the runtime is a Linux VM, so 127.0.0.1 is the VM — dial the host via
+    # host.containers.internal, and DON'T pass --network=host (unreachable there).
+    monkeypatch.setattr(relay_mod.sys, "platform", "darwin")
+    RelayExposer().expose("mac", 8090)
+    run_line = [ln for ln in (podman_share_env / "podman.log").read_text().splitlines()
+                if ln.startswith("run ")][0]
+    assert ":host.containers.internal:8090" in run_line
+    assert "--network=host" not in run_line
+    RelayExposer().unexpose("mac")
+
+
+def test_container_mode_mirrors_image_for_airgapped_site(podman_share_env, monkeypatch):
+    # Docker Hub blocked -> point images.relay at the internal mirror; the client
+    # container pulls from there too (one override mirrors server AND client).
+    mirror = "image-registry.openshift-image-registry.svc:5000/boxy-relay/chisel:1.10"
+    monkeypatch.setenv("BOXY_RELAY_IMAGE", mirror)
+    RelayExposer().expose("mir", 8090)
+    run_line = [ln for ln in (podman_share_env / "podman.log").read_text().splitlines()
+                if ln.startswith("run ")][0]
+    assert f"--env AUTH {mirror} client" in run_line
+    assert "docker.io/jpillora" not in run_line
+    RelayExposer().unexpose("mir")
+
+
+def test_container_mode_retries_on_bind_conflict(podman_share_env, monkeypatch):
+    monkeypatch.setenv("FAKE_PODMAN_FAIL_ONCE", str(podman_share_env / "pfail"))
+    monkeypatch.setenv("FAKE_LOGS", "server: bind: address already in use")
+    url, _ = RelayExposer().expose("retryc", 8090)
+    assert url.startswith("https://retryc-boxy.")
+    log = (podman_share_env / "podman.log").read_text()
+    assert log.count("run -d --name boxy-chisel-retryc") == 2   # failed bind, re-picked, succeeded
+    RelayExposer().unexpose("retryc")
+
+
+def test_container_mode_client_mode_config_forces_container(share_env, monkeypatch):
+    # relay.client_mode=container picks a container runtime EVEN WHEN a host chisel
+    # exists (share_env provides one) — the explicit opt-in.
+    podman = share_env / "podman"
+    podman.write_text(PODMAN_SHIM)
+    podman.chmod(0o755)
+    (share_env / "podman.log").write_text("")
+    monkeypatch.setenv("PATH", f"{share_env}:{os.environ['PATH']}")
+    monkeypatch.setenv("PODMAN_LOG", str(share_env / "podman.log"))
+    monkeypatch.setenv("BOXY_RELAY_CLIENT_MODE", "container")
+    RelayExposer().expose("forced", 8090)
+    assert "run -d --name boxy-chisel-forced" in (share_env / "podman.log").read_text()
+    RelayExposer().unexpose("forced")
+
+
+def test_client_mode_host_requires_binary(podman_share_env, monkeypatch):
+    # relay.client_mode=host with no chisel binary is a clear error, not a silent
+    # fall-through to a container.
+    monkeypatch.setenv("BOXY_RELAY_CLIENT_MODE", "host")
+    with pytest.raises(ExposeError, match="no chisel binary on PATH"):
+        RelayExposer().expose("hostonly", 8090)
+
+
 # ---- the full CLI path through the fake-ssh shim -----------------------------------
 
 SSH_SHIM = r"""#!/bin/bash
@@ -267,7 +390,11 @@ def test_open_share_degrades_when_relay_missing(share_env, monkeypatch, capfd):
     monkeypatch.setenv(remote.ENV_REMOTE_CMD,
                        'echo "### READY  http://eldo1290:8090/v1   (model: m)" ; :')
     monkeypatch.setattr(remote, "_local_port_free", lambda p: True)
+    # relay client TOTALLY unavailable: no chisel binary AND no container runtime
+    # (zero-install container mode is the fallback, so both must be gone to force
+    # the local-only degrade).
     monkeypatch.setenv(relay_mod.ENV_CHISEL, "/nonexistent/chisel")
+    monkeypatch.setattr(relay_mod, "_first_runtime", lambda: "")
     rc = main(["open", "m", "--ssh", "user@login1", "--share", "nemo"])
     cap = capfd.readouterr()
     assert rc == 0                                            # tunnel survives the failed share

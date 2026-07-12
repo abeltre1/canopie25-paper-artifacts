@@ -117,7 +117,8 @@ def test_cli_generate_relay(capsys):
     assert rc == 0
     assert "kind: Deployment" in out and "--reverse" in out and "oc apply -f -" in out
     assert "boxy:pw" in out                                # lands in the Secret stringData
-    assert "brew install chisel" in out                    # laptop-side hint in the header
+    assert "boxy open <inst> --ssh <login> --share <name>" in out   # laptop-side usage in the header
+    assert "ZERO install" in out                           # zero-install (containerized chisel) hint
 
 
 def test_cli_generate_relay_requires_host(capsys):

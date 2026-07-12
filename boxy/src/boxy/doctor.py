@@ -162,6 +162,41 @@ def _check_exited_containers(runtime: str | None = None) -> Result:
                   f"{runtime} rm $({runtime} ps -aq --filter label=boxy.box --filter status=exited)")
 
 
+def _check_relay() -> Result:
+    """Zero-install `--share` readiness (RUNBOOK §0.993 'deploy once, share
+    forever'): (1) can THIS host run the chisel client — a host binary OR a
+    container runtime — and (2) when oc is reachable, is the shared OpenShift relay
+    Route admitted? Both sides need nothing else installed."""
+    from boxy import config
+    from boxy.exposers import relay
+
+    mode = config.get_str("relay.client_mode")
+    have_chisel = shutil.which(relay.chisel_bin()) is not None
+    runtime = relay._first_runtime()
+    if runtime and mode != "host":
+        client = f"containerized chisel via {runtime} (zero install)"
+    elif have_chisel:
+        client = "host chisel binary"
+    elif runtime:  # mode == host but no binary — still, a runtime exists
+        client = f"containerized chisel via {runtime} (set relay.client_mode=container/auto)"
+    else:
+        return Result("share relay", WARN,
+                      "no chisel binary and no container runtime — `--share` can't run the client here",
+                      "install podman/docker (boxy runs chisel in a container) or `brew install chisel-tunnel`")
+
+    status, detail = relay.relay_admission()
+    if status == "ok":
+        return Result("share relay", OK, f"client: {client}; relay Route {detail}")
+    if status == "rejected":
+        return Result("share relay", FAIL, f"client: {client}; {detail}",
+                      "the relay host is taken or ingress rejected it — pick a free host and redeploy the relay")
+    if status == "missing":
+        return Result("share relay", WARN, f"client: {client}; {detail}",
+                      "deploy it ONCE per cluster: "
+                      "boxy generate relay --host relay-boxy.apps.<cluster> --auth boxy:<pw> | oc apply -f -")
+    return Result("share relay", OK, f"client: {client}; {detail}")
+
+
 def _check_podman_machine() -> Result | None:
     """macOS/Windows only: the podman VM's RAM is the usual cause of the
     'second instance killed the first' (exit 137). None on Linux (no VM)."""
@@ -302,6 +337,7 @@ def run_checks(net: bool = False) -> list[Result]:
         _check_hf_token(),
         _check_cluster_state(),
         _check_exited_containers(),
+        _check_relay(),
     ]
     machine = _check_podman_machine()
     if machine is not None:

@@ -241,16 +241,29 @@ that boxy dials from your laptop; a per-name Route points the public hostname at
 `hosts` member is a local-only /etc/hosts name. New exposers drop into that
 registry without touching the tunnel code.
 
-**One-time admin (deploy the relay once per cluster):**
+**Deploy once, share forever (one-time admin, once per cluster):**
 ```bash
 helm install boxy-relay deploy/openshift/chart-relay --namespace boxy-relay \
   --create-namespace --set host=relay-boxy.apps.<cluster> \
   --set auth="boxy:$(openssl rand -hex 16)" --set keySeed="$(openssl rand -hex 16)"
 # no-Helm equivalent:
 #   boxy generate relay --host relay-boxy.apps.<cluster> --auth boxy:<pw> | oc apply -f -
-brew install chisel-tunnel   # laptop, once — jpillora/chisel. NOT `brew install chisel`
-                             # (that's Facebook's LLDB tool). Installs the `chisel` binary.
-                             # (go install github.com/jpillora/chisel@latest works too)
+```
+After that single deploy, **every teammate needs nothing installed** — they open
+`https://<name>-boxy.apps.<cluster>/` in a browser or `curl` it. And the person
+sharing needs nothing installed either:
+
+**Zero install on the sharing side too — chisel runs in a container.** By default
+(`relay.client_mode = auto`) boxy runs the `chisel client` inside a **podman/
+docker/apptainer** container, so there is **no `brew install` on your Mac or the
+HPC login node** — a container runtime is all it takes. `boxy doctor` confirms
+readiness (`share relay: … client: containerized chisel via podman (zero install)`).
+```bash
+# optional: force a mode, or use a host binary instead of a container
+export BOXY_RELAY_CLIENT_MODE=container   # auto (default) | container | host
+# host mode only, if you prefer a binary:
+#   brew install chisel-tunnel  (jpillora/chisel — NOT `brew install chisel`, Facebook's LLDB tool;
+#   or: go install github.com/jpillora/chisel@latest)
 ```
 
 **Everyday — share a model:**
@@ -291,6 +304,12 @@ Secret via your logged-in `oc` (override `BOXY_RELAY_AUTH=user:pass`); the relay
 auto-discovers from the Route (override `BOXY_RELAY_URL`). If `oc` is unavailable,
 boxy prints the Service+Route YAML to apply by hand and keeps the tunnel up. Behind
 an explicit proxy / custom CA: `BOXY_CHISEL_ARGS="--proxy http://... --tls-ca <bundle>"`.
+In **container** client mode the credential is passed to the container by name
+(`--env AUTH`), never on the argv, so it never shows in `podman inspect`/`ps`. The
+client container image is `images.relay` (`BOXY_RELAY_IMAGE` / `[images].relay`) —
+the **same** setting as the relay server — so mirroring it once (the ImagePullBackOff
+fix above) repoints **both** the server pod and the laptop/login-node client, which
+is exactly what air-gapped sites need.
 
 **Security:** the relay credential gates who may CREATE tunnels, not who may USE the
 URL — anything on the corporate network reaches the model unauthenticated (same

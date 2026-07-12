@@ -272,8 +272,13 @@ selinux_relabel = "auto"    # add ':z' to bind mounts on SELinux-enforcing hosts
 ```
 
 Team sharing (the OpenShift relay) is off unless you enable it — set
-`BOXY_SHARE_ENABLED=1` (or `[share] enabled = true`) once the relay client is
-installed and approved at your site.
+`BOXY_SHARE_ENABLED=1` (or `[share] enabled = true`). **Zero install on both
+ends:** deploy the chisel relay to OpenShift once per cluster and teammates reach
+`https://<name>-boxy.apps.<cluster>/` with nothing installed; on the sharing side
+boxy runs the `chisel client` in a **container** by default (`relay.client_mode =
+auto` → `container` unless a host `chisel` binary is present), so no `brew install`
+on your Mac or the HPC login node — only a container runtime. Point `[images].relay`
+at a site mirror for air-gapped clusters. See `RUNBOOK.md` §0.993.
 
 ## Seen in action
 

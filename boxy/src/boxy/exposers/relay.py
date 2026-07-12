@@ -35,6 +35,15 @@ RELAY_PORT_RANGE = range(31000, 32000)  # per-share reverse ports; ACL-able as R
 RELAY_APP = "boxy-relay"                # Deployment/Service/Route/Secret name + selector
 SHARE_LABEL = "boxy.share"              # every per-alias object carries this for teardown
 
+# Zero-install client mode: run `chisel client` inside a container so nothing is
+# installed on the laptop/login node. podman/docker use a DETACHED named container
+# (conmon owns its lifecycle, independent of boxy); apptainer — which HPC sites
+# ship instead — shares the host network namespace by default, so it rides the
+# same detached-process path as a host chisel binary (pid-based liveness).
+CLIENT_CONTAINER = "podman", "docker"       # detached, name-tracked runtimes
+CLIENT_RUNTIMES = ("podman", "docker", "apptainer")  # autodetect preference order
+CLIENT_NAME_PREFIX = "boxy-chisel-"         # per-alias container name
+
 ENV_RELAY_URL = "BOXY_RELAY_URL"            # https://relay-boxy.apps.<cluster> (skip oc discovery)
 ENV_RELAY_NAMESPACE = "BOXY_RELAY_NAMESPACE"
 ENV_RELAY_AUTH = "BOXY_RELAY_AUTH"          # user:pass (skip oc secret fetch)
@@ -66,6 +75,69 @@ def relay_port_range() -> range:
     from boxy import config
 
     return range(config.get_int("relay.port_min"), config.get_int("relay.port_max"))
+
+
+# ---- zero-install client-in-a-container helpers ---------------------------------
+
+
+def _first_runtime() -> str:
+    """First container runtime on PATH, in preference order (podman > docker >
+    apptainer). "" when none is present. Cheap (no probe) — matches the family's
+    available() idiom; a broken runtime surfaces its real error when we run it."""
+    for rt in CLIENT_RUNTIMES:
+        if shutil.which(rt):
+            return rt
+    return ""
+
+
+def host_loopback(runtime: str) -> str:
+    """Where the container must dial to reach the laptop/login-node loopback that
+    `ssh -L` is listening on. Linux (podman/docker --network=host, and apptainer's
+    default shared netns): the container's 127.0.0.1 IS the host's, so 127.0.0.1.
+    macOS: the runtime is a Linux VM, so 127.0.0.1 is the VM — reach the real host
+    via the runtime's magic DNS name (host.docker.internal / host.containers.internal).
+    Same platform fix as backends/podman.network_args()."""
+    if sys.platform == "darwin" and runtime in CLIENT_CONTAINER:
+        return "host.docker.internal" if runtime == "docker" else "host.containers.internal"
+    return "127.0.0.1"
+
+
+def relay_image() -> str:
+    """The chisel image for the client container — the SAME image the OpenShift
+    relay server runs (config images.relay), so one override mirrors both. Resolved
+    through registries.py: set images.relay (BOXY_RELAY_IMAGE / [images].relay) to a
+    site mirror when Docker Hub is blocked, and air-gapped pulls just work."""
+    from boxy import config, registries
+
+    return registries.resolve_image(config.get("images.relay"))
+
+
+def _run_container(argv: list[str], *, timeout: float = 30, env: dict | None = None) -> tuple[int, str]:
+    """Run a one-shot container command (run -d / inspect / logs / rm), capturing
+    combined output. `env` (for the AUTH-by-name credential) rides the subprocess
+    env, never argv. Never raises — a missing/broken runtime returns (127, msg),
+    exactly like _oc()."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, str(e)
+
+
+def _container_status(runtime: str, name: str) -> str:
+    """The container's State.Status ('running'|'exited'|'created'|...); "" if the
+    container is gone or inspect failed."""
+    rc, out = _run_container([runtime, "inspect", "--format", "{{.State.Status}}", name], timeout=10)
+    return out.strip().lower() if rc == 0 else ""
+
+
+def _container_running(runtime: str, name: str) -> bool:
+    return _container_status(runtime, name) == "running"
+
+
+def _container_logs(runtime: str, name: str) -> str:
+    rc, out = _run_container([runtime, "logs", name], timeout=10)
+    return out if rc == 0 else ""
 
 
 # ---- pure helpers ---------------------------------------------------------------
@@ -185,9 +257,12 @@ spec:
             f'--from-literal=auth="boxy:$(openssl rand -hex 16)" '
             f'--from-literal=key-seed="$(openssl rand -hex 16)" --dry-run=client -o yaml | oc apply -f -\n')
     header = (f"# boxy relay (chisel server) on OpenShift — the everyone-URL ingress for boxy shares.\n"
+              f"# Deploy ONCE per cluster; teammates then reach shares at https://<name>-boxy.{host.split('.', 1)[-1] if '.' in host else 'apps.<cluster>'}/ with NOTHING installed.\n"
               f"# apply:  oc new-project {namespace} 2>/dev/null; "
               f"boxy generate relay --host {host} | oc apply -f -\n" + hint +
-              "# then on the laptop:  brew install chisel-tunnel;  boxy open <inst> --ssh <login> --share <name>\n")
+              "# then on the laptop/login node (ZERO install — chisel runs in a container):\n"
+              "#   boxy open <inst> --ssh <login> --share <name>\n"
+              "#   (needs only podman/docker/apptainer; set relay.client_mode=host to use a chisel binary)\n")
     return header + "\n---\n".join(docs) + "\n"
 
 
@@ -238,15 +313,70 @@ def _oc(args: list[str], *, stdin: str | None = None, timeout: float = 20) -> tu
         return 127, str(e)
 
 
+def relay_admission(namespace: str = "") -> tuple[str, str]:
+    """Doctor helper (read-only): is the shared relay Route admitted on this
+    cluster? Returns (status, detail) with status in {'ok', 'missing', 'rejected',
+    'no-oc', 'unknown'} — so `boxy doctor` can report 'deploy once, share forever'
+    readiness without a second oc-query implementation."""
+    from boxy import config
+
+    ns = namespace or config.get("relay.namespace")
+    if shutil.which(oc_bin()) is None:
+        return "no-oc", "oc not on PATH — relay server not checked from here"
+    rc, host = _oc(["get", "route", RELAY_APP, "-n", ns, "-o", "jsonpath={.spec.host}"])
+    if rc != 0 or not host:
+        return "missing", f"no {RELAY_APP!r} Route in namespace {ns!r}"
+    rc, admitted = _oc(["get", "route", RELAY_APP, "-n", ns, "-o",
+                        'jsonpath={.status.ingress[0].conditions[?(@.type=="Admitted")].status}'])
+    if admitted == "True":
+        return "ok", f"https://{host} admitted (ns {ns})"
+    if admitted == "False":
+        return "rejected", f"Route {RELAY_APP!r} host {host} NOT admitted (ns {ns})"
+    return "unknown", f"Route {RELAY_APP!r} present (host {host}); admission status unknown"
+
+
 class RelayExposer(Exposer):
     name = "relay"
     binary = "chisel"
 
     def available(self) -> bool:
-        # chisel_bin() honors BOXY_CHISEL; shutil.which resolves an absolute shim
-        # path (exists+executable) or a bare name on PATH — a non-existent override
-        # correctly reports unavailable.
-        return shutil.which(chisel_bin()) is not None
+        # Zero-install: `--share` works with EITHER a host chisel binary OR any
+        # container runtime (podman/docker/apptainer), since we can run the chisel
+        # client in a container. chisel_bin() honors BOXY_CHISEL; shutil.which
+        # resolves an absolute shim path or a bare name on PATH.
+        if shutil.which(chisel_bin()) is not None:
+            return True
+        return _first_runtime() != ""
+
+    def _resolve_client_mode(self) -> tuple[str, str]:
+        """(mode, launcher). mode: 'host' (a chisel binary, pid-tracked) |
+        'container' (podman/docker detached & name-tracked, or apptainer's shared-
+        netns process, pid-tracked). launcher is the concrete tool. Driven by
+        config relay.client_mode: host | container | auto (default). auto prefers a
+        host chisel (no image pull) and falls back to a container runtime."""
+        from boxy import config
+
+        want = config.get_str("relay.client_mode").strip().lower()
+        have_chisel = shutil.which(chisel_bin()) is not None
+        runtime = _first_runtime()
+        if want == "host":
+            if not have_chisel:
+                raise ExposeError(
+                    "relay.client_mode=host but no chisel binary on PATH "
+                    "(install chisel-tunnel, or use relay.client_mode=container/auto)")
+            return "host", "chisel"
+        if want == "container":
+            if not runtime:
+                raise ExposeError(
+                    "relay.client_mode=container but no container runtime found "
+                    f"(looked for {', '.join(CLIENT_RUNTIMES)})")
+            return "container", runtime
+        # auto
+        if have_chisel:
+            return "host", "chisel"
+        if runtime:
+            return "container", runtime
+        raise ExposeError(_no_client_hint())
 
     # -- config resolution ---------------------------------------------------
 
@@ -290,20 +420,69 @@ class RelayExposer(Exposer):
 
     # -- chisel client lifecycle ----------------------------------------------
 
+    def _reverse_spec(self, relay_port: int, loop: str, lport: int) -> str:
+        # relay server binds relay_port and forwards back to <loop>:<lport> as the
+        # CLIENT sees it — the laptop/login-node loopback where ssh -L listens.
+        return f"R:0.0.0.0:{relay_port}:{loop}:{lport}"
+
     def _client_argv(self, relay_url: str, relay_port: int, lport: int) -> list[str]:
+        """Host chisel BINARY argv. The binary runs directly on the host, so its
+        loopback IS the ssh -L endpoint (127.0.0.1)."""
         extra = shlex.split(os.environ.get(ENV_CHISEL_ARGS, ""))
         return [chisel_bin(), "client", "--keepalive", "25s", "--max-retry-count", "-1",
-                *extra, relay_url, f"R:0.0.0.0:{relay_port}:127.0.0.1:{lport}"]
+                *extra, relay_url, self._reverse_spec(relay_port, "127.0.0.1", lport)]
 
-    def _start_client(self, relay_url: str, cred: str, relay_port: int, lport: int,
-                      log_path) -> int:
-        """Start the detached chisel client; return its pid. Raises ExposeError
-        on an early bind failure (caller re-picks the port). The credential
-        travels as the subprocess env AUTH — never argv, never disk."""
+    def _container_argv(self, runtime: str, image: str, cname: str,
+                        relay_url: str, relay_port: int, lport: int) -> list[str]:
+        """Detached chisel CLIENT container (podman/docker) — zero host install.
+        --network=host on Linux so the container's loopback is the host's (where
+        ssh -L listens); on macOS the runtime is a VM, so no --network=host and the
+        reverse spec dials host.*.internal instead. AUTH is passed BY NAME
+        (`--env AUTH`) so the credential rides the process env, never argv (so it
+        never shows in `podman inspect`/`ps`). No --rm: an early-exiting container
+        must survive long enough to read its logs (bind-conflict detection)."""
+        extra = shlex.split(os.environ.get(ENV_CHISEL_ARGS, ""))
+        net: list[str] = [] if sys.platform == "darwin" else ["--network=host"]
+        spec = self._reverse_spec(relay_port, host_loopback(runtime), lport)
+        return [runtime, "run", "-d", "--name", cname, *net, "--env", "AUTH",
+                image, "client", "--keepalive", "25s", "--max-retry-count", "-1",
+                *extra, relay_url, spec]
+
+    def _apptainer_argv(self, image: str, relay_url: str, relay_port: int, lport: int) -> list[str]:
+        """chisel client via apptainer (what HPC sites ship). apptainer shares the
+        host network namespace by default, so 127.0.0.1 reaches ssh -L; it runs the
+        OCI image directly (docker://…). AUTH rides APPTAINERENV_AUTH (env, not argv)."""
+        extra = shlex.split(os.environ.get(ENV_CHISEL_ARGS, ""))
+        ref = image if "://" in image else f"docker://{image}"
+        return ["apptainer", "run", ref, "client", "--keepalive", "25s",
+                "--max-retry-count", "-1", *extra, relay_url,
+                self._reverse_spec(relay_port, host_loopback("apptainer"), lport)]
+
+    def _launch_client(self, launcher: str, relay_url: str, cred: str, relay_port: int,
+                       lport: int, log_path, alias: str) -> dict:
+        """Start the relay client via `launcher` and return the share-record fields
+        that describe it: name-tracked for podman/docker (a detached container),
+        pid-tracked for host chisel / apptainer (a detached process). The
+        credential rides the child's env (AUTH / APPTAINERENV_AUTH), never argv.
+        Raises _BindConflict when the relay reverse port is taken (caller re-picks)."""
+        if launcher in CLIENT_CONTAINER:
+            image = relay_image()
+            cname = CLIENT_NAME_PREFIX + alias
+            self._start_client_container(launcher, image, cname, cred, relay_url, relay_port, lport)
+            return {"client": launcher, "container": cname, "image": image}
+        if launcher == "apptainer":
+            argv = self._apptainer_argv(relay_image(), relay_url, relay_port, lport)
+            pid = self._start_client_process(argv, {**os.environ, "APPTAINERENV_AUTH": cred}, log_path)
+            return {"client": "apptainer", "pid": pid, "chisel_argv": argv}
         argv = self._client_argv(relay_url, relay_port, lport)
+        pid = self._start_client_process(argv, {**os.environ, "AUTH": cred}, log_path)
+        return {"client": "chisel", "pid": pid, "chisel_argv": argv}
+
+    def _start_client_process(self, argv: list[str], env: dict, log_path) -> int:
+        """Start a detached client PROCESS (host chisel binary or apptainer); return
+        its pid. Raises _BindConflict / ExposeError on an early exit."""
         with open(log_path, "ab") as log:
-            proc = subprocess.Popen(argv, env={**os.environ, "AUTH": cred},
-                                    stdout=log, stderr=subprocess.STDOUT,
+            proc = subprocess.Popen(argv, env=env, stdout=log, stderr=subprocess.STDOUT,
                                     start_new_session=True)  # outlives boxy, like ControlPersist
         deadline = time.monotonic() + BIND_GRACE
         while time.monotonic() < deadline:
@@ -315,41 +494,62 @@ class RelayExposer(Exposer):
             time.sleep(0.1)
         return proc.pid
 
+    def _start_client_container(self, runtime: str, image: str, cname: str, cred: str,
+                                relay_url: str, relay_port: int, lport: int) -> str:
+        """Start the detached chisel client CONTAINER; return its name. Pre-cleans a
+        stale same-named container (idempotent restart), then watches briefly for an
+        early exit — a taken relay reverse port -> _BindConflict (caller re-picks)."""
+        _run_container([runtime, "rm", "-f", cname])  # idempotent restart
+        argv = self._container_argv(runtime, image, cname, relay_url, relay_port, lport)
+        rc, out = _run_container(argv, env={**os.environ, "AUTH": cred})
+        if rc != 0:
+            raise ExposeError(f"could not start the chisel client container "
+                              f"(runtime {runtime}, image {image}): {out[-300:]}")
+        deadline = time.monotonic() + BIND_GRACE
+        while time.monotonic() < deadline:
+            if _container_status(runtime, cname) in ("exited", "dead"):
+                logs = _container_logs(runtime, cname)
+                _run_container([runtime, "rm", "-f", cname])
+                if "address already in use" in logs:
+                    raise _BindConflict()
+                raise ExposeError(f"chisel client container exited: {(logs or out)[-300:]}")
+            time.sleep(0.1)
+        return cname
+
     # -- the exposer contract --------------------------------------------------
 
     def expose(self, alias: str, lport: int) -> tuple[str, str]:
         from boxy import jobs
 
         if not self.available():
-            raise ExposeError("chisel not installed — `brew install chisel-tunnel` "
-                              "(NOT `brew install chisel`, which is Facebook's LLDB tool; "
-                              "or: go install github.com/jpillora/chisel@latest)")
+            raise ExposeError(_no_client_hint())
+        mode, launcher = self._resolve_client_mode()
         relay_url = self._relay_url()
         host = share_host(alias, apps_domain_from_url(relay_url))
         url = f"https://{host}"
         ns = self._namespace()
 
         old = jobs.read_share(alias)
-        if old and _pid_is_our_chisel(old.get("pid"), old.get("relay_port")):
+        if old and share_is_live(old):
             if old.get("lport") == lport:
                 return f"{url}/v1", "already shared (reusing the live relay client)"
-            _terminate(old["pid"])  # tunnel moved ports: re-expose, SAME public URL
+            _stop_client(old)  # tunnel moved ports: re-expose, SAME public URL
         relay_port = old["relay_port"] if old else None
 
         cred = self._credential()
         log_path = jobs.share_log_path(alias)
         taken = self._taken_ports() if relay_port is None else set()
-        pid = None
+        client: dict | None = None
         for _ in range(3):
             port = relay_port if relay_port is not None else pick_relay_port(taken)
             try:
-                pid = self._start_client(relay_url, cred, port, lport, log_path)
+                client = self._launch_client(launcher, relay_url, cred, port, lport, log_path, alias)
                 relay_port = port
                 break
             except _BindConflict:
                 taken.add(port)
                 relay_port = None
-        if pid is None:
+        if client is None:
             raise ExposeError("could not bind a relay port after 3 attempts")
 
         yaml_text = emit_share_manifest(alias, host, relay_port, ns)
@@ -363,14 +563,14 @@ class RelayExposer(Exposer):
             admitted = self._await_admission(alias, ns)
             if admitted is False:
                 _oc(["delete", "route,svc", "-n", ns, "-l", f"{SHARE_LABEL}={alias}"])
-                _terminate(pid)
+                _stop_client(client)
                 raise ExposeError(f"share name {alias!r} is taken on this cluster — pick another --share name")
 
-        jobs.write_share(alias, {"alias": alias, "url": url, "host": host,
-                                 "relay_port": relay_port, "lport": lport,
-                                 "namespace": ns, "pid": pid,
-                                 "chisel_argv": self._client_argv(relay_url, relay_port, lport),
-                                 "created": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        record = {"alias": alias, "url": url, "host": host,
+                  "relay_port": relay_port, "lport": lport,
+                  "namespace": ns, "client_mode": mode,
+                  "created": time.strftime("%Y-%m-%dT%H:%M:%S"), **client}
+        jobs.write_share(alias, record)
         return f"{url}/v1", note
 
     def _await_admission(self, alias: str, ns: str) -> bool | None:
@@ -394,9 +594,7 @@ class RelayExposer(Exposer):
         record = jobs.read_share(alias)
         if not record:
             return
-        pid = record.get("pid")
-        if _pid_is_our_chisel(pid, record.get("relay_port")):
-            _terminate(pid)
+        _stop_client(record)  # rm -f the container, or SIGTERM the process group
         ns = record.get("namespace", self._namespace())
         rc, out = _oc(["delete", "route,svc", "-n", ns, "-l", f"{SHARE_LABEL}={alias}"])
         if rc != 0:
@@ -420,8 +618,36 @@ def _tail(path, nbytes: int = 2000) -> str:
 
 
 def share_is_live(record: dict) -> bool:
-    """Is the share's detached chisel client still running? (For `boxy list`.)"""
+    """Is the share's detached relay client still running? (For `boxy list`.)
+    Container-tracked shares (podman/docker) check the container's state; process-
+    tracked shares (host chisel binary / apptainer) check the pid."""
+    cname = record.get("container")
+    if cname:
+        return _container_running(record.get("client", "podman"), cname)
     return _pid_is_our_chisel(record.get("pid"), record.get("relay_port"))
+
+
+def _stop_client(record: dict) -> None:
+    """Stop a share's relay client — a detached CONTAINER (`<rt> rm -f <name>`) or a
+    detached PROCESS (SIGTERM the group, PID-reuse-guarded). Idempotent; safe on a
+    partial record and on either client mode."""
+    cname = record.get("container")
+    if cname:
+        _run_container([record.get("client", "podman"), "rm", "-f", cname])
+        return
+    pid = record.get("pid")
+    if _pid_is_our_chisel(pid, record.get("relay_port")):
+        _terminate(pid)
+
+
+def _no_client_hint() -> str:
+    """One message covering BOTH zero-install (container) and binary install paths."""
+    return ("no way to run the relay client: no chisel binary on PATH and no container "
+            "runtime (podman/docker/apptainer). Easiest is ZERO install — install podman "
+            "(or docker) and boxy runs `chisel client` in a container for you "
+            "(relay.client_mode=auto). Or install the binary: `brew install chisel-tunnel` "
+            "(NOT `brew install chisel`, Facebook's LLDB tool; or "
+            "`go install github.com/jpillora/chisel@latest`).")
 
 
 def _pid_is_our_chisel(pid, relay_port) -> bool:

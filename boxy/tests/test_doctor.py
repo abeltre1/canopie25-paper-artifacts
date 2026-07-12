@@ -98,6 +98,51 @@ def test_doctor_runtime_none_is_fail(monkeypatch):
     assert r.status == doctor.FAIL and "none of" in r.detail
 
 
+# ---- share-relay readiness (RUNBOOK §0.993 'deploy once, share forever') --------
+
+
+def test_relay_check_container_client_and_admitted_route_is_ok(monkeypatch):
+    from boxy.exposers import relay
+
+    monkeypatch.setattr(relay, "_first_runtime", lambda: "podman")     # a runtime, no host chisel
+    monkeypatch.setattr(doctor.shutil, "which", lambda b: None)
+    monkeypatch.setattr(relay, "relay_admission",
+                        lambda namespace="": ("ok", "https://relay-boxy.apps.x admitted (ns boxy-relay)"))
+    r = doctor._check_relay()
+    assert r.status == doctor.OK and "zero install" in r.detail and "admitted" in r.detail
+
+
+def test_relay_check_missing_route_warns_with_deploy_once_hint(monkeypatch):
+    from boxy.exposers import relay
+
+    monkeypatch.setattr(relay, "_first_runtime", lambda: "docker")
+    monkeypatch.setattr(doctor.shutil, "which", lambda b: None)
+    monkeypatch.setattr(relay, "relay_admission",
+                        lambda namespace="": ("missing", "no 'boxy-relay' Route in namespace 'boxy-relay'"))
+    r = doctor._check_relay()
+    assert r.status == doctor.WARN and "deploy it ONCE" in r.fix and "generate relay" in r.fix
+
+
+def test_relay_check_rejected_route_is_fail(monkeypatch):
+    from boxy.exposers import relay
+
+    monkeypatch.setattr(relay, "_first_runtime", lambda: "podman")
+    monkeypatch.setattr(doctor.shutil, "which", lambda b: None)
+    monkeypatch.setattr(relay, "relay_admission",
+                        lambda namespace="": ("rejected", "Route 'boxy-relay' host taken NOT admitted"))
+    r = doctor._check_relay()
+    assert r.status == doctor.FAIL and "redeploy" in r.fix
+
+
+def test_relay_check_no_client_at_all_warns(monkeypatch):
+    from boxy.exposers import relay
+
+    monkeypatch.setattr(relay, "_first_runtime", lambda: "")           # no runtime
+    monkeypatch.setattr(doctor.shutil, "which", lambda b: None)        # no chisel binary
+    r = doctor._check_relay()
+    assert r.status == doctor.WARN and "can't run the client here" in r.detail
+
+
 # ---- agentless remote audit (boxy doctor --ssh: NO boxy on the cluster) --------
 
 

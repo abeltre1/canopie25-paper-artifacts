@@ -99,6 +99,12 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
                  "the local tunnel and --route still work."),
     Setting("relay.namespace", "BOXY_RELAY_NAMESPACE", "boxy-relay",
             help="OpenShift namespace the share relay lives in."),
+    Setting("relay.client_mode", "BOXY_RELAY_CLIENT_MODE", "auto",
+            help="how the chisel relay CLIENT runs for `--share`: host (a chisel "
+                 "binary on PATH) | container (run it in podman/docker/apptainer — "
+                 "ZERO install on the laptop/login node) | auto (host if a chisel "
+                 "binary is present, else container). Container mode needs only a "
+                 "container runtime; point images.relay at a mirror for air-gapped sites."),
     Setting("relay.port_min", "BOXY_RELAY_PORT_MIN", 31000, int,
             help="low end of the per-share reverse-tunnel port range."),
     Setting("relay.port_max", "BOXY_RELAY_PORT_MAX", 32000, int,
