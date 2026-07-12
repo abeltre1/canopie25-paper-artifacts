@@ -1,0 +1,45 @@
+# TEMPLATE for a standalone boxy repository (after `git filter-repo
+# --subdirectory-filter boxy`). Move this to .github/workflows/ci.yml. It differs
+# from the monorepo boxy-ci.yml only in that boxy is the repo root: no `boxy/`
+# path prefixes, no `working-directory`, and no paths filter.
+name: ci
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e '.[ramalama,s3,test]' ruff
+      - run: ruff check src tests
+      - run: python -m pytest -q --ignore=tests/test_degraded_and_live.py
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - run: |
+          python -m pip install dist/*.whl
+          boxy --version && python -m boxy --version && boxy config >/dev/null && boxy examples >/dev/null
