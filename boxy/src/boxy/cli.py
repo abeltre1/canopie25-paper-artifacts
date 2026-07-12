@@ -17,7 +17,7 @@ import socket
 import subprocess
 import sys
 
-from boxy import ramalama_shim, version_string
+from boxy import config, ramalama_shim, version_string
 from boxy.backends import BACKENDS
 from boxy.box import TRANSPORT_SCHEMES, Box
 from boxy.location import ACCELERATORS, Location
@@ -818,6 +818,30 @@ def _apply_proxy_env(args) -> None:
         os.environ[key] = val
 
 
+def _apply_bind_host_env(args) -> None:
+    """Realize the flag>env>file>default layering for the bind host: a `--bind-host`
+    flag is exported as BOXY_BIND_HOST so every downstream config.get("network.
+    bind_host") (engines, router, foreground/agentless re-runs) sees it. No-op
+    without the flag."""
+    host = getattr(args, "bind_host", "") or ""
+    if host:
+        os.environ["BOXY_BIND_HOST"] = host
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """Show the effective config (value + provenance for each setting), or emit a
+    starter config.toml with --init. The debugging tool for 'why did my layered
+    value not take effect' — provenance is 'env <NAME>', 'file', or 'default'."""
+    if args.init:
+        print(config.render_template(), end="")
+        return 0
+    width = max(len(k) for k in config.SETTINGS)
+    for key in config.SETTINGS:
+        value, prov = config.source(key)
+        print(f"{key:<{width}}  = {value!r:<40}  ({prov})")
+    return 0
+
+
 def _require_scheduler_binary(binary: str, scheduler_name: str) -> None:
     """Fail early and CLEARLY when the scheduler's submit tool isn't on this
     host — otherwise subprocess raises a bare '[Errno 2] ... sbatch'. The usual
@@ -1216,7 +1240,8 @@ def _serve_replicas(args, scheduler_name: str, profile, replicas: int, router_po
         for slot, i in enumerate(members):
             ids = ",".join(str(g) for g in range(slot * r, slot * r + r))
             inner_cmds.append(proxy_prefix + _inner_serve_command(
-                args, args.model, replica_names[i], port=8000 + slot, visible_gpus=ids,
+                args, args.model, replica_names[i],
+                port=config.get_int("network.replica_port_base") + slot, visible_gpus=ids,
                 gpus=r, forward_geometry=False, extra_engine_args=tp_args))
         output_log = str(jobs.log_path(job_name, scheduler.output_token) if scheduler.output_token
                          else jobs.log_path(job_name))
@@ -1389,6 +1414,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if rc is not None:
         return rc
     _apply_proxy_env(args)  # --proxy reaches the login-node model pull, not just the job
+    _apply_bind_host_env(args)  # --bind-host wins over env/file/default for this serve
     if getattr(args, "share", None):
         raise UsageError("--share needs the laptop tunnel (`boxy serve ... --ssh user@login "
                          "--share NAME`) — it publishes the LOCAL end of the forward")
@@ -1621,6 +1647,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
     if rc is not None:
         return rc
     _apply_proxy_env(args)  # --proxy: reach HF through the corporate proxy
+    _apply_bind_host_env(args)  # --bind-host wins over env/file/default
     model = args.model
     if not model and args.box:
         box = Box.from_toml(args.box)
@@ -1746,7 +1773,7 @@ def _generate_relay(args: argparse.Namespace) -> int:
               "e.g. relay-boxy.apps.<cluster>)", file=sys.stderr)
         return 2
     text = relay.emit_relay_manifest(args.host, args.namespace or relay.DEFAULT_NAMESPACE,
-                                     image=args.image or relay.RELAY_IMAGE,
+                                     image=args.image or config.get("images.relay"),
                                      auth=args.auth, key_seed=args.key_seed)
     if args.output:
         with open(args.output, "w") as f:
@@ -1766,8 +1793,8 @@ def _generate_flux_mcp(args: argparse.Namespace) -> int:
               "e.g. flux-mcp.apps.<cluster>)", file=sys.stderr)
         return 2
     text = mcp.emit_flux_mcp_manifest(args.host, args.namespace or "flux-mcp",
-                                      image=args.image or mcp.FLUX_MCP_IMAGE,
-                                      flux_uri=args.flux_uri)
+                                      image=args.image or config.get("images.flux_mcp"),
+                                      flux_uri=args.flux_uri, port=config.get_int("mcp.flux_port"))
     if args.output:
         with open(args.output, "w") as f:
             f.write(text)
@@ -2519,6 +2546,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also probe each model registry with the current trust store")
     p.set_defaults(func=cmd_info)
 
+    p = sub.add_parser("config", help="show the effective configuration and where each "
+                                      "value comes from (flag > env > file > default)")
+    p.add_argument("--init", action="store_true",
+                   help="print a starter config.toml (all keys, commented) to stdout")
+    p.set_defaults(func=cmd_config, location=None)
+
     p = sub.add_parser("doctor", help="audit the environment for known field issues "
                                       "(proxy/CA/runtime/scheduler/OOM/…); OK/WARN/FAIL + a fix each")
     p.add_argument("--net", action="store_true",
@@ -2613,8 +2646,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--foreground", action="store_true",
                    help="stay attached with engine logs; with --scheduler, uses attached srun/flux-run "
                         "instead of submitting a batch job")
-    p.add_argument("--ready-timeout", type=float, default=180.0,
-                   help="seconds to wait for the endpoint once the server starts (default 180)")
+    p.add_argument("--ready-timeout", type=float, default=config.get_float("timeouts.readiness"),
+                   help="seconds to wait for the endpoint once the server starts "
+                        "(default from config timeouts.readiness / BOXY_READY_TIMEOUT)")
+    p.add_argument("--bind-host", default=None, metavar="ADDR",
+                   help="address the engine binds inside the container (default "
+                        "network.bind_host / BOXY_BIND_HOST, i.e. 0.0.0.0). Use 127.0.0.1 "
+                        "only for a purely local single-host serve.")
     p.add_argument("--endpoint-file", default=None, help=argparse.SUPPRESS)
     p.add_argument("--save-profile", default=None, metavar="PREFIX",
                    help="write the resolved config to PREFIX.box.toml + PREFIX.location.toml")

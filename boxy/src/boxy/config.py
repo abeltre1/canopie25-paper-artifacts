@@ -1,0 +1,304 @@
+"""Layered configuration — the single place a hardcoded default can be overridden.
+
+Resolution order (highest wins):
+
+    CLI flag  >  environment variable  >  config file  >  built-in default
+
+CLI flags stay in cli.py (`args.x or config.get("...")`); this module owns the
+lower three layers. The config file is TOML, discovered at (first hit wins):
+
+    1. $BOXY_CONFIG                       (explicit; a bad/missing file here is fatal)
+    2. $XDG_CONFIG_HOME/boxy/config.toml  (default ~/.config/boxy/config.toml)
+
+Design rules that keep the rest of the codebase (and its 550+ tests) working:
+  * this module imports NOTHING from boxy — no import cycles, ever;
+  * the environment is read PER CALL (so a test's monkeypatch of BOXY_* is
+    honored without cache-busting); only the file parse is cached;
+  * every setting declares its legacy env-var spelling explicitly, so the 24
+    pre-existing BOXY_* vars keep their exact names;
+  * unknown file keys warn (forward-compat), they don't crash.
+
+Call `config.get("network.bind_host")` inside functions — never to initialize a
+module-level constant (that would freeze the value at import and defeat layering).
+The old module constants stay as the built-in DEFAULT, reached through the
+Setting registry below.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+
+def _as_bool(raw: str) -> bool:
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+@dataclass(frozen=True)
+class Setting:
+    key: str                                   # dotted, e.g. "network.bind_host"
+    env: str                                   # primary env var (legacy spelling preserved)
+    default: Any
+    cast: Callable[[str], Any] = str           # parse the env-var string with this
+    help: str = ""
+    aliases: tuple[str, ...] = field(default_factory=tuple)  # extra legacy env spellings
+
+
+# One entry per overridable constant. Grouped by section only for readability;
+# the dict is flat and keyed by the dotted config key.
+SETTINGS: dict[str, Setting] = {s.key: s for s in [
+    # -- network ---------------------------------------------------------------
+    Setting("network.bind_host", "BOXY_BIND_HOST", "0.0.0.0",
+            help="host the engine/router binds inside the container. 0.0.0.0 is "
+                 "required for the compute-node rendezvous and multi-node Ray; "
+                 "set 127.0.0.1 only for a purely local, single-host serve."),
+    Setting("network.ray_port", "BOXY_RAY_PORT", 6379, int,
+            help="Ray head port for multi-node (distributed) vLLM serving."),
+    Setting("network.replica_port_base", "BOXY_REPLICA_PORT_BASE", 8000, int,
+            help="first port for --replicas fan-out (replica N binds base+N)."),
+
+    # -- per-engine default ports ---------------------------------------------
+    Setting("ports.vllm", "BOXY_PORT_VLLM", 8000, int,
+            help="default listen port for the vLLM engine."),
+    Setting("ports.llama_cpp", "BOXY_PORT_LLAMACPP", 8090, int,
+            help="default listen port for the llama.cpp engine."),
+
+    # -- container images ------------------------------------------------------
+    Setting("images.relay", "BOXY_RELAY_IMAGE", "docker.io/jpillora/chisel:1.10",
+            help="chisel image for the OpenShift share relay (point at a mirror "
+                 "if Docker Hub is blocked)."),
+    Setting("images.flux_mcp", "BOXY_FLUX_MCP_IMAGE", "ghcr.io/converged-computing/flux-mcp:latest",
+            help="flux-mcp image for the persistent OpenShift MCP service."),
+    Setting("images.awscli", "BOXY_AWSCLI_IMAGE", "public.ecr.aws/aws-cli/aws-cli:latest",
+            help="aws-cli image for the container S3 staging backend."),
+
+    # -- timeouts (seconds) ----------------------------------------------------
+    Setting("timeouts.readiness", "BOXY_READY_TIMEOUT", 180.0, float,
+            help="how long `serve` waits for the endpoint to answer /v1 before giving up."),
+    Setting("timeouts.route_admit", "BOXY_ROUTE_ADMIT_TIMEOUT", 10.0, float,
+            help="how long the relay waits for an OpenShift Route to be admitted."),
+
+    # -- ssh -------------------------------------------------------------------
+    Setting("ssh.control_path", "BOXY_SSH_CONTROL_PATH", "~/.ssh/boxy-cm-%C",
+            help="OpenSSH ControlPath for the multiplexed master (%C keeps it "
+                 "under the ~104-char unix-socket limit)."),
+    Setting("ssh.control_persist", "BOXY_SSH_PERSIST", "12h",
+            help="idle lifetime of the ssh master + its tunnels (OpenSSH time "
+                 "format: 30m, 8h, ...). One OTP/touch buys this much access."),
+    Setting("ssh.server_alive_interval", "BOXY_SSH_ALIVE_INTERVAL", 30, int,
+            help="ssh ServerAliveInterval (seconds) for the master."),
+
+    # -- share relay -----------------------------------------------------------
+    Setting("share.enabled", "BOXY_SHARE_ENABLED", True, _as_bool,
+            help="whether `--share` publishes a team URL. Set false to turn team "
+                 "sharing off (e.g. until the relay client is installed/approved); "
+                 "the local tunnel and --route still work."),
+    Setting("relay.namespace", "BOXY_RELAY_NAMESPACE", "boxy-relay",
+            help="OpenShift namespace the share relay lives in."),
+    Setting("relay.port_min", "BOXY_RELAY_PORT_MIN", 31000, int,
+            help="low end of the per-share reverse-tunnel port range."),
+    Setting("relay.port_max", "BOXY_RELAY_PORT_MAX", 32000, int,
+            help="high end (exclusive) of the per-share reverse-tunnel port range."),
+
+    # -- flux-mcp --------------------------------------------------------------
+    Setting("mcp.flux_port", "BOXY_FLUX_MCP_PORT", 8089, int,
+            help="HTTP/SSE port the flux-mcp service listens on."),
+
+    # -- paths -----------------------------------------------------------------
+    Setting("paths.jobs_root", "BOXY_JOBS_ROOT", "~/.local/share/boxy/jobs",
+            help="base dir for job records/endpoints (partitioned per cluster). "
+                 "Point at shared scratch on sites where $HOME is not on compute nodes."),
+    Setting("paths.store", "BOXY_STORE", "~/.local/share/boxy/store",
+            help="boxy's own store dir (merged CA bundle, staged models)."),
+    Setting("paths.models_dir", "BOXY_MODELS_DIR", "./models",
+            help="default destination for staged models."),
+
+    # -- mounts ----------------------------------------------------------------
+    Setting("mounts.selinux_relabel", "BOXY_SELINUX_RELABEL", "auto",
+            help="add ':z' to bind mounts for SELinux: auto (only when enforcing) "
+                 "| always | never."),
+
+    # -- external binaries (test shims / site spellings) -----------------------
+    Setting("binaries.ssh", "BOXY_SSH", "ssh", help="ssh binary."),
+    Setting("binaries.oc", "BOXY_OC", "oc", help="OpenShift oc binary."),
+    Setting("binaries.chisel", "BOXY_CHISEL", "chisel", help="chisel binary for the share relay."),
+    Setting("binaries.remote_command", "BOXY_REMOTE_COMMAND", "boxy",
+            help="how boxy is spelled on the remote cluster (for --ssh)."),
+]}
+
+
+# ---- file discovery + cache -----------------------------------------------------
+
+_file_cache: dict[str, Any] | None = None
+
+
+def _discover() -> tuple[Path | None, bool]:
+    """Return (config_path_or_None, explicit). `explicit` is True when BOXY_CONFIG
+    was set, so an unreadable/invalid file there is fatal rather than skipped."""
+    explicit = os.environ.get("BOXY_CONFIG")
+    if explicit:
+        return Path(os.path.expanduser(explicit)), True
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    path = Path(xdg) / "boxy" / "config.toml"
+    return (path if path.exists() else None), False
+
+
+def _flatten(data: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in data.items():
+        key = f"{prefix}{k}"
+        if isinstance(v, dict):
+            out.update(_flatten(v, f"{key}."))
+        else:
+            out[key] = v
+    return out
+
+
+def _warn_unknown(flat: dict[str, Any], path: Path) -> None:
+    unknown = sorted(set(flat) - set(SETTINGS))
+    if unknown:
+        print(f"boxy: warning: {path}: unknown config keys ignored: {', '.join(unknown)}",
+              file=sys.stderr)
+
+
+def _load_file() -> dict[str, Any]:
+    global _file_cache
+    if _file_cache is not None:
+        return _file_cache
+    path, explicit = _discover()
+    flat: dict[str, Any] = {}
+    if path is not None:
+        try:
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            if explicit:
+                raise ValueError(f"BOXY_CONFIG={path}: {e}") from None
+            data = {}
+        else:
+            flat = _flatten(data)
+            _warn_unknown(flat, path)
+    _file_cache = flat
+    return flat
+
+
+def _coerce(s: Setting, value: Any, path_hint: str) -> Any:
+    """Coerce a TOML file value to the setting's declared type (type(default))."""
+    want = type(s.default)
+    if want is bool:
+        return bool(value)
+    try:
+        if want is int:
+            return int(value)
+        if want is float:
+            return float(value)
+        if want is str:
+            return str(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"config key {s.key!r} ({path_hint}): expected {want.__name__}, got {value!r}"
+        ) from None
+    return value
+
+
+# ---- public accessors -----------------------------------------------------------
+
+
+def get(key: str) -> Any:
+    """Resolve `key` through env > file > default. Env is read per call (test
+    shims work); the file is cached. KeyError means an unregistered key — a
+    programmer error, surfaced immediately."""
+    s = SETTINGS[key]
+    for name in (s.env, *s.aliases):
+        raw = os.environ.get(name)
+        if raw is not None:
+            return s.cast(raw)
+    file_vals = _load_file()
+    if key in file_vals:
+        return _coerce(s, file_vals[key], "config file")
+    return s.default
+
+
+def get_str(key: str) -> str:
+    return str(get(key))
+
+
+def get_int(key: str) -> int:
+    return int(get(key))
+
+
+def get_float(key: str) -> float:
+    return float(get(key))
+
+
+def get_bool(key: str) -> bool:
+    v = get(key)
+    return _as_bool(v) if isinstance(v, str) else bool(v)
+
+
+def source(key: str) -> tuple[Any, str]:
+    """(value, provenance) where provenance is 'env <NAME>', 'file', or 'default'.
+    Powers `boxy config` so a user can see why a value took effect."""
+    s = SETTINGS[key]
+    for name in (s.env, *s.aliases):
+        raw = os.environ.get(name)
+        if raw is not None:
+            return s.cast(raw), f"env {name}"
+    file_vals = _load_file()
+    if key in file_vals:
+        return _coerce(s, file_vals[key], "config file"), "file"
+    return s.default, "default"
+
+
+def reset() -> None:
+    """Drop the cached file parse (tests re-point BOXY_CONFIG/XDG between cases)."""
+    global _file_cache
+    _file_cache = None
+
+
+def render_template() -> str:
+    """A commented starter config.toml covering every setting (for `boxy config --init`)."""
+    by_section: dict[str, list[Setting]] = {}
+    for s in SETTINGS.values():
+        section = s.key.split(".", 1)[0]
+        by_section.setdefault(section, []).append(s)
+    lines = ["# boxy config — every value here is also overridable by its BOXY_* env",
+             "# var (which wins) and by a CLI flag (which wins over that).", ""]
+    for section in by_section:
+        lines.append(f"[{section}]")
+        for s in by_section[section]:
+            leaf = s.key.split(".", 1)[1]
+            for hl in _wrap(s.help):
+                lines.append(f"# {hl}")
+            lines.append(f"# env: {s.env}")
+            lines.append(f"# {_toml_kv(leaf, s.default)}")
+            lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _toml_kv(leaf: str, value: Any) -> str:
+    key = leaf if leaf.isidentifier() else f'"{leaf}"'
+    if isinstance(value, str):
+        return f'{key} = "{value}"'
+    if isinstance(value, bool):
+        return f"{key} = {str(value).lower()}"
+    return f"{key} = {value}"
+
+
+def _wrap(text: str, width: int = 76) -> list[str]:
+    if not text:
+        return []
+    words, line, out = text.split(), "", []
+    for w in words:
+        if line and len(line) + 1 + len(w) > width:
+            out.append(line)
+            line = w
+        else:
+            line = f"{line} {w}" if line else w
+    if line:
+        out.append(line)
+    return out

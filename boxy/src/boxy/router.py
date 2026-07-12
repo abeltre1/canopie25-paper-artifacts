@@ -288,14 +288,16 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
-def make_server(pool: Pool, port: int, host: str = "0.0.0.0",
+def make_server(pool: Pool, port: int, host: str = "",
                 connect_timeout: float = 2.0, read_timeout: float = 600.0,
                 max_retries: int = 2) -> ThreadingHTTPServer:
+    from boxy import config
+
     handler = type("_BoxyProxyHandler", (_ProxyHandler,), {
         "pool": pool, "connect_timeout": connect_timeout,
         "read_timeout": read_timeout, "max_retries": max_retries,
     })
-    server = ThreadingHTTPServer((host, port), handler)
+    server = ThreadingHTTPServer((host or config.get("network.bind_host"), port), handler)
     server.daemon_threads = True  # don't block shutdown on a live stream
     return server
 

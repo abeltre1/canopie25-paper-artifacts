@@ -52,7 +52,9 @@ def _dir() -> Path:
         path = Path(os.path.expanduser(exact))
         path.mkdir(parents=True, exist_ok=True)
         return path
-    root = Path(os.path.expanduser(os.environ.get("BOXY_JOBS_ROOT", DEFAULT_ROOT)))
+    from boxy import config
+
+    root = Path(os.path.expanduser(config.get("paths.jobs_root")))
     path = root / local_cluster()
     path.mkdir(parents=True, exist_ok=True)
     return path

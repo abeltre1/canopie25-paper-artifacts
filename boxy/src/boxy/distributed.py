@@ -19,9 +19,10 @@ import shlex
 import socket
 import subprocess
 
+from boxy import config
 from boxy.location import Resources
 
-RAY_PORT = 6379
+RAY_PORT = 6379  # built-in default; effective value via config network.ray_port (BOXY_RAY_PORT)
 HEAD_ENV = "BOXY_RAY_HEAD"  # a worker reads the head IP from this env var
 
 
@@ -65,7 +66,7 @@ def ray_head_inner(vllm_argv: list[str], gpus_per_node: int, world: int) -> list
     """Container inner command for the HEAD node: start the Ray head, wait for all
     workers to join (all `world` GPUs), then exec vLLM using the Ray cluster."""
     script = (
-        f"ray start --head --port={RAY_PORT} --num-gpus={gpus_per_node} && "
+        f"ray start --head --port={config.get_int('network.ray_port')} --num-gpus={gpus_per_node} && "
         f"{_ray_wait(world)} && "
         f"exec {shlex.join(vllm_argv)}"
     )
@@ -76,7 +77,8 @@ def ray_worker_inner(gpus_per_node: int) -> list[str]:
     """Container inner command for a WORKER node: join the head's Ray cluster and
     --block (keeps the node in the cluster for the job's lifetime). The head IP
     arrives via the BOXY_RAY_HEAD env var set on the srun that launches it."""
-    script = f"ray start --address=${{{HEAD_ENV}}}:{RAY_PORT} --num-gpus={gpus_per_node} --block"
+    script = (f"ray start --address=${{{HEAD_ENV}}}:{config.get_int('network.ray_port')} "
+              f"--num-gpus={gpus_per_node} --block")
     return ["bash", "-lc", script]
 
 

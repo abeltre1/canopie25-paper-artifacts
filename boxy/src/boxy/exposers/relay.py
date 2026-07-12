@@ -51,11 +51,21 @@ _ALIAS_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$")
 
 
 def chisel_bin() -> str:
-    return os.environ.get(ENV_CHISEL, "chisel")
+    from boxy import config
+
+    return config.get("binaries.chisel")
 
 
 def oc_bin() -> str:
-    return os.environ.get(ENV_OC, "oc")
+    from boxy import config
+
+    return config.get("binaries.oc")
+
+
+def relay_port_range() -> range:
+    from boxy import config
+
+    return range(config.get_int("relay.port_min"), config.get_int("relay.port_max"))
 
 
 # ---- pure helpers ---------------------------------------------------------------
@@ -90,10 +100,11 @@ def pick_relay_port(taken: set[int], rand: random.Random | None = None) -> int:
     """A random free reverse port in RELAY_PORT_RANGE (random so two laptops
     racing rarely collide; a collision is caught by chisel's bind error and
     retried)."""
-    free = [p for p in RELAY_PORT_RANGE if p not in taken]
+    port_range = relay_port_range()
+    free = [p for p in port_range if p not in taken]
     if not free:
-        raise ExposeError(f"all {len(RELAY_PORT_RANGE)} relay ports are taken — "
-                          f"`boxy unshare` stale shares or widen RELAY_PORT_RANGE")
+        raise ExposeError(f"all {len(port_range)} relay ports are taken — "
+                          f"`boxy unshare` stale shares or widen relay.port_min/max")
     return (rand or random).choice(free)
 
 
@@ -240,7 +251,9 @@ class RelayExposer(Exposer):
     # -- config resolution ---------------------------------------------------
 
     def _namespace(self) -> str:
-        return os.environ.get(ENV_RELAY_NAMESPACE, DEFAULT_NAMESPACE)
+        from boxy import config
+
+        return config.get("relay.namespace")
 
     def _relay_url(self) -> str:
         env = os.environ.get(ENV_RELAY_URL, "").strip()

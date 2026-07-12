@@ -75,7 +75,9 @@ _CRED_ENV = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
 
 
 def container_image() -> str:
-    return os.environ.get("BOXY_AWSCLI_IMAGE", CONTAINER_IMAGE_DEFAULT)
+    from boxy import config
+
+    return config.get("images.awscli")
 
 
 def choose_backend(runtime: str | None = None) -> str:

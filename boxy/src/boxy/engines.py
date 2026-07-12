@@ -8,16 +8,22 @@ use. For store-pulled models the resolved path flows in the same way.
 
 from __future__ import annotations
 
+from boxy import config
 from boxy.box import Box
 from boxy.location import Location
 
 # One default per engine, used everywhere (resolve, engines, banners, bench).
 # Sweep finding: three different llama.cpp defaults (8000/8080/8090) made the
 # printed endpoint disagree with the port the server actually bound.
+# These are the built-in DEFAULTS; the effective value is config-layered
+# (ports.vllm / ports.llama_cpp -> BOXY_PORT_* -> config file).
 DEFAULT_PORTS = {"llama.cpp": 8090, "vllm": 8000}
 
 
 def default_port(engine: str) -> int:
+    key = "ports." + engine.replace(".", "_")  # "llama.cpp" -> "ports.llama_cpp"
+    if key in config.SETTINGS:
+        return config.get_int(key)
     return DEFAULT_PORTS.get(engine, 8000)
 
 
@@ -66,7 +72,7 @@ def build_serve_cmd(
     box: Box,
     location: Location,
     model_path: str,
-    host: str = "0.0.0.0",
+    host: str = "",  # "" -> config network.bind_host (default 0.0.0.0)
     port: int | None = None,
     extra_args: list[str] | None = None,
     parallelism: tuple[int, int] | None = None,
@@ -83,7 +89,7 @@ def build_llamacpp_serve_cmd(
     box: Box,
     location: Location,
     model_path: str,
-    host: str = "0.0.0.0",
+    host: str = "",  # "" -> config network.bind_host (default 0.0.0.0)
     port: int | None = None,
     extra_args: list[str] | None = None,
 ) -> list[str]:
@@ -108,7 +114,8 @@ def build_llamacpp_serve_cmd(
     cmd = _tack_on_last(cmd, box_args, style="space")
     cmd = _tack_on_last(cmd, tuning, style="space")
     resolved_port = port or (box.ports[0] if box.ports else default_port("llama.cpp"))
-    cmd = _tack_on_last(cmd, {"host": host, "port": resolved_port}, style="space")
+    cmd = _tack_on_last(cmd, {"host": host or config.get("network.bind_host"),
+                              "port": resolved_port}, style="space")
     return cmd
 
 
@@ -116,7 +123,7 @@ def build_vllm_serve_cmd(
     box: Box,
     location: Location,
     model_path: str,
-    host: str = "0.0.0.0",
+    host: str = "",  # "" -> config network.bind_host (default 0.0.0.0)
     port: int | None = None,
     extra_args: list[str] | None = None,
     parallelism: tuple[int, int] | None = None,
@@ -155,7 +162,8 @@ def build_vllm_serve_cmd(
     if not os.environ.get("BOXY_NO_VLLM_EAGER"):
         cmd = _tack_on_last(cmd, {"safetensors_load_strategy": "eager"})
     resolved_port = port or (box.ports[0] if box.ports else default_port("vllm"))
-    cmd = _tack_on_last(cmd, {"host": host, "port": resolved_port})
+    cmd = _tack_on_last(cmd, {"host": host or config.get("network.bind_host"),
+                              "port": resolved_port})
     return cmd
 
 

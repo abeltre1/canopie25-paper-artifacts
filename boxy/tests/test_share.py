@@ -230,6 +230,31 @@ def test_open_share_prints_everyone_url(share_env, monkeypatch, capfd):
     main(["unshare", "nemo"])
 
 
+def test_open_share_disabled_skips_relay_cleanly(share_env, monkeypatch, capfd):
+    # BOXY_SHARE_ENABLED=0 -> no chisel/relay attempt at all, calm message, tunnel lives
+    ssh = share_env / "ssh"
+    ssh.write_text(SSH_SHIM)
+    ssh.chmod(0o755)
+    monkeypatch.setenv(remote.ENV_SSH_BIN, str(ssh))
+    monkeypatch.setenv("SHIM_LOG", str(share_env / "ssh.log"))
+    monkeypatch.setenv("SHIM_STATE", str(share_env / "master.up"))
+    monkeypatch.delenv(remote.ENV_ACTIVE, raising=False)
+    monkeypatch.delenv(remote.ENV_HOST, raising=False)
+    monkeypatch.setenv(remote.ENV_REMOTE_CMD,
+                       'echo "### READY  http://eldo1290:8090/v1   (model: m)" ; :')
+    monkeypatch.setattr(remote, "_local_port_free", lambda p: True)
+    monkeypatch.setenv("BOXY_SHARE_ENABLED", "0")
+    rc = main(["open", "m", "--ssh", "user@login1", "--share", "nemo"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "### LOCAL   http://127.0.0.1:8090/v1" in cap.out
+    assert "### SHARE" not in cap.out                    # relay never attempted
+    assert "team sharing disabled" in cap.out
+    assert "share failed" not in cap.err                 # not treated as an error
+    # chisel was never invoked
+    assert not (share_env / "chisel.log").read_text().strip()
+
+
 def test_open_share_degrades_when_relay_missing(share_env, monkeypatch, capfd):
     ssh = share_env / "ssh"
     ssh.write_text(SSH_SHIM)

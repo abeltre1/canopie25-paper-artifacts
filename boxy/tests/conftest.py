@@ -11,6 +11,21 @@ from boxy.location import Location, Resources, Staging
 EXAMPLES = Path(__file__).parent.parent / "examples"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_config(monkeypatch, tmp_path):
+    """Keep the developer's real ~/.config/boxy/config.toml out of every test, and
+    clear config.py's cached file parse between tests (it is process-global). Tests
+    that exercise the file layer re-point XDG_CONFIG_HOME/BOXY_CONFIG and call
+    config.reset() themselves."""
+    from boxy import config
+
+    monkeypatch.delenv("BOXY_CONFIG", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-none"))
+    config.reset()
+    yield
+    config.reset()
+
+
 @pytest.fixture
 def vllm_box() -> Box:
     return Box(

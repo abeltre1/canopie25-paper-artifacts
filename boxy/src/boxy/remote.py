@@ -37,6 +37,8 @@ import socket
 import subprocess
 import sys
 
+from boxy import config
+
 ENV_HOST = "BOXY_SSH_HOST"          # set once in your shell profile -> "from anywhere"
 ENV_ACTIVE = "BOXY_REMOTE_ACTIVE"   # recursion guard: set on the remote side
 ENV_SSH_BIN = "BOXY_SSH"            # override the ssh binary (tests: a local shim)
@@ -50,7 +52,7 @@ def control_persist() -> str:
     """Idle lifetime of the multiplexed SSH master (and every tunnel riding it),
     so one OTP+YubiKey keeps working for a full workday. Override per your site's
     session cap: BOXY_SSH_PERSIST=8h (accepts OpenSSH time formats: 30m, 12h, ...)."""
-    return os.environ.get(ENV_PERSIST, DEFAULT_PERSIST)
+    return config.get("ssh.control_persist")
 
 # tunnel-worthy endpoint banners from the remote serve: a fresh READY, or an
 # ALREADY SERVING reconnect (rerunning the same model finds the live job).
@@ -74,13 +76,13 @@ NOISE_RE = re.compile(
 
 
 def ssh_bin() -> str:
-    return os.environ.get(ENV_SSH_BIN, "ssh")
+    return config.get("binaries.ssh")
 
 
 def control_path() -> str:
     # %C = hash(local host, remote host, port, user): short + collision-free
     # (macOS caps unix-socket paths at ~104 chars, so never build long literals).
-    return "~/.ssh/boxy-cm-%C"
+    return config.get("ssh.control_path")
 
 
 def _base_opts() -> list[str]:
@@ -88,7 +90,7 @@ def _base_opts() -> list[str]:
         "-o", "ControlMaster=auto",
         "-o", f"ControlPath={control_path()}",
         "-o", f"ControlPersist={control_persist()}",
-        "-o", "ServerAliveInterval=30",
+        "-o", f"ServerAliveInterval={config.get_int('ssh.server_alive_interval')}",
     ]
 
 
@@ -168,7 +170,7 @@ def _remote_command(argv: list[str]) -> str:
     """The command line run on the login node. `bash -lc` gives a LOGIN shell so
     the user's PATH/venv/modules load — the remote `boxy` must be installed there
     (spelling overridable: BOXY_REMOTE_COMMAND='source ~/venv/bin/activate && boxy')."""
-    boxy_cmd = os.environ.get(ENV_REMOTE_CMD, "boxy")
+    boxy_cmd = config.get("binaries.remote_command")
     inner = f"{ENV_ACTIVE}=1 {boxy_cmd} {shlex.join(argv)}"
     return f"bash -lc {shlex.quote(inner)}"
 
@@ -283,7 +285,14 @@ def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False,
                     elif not share:
                         print(f"###   browser: open http://127.0.0.1:{lport}/   "
                               f"(llama.cpp serves a web UI there; vLLM exposes only /v1)")
-                    if share:
+                    if share and not config.get_bool("share.enabled"):
+                        # team sharing turned off (e.g. relay client not yet
+                        # installed/approved): a deliberate state, not a failure —
+                        # keep the local tunnel and say so calmly.
+                        rurl, _ = route_url(share, lport)
+                        print(f"### ROUTE   {rurl}   (team sharing disabled; local tunnel only — "
+                              f"enable with BOXY_SHARE_ENABLED=1)")
+                    elif share:
                         try:
                             from boxy.exposers import get_exposer
                             surl, snote = get_exposer(exposer_name).expose(share, lport)
