@@ -72,7 +72,7 @@ def relay_port_range() -> range:
 
 
 def apps_domain_from_url(relay_url: str) -> str:
-    """`https://relay-boxy.apps.goodall.sandia.gov` -> `apps.goodall.sandia.gov`.
+    """`https://relay-boxy.apps.apps.cluster.example.com` -> `apps.apps.cluster.example.com`.
     Shared names live directly under the cluster's wildcard, which corporate DNS
     already serves — that's the whole reason teammates need zero setup."""
     host = relay_url.strip().rstrip("/")

@@ -16,7 +16,7 @@ def test_gap1_run_does_not_leak_dash_dash_separator(capsys):
         [
             "run",
             "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
-            "--location", str(EXAMPLES / "locations" / "hops.toml"),
+            "--location", str(EXAMPLES / "locations" / "slurm-podman-cuda.toml"),
             "--dryrun",
             "--",
             "serve", "m1",
@@ -59,7 +59,7 @@ def test_gap6_generate_sky_warns_on_hpc_scheduler(capsys):
         [
             "generate", "sky",
             "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
-            "--location", str(EXAMPLES / "locations" / "hops.toml"),
+            "--location", str(EXAMPLES / "locations" / "slurm-podman-cuda.toml"),
         ]
     )
     assert rc == 0

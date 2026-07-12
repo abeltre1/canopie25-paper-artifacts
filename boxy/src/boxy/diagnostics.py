@@ -213,10 +213,10 @@ def _image_pull_blocked(m: "re.Match[str]", log: str) -> str:
         "      $HOME then reuse it with NO pull. Verify the store is shared: podman images on\n"
         "      the compute node should list it.)\n"
         "  2. Or point boxy at a registry the compute node CAN reach (a site mirror):\n"
-        "       boxy serve ... --registry registry.mysite.gov/mirror\n"
+        "       boxy serve ... --registry registry.example.com/mirror\n"
         "     or [location.image_mirrors] in a --location profile (RUNBOOK §0.97).\n"
         "  3. Or route the pull through your proxy INSIDE the job (only if it permits the\n"
-        "     registry):  export HTTPS_PROXY=http://proxy.mysite.gov:80 in the job env.",
+        "     registry):  export HTTPS_PROXY=http://proxy.example.com:80 in the job env.",
     )
 
 
@@ -246,7 +246,7 @@ RULES: list[Rule] = [
     Rule(
         # the container IMAGE pull failed (registry blocked/403/air-gapped) —
         # distinct from a MODEL problem. Must beat gguf-load-fail, whose log can
-        # carry 'GGUF' from the repo name (field report: hops compute node, ghcr
+        # carry 'GGUF' from the repo name (field report: clusterB compute node, ghcr
         # 403 via Zscaler, misdiagnosed as a bad GGUF file).
         "image-pull-blocked",
         re.compile(r"pinging container registry|initializing source docker://|"

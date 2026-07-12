@@ -1,6 +1,6 @@
-# Eldorado cluster (paper): AMD MI300a nodes, Flux, Apptainer.
+# Flux/ROCm example cluster (paper): AMD MI300a nodes, Flux, Apptainer.
 [location]
-name = "eldorado"
+name = "flux-apptainer-rocm"
 scheduler = "flux"
 accelerator = "rocm"
 runtime = "apptainer"

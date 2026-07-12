@@ -1,6 +1,6 @@
-# HOPS cluster (paper): NVIDIA H100 nodes, Slurm, Podman.
+# Slurm/CUDA example cluster (paper): NVIDIA H100 nodes, Slurm, Podman.
 [location]
-name = "hops"
+name = "slurm-podman-cuda"
 scheduler = "slurm"
 accelerator = "cuda"
 runtime = "podman"

@@ -1,6 +1,6 @@
 """Submit from ANYWHERE: run boxy against a remote cluster over SSH.
 
-    laptop$ boxy serve MODEL --scheduler slurm --gpus 4 --ssh user@hops-login1
+    laptop$ boxy serve MODEL --scheduler slurm --gpus 4 --ssh user@clusterB-login1
 
 boxy re-runs the SAME command on the cluster's login node over SSH, streams the
 output back, and when the remote serve prints its READY endpoint, opens a port
@@ -60,7 +60,7 @@ READY_RE = re.compile(r"###\s+(?:READY|ALREADY SERVING)\s+http://([^:/\s]+):(\d+
 
 # the remote boxy rejecting a subcommand/flag the local one just sent means the
 # CLUSTER's install is older than the laptop's (field report: `boxy logs --ssh
-# eldorado` -> "invalid choice: 'logs'") — say so instead of a bare usage error.
+# clusterA` -> "invalid choice: 'logs'") — say so instead of a bare usage error.
 STALE_RE = re.compile(r"invalid choice: '[^']+'|unrecognized arguments:")
 
 # rootless podman on an HPC login node has no /run/user/$UID (no user systemd
@@ -68,7 +68,7 @@ STALE_RE = re.compile(r"invalid choice: '[^']+'|unrecognized arguments:")
 # events dirs: ... permission denied' before failing. That noise is meaningless to
 # the user (the real instances are the scheduler jobs) — filter it from the SSH
 # stream on the LAPTOP side so it's gone regardless of the cluster's boxy version
-# (field report: boxy list --ssh eldorado). Kept tight so real errors still show.
+# (field report: boxy list --ssh clusterA). Kept tight so real errors still show.
 NOISE_RE = re.compile(
     r"Failed to get rootless runtime dir"
     r"|creating events dirs:.*(?:/run/user/|permission denied)"

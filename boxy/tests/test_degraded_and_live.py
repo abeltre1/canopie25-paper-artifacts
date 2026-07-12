@@ -56,7 +56,7 @@ class TestDegradedWithoutRamalama:
         p = _run_isolated(
             "from boxy.cli import main; import sys; "
             "sys.exit(main(['serve', '--box', 'examples/boxes/vllm.toml', "
-            "'--location', 'examples/locations/eldorado.toml', '--dryrun']))"
+            "'--location', 'examples/locations/flux-apptainer-rocm.toml', '--dryrun']))"
         )
         assert p.returncode == 0
         assert "apptainer exec" in p.stdout and "vllm-rocm.sif" in p.stdout

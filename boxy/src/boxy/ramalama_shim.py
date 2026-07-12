@@ -210,7 +210,7 @@ def _merge_with_certifi(primary: str, note: str) -> str | None:
 
 def ensure_trust_bundle() -> str | None:
     """Repair the TLS trust store for pulls. Verified OpenSSL behaviors that
-    bite HPC users (field findings #13, Mac run-through #3, eldorado 2026-07):
+    bite HPC users (field findings #13, Mac run-through #3, clusterA 2026-07):
 
       * SSL_CERT_FILE REPLACES the trust store — a file holding only the
         site/proxy CA breaks every registry that is NOT intercepted with that

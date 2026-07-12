@@ -1,6 +1,6 @@
 """The `location` abstraction: the target site / execution environment (the *where*).
 
-Generalizes the `hops`/`eldorado` $CLUSTER switch from the paper prototype
+Generalizes the `clusterB`/`clusterA` $CLUSTER switch from the paper prototype
 (hpc-workflow/common_boxy.sh). The location selects the scheduler, container
 runtime backend, accelerator, offline mode, staging paths, and site tuning.
 """
@@ -53,7 +53,7 @@ class Location:
     modules: list[str] = field(default_factory=list)
     staging: Staging = field(default_factory=Staging)
     # Raw site flags for batch submissions, in the scheduler's own spelling
-    # (e.g. ["--partition=short", "--license=tscratch:1", "--account=fy260064"]).
+    # (e.g. ["--partition=short", "--license=tscratch:1", "--account=fyNNNNNN"]).
     scheduler_args: list[str] = field(default_factory=list)
     # Site quirks mapped to engine args, appended last unless the user
     # already set them (e.g. MI300a: gpu_memory_utilization = 0.7).

@@ -51,7 +51,7 @@ def test_cli_serve_dryrun_examples(capsys):
         [
             "serve",
             "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
-            "--location", str(EXAMPLES / "locations" / "eldorado.toml"),
+            "--location", str(EXAMPLES / "locations" / "flux-apptainer-rocm.toml"),
             "--no-distributed",
             "--dryrun",
         ]
@@ -69,7 +69,7 @@ def test_cli_serve_dryrun_distributed_flux(capsys):
         [
             "serve",
             "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
-            "--location", str(EXAMPLES / "locations" / "eldorado.toml"),
+            "--location", str(EXAMPLES / "locations" / "flux-apptainer-rocm.toml"),
             "--dryrun",
         ]
     )
@@ -110,7 +110,7 @@ def test_cli_serve_custom_image(capsys):
     # --image serves a user-built image (the build-it-yourself flow for models
     # needing extra pip packages: podman build a thin FROM+pip image, pass it here).
     rc = main(["serve", "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
-               "--location", str(EXAMPLES / "locations" / "hops.toml"),
+               "--location", str(EXAMPLES / "locations" / "slurm-podman-cuda.toml"),
                "--no-distributed", "--image", "localhost/vllm-extra:latest", "--dryrun"])
     assert rc == 0
     out = capsys.readouterr().out
@@ -122,7 +122,7 @@ def test_cli_serve_trust_remote_code(capsys):
     # --trust-remote-code adds the vLLM flag; the scheduler path forwards it to the
     # compute-node inner serve (re-applied engine-aware there).
     rc = main(["serve", "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
-               "--location", str(EXAMPLES / "locations" / "hops.toml"),
+               "--location", str(EXAMPLES / "locations" / "slurm-podman-cuda.toml"),
                "--no-distributed", "--trust-remote-code", "--dryrun"])
     assert rc == 0
     out = capsys.readouterr().out
@@ -135,7 +135,7 @@ def test_cli_run_passthrough_dryrun(capsys):
         [
             "run",
             "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
-            "--location", str(EXAMPLES / "locations" / "hops.toml"),
+            "--location", str(EXAMPLES / "locations" / "slurm-podman-cuda.toml"),
             "--dryrun",
             "--",
             "serve", "some-model", "--max-model-len=4096",
@@ -157,7 +157,7 @@ def test_cli_build_oci_noop(capsys):
         [
             "build",
             "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
-            "--location", str(EXAMPLES / "locations" / "hops.toml"),
+            "--location", str(EXAMPLES / "locations" / "slurm-podman-cuda.toml"),
             "--dryrun",
         ]
     )

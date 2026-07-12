@@ -70,7 +70,7 @@ def test_box_args_port_and_host_win_over_defaults():
 # ---- per-engine tuning (findings 4/36) ----
 
 def test_vllm_only_tuning_never_reaches_llamacpp():
-    eldorado = Location.from_toml(EXAMPLES / "locations" / "eldorado.toml")
+    eldorado = Location.from_toml(EXAMPLES / "locations" / "flux-apptainer-rocm.toml")
     box = Box(name="g", image="i:1", engine="llama.cpp", model="m.gguf")
     cmd = engines.build_llamacpp_serve_cmd(box, eldorado, "/m.gguf")
     assert "--gpu-memory-utilization" not in cmd  # llama-server exits 2 on it
@@ -646,7 +646,7 @@ def test_r2_extras_port_beats_port_flag_with_warning(gguf, capsys):
 
 
 def test_r2_decision_lines_name_profile_provenance(gguf, capsys):
-    rc = main(["serve", str(gguf), "--location", str(EXAMPLES / "locations" / "hops.toml"),
+    rc = main(["serve", str(gguf), "--location", str(EXAMPLES / "locations" / "slurm-podman-cuda.toml"),
                "--foreground", "--dryrun"])
     out = capsys.readouterr().out
     assert rc == 0

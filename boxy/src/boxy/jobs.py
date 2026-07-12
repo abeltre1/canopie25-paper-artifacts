@@ -26,9 +26,9 @@ DEFAULT_ROOT = "~/.local/share/boxy/jobs"
 
 
 def cluster_id(host: str) -> str:
-    """Best-effort cluster identity from a hostname: 'eldorado-login2',
-    'eldorado-login1.sandia.gov', 'eldorado' -> 'eldorado'; 'hops42',
-    'hops-login5' -> 'hops'. Sites with unusual naming set BOXY_CLUSTER."""
+    """Best-effort cluster identity from a hostname: 'clusterA-login2',
+    'clusterA-login1.example.com', 'clusterA' -> 'clusterA'; 'clusterB42',
+    'clusterB-login5' -> 'clusterB'. Sites with unusual naming set BOXY_CLUSTER."""
     short = host.split(".", 1)[0].lower()
     trimmed = re.sub(r"[-_]?login$", "", re.sub(r"\d+$", "", short)).rstrip("-_")
     # a laptop asset tag like 's1088597' trims to 's' — a meaningless bucket; keep
@@ -43,8 +43,8 @@ def local_cluster() -> str:
 def _dir() -> Path:
     """Where job state (records/endpoints/scripts/logs) lives. Labs share $HOME
     across clusters, so BY DEFAULT this is partitioned per cluster —
-    <root>/<cluster>/ — so `boxy logs/list/curl` on hops never surface an
-    eldorado job (field report). BOXY_JOBS_DIR pins an EXACT dir (no
+    <root>/<cluster>/ — so `boxy logs/list/curl` on clusterB never surface an
+    clusterA job (field report). BOXY_JOBS_DIR pins an EXACT dir (no
     partitioning: the explicit escape hatch, and what tests use); BOXY_JOBS_ROOT
     overrides only the partitioned base."""
     exact = os.environ.get("BOXY_JOBS_DIR")

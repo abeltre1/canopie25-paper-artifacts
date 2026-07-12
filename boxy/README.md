@@ -177,23 +177,23 @@ boxy pull hf://org/repo --force    # wipe a partial/corrupt cache and re-pull cl
 # Override per-serve with `-- --safetensors-load-strategy prefetch`, or BOXY_NO_VLLM_EAGER=1.
 
 # Freeze what was resolved into reviewable, reusable profiles:
-boxy serve model.gguf --save-profile mysite     # writes mysite.box.toml + mysite.location.toml
-boxy serve --box mysite.box.toml --location mysite.location.toml
+boxy serve model.gguf --save-profile example     # writes example.box.toml + example.location.toml
+boxy serve --box example.box.toml --location example.location.toml
 
 # Lifecycle:
 boxy list
 boxy stop boxy-model-name         # name is printed in the READY banner
 
 # Everything still works profile-first too (the paper's pipeline):
-boxy serve --box examples/boxes/vllm.toml --location examples/locations/eldorado.toml --dryrun
-boxy build --box examples/boxes/vllm.toml --location examples/locations/eldorado.toml   # OCI -> SIF
+boxy serve --box examples/boxes/vllm.toml --location examples/locations/clusterA.toml --dryrun
+boxy build --box examples/boxes/vllm.toml --location examples/locations/clusterA.toml   # OCI -> SIF
 boxy bench --box examples/boxes/vllm.toml --batch-sizes 1,2,4,8 -o results.csv
 
 # Cloud: delegate the same box to SkyPilot (pip install 'boxy-hpc[cloud]'):
 boxy launch --box examples/boxes/vllm.toml --location examples/locations/cloud-gpu.toml --serve
 ```
 
-Drop `--dryrun` from any profile command to execute. The Eldorado dry-run
+Drop `--dryrun` from any profile command to execute. The ClusterA dry-run
 reproduces the prototype's known-good command:
 
 ```

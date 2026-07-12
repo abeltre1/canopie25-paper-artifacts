@@ -135,7 +135,7 @@ def test_launch_cli_warns_on_hpc_scheduler(capsys):
     rc = main([
         "launch",
         "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
-        "--location", str(EXAMPLES / "locations" / "hops.toml"),
+        "--location", str(EXAMPLES / "locations" / "slurm-podman-cuda.toml"),
         "--dryrun",
     ])
     assert rc == 0

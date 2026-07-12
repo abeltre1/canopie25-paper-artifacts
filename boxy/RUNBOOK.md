@@ -30,7 +30,7 @@ Be precise about what "tested" means. Three tiers:
 | Degraded mode (no ramalama installed) | **E** | CI sandbox (subprocess harness) |
 | `generate sky` / `launch` YAML | **E** (validated by SkyPilot 0.12.3's parser) | CI sandbox |
 | Podman **CUDA** serve (vLLM) | **G** → **P** | needs HOPS-class node |
-| Apptainer **ROCm** serve + OCI→SIF build | **G** → **P** | needs Eldorado-class node |
+| Apptainer **ROCm** serve + OCI→SIF build | **G** → **P** | needs ClusterA-class node |
 | srun / flux-run wrapping, module preamble | **G** → **P** | needs cluster |
 | `sky launch` execution | **P** | needs cloud credentials |
 
@@ -65,7 +65,7 @@ boxy serve $M --scheduler flux  --gpus 1
 boxy launch   --box examples/boxes/llama-3.2-1b.toml --location examples/locations/cloud-gpu.toml
 boxy generate sky --box examples/boxes/llama-3.2-1b.toml --location <loc> -o task.yaml   # then: sky launch task.yaml
 #    b. any on-prem site: write one location file and reuse every command above:
-boxy serve $M --location examples/locations/mysite.toml
+boxy serve $M --location examples/locations/example.toml
 ```
 All scale/serve flags (`--replicas`, `--nodes`, `--nodes-per-replica`, `--distributed`,
 `--router`, `boxy sweep`, `boxy bench`) compose on top of ANY row unchanged. For the
@@ -79,13 +79,13 @@ tunnels the endpoint back:
 
 ```bash
 # one-shot spelling:
-boxy serve <model> --scheduler slurm --gpus 4 --ssh ambelt@hops-login1.sandia.gov
+boxy serve <model> --scheduler slurm --gpus 4 --ssh ambelt@clusterB-login1.example.com
 # set-and-forget spelling (then EVERY boxy command is remote, verbatim):
-export BOXY_SSH_HOST=ambelt@hops-login1.sandia.gov
+export BOXY_SSH_HOST=ambelt@clusterB-login1.example.com
 boxy serve <model> --scheduler slurm --gpus 4
 boxy list        # runs on the cluster
 boxy stop <name> # runs on the cluster
-# profile spelling: put `remote = "ambelt@hops-login1.sandia.gov"` in [location].
+# profile spelling: put `remote = "ambelt@clusterB-login1.example.com"` in [location].
 ```
 
 What happens behind the scenes:
@@ -111,14 +111,14 @@ What happens behind the scenes:
   (`invalid choice: 'logs'`), boxy prints a *stale install* hint — fix it with
   `git pull && pip install -e .` in the checkout on that login node.
 
-### 0.96 Several clusters, one $HOME (hops + eldorado)
+### 0.96 Several clusters, one $HOME (clusterB + clusterA)
 
 Lab clusters often share your home directory. boxy therefore **partitions its
 job state per cluster automatically**: records/endpoints/scripts/logs live in
-`~/.local/share/boxy/jobs/<cluster>/` (`hops`, `eldorado`, …), so `boxy list`,
+`~/.local/share/boxy/jobs/<cluster>/` (`clusterB`, `clusterA`, …), so `boxy list`,
 `boxy logs`, and `boxy curl` on one cluster never surface another's — no mixing,
-no confusion. The cluster name comes from the host (`eldorado-login2` →
-`eldorado`, `hops42` → `hops`); if your site's hostnames don't encode it, set
+no confusion. The cluster name comes from the host (`clusterA-login2` →
+`clusterA`, `clusterB42` → `clusterB`); if your site's hostnames don't encode it, set
 `BOXY_CLUSTER=<name>` per cluster (shell profile).
 
 Knobs (rarely needed):
@@ -143,7 +143,7 @@ container's in-container downloads:
 ```bash
 # provide it explicitly:
 boxy serve <model> --scheduler slurm --gpus 1 --ssh user@login \
-    --proxy http://proxy.mysite.gov:80 --account <acct> --time 30:00
+    --proxy http://proxy.example.com:80 --account <acct> --time 30:00
 # or just have http_proxy/https_proxy exported on the login node — boxy auto-uses them.
 ```
 
@@ -160,7 +160,7 @@ registries with data, never code:
 
 ```bash
 # blanket: send EVERY image to one registry (replaces docker.io/ghcr.io/...)
-boxy serve <model> --registry registry.mysite.gov/mirror ...
+boxy serve <model> --registry registry.example.com/mirror ...
 # an image you built yourself, no registry at all:
 boxy serve <model> --image localhost/my-vllm:dev ...
 ```
@@ -169,9 +169,9 @@ Per-registry rewrite map in a location profile (mirrors win over `--registry`):
 
 ```toml
 [location.image_mirrors]
-"docker.io" = "registry.mysite.gov/dockerhub"
-"ghcr.io"   = "registry.mysite.gov/ghcr"
-"*"         = "registry.mysite.gov/mirror"   # catch-all; omit to leave others alone
+"docker.io" = "registry.example.com/dockerhub"
+"ghcr.io"   = "registry.example.com/ghcr"
+"*"         = "registry.example.com/mirror"   # catch-all; omit to leave others alone
 ```
 
 Bare names (`vllm/vllm-openai`) count as docker.io. `localhost/...` images stay
@@ -187,7 +187,7 @@ per-cluster state, OOM'd containers). Each check is OK/WARN/FAIL + a fix:
 ```bash
 boxy doctor                 # local audit; exit non-zero if anything FAILs
 boxy doctor --net           # also probe ghcr.io/docker.io reachability (the 403 check)
-boxy doctor --ssh ambelt@hops.sandia.gov   # audit the CLUSTER (no boxy needed there)
+boxy doctor --ssh ambelt@clusterB.example.com   # audit the CLUSTER (no boxy needed there)
 ```
 
 `boxy doctor --ssh` probes the cluster over SSH with plain shell (`command -v`,
@@ -207,15 +207,15 @@ don't want the engine default):
 
 ```bash
 # 1. Inspect / hand-submit the script (zero boxy on the cluster):
-boxy generate slurm --box mybox.toml --location hops.toml \
-     --accelerator cuda --account fy260064 --time 30:00 -o job.sh
+boxy generate slurm --box mybox.toml --location clusterB.toml \
+     --accelerator cuda --account fyNNNNNN --time 30:00 -o job.sh
 #    -> job.sh has #SBATCH + `podman run …` + an endpoint write; NO boxy token.
-#    submit it yourself:  ssh hops 'sbatch job.sh'
+#    submit it yourself:  ssh clusterB 'sbatch job.sh'
 
 # 2. Or let boxy submit + follow it (boxy on the LOGIN node orchestrates; the
 #    WORKLOAD node stays boxy-free):
 boxy serve /shared/models/llama-3.2-1b.q4.gguf --scheduler slurm --gpus 1 \
-     --agentless --accelerator cuda --account fy260064 --time 30:00 --ssh ambelt@hops.sandia.gov
+     --agentless --accelerator cuda --account fyNNNNNN --time 30:00 --ssh ambelt@clusterB.example.com
 ```
 
 Design + boundaries: `SPEC.md §8c`. A transport URI (`hf://…`) is refused — it
@@ -255,7 +255,7 @@ brew install chisel-tunnel   # laptop, once — jpillora/chisel. NOT `brew insta
 
 **Everyday — share a model:**
 ```bash
-boxy open <inst> --ssh ambelt@eldorado --port 8090 --share nemotron
+boxy open <inst> --ssh ambelt@clusterA --port 8090 --share nemotron
 #   ### LOCAL   http://127.0.0.1:8090/v1
 #   ### SHARE   https://nemotron-boxy.apps.<cluster>/v1   (reachable by ANYONE on the corporate network)
 boxy list                    # shows the share + LIVE/DEAD
@@ -310,7 +310,7 @@ Beyond model inference, boxy emits OpenShift manifests for standing services —
 e.g. **flux-mcp** (agentic MCP control of Flux jobs, HTTP/SSE on :8089):
 ```bash
 boxy generate flux-mcp --host flux-mcp.apps.<cluster> \
-     --flux-uri ssh://eldorado/run/flux/local | oc apply -f -
+     --flux-uri ssh://clusterA/run/flux/local | oc apply -f -
 # or the Helm chart: deploy/openshift/chart-flux-mcp (helm install flux-mcp ... --set host=...)
 # agents then connect to the MCP endpoint at https://flux-mcp.apps.<cluster>/
 
@@ -320,7 +320,7 @@ Beyond model inference, boxy emits OpenShift manifests for standing services —
 e.g. **flux-mcp** (agentic MCP control of Flux jobs, HTTP/SSE on :8089):
 ```bash
 boxy generate flux-mcp --host flux-mcp.apps.<cluster> \
-     --flux-uri ssh://eldorado/run/flux/local | oc apply -f -
+     --flux-uri ssh://clusterA/run/flux/local | oc apply -f -
 # or the Helm chart: deploy/openshift/chart-flux-mcp (helm install flux-mcp ... --set host=...)
 # agents then connect to the MCP endpoint at https://flux-mcp.apps.<cluster>/
 ```
@@ -461,7 +461,7 @@ boxy pull hf://TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.Q
 # (--partition/--account/--time) and hands anything else to the active scheduler:
 boxy serve hf://TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
   --scheduler slurm --gpus 1 \
-  --partition=short --account=fy260064 --license=tscratch:1
+  --partition=short --account=fyNNNNNN --license=tscratch:1
 # EXPECT:
 #   ### Submitted slurm job N  (boxy-tinyllama-...)
 #   ###   job N: PENDING ... RUNNING
@@ -477,7 +477,7 @@ boxy serve <model> --scheduler flux --gpus 4 --partition pbatch --account guests
 # Portable spellings if you prefer them: --partition/--account/--time translate
 # per scheduler (slurm --partition / flux --queue, etc). Site defaults belong
 # in a --location profile:  scheduler_args = ["--partition=short", ...]
-boxy serve <model> --location hops.toml
+boxy serve <model> --location clusterB.toml
 ```
 
 Notes: `--foreground` keeps the old attached `srun`/`flux run` mode. Batch
@@ -495,44 +495,44 @@ boxy pull --box examples/boxes/vllm-hf.toml
 # box (examples/boxes/vllm.toml + [location.staging] models_dir), per the paper.
 
 # 3.3 Eyeball the exact command before running anything:
-boxy serve --box examples/boxes/vllm-hf.toml --location examples/locations/hops.toml --dryrun
+boxy serve --box examples/boxes/vllm-hf.toml --location examples/locations/clusterB.toml --dryrun
 # EXPECT: srun --nodes=.. --gpus-per-node=.. podman run ... --device nvidia.com/gpu=all
 #         ... vllm/vllm-openai:v0.24.0 serve <model> --host=0.0.0.0 --port=8000 ...
-# Adjust examples/locations/hops.toml (nodes/gpus/partition-specific tuning) to your site.
+# Adjust examples/locations/clusterB.toml (nodes/gpus/partition-specific tuning) to your site.
 
 # 3.4 Single-node first (inside an allocation, scheduler wrap not needed):
 salloc -N1 --gpus-per-node=4
-#   in the job shell: set scheduler="none" in a copy of hops.toml, then
-boxy serve --box examples/boxes/vllm-hf.toml --location my-hops-1node.toml
+#   in the job shell: set scheduler="none" in a copy of clusterB.toml, then
+boxy serve --box examples/boxes/vllm-hf.toml --location my-clusterB-1node.toml
 # EXPECT: vLLM v0.24.0 engine startup, CUDA graphs, "Uvicorn running on 0.0.0.0:8000"
 curl -s http://localhost:8000/v1/models
 
 # 3.5 Then the scheduler-wrapped form from the login node (scheduler="slurm"):
-boxy serve --box examples/boxes/vllm-hf.toml --location examples/locations/hops.toml
+boxy serve --box examples/boxes/vllm-hf.toml --location examples/locations/clusterB.toml
 
 # 3.6 Benchmark (paper's step 5; from a node that can reach the serving node):
 boxy bench --box examples/boxes/vllm-hf.toml --url http://<node>:8000 \
      --dataset ShareGPT_V3_unfiltered_cleaned_split.json \
-     --batch-sizes 1,2,4,8,16,32,64,128,256,512,1024 -o hops-results.csv
+     --batch-sizes 1,2,4,8,16,32,64,128,256,512,1024 -o clusterB-results.csv
 
 # 3.7 Lifecycle
 boxy list ; boxy stop --box examples/boxes/vllm-hf.toml
 ```
 
-## 4. Flux + Apptainer + ROCm cluster (Eldorado-class)
+## 4. Flux + Apptainer + ROCm cluster (ClusterA-class)
 
 ```bash
 boxy info                     # EXPECT: accelerator: rocm | apptainer | flux
 # 4.1 Pre-build the SIF once (large image; uses APPTAINER cache):
-boxy build --box examples/boxes/vllm.toml --location examples/locations/eldorado.toml
+boxy build --box examples/boxes/vllm.toml --location examples/locations/clusterA.toml
 # EXPECT: apptainer build --force vllm-rocm.sif docker://vllm/vllm-openai:v0.24.0
 # 4.2 Check the emitted command (module load rocm, --rocm, --fakeroot, tuning):
-boxy serve --box examples/boxes/vllm.toml --location examples/locations/eldorado.toml --dryrun
+boxy serve --box examples/boxes/vllm.toml --location examples/locations/clusterA.toml --dryrun
 # 4.3 Run inside a flux alloc (or let boxy wrap with flux run):
 flux alloc -N1
-boxy serve --box examples/boxes/vllm.toml --location my-eldorado-1node.toml
+boxy serve --box examples/boxes/vllm.toml --location my-clusterA-1node.toml
 curl -s http://localhost:8000/v1/models
-# NOTE eldorado.toml carries the MI300a HBM tuning (gpu-memory-utilization=0.7).
+# NOTE clusterA.toml carries the MI300a HBM tuning (gpu-memory-utilization=0.7).
 ```
 
 ## 4.5 Scaling out — distributed, replicas, and sweeps

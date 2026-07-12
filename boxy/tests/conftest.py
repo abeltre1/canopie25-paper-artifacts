@@ -8,7 +8,7 @@ import pytest
 from boxy.box import Box, Volume
 from boxy.location import Location, Resources, Staging
 
-EXAMPLES = Path(__file__).parent.parent / "examples"
+EXAMPLES = Path(__file__).parent.parent / "src" / "boxy" / "data" / "examples"
 
 
 @pytest.fixture(autouse=True)

@@ -275,7 +275,7 @@ def test_plan_serve_distributed_needs_gpu_count():
 def test_cli_auto_distributes_vllm_on_slurm_multinode(capsys):
     # hops = 2-node slurm vLLM: auto-distributed, workers placed with srun.
     rc = main(["serve", "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
-               "--location", str(EXAMPLES / "locations" / "hops.toml"), "--dryrun"])
+               "--location", str(EXAMPLES / "locations" / "slurm-podman-cuda.toml"), "--dryrun"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "### Head" in out and "### Worker" in out
@@ -289,7 +289,7 @@ def test_cli_auto_distributes_vllm_on_slurm_multinode(capsys):
 def test_cli_no_distribute_flag_forces_single_container(capsys):
     # --no-distributed on the 2-node slurm location: back to the classic srun wrap.
     rc = main(["serve", "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
-               "--location", str(EXAMPLES / "locations" / "hops.toml"),
+               "--location", str(EXAMPLES / "locations" / "slurm-podman-cuda.toml"),
                "--no-distributed", "--dryrun"])
     assert rc == 0
     out = capsys.readouterr().out

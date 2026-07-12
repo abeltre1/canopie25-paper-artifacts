@@ -20,7 +20,7 @@ def test_box_transport_uri_detection(vllm_box):
 
 
 def test_location_from_toml():
-    loc = Location.from_toml(EXAMPLES / "locations" / "eldorado.toml")
+    loc = Location.from_toml(EXAMPLES / "locations" / "flux-apptainer-rocm.toml")
     assert loc.scheduler == "flux"
     assert loc.accelerator == "rocm"
     assert loc.runtime == "apptainer"

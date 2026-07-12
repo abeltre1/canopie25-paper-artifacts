@@ -1,5 +1,5 @@
 # Generic vLLM serving box — runtime- and accelerator-agnostic.
-# Pair it with a location: boxy serve --box vllm.toml --location eldorado.toml
+# Pair it with a location: boxy serve --box vllm.toml --location flux-apptainer-rocm.toml
 [box]
 name = "vllm"
 image = "vllm/vllm-openai:v0.24.0"  # latest (registry-verified); the paper used v0.9.1

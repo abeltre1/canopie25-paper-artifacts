@@ -29,7 +29,7 @@ VLLM_ENV: dict[str, str] = {
     "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
 }
 
-# vLLM-on-ROCm quirks (prototype: eldorado/MI300a).
+# vLLM-on-ROCm quirks (prototype: clusterA/MI300a).
 ROCM_VLLM_ENV: dict[str, str] = {
     "VLLM_USE_V1": "1",
     "VLLM_USE_TRITON_FLASH_ATTN": "0",

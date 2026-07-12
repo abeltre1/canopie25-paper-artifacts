@@ -828,6 +828,47 @@ def _apply_bind_host_env(args) -> None:
         os.environ["BOXY_BIND_HOST"] = host
 
 
+def cmd_examples(args: argparse.Namespace) -> int:
+    """List / show / export the packaged example box & location profiles. Uses
+    importlib.resources so it works from an installed wheel (not just a checkout)."""
+    from importlib.resources import files
+    from pathlib import Path
+
+    root = files("boxy.data") / "examples"
+
+    def _iter():
+        for kind in ("boxes", "locations"):
+            d = root / kind
+            for entry in sorted(d.iterdir(), key=lambda p: p.name):
+                if entry.name.endswith(".toml"):
+                    yield kind, entry
+
+    if args.action == "show":
+        for _, entry in _iter():
+            if entry.name in (args.name, f"{args.name}.toml"):
+                print(entry.read_text(), end="")
+                return 0
+        print(f"boxy examples: no example named {args.name!r} (see `boxy examples`)", file=sys.stderr)
+        return 1
+
+    if args.action == "export":
+        import shutil as _shutil
+        dest = Path(args.dest)
+        for kind, entry in _iter():
+            target = dest / kind / entry.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with entry.open("rb") as src, open(target, "wb") as out:
+                _shutil.copyfileobj(src, out)
+        print(f"exported packaged examples to {dest}/  (boxes/ + locations/)")
+        return 0
+
+    # default: list
+    print("packaged examples (boxy examples show NAME | export DIR):")
+    for kind, entry in _iter():
+        print(f"  {kind:<10} {entry.name}")
+    return 0
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     """Show the effective config (value + provenance for each setting), or emit a
     starter config.toml with --init. The debugging tool for 'why did my layered
@@ -861,7 +902,7 @@ def _submission_hint(stderr: str) -> str:
     low = stderr.lower()
     if "flux batch" in low or "flux-batch" in low:
         return ("boxy hint: you asked for --scheduler slurm, but this cluster's `sbatch` is a\n"
-                "  FLUX compatibility wrapper — this is a Flux system (eldorado-class). Rerun with\n"
+                "  FLUX compatibility wrapper — this is a Flux system (clusterA-class). Rerun with\n"
                 "  --scheduler flux (same portable flags: --partition/--account/--time translate).\n"
                 "  Tip: keep a --location profile per cluster so the scheduler is pinned correctly.")
     if "invalid account or account/partition combination" in low:
@@ -960,7 +1001,7 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
         mismatch = rec_sched_name != scheduler_name
         # A job under a DIFFERENT scheduler that we cannot confirm is alive (state
         # UNKNOWN) is NOT ours to protect: it lives on another cluster (labs share
-        # $HOME across sites, so an eldorado flux record shows up on a hops slurm
+        # $HOME across sites, so an clusterA flux record shows up on a clusterB slurm
         # login node) or on a scheduler instance we can't reach from here. Blocking
         # the local submission would strand the user. A different-scheduler job we
         # CAN see resolves to PENDING/RUNNING (handled below), never UNKNOWN, so
@@ -1961,8 +2002,8 @@ def cmd_list(args: argparse.Namespace) -> int:
                 state = _job_state(scheduler_obj, record["job"])
             else:
                 # Labs share $HOME across clusters, so this jobs dir holds OTHER
-                # clusters' records too (field report: an eldorado flux job listed
-                # on hops as UNKNOWN). No point probing — the job lives elsewhere;
+                # clusters' records too (field report: an clusterA flux job listed
+                # on clusterB as UNKNOWN). No point probing — the job lives elsewhere;
                 # say where it IS instead of UNKNOWN.
                 state = f"FOREIGN({origin})"
                 foreign_seen = True
@@ -2110,8 +2151,8 @@ def cmd_router(args: argparse.Namespace) -> int:
 def _scheduler_reachable(scheduler_obj) -> bool:
     """Can THIS host speak that scheduler? (its state binary is on PATH). Only a
     FALLBACK for legacy records without an origin — clusters often ship other
-    schedulers' binaries too (field report: hops has `flux` on PATH, so an
-    eldorado flux record passed this check and boxy curl chased eldo1025)."""
+    schedulers' binaries too (field report: clusterB has `flux` on PATH, so an
+    clusterA flux record passed this check and boxy curl chased eldo1025)."""
     return shutil.which(scheduler_obj.state_command("x")[0]) is not None
 
 
@@ -2552,6 +2593,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="print a starter config.toml (all keys, commented) to stdout")
     p.set_defaults(func=cmd_config, location=None)
 
+    p = sub.add_parser("examples", help="list, show, or export the packaged example "
+                                        "box & location profiles")
+    ex = p.add_subparsers(dest="action")
+    ex.add_parser("list", help="list packaged examples (default)")
+    sh = ex.add_parser("show", help="print one example profile to stdout")
+    sh.add_argument("name", help="example filename, e.g. vllm.toml or local-podman.toml")
+    xp = ex.add_parser("export", help="copy the packaged examples into a directory")
+    xp.add_argument("dest", nargs="?", default="./examples", help="destination dir (default ./examples)")
+    p.set_defaults(func=cmd_examples, location=None, action=None)
+
     p = sub.add_parser("doctor", help="audit the environment for known field issues "
                                       "(proxy/CA/runtime/scheduler/OOM/…); OK/WARN/FAIL + a fix each")
     p.add_argument("--net", action="store_true",
@@ -2582,7 +2633,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "replaces the image's registry component. Per-registry rewrites go in "
                         "[location.image_mirrors]")
     p.add_argument("--proxy", default=None, metavar="URL",
-                   help="corporate proxy (e.g. http://proxy.mysite.gov:80) applied to BOTH the "
+                   help="corporate proxy (e.g. http://proxy.example.com:80) applied to BOTH the "
                         "login-node model download (Hugging Face) AND the compute node's image pull + "
                         "in-container downloads. Omit to auto-use your http_proxy/https_proxy env. "
                         "Fixes ghcr.io/huggingface.co 403 on nodes that must egress through a proxy")

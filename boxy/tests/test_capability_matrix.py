@@ -87,7 +87,7 @@ def test_location_unknown_key_and_modules_list_form(tmp_path):
 
 
 def test_all_example_locations_parse():
-    for name in ("local", "local-docker", "hops", "eldorado", "cloud-gpu"):
+    for name in ("local", "local-docker", "slurm-podman-cuda", "flux-apptainer-rocm", "cloud-gpu"):
         loc = Location.from_toml(EXAMPLES / "locations" / f"{name}.toml")
         assert loc.name in (name, name.replace(".toml", ""))
 
@@ -231,7 +231,7 @@ def test_cli_version(capsys):
 
 def test_cli_serve_port_override(capsys):
     rc = main(["serve", "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
-               "--location", str(EXAMPLES / "locations" / "hops.toml"), "--dryrun", "--port", "9001"])
+               "--location", str(EXAMPLES / "locations" / "slurm-podman-cuda.toml"), "--dryrun", "--port", "9001"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "--port=9001" in out and "--port=8000" not in out
@@ -253,14 +253,14 @@ def test_cli_pull_no_model_is_error(tmp_path, capsys):
 
 def test_cli_stop_apptainer_location_is_helpful_error(capsys):
     rc = main(["stop", "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
-               "--location", str(EXAMPLES / "locations" / "eldorado.toml"), "--dryrun"])
+               "--location", str(EXAMPLES / "locations" / "flux-apptainer-rocm.toml"), "--dryrun"])
     assert rc == 1
     assert "scancel / flux cancel" in capsys.readouterr().err
 
 
 def test_cli_build_apptainer_dryrun_prints_sif_build(capsys):
     rc = main(["build", "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
-               "--location", str(EXAMPLES / "locations" / "eldorado.toml"), "--dryrun"])
+               "--location", str(EXAMPLES / "locations" / "flux-apptainer-rocm.toml"), "--dryrun"])
     assert rc == 0
     assert "apptainer build --force vllm-rocm.sif" in capsys.readouterr().out
 

@@ -52,7 +52,7 @@ def test_mirrors_map_exact_wildcard_and_precedence():
 
 def test_serve_registry_flag_rewrites_image(capsys):
     rc = main(["serve", "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
-               "--location", str(EXAMPLES / "locations" / "hops.toml"),
+               "--location", str(EXAMPLES / "locations" / "slurm-podman-cuda.toml"),
                "--no-distributed", "--registry", "registry.sandia.gov/mirror", "--dryrun"])
     assert rc == 0
     out = capsys.readouterr().out

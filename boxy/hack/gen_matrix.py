@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
+EXAMPLES = ROOT / "src" / "boxy" / "data" / "examples"
 
 from boxy.cli import main  # noqa: E402
 
@@ -27,6 +28,7 @@ generating machine, and pulled-model paths as the dry-run placeholder
 /path/to/model). The E2E steps are identical for every combo:
 
 ```bash
+boxy examples export ./examples          # drop the packaged profiles into ./examples first
 boxy pull  --box examples/boxes/<box>.toml                          # skip for path-based models
 boxy build --box examples/boxes/<box>.toml --location examples/locations/<loc>.toml   # apptainer only (OCI->SIF)
 boxy serve --box examples/boxes/<box>.toml --location examples/locations/<loc>.toml
@@ -54,11 +56,11 @@ COMBOS = [
     ("podman", "none", "local-podman.toml"),
     ("docker", "none", "local-docker.toml"),
     ("apptainer", "none", "local-apptainer.toml"),
-    ("podman", "slurm", "hops.toml"),
+    ("podman", "slurm", "slurm-podman-cuda.toml"),
     ("apptainer", "slurm", "slurm-apptainer-cuda.toml"),
     ("docker", "slurm", "slurm-docker-cuda.toml"),
     ("podman", "flux", "flux-podman-rocm.toml"),
-    ("apptainer", "flux", "eldorado.toml"),
+    ("apptainer", "flux", "flux-apptainer-rocm.toml"),
     ("docker", "flux", "flux-docker-rocm.toml"),
 ]
 ENGINES = [("llama.cpp", "qwen-gguf.toml"), ("vllm", "vllm.toml")]
@@ -69,8 +71,8 @@ def dryrun(box: str, location: str) -> str:
     with contextlib.redirect_stdout(out):
         rc = main([
             "serve",
-            "--box", str(ROOT / "examples" / "boxes" / box),
-            "--location", str(ROOT / "examples" / "locations" / location),
+            "--box", str(EXAMPLES / "boxes" / box),
+            "--location", str(EXAMPLES / "locations" / location),
             "--dryrun",
         ])
     if rc != 0:
@@ -90,6 +92,6 @@ def generate() -> str:
 
 if __name__ == "__main__":
     os.chdir(ROOT)
-    target = ROOT / "examples" / "MATRIX.md"
+    target = EXAMPLES / "MATRIX.md"
     target.write_text(generate())
     print(f"wrote {target}")

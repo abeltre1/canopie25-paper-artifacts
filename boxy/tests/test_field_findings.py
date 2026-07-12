@@ -311,7 +311,7 @@ def test_finding4b_cli_prints_workdir_warning(tmp_path, capsys):
     boxfile = tmp_path / "b.toml"
     boxfile.write_text('[box]\nname="w"\nimage="i"\nmodel="m"\nworkdir="/nope"\n')
     rc = main(["serve", "--box", str(boxfile),
-               "--location", str(EXAMPLES / "locations" / "hops.toml"), "--dryrun"])
+               "--location", str(EXAMPLES / "locations" / "slurm-podman-cuda.toml"), "--dryrun"])
     assert rc == 0
     assert "Podman will refuse" in capsys.readouterr().err
 

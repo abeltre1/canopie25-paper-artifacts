@@ -8,11 +8,11 @@ data, so swapping registries never touches engine/backend code:
   1. `[location.image_mirrors]` — a rewrite map, per-registry, mirroring how
      containers' registries.conf mirrors work:
          [location.image_mirrors]
-         "docker.io" = "registry.mysite.gov/dockerhub"
-         "ghcr.io"   = "registry.mysite.gov/ghcr"
-         "*"         = "registry.mysite.gov/mirror"     # catch-all
+         "docker.io" = "registry.example.com/dockerhub"
+         "ghcr.io"   = "registry.example.com/ghcr"
+         "*"         = "registry.example.com/mirror"     # catch-all
      `docker.io/vllm/vllm-openai` (or the bare `vllm/vllm-openai`, which implies
-     docker.io) becomes `registry.mysite.gov/dockerhub/vllm/vllm-openai`.
+     docker.io) becomes `registry.example.com/dockerhub/vllm/vllm-openai`.
   2. `--registry HOST[/path]` (or `registry=` in [location]) — send EVERYTHING
      to one registry: replaces the image's registry component, or prefixes a
      bare name. Mirrors win over this when both match.
