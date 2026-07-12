@@ -17,10 +17,12 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         python-version: ["3.11", "3.12", "3.13"]
-        include:
-          # one macOS leg (darwin has real code paths: podman network args, GPU/mount handling)
-          - os: macos-latest
-            python-version: "3.12"
+        # NOTE: no macOS leg. GitHub's hosted macOS runners ship no container
+        # runtime (podman/docker/apptainer), so boxy's dryrun tests can't resolve
+        # one, and one backend test is deliberately Linux-specific (the darwin
+        # network path publishes ports instead of --network=host). macOS is a
+        # best-effort target, verified locally; adding a green macOS leg would
+        # need a runtime install + Linux-only test markers (tracked for 0.2).
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

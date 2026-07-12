@@ -18,9 +18,8 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         python-version: ["3.11", "3.12", "3.13"]
-        include:
-          - os: macos-latest
-            python-version: "3.12"
+        # No macOS leg: hosted macOS runners have no container runtime, so the
+        # dryrun tests can't resolve one (macOS is best-effort, verified locally).
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
