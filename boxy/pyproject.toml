@@ -1,16 +1,31 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "boxy-hpc"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Unified, site-portable, offline-first CLI for containerized GenAI serving on HPC"
 readme = "README.md"
-requires-python = ">=3.10"
-license = { text = "MIT" }
-authors = [{ name = "Angel M. Beltre" }]
-keywords = ["hpc", "genai", "vllm", "apptainer", "podman", "slurm", "flux"]
+# tomllib (stdlib) is imported unguarded in location.py/box.py; it is 3.11+ only.
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Angel M. Beltre", email = "ambelt@sandia.gov" }]
+keywords = ["hpc", "genai", "vllm", "llama.cpp", "apptainer", "podman", "slurm", "flux"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Distributed Computing",
+]
 # certifi: public CAs for the TLS trust-bundle merge (SSL_CERT_FILE REPLACES
 # the trust store; sites with partial TLS interception need site CA + public
 # CAs together). Tiny, pure-data, load-bearing for model pulls.
@@ -22,13 +37,25 @@ dependencies = ["certifi"]
 [project.optional-dependencies]
 ramalama = ["ramalama==0.23.*"]
 cloud = ["skypilot>=0.12"]
+s3 = ["boto3"]
 test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/abeltre1/canopie25-paper-artifacts/tree/main/boxy"
+Source = "https://github.com/abeltre1/canopie25-paper-artifacts"
+Issues = "https://github.com/abeltre1/canopie25-paper-artifacts/issues"
 
 [project.scripts]
 boxy = "boxy.cli:main"
 
+[tool.setuptools.dynamic]
+version = { attr = "boxy.__version__" }
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"boxy.data" = ["examples/**/*.toml", "examples/**/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
