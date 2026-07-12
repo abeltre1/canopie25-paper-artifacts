@@ -8,7 +8,7 @@ found necessary)."""
 
 from __future__ import annotations
 
-from boxy.backends.base import RuntimeBackend
+from boxy.backends.base import DRI_ACCELERATORS, RuntimeBackend, warn_cpu_only
 from boxy.box import Box
 from boxy.location import Location
 
@@ -39,6 +39,10 @@ class ApptainerBackend(RuntimeBackend):
             return ["--nv"]
         if accelerator == "rocm":
             return ["--rocm"]
+        if accelerator in DRI_ACCELERATORS:  # intel / vulkan / asahi via /dev/dri
+            return ["--bind", "/dev/dri"]
+        if accelerator and accelerator != "none":
+            warn_cpu_only(accelerator, self.name)
         return []
 
     def build_command(

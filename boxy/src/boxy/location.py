@@ -12,9 +12,12 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-SCHEDULERS = ("slurm", "flux", "none")
+# RUNTIMES is the autodetect PREFERENCE order for resolve_runtime(); the set of
+# VALID schedulers/runtimes is derived from the plugin registries at validation
+# time (see __post_init__) so adding a backend/scheduler there is enough — no
+# second list to keep in sync.
 RUNTIMES = ("podman", "apptainer", "docker")
-ACCELERATORS = ("cuda", "rocm", "intel", "vulkan", "asahi", "ascend", "musa", "none")
+ACCELERATORS = ("cuda", "rocm", "intel", "vulkan", "asahi", "ascend", "musa", "metal", "none")
 
 
 @dataclass
@@ -57,10 +60,16 @@ class Location:
     tuning: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        # Derive the valid sets from the plugin registries (lazy import: this runs
+        # at instance creation, when both modules are fully loaded — no cycle).
+        from boxy.backends import BACKENDS
+        from boxy.schedulers import SCHEDULERS
         if self.scheduler not in SCHEDULERS:
-            raise ValueError(f"location {self.name}: unknown scheduler {self.scheduler!r} (expected {SCHEDULERS})")
-        if self.runtime and self.runtime not in RUNTIMES:
-            raise ValueError(f"location {self.name}: unknown runtime {self.runtime!r} (expected {RUNTIMES})")
+            raise ValueError(f"location {self.name}: unknown scheduler {self.scheduler!r} "
+                             f"(expected {tuple(SCHEDULERS)})")
+        if self.runtime and self.runtime not in BACKENDS:
+            raise ValueError(f"location {self.name}: unknown runtime {self.runtime!r} "
+                             f"(expected {tuple(BACKENDS)})")
         if self.accelerator and self.accelerator not in ACCELERATORS:
             raise ValueError(
                 f"location {self.name}: unknown accelerator {self.accelerator!r} (expected {ACCELERATORS})"

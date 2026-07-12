@@ -5,7 +5,13 @@ from __future__ import annotations
 
 import sys
 
-from boxy.backends.base import RuntimeBackend
+from boxy.backends.base import (
+    DRI_ACCELERATORS,
+    RuntimeBackend,
+    relabel_option,
+    selinux_enforcing,
+    warn_cpu_only,
+)
 from boxy.box import Box
 from boxy.location import Location
 
@@ -53,6 +59,10 @@ class PodmanBackend(RuntimeBackend):
             return list(CUDA_ARGS)
         if accelerator == "rocm":
             return list(ROCM_ARGS)
+        if accelerator in DRI_ACCELERATORS:  # intel / vulkan / asahi via /dev/dri
+            return ["--device", "/dev/dri"]
+        if accelerator and accelerator != "none":  # known but no device pass-through
+            warn_cpu_only(accelerator, self.name)
         return []
 
     def build_command(
@@ -72,7 +82,13 @@ class PodmanBackend(RuntimeBackend):
             cmd += [f"--entrypoint={entrypoint}"]
         if box.workdir:
             cmd += [f"--workdir={box.workdir}"]
+        from boxy import config
+
+        relabel_mode, enforcing = config.get("mounts.selinux_relabel"), selinux_enforcing()
         for source, target, options in mounts:
+            # add ':z' on SELinux-enforcing hosts so rootless bind mounts don't
+            # get 'permission denied' (config mounts.selinux_relabel: auto|always|never).
+            options = relabel_option(options, relabel_mode, enforcing)
             spec = f"{source}:{target}"
             if options:
                 spec += f":{options}"

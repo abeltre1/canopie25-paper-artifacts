@@ -2912,6 +2912,14 @@ def _dynamic_ignored(dynamic: list, active: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if sys.platform == "win32":
+        # boxy leans on POSIX process control (os.killpg, start_new_session, `ps`)
+        # and OpenSSH connection multiplexing (`ssh -O`, ControlMaster), none of
+        # which exist on native Windows. Fail clearly rather than half-work.
+        print("boxy: Windows is not supported (it needs POSIX process control and "
+              "OpenSSH multiplexing). Run it under WSL2: "
+              "https://learn.microsoft.com/windows/wsl/", file=sys.stderr)
+        return 2
     # Everything after a standalone `--` is engine args, verbatim. argparse
     # cannot express this next to optional positionals (a `*` positional only
     # matches one contiguous chunk), so split before parsing.

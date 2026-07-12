@@ -123,11 +123,20 @@ def discover_topology(launcher: str) -> tuple[str, str, int]:
     except (OSError, subprocess.SubprocessError):
         nodes = []
     head = nodes[0] if nodes else socket.gethostname()
-    head_ip = "127.0.0.1"
+    return head, _primary_ip(), len(nodes) or 1
+
+
+def _primary_ip() -> str:
+    """The host's primary (default-route) IPv4, portably. `hostname -I` is
+    GNU-only (absent on macOS/BSD); the UDP-connect trick transmits nothing —
+    connecting a datagram socket just makes the kernel pick the egress interface —
+    and works offline. Falls back to hostname resolution, then loopback."""
     try:
-        ips = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=15).stdout.split()
-        if ips:
-            head_ip = ips[0]
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return head, head_ip, len(nodes) or 1
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.254.254.254", 1))  # unroutable TEST-NET-ish; no packet sent
+            return s.getsockname()[0]
+    except OSError:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return "127.0.0.1"
