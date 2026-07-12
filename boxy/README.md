@@ -1,9 +1,9 @@
 # boxy
 
 Unified, site-portable, offline-first CLI for deploying and serving
-containerized GenAI/LLM services on HPC — the Python formalization of the
-bash prototype in [`../hpc-workflow/`](../hpc-workflow/), designed in
-[`../SPEC.md`](../SPEC.md).
+containerized GenAI/LLM services on HPC. It grew out of a bash prototype and
+its design notes, both in the
+[source repository](https://github.com/abeltre1/canopie25-paper-artifacts).
 
 One command, everything auto-resolved and explained:
 
@@ -71,21 +71,29 @@ HPC guard rails (from the design review):
 
 ## Install
 
-Use an **editable** install (`-e`) while boxy is under active development —
-a plain `pip install ./boxy` COPIES the code into site-packages, and after
-that `git pull` changes nothing until you reinstall. (This bit a real user.)
+Requires **Python 3.11+** on a POSIX host (Linux, or macOS best-effort; Windows
+is unsupported — use WSL2). The core has one dependency (`certifi`); everything
+else degrades gracefully.
 
 ```bash
-# pip
-pip install -e './boxy[ramalama,test]'
-
-# uv
-uv venv .boxy && source .boxy/bin/activate
-uv pip install -e './boxy[ramalama,test]'
-
-# verify your installed code matches the checkout after any pull:
-python3 -c "import boxy.resolve; print('current')" 2>/dev/null || echo 'STALE - reinstall with -e'
+pip install boxy-hpc            # the distribution is boxy-hpc; the command is `boxy`
+pip install "boxy-hpc[ramalama]"   # + model pulls / accelerator autodetect (recommended)
+pip install "boxy-hpc[cloud]"      # + SkyPilot cloud launch
+pip install "boxy-hpc[s3]"         # + boto3 for S3 model staging
 ```
+
+| Extra | Adds | For |
+|-------|------|-----|
+| `ramalama` | RamaLama | `hf://`/`ollama://` pulls, GPU autodetect |
+| `cloud` | SkyPilot | `boxy launch` on cloud VMs |
+| `s3` | boto3 | S3 model staging |
+
+Developing on boxy? Use an **editable** install so `git pull` takes effect
+without reinstalling: `pip install -e './boxy[ramalama,test]'`.
+
+**uv note:** uv-managed standalone Pythons don't inherit the system CA store,
+so HTTPS (model pulls) fails with `CERTIFICATE_VERIFY_FAILED` until you set
+`SSL_CERT_FILE`. `boxy pull` prints the remedy if you hit it.
 
 **uv note:** uv-managed standalone Pythons don't inherit the system CA store,
 so HTTPS (model pulls) fails with `CERTIFICATE_VERIFY_FAILED` until you set
@@ -230,13 +238,41 @@ flux run -N2 --gpus-per-node=4 bash -lc 'module load rocm/6.4.0 && exec \
   lives in `src/boxy/ramalama_shim.py`; without it boxy still works with
   explicit locations and path-based models.
 
+## Configuration
+
+Every built-in default is layered: **CLI flag > environment variable > config
+file > default**. The config file is TOML at `$BOXY_CONFIG` or
+`~/.config/boxy/config.toml`:
+
+```bash
+boxy config              # show every setting + where its value came from
+boxy config --init > ~/.config/boxy/config.toml   # a commented starter file
+```
+
+```toml
+# ~/.config/boxy/config.toml
+[network]
+bind_host = "0.0.0.0"        # 127.0.0.1 only for a purely local serve
+[timeouts]
+readiness = 300             # BOXY_READY_TIMEOUT / --ready-timeout override this
+[paths]
+jobs_root = "/scratch/$USER/boxy/jobs"   # for sites where $HOME isn't on compute nodes
+[mounts]
+selinux_relabel = "auto"    # add ':z' to bind mounts on SELinux-enforcing hosts
+```
+
+Team sharing (the OpenShift relay) is off unless you enable it — set
+`BOXY_SHARE_ENABLED=1` (or `[share] enabled = true`) once the relay client is
+installed and approved at your site.
+
 ## Seen in action
 
-[`DEMO.md`](DEMO.md) records a real end-to-end run: `boxy serve` launching a
-live llama.cpp OpenAI endpoint in a container (in a fully air-gapped sandbox)
-and answering `/v1/chat/completions`, plus the cloud-path YAML being accepted
-by SkyPilot 0.12.3 itself. [`examples/MATRIX.md`](examples/MATRIX.md) shows a
-machine-generated command for every engine × runtime × scheduler combination.
+The packaged examples ship inside the wheel — `boxy examples` lists them,
+`boxy examples export ./examples` drops them into a directory, and
+[`examples/MATRIX.md`](https://github.com/abeltre1/canopie25-paper-artifacts/blob/main/boxy/src/boxy/data/examples/MATRIX.md)
+shows a machine-generated command for every engine × runtime × scheduler
+combination. [`DEMO.md`](https://github.com/abeltre1/canopie25-paper-artifacts/blob/main/boxy/DEMO.md)
+records a real end-to-end run.
 
 ## Cloud path (SkyPilot delegation)
 
@@ -252,7 +288,7 @@ sky serve up task.yaml      # managed serving (SkyServe replicas + readiness pro
 
 ## Going to production
 
-**[`RUNBOOK.md`](RUNBOOK.md)** is the step-by-step path from fresh checkout to
+**[`RUNBOOK.md`](https://github.com/abeltre1/canopie25-paper-artifacts/blob/main/boxy/RUNBOOK.md)** is the step-by-step path from fresh checkout to
 serving on your cluster — laptop first, then Slurm+CUDA, then Flux+ROCm — with
 expected output at each step, a test-provenance table (what has been *executed*
 vs. verified-by-construction), and a troubleshooting table covering every
