@@ -23,7 +23,8 @@ REGISTRIES = {
     "ms": ("modelscope.cn", "ModelScope — operated by Alibaba (China)"),
     "modelscope": ("modelscope.cn", "ModelScope — operated by Alibaba (China)"),
     "rlcr": ("rlcr.io", "RamaLama container registry"),
-    "oci": ("(arbitrary OCI registry)", "any OCI registry the URI names"),
+    "oci": ("(arbitrary OCI registry)", "any OCI registry the URI names — pull not implemented yet"),
+    "docker": ("(arbitrary Docker/OCI registry)", "any registry the URI names — pull not implemented yet"),
 }
 
 # aliases normalize to one policy key

@@ -2616,7 +2616,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="serve MODEL as an OpenAI-compatible endpoint (engine/image/runtime/port auto-resolved)",
     )
     p.add_argument("model", nargs="?", default=None,
-                   help="local path or transport URI (hf://, ollama://, oci://); alternative: --box")
+                   help="local path or transport URI: hf://, ollama:// (pulled via RamaLama), "
+                        "s3:// (staged from a bucket). oci://, docker:// are recognized but their "
+                        "pull is not implemented yet — pull with podman/docker and serve by path. "
+                        "Alternative: --box")
     p.add_argument("--box", default=None, help="serve from a box TOML profile instead of MODEL")
     p.add_argument("--location", default=None, help="site TOML profile (scheduler/runtime/accelerator/tuning)")
     p.add_argument("--engine", choices=["llama.cpp", "vllm"], default=None,
@@ -2729,7 +2732,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("pull", help="pre-stage a model via RamaLama transports (pull on the login node)")
     p.add_argument("model", nargs="?", default=None,
-                   help="transport URI (hf://, ollama://, oci://); alternative: --box")
+                   help="transport URI: hf://, ollama:// (pulled via RamaLama). oci://, docker:// "
+                        "are recognized but their pull is not implemented yet (pull with "
+                        "podman/docker, serve by path). Alternative: --box")
     p.add_argument("--box", default=None, help="pull the model named by a box TOML profile")
     p.add_argument("--force", action="store_true",
                    help="remove any cached copy and re-pull clean (fixes a partial/corrupt "

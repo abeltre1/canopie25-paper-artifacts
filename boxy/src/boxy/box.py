@@ -10,7 +10,10 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-TRANSPORT_SCHEMES = ("hf://", "huggingface://", "ollama://", "oci://", "ms://", "modelscope://", "rlcr://")
+# oci:// and docker:// are RECOGNIZED (parsed + policy-gated) but their pull is
+# not implemented yet — pull_model() errors with guidance (SPEC roadmap).
+TRANSPORT_SCHEMES = ("hf://", "huggingface://", "ollama://", "oci://", "docker://",
+                     "ms://", "modelscope://", "rlcr://")
 
 
 @dataclass

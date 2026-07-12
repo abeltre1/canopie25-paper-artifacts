@@ -33,7 +33,7 @@ quirks (modules, tuning, offline mode, GPU counts) are pinned once and reused.
 
 | Decision | Rule |
 |---|---|
-| model | **Syntax decides**: `hf://`, `ollama://`, `oci://`, ... = remote (pulled via RamaLama); anything else = local path. Bare names are never guessed. |
+| model | **Syntax decides**: `hf://`, `ollama://` = remote (pulled via RamaLama); `s3://` = staged from a bucket; anything else = local path. Bare names are never guessed. `oci://`/`docker://` are recognized but their **pull is not implemented yet** (roadmap) — pull the OCI artifact with podman/docker and serve the extracted weights by path. |
 | engine | GGUF or `ollama://` → llama.cpp; safetensors/HF repo → vLLM (needs a GPU, detected or `--gpus N`) |
 | accelerator | RamaLama's `get_accel()` (nvidia-smi, ROCm sysfs, ...), normalized (`hip`→`rocm`) |
 | runtime | first of podman > docker > apptainer that is **actually working** (probed, not just on PATH) |
@@ -47,7 +47,17 @@ default `hf` (huggingface.co) and `ollama` (registry.ollama.ai). ModelScope
 transports are **blocked by default**; the refusal names the registry and its
 origin. Opting in is a deliberate, auditable act:
 `export BOXY_ALLOW_TRANSPORTS=hf,ollama,ms` — env-only on purpose, so a TOML
-profile in a repo can never widen the policy silently. `boxy info` shows the
+profile in a repo can never widen the policy silently.
+
+**Transport support (today):** model *weights* pull via `hf://` and `ollama://`
+(live-verified), `s3://` staging, and local paths. `ms://`/`rlcr://` are
+allow-list-gated. `oci://` and `docker://` are recognized (parsed + policy-gated)
+but their **pull is not yet implemented** — boxy errors with guidance; pull the
+artifact with podman/docker and serve the extracted weights by path. (Note: this
+is the model *transport* — a container **image** stored as an OCI artifact works
+fine via `--image registry/…`.)
+
+`boxy info` shows the
 active allow/block lists plus auth status (HuggingFace token, S3 credentials —
 status and source only, values are never printed), and `boxy info --net`
 probes only allowed registries.

@@ -348,10 +348,13 @@ def test_oci_pull_rejected_with_boxy_wording(monkeypatch):
     monkeypatch.delenv("BOXY_ALLOW_TRANSPORTS", raising=False)
     with pytest.raises(RuntimeError, match="registry allowlist"):
         ramalama_shim.pull_model("oci://quay.io/ramalama/smollm:135m", dryrun=True)
-    # even when opted in, the store-only pull path can't drive an engine
-    monkeypatch.setenv("BOXY_ALLOW_TRANSPORTS", "hf,ollama,oci")
+    # even when opted in, the store-only pull path can't drive an engine — oci://
+    # AND docker:// are recognized transports but their pull is not implemented yet
+    monkeypatch.setenv("BOXY_ALLOW_TRANSPORTS", "hf,ollama,oci,docker")
     with pytest.raises(RuntimeError, match="container engine to pull"):
         ramalama_shim.pull_model("oci://quay.io/ramalama/smollm:135m", dryrun=True)
+    with pytest.raises(RuntimeError, match="container engine to pull"):
+        ramalama_shim.pull_model("docker://quay.io/ramalama/smollm:135m", dryrun=True)
 
 
 def test_trust_bundle_directory_and_unwritable_store(monkeypatch, tmp_path, capsys):
