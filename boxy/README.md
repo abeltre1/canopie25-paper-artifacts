@@ -278,7 +278,11 @@ ends:** deploy the chisel relay to OpenShift once per cluster and teammates reac
 boxy runs the `chisel client` in a **container** by default (`relay.client_mode =
 auto` → `container` unless a host `chisel` binary is present), so no `brew install`
 on your Mac or the HPC login node — only a container runtime. Point `[images].relay`
-at a site mirror for air-gapped clusters. See `RUNBOOK.md` §0.993.
+at a site mirror for air-gapped clusters. Step-by-step walkthrough (deploy once →
+serve → share → teammate access → teardown) in
+[`DEMO-chisel.md`](https://github.com/abeltre1/canopie25-paper-artifacts/blob/main/boxy/DEMO-chisel.md);
+one-shot relay deploy in `deploy/openshift/chart-relay/deploy-relay.sh`; full
+reference in `RUNBOOK.md` §0.993.
 
 ## Seen in action
 
