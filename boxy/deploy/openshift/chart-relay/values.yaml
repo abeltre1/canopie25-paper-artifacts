@@ -28,5 +28,18 @@ route:
   timeout: 3600s
   timeoutTunnel: 3600s
 
+# OpenShift restricted-v2 SCC compliance (Pod Security Admission, 4.11+). Leave
+# runAsUser UNSET so the namespace's SCC assigns a non-root UID; the container
+# also drops all caps, forbids privilege escalation, and runs read-only rootfs.
 securityContext:
   runAsNonRoot: true
+  seccompProfile: RuntimeDefault
+
+# The relay is tiny (a static Go proxy). Requests/limits keep it schedulable on
+# clusters with a LimitRange and cap its footprint.
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 128Mi

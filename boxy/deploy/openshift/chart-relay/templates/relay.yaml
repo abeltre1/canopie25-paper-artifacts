@@ -27,12 +27,26 @@ spec:
       labels:
         app: boxy-relay
     spec:
+      # OpenShift restricted-v2 SCC / Pod Security Admission (4.11+): no runAsUser
+      # (the SCC assigns a non-root UID), drop all caps, no privilege escalation,
+      # RuntimeDefault seccomp, read-only rootfs. chisel is a static binary that
+      # holds its key in memory and binds an unprivileged port — needs none of them.
       securityContext:
         runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+        seccompProfile:
+          type: {{ .Values.securityContext.seccompProfile | default "RuntimeDefault" }}
       containers:
         - name: chisel
           image: {{ .Values.image }}
           args: ["server", "--reverse", "--port", "{{ .Values.port }}", "--key", "$(KEY_SEED)", "--keepalive", "25s"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: {{ .Values.securityContext.seccompProfile | default "RuntimeDefault" }}
           env:
             - name: AUTH
               valueFrom:
@@ -47,6 +61,12 @@ spec:
           ports:
             - containerPort: {{ .Values.port }}
               name: http
+          resources:
+            requests:
+              cpu: {{ .Values.resources.requests.cpu | default "10m" | quote }}
+              memory: {{ .Values.resources.requests.memory | default "32Mi" | quote }}
+            limits:
+              memory: {{ .Values.resources.limits.memory | default "128Mi" | quote }}
 ---
 apiVersion: v1
 kind: Service

@@ -78,7 +78,19 @@ def test_relay_manifest_shape_and_security():
     assert "s3cret" not in " ".join(c["args"])
     assert c["env"][0]["name"] == "AUTH"
     assert c["env"][0]["valueFrom"]["secretKeyRef"] == {"name": "boxy-relay", "key": "auth"}
-    assert docs[1]["spec"]["template"]["spec"]["securityContext"]["runAsNonRoot"] is True
+    # OpenShift restricted-v2 SCC / Pod Security Admission compliance: pod runs
+    # non-root with RuntimeDefault seccomp and NO hardcoded runAsUser (the SCC
+    # assigns the UID); the container drops all caps, forbids privesc, read-only.
+    pod_sc = docs[1]["spec"]["template"]["spec"]["securityContext"]
+    assert pod_sc["runAsNonRoot"] is True
+    assert pod_sc["seccompProfile"]["type"] == "RuntimeDefault"
+    assert "runAsUser" not in pod_sc                       # SCC assigns the arbitrary UID
+    csc = c["securityContext"]
+    assert csc["allowPrivilegeEscalation"] is False
+    assert csc["runAsNonRoot"] is True
+    assert csc["readOnlyRootFilesystem"] is True
+    assert csc["capabilities"]["drop"] == ["ALL"]
+    assert csc["seccompProfile"]["type"] == "RuntimeDefault"
     route = docs[3]
     assert route["spec"]["tls"]["termination"] == "edge"
     ann = route["metadata"]["annotations"]

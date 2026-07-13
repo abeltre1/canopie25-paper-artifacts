@@ -284,6 +284,27 @@ share (fix: the login-node bridge, below). If the underlying `ssh -L` lapses
 public URL is stable). boxy takes the LOCAL end of a tunnel, so `--share` needs
 `--ssh` (or the bridge); `--share` alone errors.
 
+**Built to run on OpenShift (restricted-v2 SCC):** the relay Deployment (both the
+`boxy generate relay` manifest and the Helm chart) sets the full Pod Security
+Admission profile — `runAsNonRoot`, **no** hardcoded `runAsUser` (the namespace SCC
+assigns the UID), `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`,
+`seccompProfile: RuntimeDefault`, and `readOnlyRootFilesystem: true`. The chisel
+server is a static Go binary that binds an unprivileged port and keeps its host key
+in memory, so it needs no root, no writable rootfs, and no capabilities — it runs
+clean under the strictest default OpenShift policy with no SCC waiver.
+
+**Want a guaranteed-non-root image (for `<registry>/user/chisel:1.10.1`):** build
+the OpenShift-ready image from `deploy/openshift/chart-relay/Containerfile` — it
+re-bases upstream chisel with a numeric non-root `USER`, so it satisfies
+`runAsNonRoot` on any platform and is mirror/air-gap ready:
+```bash
+podman build -t <registry>/user/chisel:1.10.1 \
+    -f deploy/openshift/chart-relay/Containerfile deploy/openshift/chart-relay
+podman push  <registry>/user/chisel:1.10.1
+export BOXY_RELAY_IMAGE=<registry>/user/chisel:1.10.1   # feeds server manifest AND client container
+boxy generate relay --host relay-boxy.apps.<cluster> --auth "boxy:$(openssl rand -hex 16)" | oc apply -f -
+```
+
 **If the relay pod ImagePullBackOffs (Zscaler 403 on Docker Hub):** the cluster
 egress to `docker.io` is blocked (a `<!--# ... -->` Zscaler page, same class as the
 ghcr compute-node block). Mirror chisel into the cluster's OWN registry from your

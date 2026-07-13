@@ -214,19 +214,36 @@ spec:
     metadata:
       labels: {{app: {RELAY_APP}}}
     spec:
+      # OpenShift restricted-v2 SCC / Pod Security Admission (4.11+): NO runAsUser
+      # (the namespace's SCC assigns an arbitrary non-root UID), drop every
+      # capability, forbid privilege escalation, RuntimeDefault seccomp, read-only
+      # rootfs. The chisel server is a static Go binary that binds an unprivileged
+      # port and holds its host key in memory (--key $(KEY_SEED)) — it needs no
+      # root, no writable filesystem, and no Linux capabilities, so it runs cleanly
+      # under the strictest default OpenShift policy.
       securityContext:
         runAsNonRoot: true
+        seccompProfile: {{type: RuntimeDefault}}
       containers:
         - name: chisel
           image: {image}
           args: ["server", "--reverse", "--port", "{port}", "--key", "$(KEY_SEED)", "--keepalive", "25s"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            capabilities: {{drop: ["ALL"]}}
+            seccompProfile: {{type: RuntimeDefault}}
           env:
             - name: AUTH
               valueFrom: {{secretKeyRef: {{name: {RELAY_APP}, key: auth}}}}
             - name: KEY_SEED
               valueFrom: {{secretKeyRef: {{name: {RELAY_APP}, key: key-seed}}}}
           ports:
-            - {{containerPort: {port}, name: http}}""",
+            - {{containerPort: {port}, name: http}}
+          resources:
+            requests: {{cpu: 10m, memory: 32Mi}}
+            limits: {{memory: 128Mi}}""",
         f"""apiVersion: v1
 kind: Service
 metadata:
