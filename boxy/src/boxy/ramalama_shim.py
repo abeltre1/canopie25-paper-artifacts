@@ -208,6 +208,19 @@ def _merge_with_certifi(primary: str, note: str) -> str | None:
     return merged
 
 
+# Provenance of boxy's ca-merged.crt (set by ensure_trust_bundle), so a later
+# CERTIFICATE_VERIFY_FAILED remedy can distinguish "boxy auto-merged this node's OS
+# store, which lacks the interceptor CA" from "you gave a site CA that doesn't cover
+# THIS host" — instead of the old message that assumed the user set SSL_CERT_FILE.
+_ca_merge_kind: str = ""      # "" | "os" | "site"
+_ca_merge_source: str = ""    # the primary bundle merged with certifi
+
+
+def _record_merge(kind: str, source: str) -> None:
+    global _ca_merge_kind, _ca_merge_source
+    _ca_merge_kind, _ca_merge_source = kind, source
+
+
 def ensure_trust_bundle() -> str | None:
     """Repair the TLS trust store for pulls. Verified OpenSSL behaviors that
     bite HPC users (field findings #13, Mac run-through #3, clusterA 2026-07):
@@ -235,11 +248,14 @@ def ensure_trust_bundle() -> str | None:
         os_bundle = discover_os_ca_bundle()
         if not os_bundle:
             return None
-        return _merge_with_certifi(
+        merged = _merge_with_certifi(
             os_bundle,
             f"tls: no SSL_CERT_FILE set — merged the OS trust store ({os_bundle}) with certifi's "
             f"public CAs so pulls trust the same roots as the system",
         )
+        if merged:
+            _record_merge("os", os_bundle)
+        return merged
     if not os.path.exists(site):
         print(
             f"warning: SSL_CERT_FILE={site} does not exist — OpenSSL silently ignores missing "
@@ -260,8 +276,11 @@ def ensure_trust_bundle() -> str | None:
         return None
     if site.endswith("ca-merged.crt"):  # already ours (idempotent within a process)
         return site
-    return _merge_with_certifi(
+    merged = _merge_with_certifi(
         site, f"tls: merged your SSL_CERT_FILE ({site}) with certifi's public CAs (site CA kept)")
+    if merged:
+        _record_merge("site", site)
+    return merged
 
 
 class _LogTap(logging.Handler):
@@ -515,7 +534,26 @@ def _pull_failure_message(model_uri: str, error: Exception, logged: list[str] | 
     elif distinct_logged:
         msg += f"\n  root cause: {distinct_logged[0]}"
     if "CERTIFICATE_VERIFY_FAILED" in combined:
-        if os.environ.get("SSL_CERT_FILE"):
+        ssl_cert = os.environ.get("SSL_CERT_FILE", "")
+        if ssl_cert.endswith("ca-merged.crt"):
+            # boxy BUILT this bundle (certifi public CAs + your site CA or this
+            # node's OS store) and it STILL failed -> the host is TLS-intercepted
+            # by a proxy whose root CA is in NEITHER. The old message wrongly told
+            # the user THEY set SSL_CERT_FILE and blamed a site-CA-only file.
+            src = (f"this node's OS trust store ({_ca_merge_source})" if _ca_merge_kind == "os"
+                   else f"your SSL_CERT_FILE ({_ca_merge_source})" if _ca_merge_kind == "site"
+                   else "your trust store")
+            msg += (
+                f"\n  remedy: boxy already merged {src} with certifi's public CAs and verification"
+                " STILL failed — so this host is TLS-intercepted by a proxy (e.g. Zscaler) whose root"
+                " CA is in NEITHER bundle. Point SSL_CERT_FILE at THAT interceptor CA (the same one"
+                " that works on your laptop) and boxy re-merges it with the public roots:\n"
+                "      export SSL_CERT_FILE=/path/to/site-ca.crt   # on a cluster, copy it into shared $HOME\n"
+                "      echo 'export SSL_CERT_FILE=$HOME/.../site-ca.crt' >> ~/.bashrc   # persist it\n"
+                "  (a compute node's OS trust store often lacks the interceptor CA even when your laptop has it.)\n"
+                "  Diagnose per registry: boxy info --net"
+            )
+        elif ssl_cert:
             msg += (
                 "\n  remedy: SSL_CERT_FILE is set but verification still failed. SSL_CERT_FILE"
                 " REPLACES Python's trust store, so:\n"

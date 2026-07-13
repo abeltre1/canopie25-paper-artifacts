@@ -55,8 +55,30 @@ def test_finding12_chainless_retry_error_still_surfaces_ssl_remedy(monkeypatch):
     assert "SSL_CERT_FILE" in msg and "persist" in msg  # sticky remedy, not a one-shell export
     # with SSL_CERT_FILE already set, the remedy explains REPLACE semantics instead
     monkeypatch.setenv("SSL_CERT_FILE", "/some/site-ca.crt")
+    monkeypatch.setattr(ramalama_shim, "_ca_merge_kind", "")   # not a boxy-merged bundle
     msg = ramalama_shim._pull_failure_message("ollama://granite3-moe", err, logged=logged)
     assert "REPLACES" in msg and "boxy info --net" in msg and "certifi" in msg
+
+
+def test_ssl_remedy_names_missing_interceptor_ca_after_os_automerge(monkeypatch):
+    """Compute-node case (SNL, 2026-07): SSL_CERT_FILE was unset, so boxy
+    auto-merged this node's OS trust store + certifi and set SSL_CERT_FILE to its
+    OWN ca-merged.crt. A pull then fails CERTIFICATE_VERIFY_FAILED because the OS
+    store lacks the site's TLS-interceptor CA (the laptop has it). The OLD remedy
+    wrongly said 'you set SSL_CERT_FILE / site-CA-only file'; it must instead name
+    the missing interceptor CA and how to supply it."""
+    monkeypatch.setenv("SSL_CERT_FILE", "/home/u/.local/share/boxy/store/ca-merged.crt")
+    monkeypatch.setattr(ramalama_shim, "_ca_merge_kind", "os")
+    monkeypatch.setattr(ramalama_shim, "_ca_merge_source", "/etc/pki/tls/certs/ca-bundle.crt")
+    err = ConnectionError("Download failed after multiple attempts")
+    logged = ["[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+              "unable to get local issuer certificate (_ssl.c:1028)"]
+    msg = ramalama_shim._pull_failure_message("hf://meta-llama/Llama-3.2-1B-Instruct", err, logged=logged)
+    assert "OS trust store" in msg and "/etc/pki/tls/certs/ca-bundle.crt" in msg
+    assert "intercept" in msg.lower() and "export SSL_CERT_FILE=/path/to/site-ca.crt" in msg
+    assert "site-CA-only file" not in msg            # NOT the old misleading wording
+    # persist hint so it survives the job's login shell
+    assert "~/.bashrc" in msg
 
 
 def test_finding13_trust_bundle_merges_site_ca_with_certifi(monkeypatch, tmp_path, capsys):
