@@ -68,6 +68,79 @@ def test_remote_argv_strips_ssh_flag():
     assert remote.remote_argv(raw) == ["serve", "M", "--gpus", "4", "--dryrun"]
 
 
+# ---- laptop CA -> cluster propagation (--ssh from-anywhere) --------------------
+
+
+def test_remote_command_injects_ssl_cert_file():
+    cmd = remote._remote_command(["serve", "m"], remote.REMOTE_CA_PATH)
+    assert f"SSL_CERT_FILE={remote.REMOTE_CA_PATH}" in cmd
+    assert "SSL_CERT_FILE" not in remote._remote_command(["serve", "m"], None)
+
+
+def test_propagate_ca_copies_site_ca_over_the_master(shim, tmp_path, monkeypatch):
+    # $HOME points at tmp so the "remote" `cat >` lands in a scratch tree, not the
+    # runner's real home; propagation is opt-in (conftest disables it by default).
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(remote.ENV_NO_CA_PROP, raising=False)
+    ca = tmp_path / "new-nix.crt"
+    ca.write_text("-----BEGIN CERTIFICATE-----\nSNLROOT\n-----END CERTIFICATE-----\n")
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca))
+    path = remote.propagate_ca("user@login")
+    assert path == remote.REMOTE_CA_PATH
+    dst = tmp_path / ".local/share/boxy/store/laptop-ca.crt"
+    assert "SNLROOT" in dst.read_text()                       # landed on the (fake) cluster $HOME
+    log = shim.read_text()
+    assert "mkdir -p" in log and "laptop-ca.crt" in log       # copied over the master, not scp
+
+
+def test_propagate_ca_skips_disabled_missing_and_boxy_merged(shim, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("boxy.ramalama_shim._ca_merge_kind", "")   # no leaked provenance
+    ca = tmp_path / "site.crt"
+    ca.write_text("X")
+    # opt-out wins even with a real site CA present
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca))
+    monkeypatch.setenv(remote.ENV_NO_CA_PROP, "1")
+    assert remote.propagate_ca("h") is None
+    # nothing to send when SSL_CERT_FILE is unset
+    monkeypatch.delenv(remote.ENV_NO_CA_PROP, raising=False)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    assert remote.propagate_ca("h") is None
+    # boxy's OWN merged bundle is never propagated (it carries the laptop OS store,
+    # useless to the cluster; only a genuine site CA is worth sending)
+    merged = tmp_path / "ca-merged.crt"
+    merged.write_text("Y")
+    monkeypatch.setenv("SSL_CERT_FILE", str(merged))
+    assert remote.propagate_ca("h") is None
+
+
+def test_run_remote_propagates_ca_and_injects_env(shim, tmp_path, monkeypatch, capfd):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(remote.ENV_NO_CA_PROP, raising=False)
+    ca = tmp_path / "new-nix.crt"
+    ca.write_text("SNLROOT")
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca))
+    monkeypatch.setenv(remote.ENV_REMOTE_CMD, "true")         # remote boxy no-op
+    rc = remote.run_remote("user@login", ["list"])
+    out = capfd.readouterr().out
+    assert rc == 0 and "### CA" in out and "laptop-ca.crt" in out
+    # the delegated boxy command carried SSL_CERT_FILE=$HOME/.../laptop-ca.crt
+    lines = shim.read_text().splitlines()
+    assert any("SSL_CERT_FILE=" in ln and "laptop-ca.crt" in ln for ln in lines)
+
+
+def test_run_remote_without_site_ca_does_not_propagate(shim, tmp_path, monkeypatch, capfd):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(remote.ENV_NO_CA_PROP, raising=False)
+    monkeypatch.setattr("boxy.ramalama_shim._ca_merge_kind", "")
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.setenv(remote.ENV_REMOTE_CMD, "true")
+    rc = remote.run_remote("user@login", ["list"])
+    out = capfd.readouterr().out
+    assert rc == 0 and "### CA" not in out
+    assert not any("SSL_CERT_FILE=" in ln for ln in shim.read_text().splitlines())
+
+
 def test_run_remote_filters_login_node_podman_noise(shim, capfd, monkeypatch):
     # `boxy list --ssh` runs the CLUSTER's (possibly OLD) boxy; on a login node
     # rootless podman spews runtime-dir noise. Filter it laptop-side so it's gone

@@ -21,6 +21,9 @@ def _isolate_config(monkeypatch, tmp_path):
 
     monkeypatch.delenv("BOXY_CONFIG", raising=False)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-none"))
+    # remote CA propagation is opt-in per test: off by default so a delegated
+    # command never tries to `cat >` a CA into the test runner's real $HOME.
+    monkeypatch.setenv("BOXY_NO_CA_PROPAGATE", "1")
     config.reset()
     yield
     config.reset()

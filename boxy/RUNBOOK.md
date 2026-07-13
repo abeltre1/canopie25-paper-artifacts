@@ -100,6 +100,13 @@ What happens behind the scenes:
   and prints `### LOCAL http://127.0.0.1:port/v1` — point your client there. The
   tunnel lives on the SSH master, so it outlives the boxy command; close it with
   the printed `ssh -O cancel ...` line.
+- **Your trust store comes with you.** If `SSL_CERT_FILE` on your laptop points at
+  a site/interceptor CA (e.g. a Zscaler root), boxy copies it to the cluster's
+  shared `$HOME` over the SAME ssh master (no re-auth) and sets `SSL_CERT_FILE` on
+  the remote command — so the compute-node model pull trusts exactly what your
+  laptop trusts, without you scp-ing certs around. You'll see a `### CA copied your
+  site CA -> …` line. Opt out with `BOXY_NO_CA_PROPAGATE=1`. (Only a real site CA
+  is sent — never boxy's own merged bundle or a plain OS store.)
 - **Nothing installed on the cluster** except boxy itself (`pip install` once, or
   set BOXY_REMOTE_COMMAND='source ~/venv/bin/activate && boxy' if it lives in a
   venv). No daemon, no agent — unlike VS Code Remote-SSH's server.

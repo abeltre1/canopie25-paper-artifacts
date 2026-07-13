@@ -44,8 +44,15 @@ ENV_ACTIVE = "BOXY_REMOTE_ACTIVE"   # recursion guard: set on the remote side
 ENV_SSH_BIN = "BOXY_SSH"            # override the ssh binary (tests: a local shim)
 ENV_REMOTE_CMD = "BOXY_REMOTE_COMMAND"  # remote boxy spelling (default: "boxy")
 ENV_PERSIST = "BOXY_SSH_PERSIST"    # how long the master + its tunnels live idle
+ENV_NO_CA_PROP = "BOXY_NO_CA_PROPAGATE"  # opt out of copying the laptop CA to the cluster
 
 DEFAULT_PERSIST = "12h"  # one OTP+touch buys this much multiplexed access
+
+# Where the propagated laptop CA lands on the cluster. $HOME (not ~) so it expands
+# inside the `bash -lc` wrapper AND so it's on the SHARED filesystem every HPC site
+# guarantees — the compute node running the job sees the same file.
+REMOTE_CA_DIR = "$HOME/.local/share/boxy/store"
+REMOTE_CA_PATH = "$HOME/.local/share/boxy/store/laptop-ca.crt"
 
 
 def control_persist() -> str:
@@ -166,12 +173,67 @@ def remote_argv(raw_argv: list[str]) -> list[str]:
     return out
 
 
-def _remote_command(argv: list[str]) -> str:
+def _local_site_ca() -> str | None:
+    """The user's ORIGINAL site/interceptor CA to carry to the cluster, or None.
+    Prefer a user-set SSL_CERT_FILE that is a real file and NOT boxy's own merged
+    bundle; else the site CA boxy recorded when it merged one this process. An
+    AUTO-merged OS store is never propagated — the cluster has its own OS store;
+    what a compute node is missing is the site's TLS-interceptor CA, which only the
+    user's SSL_CERT_FILE carries (field case: SNL compute node, 2026-07)."""
+    cert = os.environ.get("SSL_CERT_FILE", "")
+    if cert and not cert.endswith("ca-merged.crt") and os.path.isfile(cert):
+        return cert
+    try:  # boxy may have already overwritten SSL_CERT_FILE with its merged bundle
+        from boxy import ramalama_shim
+
+        if ramalama_shim._ca_merge_kind == "site" and os.path.isfile(ramalama_shim._ca_merge_source):
+            return ramalama_shim._ca_merge_source
+    except Exception:  # noqa: BLE001 — CA propagation must never break the delegation
+        pass
+    return None
+
+
+def propagate_ca(host: str) -> str | None:
+    """Copy the laptop's site CA to `host` over the LIVE ssh master (no re-auth),
+    landing it on the cluster's shared $HOME, and return the remote path — so the
+    remote command (and the sbatch job it submits, via SLURM --export=ALL) can trust
+    the same interceptor CA the laptop does. Returns None when there's nothing to
+    send or BOXY_NO_CA_PROPAGATE is set. Best-effort: a copy failure warns but never
+    aborts the delegation (the remote may already have a working trust store)."""
+    if os.environ.get(ENV_NO_CA_PROP):
+        return None
+    ca = _local_site_ca()
+    if not ca:
+        return None
+    try:
+        with open(ca, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    # `cat >` over the master beats scp: no second auth, and it reuses the exact
+    # multiplexed connection (ProxyJump/bastion included). $HOME expands remote-side.
+    proc = subprocess.run(
+        [ssh_bin(), "-o", f"ControlPath={control_path()}", host,
+         f"mkdir -p {REMOTE_CA_DIR} && cat > {REMOTE_CA_PATH}"],
+        input=data, capture_output=True)
+    if proc.returncode != 0:
+        print(f"warning: could not copy your site CA to {host} ({(proc.stderr or b'').decode(errors='replace')[:200]}) "
+              f"— if remote pulls fail TLS, set SSL_CERT_FILE on the cluster manually", file=sys.stderr)
+        return None
+    return REMOTE_CA_PATH
+
+
+def _remote_command(argv: list[str], remote_ca: str | None = None) -> str:
     """The command line run on the login node. `bash -lc` gives a LOGIN shell so
     the user's PATH/venv/modules load — the remote `boxy` must be installed there
-    (spelling overridable: BOXY_REMOTE_COMMAND='source ~/venv/bin/activate && boxy')."""
+    (spelling overridable: BOXY_REMOTE_COMMAND='source ~/venv/bin/activate && boxy').
+    `remote_ca` (from propagate_ca) is injected as SSL_CERT_FILE so the cluster and
+    its job trust the laptop's interceptor CA; $HOME expands inside the login shell."""
     boxy_cmd = config.get("binaries.remote_command")
-    inner = f"{ENV_ACTIVE}=1 {boxy_cmd} {shlex.join(argv)}"
+    prefix = f"{ENV_ACTIVE}=1"
+    if remote_ca:
+        prefix += f" SSL_CERT_FILE={remote_ca}"
+    inner = f"{prefix} {boxy_cmd} {shlex.join(argv)}"
     return f"bash -lc {shlex.quote(inner)}"
 
 
@@ -244,10 +306,16 @@ def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False,
               f"your VPN, and that you completed the OTP/YubiKey prompt", file=sys.stderr)
         return rc
     argv = remote_argv(raw_argv)
+    # carry the laptop's site/interceptor CA to the cluster over the same master, so
+    # the remote pull trusts what the laptop trusts (compute nodes often lack the
+    # site CA even when the laptop has it). Best-effort; never blocks the command.
+    remote_ca = propagate_ca(host)
+    if remote_ca:
+        print(f"### CA      copied your site CA -> {host}:{REMOTE_CA_PATH}  (remote SSL_CERT_FILE)")
     # label what follows: everything below runs the CLUSTER's boxy install (keep
     # it as current as the local one: git pull + pip install -e on the login node).
     print(f"### Remote  {host}  $ boxy {shlex.join(argv)}")
-    cmd = [ssh_bin(), "-o", f"ControlPath={control_path()}", host, _remote_command(argv)]
+    cmd = [ssh_bin(), "-o", f"ControlPath={control_path()}", host, _remote_command(argv, remote_ca)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     tunneled: set[tuple[str, int]] = set()
     stale = False
