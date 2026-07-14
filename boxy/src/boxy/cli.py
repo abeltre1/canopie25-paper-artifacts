@@ -995,33 +995,6 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
             name="auto", scheduler=scheduler_name,
             resources=Resources(nodes=args.nodes or 1, gpus_per_node=args.gpus or 0))
     scheduler = get_scheduler(scheduler_name)
-    # Fail early and clearly if the scheduler isn't on THIS host (no --ssh) —
-    # before any site probing (mywcid/sacctmgr), so a laptop user gets the
-    # add-`--ssh` guidance, not a wasted account lookup. Dryrun still renders.
-    if not args.dryrun:
-        _require_scheduler_binary(scheduler.submit_command("x")[0], scheduler_name)
-    site_args = list(location.scheduler_args)
-    # Turnkey site resolution: fill account/partition/time when the flags are
-    # absent (mywcid/env/sacctmgr for account; config defaults for the rest),
-    # each printing an auto: line. Explicit flags win; the Flux single-queue
-    # guard trims a Slurm-style comma partition. (Skip the prints for the
-    # --replicas fan-out, which owns the shared auto: block once.)
-    from boxy import site
-
-    site_map, site_decisions = site.resolve_site(args, scheduler_name)
-    if name_override is None:
-        for line in site_decisions:
-            print(f"  auto: {line}")
-    for kind in ("partition", "account", "time"):
-        if site_map.get(kind):
-            site_args.append(scheduler.site_directive(kind, site_map[kind]))
-    site_args += list(args.scheduler_args or [])
-    dynamic = getattr(args, "dynamic_flags", [])
-    site_args += [scheduler.dynamic_directive(k, v) for k, v in _dynamic_for(dynamic, scheduler_name)]
-    ignored = _dynamic_ignored(dynamic, scheduler_name)
-    if ignored:
-        print(f"warning: ignoring {' '.join(ignored)} (active scheduler is {scheduler_name})",
-              file=sys.stderr)
 
     if args.save_profile:
         print("note: --save-profile is not yet supported for batch submissions "
@@ -1082,6 +1055,33 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
             return 1
         elif not args.dryrun:
             jobs.remove(name)  # stale record from a finished job (S6: dryrun must not mutate)
+
+    # We are committed to submitting (the record logic above already returned for
+    # already-serving / unreachable / mismatched jobs). Now: fail early and
+    # clearly if the scheduler isn't on THIS host (no --ssh) — before any site
+    # probing — then fill account/partition/time from cards/mywcid/env/sacctmgr.
+    if not args.dryrun:
+        _require_scheduler_binary(scheduler.submit_command("x")[0], scheduler_name)
+    site_args = list(location.scheduler_args)
+    # Explicit flags win; each filled value prints an auto: line; the Flux
+    # single-queue guard trims a Slurm-style comma partition. (Skip the prints
+    # for the --replicas fan-out, which owns the shared auto: block once.)
+    from boxy import site
+
+    site_map, site_decisions = site.resolve_site(args, scheduler_name)
+    if name_override is None:
+        for line in site_decisions:
+            print(f"  auto: {line}")
+    for kind in ("partition", "account", "time"):
+        if site_map.get(kind):
+            site_args.append(scheduler.site_directive(kind, site_map[kind]))
+    site_args += list(args.scheduler_args or [])
+    dynamic = getattr(args, "dynamic_flags", [])
+    site_args += [scheduler.dynamic_directive(k, v) for k, v in _dynamic_for(dynamic, scheduler_name)]
+    ignored = _dynamic_ignored(dynamic, scheduler_name)
+    if ignored:
+        print(f"warning: ignoring {' '.join(ignored)} (active scheduler is {scheduler_name})",
+              file=sys.stderr)
 
     inner = _proxy_prefix(args) + _inner_serve_command(args, model, name)
     # request one task per node when the job will serve distributed (Ray needs a
