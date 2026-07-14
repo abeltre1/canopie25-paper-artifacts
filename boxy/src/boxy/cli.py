@@ -2693,8 +2693,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "List them with `boxy cards`. Sugar over --location; explicit flags win")
     p.add_argument("--engine", choices=["llama.cpp", "vllm"], default=None,
                    help="inference engine (default: inferred — GGUF/ollama -> llama.cpp, else vLLM)")
-    p.add_argument("--runtime", choices=["podman", "docker", "apptainer"], default=None,
-                   help="container runtime (default: first WORKING one found)")
+    p.add_argument("--runtime", choices=["podman", "docker", "apptainer", "charliecloud"], default=None,
+                   help="container runtime (default: first WORKING one found; charliecloud is experimental)")
     p.add_argument("--scheduler", choices=["none", "slurm", "flux"], default=None,
                    help="submit as a job via this scheduler (never done automatically)")
     p.add_argument("--accelerator", choices=list(ACCELERATORS), default=None,

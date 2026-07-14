@@ -92,6 +92,9 @@ _PROBES: dict[str, list[str]] = {
     "podman": ["info", "--format", "{{.Host.Arch}}"],
     "docker": ["info", "--format", "{{.ServerVersion}}"],
     "apptainer": ["version"],
+    # charliecloud is opt-in (experimental): not in the autodetect tuple below,
+    # but probeable when pinned via --runtime/a system card. Its binary is ch-run.
+    "charliecloud": ["--version"],
 }
 
 

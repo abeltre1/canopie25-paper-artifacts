@@ -16,7 +16,7 @@ from pathlib import Path
 # VALID schedulers/runtimes is derived from the plugin registries at validation
 # time (see __post_init__) so adding a backend/scheduler there is enough — no
 # second list to keep in sync.
-RUNTIMES = ("podman", "apptainer", "docker")
+RUNTIMES = ("podman", "apptainer", "docker", "charliecloud")
 ACCELERATORS = ("cuda", "rocm", "intel", "vulkan", "asahi", "ascend", "musa", "metal", "none")
 
 
