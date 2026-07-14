@@ -29,6 +29,39 @@ def test_parse_accounts_multiple_in_order():
     assert site.parse_accounts("fy260064\nfy999999\nfy260064\n") == ["fy260064", "fy999999"]
 
 
+# The REAL mywcid output (field sample, 2026-07): header row, dashed rule, data
+# rows where the DESCRIPTION starts with a bare numeric id right after the
+# account, a privilege-less 'none' row, and a trailing caps note repeating the
+# first account in uppercase.
+REAL_MYWCID = """\
+      User    Account                              Description     Parent
+---------- ---------- ---------------------------------------- --------------------
+     jdoe   fy140001        103732 system software and tools                   nd
+     jdoe   fy140252      135101 common computing environment                   nd
+     jdoe   fy260064         240928 the genesis project obbba                   nd
+     jdoe       none       default account, no job privileges
+  The Account could be on Caps too: FY140001
+"""
+
+
+def test_parse_accounts_real_mywcid_table():
+    got = site.parse_accounts(REAL_MYWCID)
+    # all three real accounts, in order; the bare description ids (103732…) are
+    # NOT mistaken for accounts; the caps-note duplicate FY140001 is deduped
+    # case-insensitively; the header/'none' rows contribute nothing.
+    assert got == ["fy140001", "fy140252", "fy260064"]
+
+
+def test_real_mywcid_first_pick_and_alternatives(clean_env, tmp_path, monkeypatch):
+    shim = tmp_path / "mywcid"
+    shim.write_text("#!/bin/bash\ncat <<'EOF'\n" + REAL_MYWCID + "EOF\n")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    acct, why = site.resolve_account(None)
+    assert acct == "fy140001"                      # first listed wins (deterministic)
+    assert "fy140252" in why and "fy260064" in why  # alternatives named for an easy override
+
+
 # ---- probe chain (shims) ----------------------------------------------------------
 
 

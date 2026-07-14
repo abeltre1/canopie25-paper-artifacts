@@ -27,9 +27,24 @@ import subprocess
 
 from boxy import config
 
-# An account/WC-ID token: optional letters then >=4 digits (fy260064, FY260064,
-# 12345678). Kept tight so prose lines in `mywcid` output don't match.
-_ACCOUNT_RE = re.compile(r"\b([A-Za-z]{0,4}\d{4,})\b")
+# An account/WC-ID token: letters then >=4 digits (fy260064, FY140001) — the
+# preferred shape; a bare 6-8 digit ID is accepted only when no letter-prefixed
+# token exists anywhere. Real `mywcid` rows carry BOTH (`... fy140001   103732
+# system software ...` — the description starts with a numeric id), and search()
+# order picks the account: 'ambelt' has no digits, so fy140001 is the first hit.
+_ACCOUNT_RE = re.compile(r"\b([A-Za-z]{1,4}\d{4,})\b")
+_BARE_ID_RE = re.compile(r"\b(\d{6,8})\b")
+
+# Header/separator lines from the real mywcid table (field sample, 2026-07):
+#       User    Account                              Description     Parent
+#   ---------- ---------- ------------------------------------ ----------
+# plus WC-ID-style headers and dashed rules: never mine these for tokens.
+_HEADER_RE = re.compile(
+    r"^\s*[-=+\s]+$"                      # dashed/blank separator rules
+    r"|^\s*user\s+account\b"              # the real mywcid header row
+    r"|\bdescription\b|\bparent\b|\btitle\b"   # other header vocabulary
+    r"|^\s*wc\s*id\s",
+    re.IGNORECASE)
 
 
 def _run(argv: list[str], timeout: float = 8) -> str:
@@ -46,22 +61,49 @@ def _run(argv: list[str], timeout: float = 8) -> str:
 
 def parse_accounts(text: str) -> list[str]:
     """Account-looking tokens from a command's output, in order, de-duplicated.
-    Tolerant of labels/columns: `mywcid` and `sacctmgr` layouts both reduce to
-    'the first token per line that looks like an account'."""
-    out: list[str] = []
+    Tolerant of the layouts seen in the field: a `mywcid` TABLE (header row +
+    data rows), a labelled line (`WCID: fy260064 (Project)`), a bare list, and
+    `sacctmgr -nP` single-column output. Header/separator lines are skipped;
+    letter-prefixed IDs (fy260064) win; bare 6-8 digit IDs are the fallback
+    ONLY when no letter-prefixed token exists anywhere."""
+    prefixed: list[str] = []
+    bare: list[str] = []
+    seen_ci: set[str] = set()   # mywcid's trailing "could be on Caps too: FY140001"
     for line in text.splitlines():
+        if _HEADER_RE.search(line):
+            continue
         m = _ACCOUNT_RE.search(line)
-        if m and m.group(1) not in out:
-            out.append(m.group(1))
-    return out
+        if m:
+            if m.group(1).lower() not in seen_ci:
+                seen_ci.add(m.group(1).lower())
+                prefixed.append(m.group(1))
+            continue
+        b = _BARE_ID_RE.search(line)
+        if b and b.group(1) not in bare:
+            bare.append(b.group(1))
+    return prefixed if prefixed else bare
 
 
-def _account_from_command() -> tuple[str | None, list[str]]:
+def _first_output_line(text: str) -> str:
+    """The first non-empty line of a probe's output, truncated — shown when
+    parsing finds nothing, so the field fix is a glance, not a debug session."""
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()[:100]
+    return ""
+
+
+def _account_from_command() -> tuple[str | None, list[str], str]:
+    """(first_account, all_accounts, raw_first_line). raw_first_line is non-empty
+    only when the command PRODUCED output that parsed to nothing — the case worth
+    showing the user verbatim."""
     cmd = config.get_str("site.account_command").strip()
     if not cmd:
-        return None, []
-    accounts = parse_accounts(_run(cmd.split()))
-    return (accounts[0] if accounts else None), accounts
+        return None, [], ""
+    out = _run(cmd.split())
+    accounts = parse_accounts(out)
+    raw = "" if accounts else _first_output_line(out)
+    return (accounts[0] if accounts else None), accounts, raw
 
 
 def _account_from_sacctmgr() -> tuple[str | None, list[str]]:
@@ -84,7 +126,7 @@ def resolve_account(explicit: str | None) -> tuple[str | None, str]:
     cfg = config.get_str("site.account").strip()
     if cfg:
         return cfg, "config site.account"
-    acct, alts = _account_from_command()
+    acct, alts, raw = _account_from_command()
     if acct:
         cmd = config.get_str("site.account_command").strip()
         extra = f"; also: {', '.join(alts[1:])}" if len(alts) > 1 else ""
@@ -93,12 +135,27 @@ def resolve_account(explicit: str | None) -> tuple[str | None, str]:
         v = os.environ.get(env)
         if v:
             return v, f"${env}"
-    acct, alts = _account_from_sacctmgr()
-    if acct:
-        extra = f"; also: {', '.join(alts[1:])}" if len(alts) > 1 else ""
-        return acct, f"sacctmgr assoc{extra}"
-    return None, ("no account discovered (mywcid / $SBATCH_ACCOUNT / sacctmgr) — "
-                  "the scheduler will use its site default; pass --account if it rejects the job")
+    sacct, salts = _account_from_sacctmgr()
+    if sacct:
+        extra = f"; also: {', '.join(salts[1:])}" if len(salts) > 1 else ""
+        return sacct, f"sacctmgr assoc{extra}"
+    why = ("no account discovered (mywcid / $SBATCH_ACCOUNT / sacctmgr) — "
+           "the scheduler will use its site default; pass --account if it rejects the job")
+    if raw:
+        cmd = config.get_str("site.account_command").strip()
+        why = (f"`{cmd}` answered but no account parsed from: {raw!r} — "
+               f"pass --account (or export BOXY_ACCOUNT) and report the format")
+    return None, why
+
+
+def remote_account_probe() -> str:
+    """The shell one-liner run ON a cluster login node (over the ssh master) to
+    discover the account when delegating with --ssh: the configured site command
+    (default `mywcid`), falling back to sacctmgr. Shared by the --ssh serve
+    injection and `boxy doctor --ssh`."""
+    cmd = config.get_str("site.account_command").strip() or "mywcid"
+    return (f"{cmd} 2>/dev/null || "
+            f"sacctmgr -nP show assoc user=$USER format=account 2>/dev/null || true")
 
 
 def resolve_partition(explicit: str | None) -> tuple[str | None, str]:
