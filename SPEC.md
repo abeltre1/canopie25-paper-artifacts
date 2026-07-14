@@ -677,6 +677,34 @@ SkyPilot are implementation details it can swap out.
   script (a verbatim `podman run` + a bash endpoint-write, no boxy on the node).
   Remaining: laptop-side `list/curl/logs` over the shared FS without a cluster
   boxy; optional bash-probe hardware auto-detection.
+- **Phase 8 — Turnkey UX (one command, zero SLURM/container knowledge). ✅
+  implemented (`claude/boxy-turnkey`).** `boxy serve <model> --scheduler slurm`
+  needs no `--gpus/--account/--partition/--time/--accelerator`. **Model cards**
+  (`data/cards/models/*.toml` + `cards.py`) map a model → GPUs/engine/args, with
+  a size heuristic (`-70B` → 4 GPUs) for unknowns; **system cards**
+  (`data/cards/systems/*.toml`, 3 per type: laptop/HPC-slurm/HPC-flux/cloud/
+  OpenShift) are deployment profiles selected by `--system`; **site discovery**
+  (`site.py`) fills `--account` from `mywcid`/`$SBATCH_ACCOUNT`/`sacctmgr` and
+  partition/time defaults. A GPU-less login node defaults the accelerator (no
+  hard error); the Flux single-queue guard fixes Slurm-style comma partitions.
+  New **CharlieCloud** RuntimeBackend (experimental) proves the runtime seam.
+  `boxy cards` lists the catalog; `ARCHITECTURE.md` diagrams where the machinery
+  is hidden. Every filled value still prints an `auto:` decision line. RamaLama
+  supplies images; SkyPilot backs the cloud cards. **Roadmap status snapshot
+  (2026-07):**
+
+  | Track | Status |
+  |---|---|
+  | Foundation (box/location, config, v0.1.0 packaging) | ✅ done |
+  | Runtime drivers: podman/docker/apptainer, registries/mirrors | ✅ done |
+  | Runtime drivers: CharlieCloud | ✅ done (experimental) · k8s-as-runtime ○ not started |
+  | HPC: Slurm/Flux submit, distributed, --replicas, --ssh, doctor, CA propagation | ✅ done |
+  | HPC: Flux live field validation | ◐ in progress (comma-queue guard shipped) |
+  | HPC: Enroot/Pyxis backends | ○ not started |
+  | AI serving: serve/bench/sweep, cloud (generate sky), zero-install chisel share | ✅ done |
+  | **Turnkey (cards + site + CharlieCloud + diagrams)** | ✅ **done (this phase)** |
+  | Dev envs: agentic sandboxes/harness, Atlas UI 3 | ○ not started (after turnkey) |
+  | Release: CI matrix + Trusted Publishing; v0.2 with turnkey | ✅ CI done · ○ v0.2 tag pending |
 
 ---
 

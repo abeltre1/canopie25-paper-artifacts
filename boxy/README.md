@@ -29,6 +29,39 @@ Every `auto:` decision is overridable by a flag (`--engine --runtime
 (`--box` = the *what*, `--location` = the *where*). Profiles are how a site's
 quirks (modules, tuning, offline mode, GPU counts) are pinned once and reused.
 
+## Turnkey: one command, from laptop to cluster
+
+A user with **zero SLURM/container knowledge** serves a model with one command —
+no `--gpus`, `--account`, `--partition`, `--time`, `--accelerator`:
+
+```bash
+boxy serve meta-llama/Llama-3.3-70B-Instruct --scheduler slurm
+#   auto: gpus: 4 per node (model card 'llama-3.3-70b-instruct', 80GB-class GPUs)
+#   auto: engine: vllm (model card)
+#   auto: account: fy260064 (via mywcid)
+#   ...submits a 4-GPU vLLM job, waits for READY, prints the endpoint.
+```
+
+boxy fills the gaps from **cards** and **site discovery**, and still prints every
+choice (nothing is hidden, only the *work*):
+
+- **model cards** (`boxy cards`) map a model → GPUs / engine / engine args; an
+  unknown model is sized from its name (`-70B` → 4 GPUs). RamaLama picks the image.
+- **system cards** are deployment profiles per system type —
+  `--system slurm-cuda | flux-rocm | laptop-podman | cloud-aws-gpu | openshift-gpu`
+  (3 per type; the cloud ones drive SkyPilot via `boxy generate sky`).
+- **site discovery** fills `--account` from `mywcid` / `$SBATCH_ACCOUNT` /
+  `sacctmgr`, plus partition/time defaults.
+
+Same command deploys anywhere — laptop (Podman/Docker), HPC (Apptainer/CharlieCloud
++ Slurm/Flux), cloud/OpenShift — because the scheduler and runtime are hidden
+behind pluggable drivers. See **[`ARCHITECTURE.md`](ARCHITECTURE.md)** for the
+layered diagram of where that hiding happens, and drop your own cards in
+`~/.config/boxy/cards/{models,systems}/` to override the built-ins.
+
+Power users keep full control: pass any flag and it wins; `--dryrun` prints the
+whole plan (batch script included) with zero network.
+
 ## How boxy decides (v2 resolution rules)
 
 | Decision | Rule |
