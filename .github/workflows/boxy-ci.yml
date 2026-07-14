@@ -2,8 +2,8 @@ name: boxy-ci
 
 on:
   push:
-    # TODO: drop the feature branch once this work merges to the default branch.
-    branches: ["claude/boxy-cli-hpc-spec-ojevsl", "main", "master"]
+    # TODO: drop the feature branches once this work merges to the default branch.
+    branches: ["claude/boxy-cli-hpc-spec-ojevsl", "claude/boxy-turnkey", "main", "master"]
     paths: ["boxy/**", ".github/workflows/boxy-ci.yml"]
   pull_request:
     paths: ["boxy/**", ".github/workflows/boxy-ci.yml"]
