@@ -1,0 +1,5 @@
+# Baremetal Linux workstation using Apptainer (OCI->SIF on first run).
+[location]
+name = "laptop-apptainer"
+scheduler = "none"
+runtime = "apptainer"

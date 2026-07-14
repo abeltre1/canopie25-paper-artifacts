@@ -1,0 +1,9 @@
+# Flux site where only Apptainer is available. Pin accelerator here if the
+# login node is GPU-less; the compute node re-detects otherwise.
+[location]
+name = "flux-apptainer"
+scheduler = "flux"
+runtime = "apptainer"
+offline = true
+[location.resources]
+gpus_per_node = 1

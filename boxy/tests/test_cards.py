@@ -134,6 +134,51 @@ def test_explicit_gpus_still_wins_end_to_end(monkeypatch, tmp_path, capsys):
     assert "auto: gpus:" not in out                 # the card stayed silent
 
 
+# ---- system cards -----------------------------------------------------------------
+
+
+def test_system_cards_cover_every_type():
+    types = {typ for _stem, typ, _r in cards.system_card_entries()}
+    assert {"laptop", "hpc-slurm", "hpc-flux", "cloud", "openshift"} <= types
+    # 3 examples per type (user direction)
+    from collections import Counter
+    counts = Counter(typ for _s, typ, _r in cards.system_card_entries())
+    for typ in ("laptop", "hpc-slurm", "hpc-flux", "cloud", "openshift"):
+        assert counts[typ] >= 3
+
+
+def test_system_card_matches_by_location_name_and_stem():
+    from boxy.location import Location
+    # canonical [location].name is unique and self-describing
+    assert Location.from_toml(cards.system_card_path("slurm-cuda")).scheduler == "slurm"
+    assert Location.from_toml(cards.system_card_path("flux-rocm")).accelerator == "rocm"
+    # a unique file stem also resolves (laptop-podman.toml)
+    assert Location.from_toml(cards.system_card_path("podman")).runtime == "podman"
+
+
+def test_unknown_system_card_lists_choices():
+    with pytest.raises(ValueError, match="unknown system card"):
+        cards.system_card_path("no-such-system")
+
+
+def test_serve_with_system_card_dryrun(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    rc = main(["serve", "hf://meta-llama/Llama-3.1-8B-Instruct",
+               "--system", "slurm-cuda", "--dryrun"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "auto: system: slurm-cuda" in out
+    assert "#SBATCH" in out and "boxy-llama-3.1-8b-instruct" in out
+
+
+def test_boxy_cards_lists_models_and_systems(capsys):
+    rc = main(["cards"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "meta-llama/Llama-3.3-70B-Instruct" in out
+    assert "hpc-slurm" in out and "cloud" in out and "openshift" in out
+
+
 def test_card_engine_args_reach_the_box(monkeypatch):
     # node-side: resolve() merges card args into box.args (tack-on-last keeps
     # user args winning at engine-command build time)

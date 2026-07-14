@@ -1,0 +1,10 @@
+# Slurm + CUDA GPU cluster (hops-like). Podman on the node; RamaLama-informed
+# vLLM/llama.cpp images chosen per accelerator.
+[location]
+name = "slurm-cuda"
+scheduler = "slurm"
+accelerator = "cuda"
+runtime = "podman"
+offline = true
+[location.resources]
+gpus_per_node = 4

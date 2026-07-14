@@ -1,0 +1,11 @@
+# Slurm + AMD ROCm cluster. Apptainer is common on ROCm HPC sites.
+[location]
+name = "slurm-rocm"
+scheduler = "slurm"
+accelerator = "rocm"
+runtime = "apptainer"
+offline = true
+[location.resources]
+gpus_per_node = 4
+[location.tuning]
+gpu_memory_utilization = 0.85

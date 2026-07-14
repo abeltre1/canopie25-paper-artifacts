@@ -1,0 +1,12 @@
+# Flux + AMD ROCm (eldorado-like). Apptainer; MI300-class memory tuning.
+[location]
+name = "flux-rocm"
+scheduler = "flux"
+accelerator = "rocm"
+runtime = "apptainer"
+offline = true
+modules = ["rocm/6.4.0"]
+[location.resources]
+gpus_per_node = 4
+[location.tuning]
+gpu_memory_utilization = 0.7

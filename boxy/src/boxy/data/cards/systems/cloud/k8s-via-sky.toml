@@ -1,0 +1,9 @@
+# Kubernetes via SkyPilot (sky supports a k8s backend). Same box+card ->
+# sky task; sky schedules the pod. boxy generate sky --location <this>.
+[location]
+name = "cloud-k8s"
+scheduler = "none"
+accelerator = "cuda"
+[location.resources]
+gpus_per_node = 1
+accelerator_type = "A100"

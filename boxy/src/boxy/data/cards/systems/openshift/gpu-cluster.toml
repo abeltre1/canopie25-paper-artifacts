@@ -1,0 +1,10 @@
+# OpenShift GPU cluster. Images pulled from the cluster-internal registry
+# mirror (Zscaler-safe); serve/relay manifests via the OpenShift emitters.
+[location]
+name = "openshift-gpu"
+scheduler = "none"
+accelerator = "cuda"
+offline = true
+[location.image_mirrors]
+"docker.io" = "image-registry.openshift-image-registry.svc:5000/boxy"
+"ghcr.io" = "image-registry.openshift-image-registry.svc:5000/boxy"

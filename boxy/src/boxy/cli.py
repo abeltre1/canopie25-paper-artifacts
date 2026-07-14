@@ -828,6 +828,33 @@ def _apply_bind_host_env(args) -> None:
         os.environ["BOXY_BIND_HOST"] = host
 
 
+def cmd_cards(args: argparse.Namespace) -> int:
+    """List the built-in deployment cards: MODEL cards (per-model geometry so
+    `serve MODEL` needs no flags) and SYSTEM cards (per-system-type profiles for
+    --system)."""
+    from boxy import cards
+
+    print("model cards (auto GPUs/engine/args for a model — `boxy serve <id> --scheduler slurm`):")
+    seen = set()
+    for c in cards.load_cards():
+        if c.card_name in seen:
+            continue
+        seen.add(c.card_name)
+        geo = f"{c.gpus} GPU" + ("s" if c.gpus != 1 else "") if c.gpus else "size-heuristic"
+        eng = f", {c.engine}" if c.engine else ""
+        print(f"  {c.match:<40} {geo}{eng}  [{c.source}]")
+    print("  (any other model -> sized from its name, e.g. '-70B' -> 4 GPUs)")
+
+    print("\nsystem cards (deployment profile per system type — `boxy serve MODEL --system <name>`):")
+    by_type: dict[str, list[str]] = {}
+    for cname, typ in cards.system_card_names():
+        by_type.setdefault(typ, []).append(cname)
+    for typ in sorted(by_type):
+        print(f"  {typ:<12} {', '.join(sorted(by_type[typ]))}")
+    print("\ndrop your own in ~/.config/boxy/cards/{models,systems}/ (they win over built-ins).")
+    return 0
+
+
 def cmd_examples(args: argparse.Namespace) -> int:
     """List / show / export the packaged example box & location profiles. Uses
     importlib.resources so it works from an installed wheel (not just a checkout)."""
@@ -1467,6 +1494,17 @@ def _delegate_remote(args, tunnel_ready: bool = False) -> int | None:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
+    # A --system card is a built-in deployment profile: materialize it to a TOML
+    # and feed it through the SAME --location machinery (explicit flags still win
+    # via the overlay). --location wins if both are given.
+    if getattr(args, "system", None) and not args.location:
+        from boxy import cards
+
+        try:
+            args.location = cards.system_card_path(args.system)
+        except ValueError as e:
+            raise UsageError(str(e))
+        print(f"  auto: system: {args.system} (built-in system card)")
     rc = _delegate_remote(args, tunnel_ready=True)
     if rc is not None:
         return rc
@@ -2626,6 +2664,10 @@ def build_parser() -> argparse.ArgumentParser:
     xp.add_argument("dest", nargs="?", default="./examples", help="destination dir (default ./examples)")
     p.set_defaults(func=cmd_examples, location=None, action=None)
 
+    p = sub.add_parser("cards", help="list the built-in model & system deployment cards "
+                                     "(turnkey: `boxy serve MODEL --scheduler slurm`)")
+    p.set_defaults(func=cmd_cards, location=None)
+
     p = sub.add_parser("doctor", help="audit the environment for known field issues "
                                       "(proxy/CA/runtime/scheduler/OOM/…); OK/WARN/FAIL + a fix each")
     p.add_argument("--net", action="store_true",
@@ -2645,6 +2687,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "Alternative: --box")
     p.add_argument("--box", default=None, help="serve from a box TOML profile instead of MODEL")
     p.add_argument("--location", default=None, help="site TOML profile (scheduler/runtime/accelerator/tuning)")
+    p.add_argument("--system", default=None, metavar="NAME",
+                   help="a built-in SYSTEM CARD (deployment profile per system type: e.g. "
+                        "slurm-cuda, flux-rocm, laptop-podman, cloud-aws-gpu, openshift-gpu). "
+                        "List them with `boxy cards`. Sugar over --location; explicit flags win")
     p.add_argument("--engine", choices=["llama.cpp", "vllm"], default=None,
                    help="inference engine (default: inferred — GGUF/ollama -> llama.cpp, else vLLM)")
     p.add_argument("--runtime", choices=["podman", "docker", "apptainer"], default=None,

@@ -1,0 +1,11 @@
+# Slurm + CUDA, multi-node distributed (Ray tensor+pipeline parallel) for a
+# 70B-class model across 2 nodes x 4 GPUs.
+[location]
+name = "slurm-cuda-multinode"
+scheduler = "slurm"
+accelerator = "cuda"
+runtime = "podman"
+offline = true
+[location.resources]
+nodes = 2
+gpus_per_node = 4

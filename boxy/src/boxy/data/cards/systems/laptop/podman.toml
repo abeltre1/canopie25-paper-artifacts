@@ -1,0 +1,6 @@
+# Laptop/baremetal with Podman (default local runtime). No scheduler; a
+# container runs here, accelerator autodetected.
+[location]
+name = "laptop-podman"
+scheduler = "none"
+runtime = "podman"

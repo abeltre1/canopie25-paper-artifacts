@@ -173,6 +173,93 @@ def resolve_model_card(model: str) -> ModelCard | None:
     return find_card(model) or size_heuristic(model)
 
 
+# ---- system cards (per-system-type deployment profiles) ---------------------------
+
+
+def _user_systems_dir() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return Path(xdg) / "boxy" / "cards" / "systems"
+
+
+def system_card_entries() -> list[tuple[str, str, object]]:
+    """(stem, type, read_text) for every system card — user dir first (wins on a
+    name clash), then the packaged catalog grouped by type subdir (laptop,
+    hpc-slurm, hpc-flux, cloud, openshift). read_text() returns the TOML text;
+    nothing is parsed until called."""
+    from importlib import resources
+
+    out: list[tuple[str, str, object]] = []
+    ud = _user_systems_dir()
+    if ud.is_dir():
+        for p in sorted(ud.rglob("*.toml")):
+            out.append((p.stem, "user", (lambda p=p: p.read_text())))
+    try:
+        root = resources.files("boxy").joinpath("data/cards/systems")
+        for typ in sorted(root.iterdir(), key=lambda e: e.name):
+            if "." in typ.name:
+                continue
+            for entry in sorted(typ.iterdir(), key=lambda e: e.name):
+                if entry.name.endswith(".toml"):
+                    out.append((entry.name[:-5], typ.name, (lambda e=entry: e.read_text())))
+    except (FileNotFoundError, ModuleNotFoundError, NotADirectoryError):
+        pass
+    return out
+
+
+def _match_system_card(name: str) -> tuple[str, str] | None:
+    """(text, stem) of the system card matching `name`. The canonical id is the
+    card's [location].name (unique: slurm-cuda, flux-cuda, …); the file stem is a
+    convenience fallback but can collide across type dirs (cuda-cluster exists
+    under both hpc-slurm and hpc-flux), so an exact location-name match wins."""
+    parsed: list[tuple[str, str, str]] = []  # (text, stem, loc_name)
+    for stem, _typ, read_text in system_card_entries():
+        text = read_text()
+        try:
+            loc_name = (tomllib.loads(text).get("location") or {}).get("name") or ""
+        except tomllib.TOMLDecodeError:
+            continue
+        parsed.append((text, stem, loc_name))
+    for text, stem, loc_name in parsed:      # pass 1: canonical location.name
+        if name == loc_name:
+            return text, stem
+    for text, stem, loc_name in parsed:      # pass 2: file-stem fallback
+        if name == stem:
+            return text, stem
+    return None
+
+
+def system_card_names() -> list[tuple[str, str]]:
+    """(canonical_name, type) for every system card — canonical = [location].name.
+    Used by `boxy cards` so the listed handle is the one --system matches first."""
+    out: list[tuple[str, str]] = []
+    for stem, typ, read_text in system_card_entries():
+        try:
+            loc_name = (tomllib.loads(read_text()).get("location") or {}).get("name")
+        except tomllib.TOMLDecodeError:
+            loc_name = None
+        out.append((loc_name or stem, typ))
+    return out
+
+
+def system_card_path(name: str) -> str:
+    """Materialize the system card `name` to a temp TOML file and return the
+    path, so `--system` is pure sugar over `--location` (all the existing profile
+    machinery — Location.from_toml, flag overlay, batch directives — is reused
+    unchanged). Raises ValueError listing choices when unknown."""
+    import tempfile
+
+    hit = _match_system_card(name)
+    if hit is None:
+        known = sorted({stem for stem, _t, _r in system_card_entries()})
+        raise ValueError(f"unknown system card {name!r}. Known: {', '.join(known)} "
+                         f"(list: `boxy cards`; or drop a TOML in {_user_systems_dir()})")
+    text, stem = hit
+    f = tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False, prefix=f"boxy-system-{stem}-")
+    f.write(text)
+    f.close()
+    return f.name
+
+
 def apply_to_args(args) -> list[str]:
     """Turnkey fill for a SCHEDULER submission: when --gpus/--nodes/--engine are
     absent, take them from the model's card (or the size heuristic), returning

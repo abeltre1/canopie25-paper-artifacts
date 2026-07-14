@@ -1,0 +1,5 @@
+# Laptop with Docker Desktop.
+[location]
+name = "laptop-docker"
+scheduler = "none"
+runtime = "docker"

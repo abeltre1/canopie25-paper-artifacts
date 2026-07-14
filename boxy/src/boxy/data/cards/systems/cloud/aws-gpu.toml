@@ -1,0 +1,9 @@
+# Cloud GPU on AWS via SkyPilot. Use with: boxy generate sky --location <this>
+# --serve. SkyPilot picks the instance for the accelerator_type across 20+ clouds.
+[location]
+name = "cloud-aws-gpu"
+scheduler = "none"
+accelerator = "cuda"
+[location.resources]
+gpus_per_node = 1
+accelerator_type = "A100"
