@@ -4,8 +4,23 @@ from __future__ import annotations
 
 import shlex
 from abc import ABC
+from dataclasses import dataclass
 
 from boxy.location import Location
+
+
+@dataclass(frozen=True)
+class PartitionInfo:
+    """One schedulable partition/queue, as discovered for `--partition auto`.
+    `idle_nodes` ranks the soonest-start pick; `up` filters out down partitions;
+    `has_gpu` marks partitions that advertise a GPU generic resource so a GPU job
+    is only offered partitions that can actually run it (the field 'stuck in a
+    CPU partition' failure)."""
+
+    name: str
+    idle_nodes: int = 0
+    up: bool = True
+    has_gpu: bool = False
 
 
 class Scheduler(ABC):
@@ -129,8 +144,7 @@ class Scheduler(ABC):
         default)."""
         return []
 
-    def parse_partitions(self, stdout: str) -> list[tuple[str, int, bool]]:
-        """Parse partitions_command() output into (name, idle_nodes, is_up) —
-        idle_nodes ranks the soonest-start pick, is_up filters out down ones.
-        Best-effort: a line that doesn't parse is skipped, never raised."""
+    def parse_partitions(self, stdout: str) -> list[PartitionInfo]:
+        """Parse partitions_command() output into PartitionInfo rows. Best-effort:
+        a line that doesn't parse is skipped, never raised."""
         return []

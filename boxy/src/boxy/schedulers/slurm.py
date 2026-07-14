@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from boxy.location import Location
-from boxy.schedulers.base import Scheduler
+from boxy.schedulers.base import PartitionInfo, Scheduler
 
 
 class SlurmScheduler(Scheduler):
@@ -81,26 +81,33 @@ class SlurmScheduler(Scheduler):
 
     def partitions_command(self) -> list[str]:
         # %R = partition name (no default `*` marker), %a = up/down,
-        # %F = nodes as allocated/idle/other/total — the idle count ranks the
-        # soonest-start pick. `-h` drops the header.
-        return ["sinfo", "-h", "-o", "%R %a %F"]
+        # %F = nodes as allocated/idle/other/total (idle ranks soonest-start),
+        # %G = generic resources (gpu:… when the partition has accelerators).
+        # Pipe-delimited because %G can be `(null)`/contain colons; `-h` drops
+        # the header.
+        return ["sinfo", "-h", "-o", "%R|%a|%F|%G"]
 
-    def parse_partitions(self, stdout: str) -> list[tuple[str, int, bool]]:
+    def parse_partitions(self, stdout: str) -> list[PartitionInfo]:
         # sinfo prints a partition on several lines (one per node-state group);
         # %F is the whole-partition A/I/O/T on each, so aggregate by name (max
-        # idle seen, up if any line is up).
+        # idle seen, up if any line is up, has_gpu if any group advertises gpu).
         agg: dict[str, list] = {}
         for line in stdout.splitlines():
-            cols = line.split()
+            cols = line.split("|")
             if len(cols) < 3:
                 continue
-            name, avail, nodes = cols[0], cols[1], cols[2]
+            name, avail, nodes = cols[0].strip(), cols[1].strip(), cols[2].strip()
+            if not name:
+                continue
             bits = nodes.split("/")
             idle = int(bits[1]) if len(bits) >= 2 and bits[1].isdigit() else 0
             up = avail.lower().startswith("up")
+            gres = cols[3].strip().lower() if len(cols) > 3 else ""
+            has_gpu = "gpu" in gres  # e.g. "gpu:a100:4"
             if name in agg:
                 agg[name][0] = max(agg[name][0], idle)
                 agg[name][1] = agg[name][1] or up
+                agg[name][2] = agg[name][2] or has_gpu
             else:
-                agg[name] = [idle, up]
-        return [(n, v[0], v[1]) for n, v in agg.items()]
+                agg[name] = [idle, up, has_gpu]
+        return [PartitionInfo(n, v[0], v[1], v[2]) for n, v in agg.items()]

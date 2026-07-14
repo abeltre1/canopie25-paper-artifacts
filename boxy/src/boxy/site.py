@@ -176,43 +176,53 @@ def discover_partitions(scheduler_name: str) -> list[tuple[str, int, bool]]:
         return []
 
 
-def rank_partitions(parts: list[tuple[str, int, bool]], scheduler_name: str) -> tuple[str, str]:
-    """Turn discovered partitions into the `--partition auto` value + provenance.
-    Slurm gets ALL up partitions as a comma-list (idle-first) so its own
-    scheduler starts the job in whichever frees soonest — the native
-    soonest-start behavior. Flux's --queue takes ONE, so pick the single best
-    (idle-first, then name). ('' , reason) when nothing usable was found."""
-    up = [(n, idle) for (n, idle, is_up) in parts if is_up]
+def rank_partitions(parts, scheduler_name: str, prefer_gpu: bool = False) -> tuple[str, str]:
+    """Turn discovered partitions (PartitionInfo rows) into the auto value +
+    provenance. Slurm gets ALL eligible up partitions as a comma-list
+    (idle-first) so its own scheduler starts the job in whichever frees soonest
+    — native soonest-start. Flux's --queue takes ONE, so pick the single best.
+    When `prefer_gpu`, restrict to partitions that advertise a GPU (so a GPU job
+    is never parked in a CPU-only partition) — but if NONE are identifiable as
+    GPU (e.g. Flux, or a site that doesn't publish GRES), fall back to all up
+    partitions rather than emit nothing. ('' , reason) when nothing usable."""
+    up = [p for p in parts if p.up]
     if not up:
         tool = "sinfo" if scheduler_name == "slurm" else "flux queue list"
-        return "", f"auto requested but no partitions discovered ({tool}) — using the scheduler's site default"
-    up.sort(key=lambda t: (-t[1], t[0]))  # most idle first, then name (deterministic)
-    names = [n for n, _ in up]
+        return "", f"no partitions discovered ({tool}) — using the scheduler's site default"
+    pool, gpu_note = up, ""
+    if prefer_gpu:
+        gpu = [p for p in up if p.has_gpu]
+        if gpu:
+            pool, gpu_note = gpu, " with GPUs"
+        else:
+            gpu_note = " (no GPU partitions identified — offering all)"
+    pool = sorted(pool, key=lambda p: (-p.idle_nodes, p.name))  # most idle first, then name
+    names = [p.name for p in pool]
     if scheduler_name == "flux":
-        return names[0], f"auto → {names[0]} (soonest-start queue of {len(names)}; flux queue list)"
-    top_idle = up[0][1]
+        return names[0], f"{names[0]} (soonest-start queue of {len(names)}{gpu_note}; flux queue list)"
+    top_idle = pool[0].idle_nodes
     note = (f"most idle: {names[0]} ({top_idle} nodes)" if top_idle
             else "none idle now — Slurm queues it to whichever frees first")
-    return ",".join(names), f"auto → {len(names)} partitions, soonest-start ({note})"
+    return ",".join(names), f"{len(names)} partitions{gpu_note}, soonest-start ({note})"
 
 
-def rank_remote_partitions(stdout: str, scheduler_name: str) -> tuple[str, str]:
+def rank_remote_partitions(stdout: str, scheduler_name: str, prefer_gpu: bool = False) -> tuple[str, str]:
     """rank_partitions for output captured on a REMOTE login node (--ssh): parse
-    with the scheduler's own parser, then rank. Used to resolve `--partition
-    auto` to a concrete list before delegating (an older cluster boxy would pass
-    the literal word 'auto' to sbatch and get 'invalid partition')."""
+    with the scheduler's own parser, then rank. Used to resolve auto to a
+    concrete list before delegating (an older cluster boxy would pass the literal
+    word 'auto'/'all' to sbatch and get 'invalid partition')."""
     from boxy.schedulers import get_scheduler
 
     try:
         parts = get_scheduler(scheduler_name).parse_partitions(stdout)
     except Exception:  # noqa: BLE001
         parts = []
-    return rank_partitions(parts, scheduler_name)
+    return rank_partitions(parts, scheduler_name, prefer_gpu)
 
 
 def remote_partition_probe(scheduler_name: str) -> str:
     """The shell one-liner run on a cluster login node (over the ssh master) to
-    list partitions for `--partition auto`. `true` when the scheduler can't
+    list partitions for auto selection. `true` when the scheduler can't
     enumerate (auto then degrades to the site default)."""
     import shlex
 
@@ -227,28 +237,48 @@ def remote_partition_probe(scheduler_name: str) -> str:
     return shlex.join(cmd) + " 2>/dev/null || true"
 
 
-def _wants_auto_partition(explicit: str | None) -> bool:
-    """True when the user asked boxy to PICK the partition: `--partition auto`,
-    or config `site.partition = auto` with no flag."""
-    if explicit is not None:
-        return explicit.strip().lower() == "auto"
-    return config.get_str("site.partition").strip().lower() == "auto"
+# `--partition off|none|default|site` (or the same in config) opts OUT of auto
+# and uses the scheduler's own default partition.
+_PARTITION_OFF = {"off", "none", "default", "site", "false", "0"}
 
 
-def resolve_partition(explicit: str | None, scheduler_name: str = "slurm") -> tuple[str | None, str]:
-    """(value, provenance). `--partition auto` (or config `site.partition=auto`)
-    discovers partitions and picks the soonest-start set; an explicit
-    partition/queue always wins; otherwise the config default or None."""
-    if explicit and explicit.strip().lower() != "auto":
-        return explicit, "--partition"
-    if _wants_auto_partition(explicit):
-        value, why = rank_partitions(discover_partitions(scheduler_name), scheduler_name)
-        return (value or None), why
-    if not explicit:
-        cfg = config.get_str("site.partition").strip()
-        if cfg:  # a non-'auto' config default (auto handled above)
-            return cfg, "config site.partition"
-    return None, ""
+def partition_mode(explicit: str | None) -> str:
+    """How to choose the partition, from the flag then config:
+      'set'  — a concrete partition/comma-list was given (use it verbatim)
+      'all'  — every up partition
+      'off'  — the scheduler's own default (no partition directive)
+      'auto' — boxy picks the soonest-start (GPU-aware) set — THE DEFAULT when
+               nothing is specified, so the user never has to pass --partition.
+    """
+    val = (explicit or "").strip().lower()
+    if not val:  # no flag -> consult config, else default to auto
+        val = config.get_str("site.partition").strip().lower()
+    if val in ("", "auto"):
+        return "auto"
+    if val == "all":
+        return "all"
+    if val in _PARTITION_OFF:
+        return "off"
+    return "set"
+
+
+def resolve_partition(explicit: str | None, scheduler_name: str = "slurm",
+                      need_gpu: bool = False) -> tuple[str | None, str]:
+    """(value, provenance). Auto is the DEFAULT (nothing set) — boxy discovers
+    partitions and offers the soonest-start set, restricted to GPU partitions
+    when the job needs a GPU. `--partition <name>` wins; `all` offers every up
+    partition; `off` uses the scheduler's site default. Discovery failure
+    degrades quietly to the site default (None)."""
+    mode = partition_mode(explicit)
+    if mode == "set":
+        if explicit and explicit.strip():
+            return explicit.strip(), "--partition"
+        return config.get_str("site.partition").strip(), "config site.partition"
+    if mode == "off":
+        return None, ""
+    prefer_gpu = need_gpu and mode == "auto"   # `all` never filters by GPU
+    value, why = rank_partitions(discover_partitions(scheduler_name), scheduler_name, prefer_gpu)
+    return (value or None), why
 
 
 def resolve_time(explicit: str | None) -> tuple[str | None, str]:
@@ -260,12 +290,13 @@ def resolve_time(explicit: str | None) -> tuple[str | None, str]:
     return None, ""
 
 
-def resolve_site(args, scheduler_name: str) -> tuple[dict, list[str]]:
+def resolve_site(args, scheduler_name: str, need_gpu: bool = False) -> tuple[dict, list[str]]:
     """Fill account/partition/time for a submission. Returns ({kind: value},
-    decision_lines). Only non-empty values are returned. Applies the Flux
-    single-queue guard: Slurm accepts a comma-list of partitions, Flux's
-    --queue takes exactly ONE, so a comma'd partition is trimmed to the first
-    with a warning (field failure: `--partition=short,batch` on Flux)."""
+    decision_lines). Only non-empty values are returned. Partition defaults to
+    auto (boxy picks the soonest-start, GPU-aware set — `need_gpu` restricts to
+    GPU partitions). Applies the Flux single-queue guard: Slurm accepts a
+    comma-list of partitions, Flux's --queue takes exactly ONE, so a comma'd
+    partition is trimmed to the first with a warning."""
     out: dict = {}
     decisions: list[str] = []
 
@@ -277,7 +308,7 @@ def resolve_site(args, scheduler_name: str) -> tuple[dict, list[str]]:
     else:
         decisions.append(f"account: {why}")
 
-    part, pwhy = resolve_partition(getattr(args, "partition", None), scheduler_name)
+    part, pwhy = resolve_partition(getattr(args, "partition", None), scheduler_name, need_gpu)
     if part:
         if scheduler_name == "flux" and "," in part:
             first = part.split(",")[0].strip()

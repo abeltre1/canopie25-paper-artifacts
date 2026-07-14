@@ -100,35 +100,37 @@ runs locally.
 $ boxy serve <model> --scheduler slurm --account fy260064 --ssh ambelt@hops
 ```
 
-### Get it running first — pick the soonest-start partition
+### Get it running first — partition selection is automatic
 
-Don't know or care which partition is emptiest? Let boxy choose:
+You don't set anything. With **no `--partition` flag**, boxy reads `sinfo` and
+submits to every **GPU-bearing** partition, idle-first, so Slurm starts the job
+wherever a GPU frees first instead of getting stuck in one queue:
 
 ```console
-$ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --scheduler slurm --partition auto --ssh ambelt@hops
-  auto: partition: gpu,short,batch (via sinfo on hops: auto → 3 partitions, soonest-start (most idle: gpu (6 nodes)))
+$ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --scheduler slurm --ssh ambelt@hops
+  auto: partition: gpu,batch (via sinfo on hops: 2 partitions with GPUs, soonest-start (most idle: gpu (6 nodes)))
   auto: account: fy140001 (via mywcid on hops …)
 ### Batch script (…):
-    #SBATCH --partition=gpu,short,batch     <-- Slurm starts the job wherever frees FIRST
+    #SBATCH --partition=gpu,batch     <-- CPU-only partitions excluded; starts wherever frees FIRST
 ```
 
-- `--partition auto` runs `sinfo` (on the cluster, over the same SSH session)
-  and submits to **every up partition, idle-first**. Slurm's own scheduler then
-  starts the job in whichever can run it soonest — that's native Slurm
-  multi-partition behavior, so there's no polling or guesswork.
-- Prefer a specific shortlist? Pass it yourself: `--partition gpu,short` — same
-  soonest-start semantics, just your set.
-- Make it the default for every job: `export BOXY_PARTITION=auto`.
-- Flux takes **one** queue, so `auto` picks the single best queue (`--queue=…`).
-- Over `--ssh`, `auto` is resolved to the concrete list **before** delegating,
-  so it works even against a cluster whose boxy predates this feature (it never
-  sees the literal word `auto`).
+- **Default (no flag)** — GPU partitions only, so a GPU job never parks in a
+  CPU-only partition (the "stuck" failure). Slurm's own scheduler starts it in
+  whichever frees soonest — native multi-partition behavior, no polling.
+- **Power-user overrides** (an explicit flag always wins):
+  - `--partition gpu,short` — your exact set.
+  - `--partition all` — every up partition, CPU ones included.
+  - `--partition off` — the scheduler's own default partition.
+  - `BOXY_PARTITION=<name|auto|all|off>` — pin a fixed default.
+- **Flux** takes one queue, so it picks the single best (`--queue=…`).
+- Over `--ssh` everything is resolved on the cluster **before** delegating, so
+  it works even against a cluster whose boxy predates this feature.
 
-Verify what `auto` would choose on a real cluster, no serving:
+Verify what boxy would choose on a real cluster, no serving:
 
 ```console
 $ boxy doctor --ssh ambelt@hops
-  partitions   [OK] --partition auto → gpu,short,batch (soonest-start; Slurm starts in whichever frees first)
+  partitions   [OK] --partition auto → gpu,batch (soonest-start; Slurm starts in whichever frees first)
 ```
 
 ---

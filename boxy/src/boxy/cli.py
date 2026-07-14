@@ -1068,7 +1068,11 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
     # for the --replicas fan-out, which owns the shared auto: block once.)
     from boxy import site
 
-    site_map, site_decisions = site.resolve_site(args, scheduler_name)
+    # a GPU job (the card/flags asked for GPUs per node) must only be offered
+    # partitions that actually have accelerators — else it parks in a CPU
+    # partition and never starts (field failure).
+    need_gpu = location.resources.gpus_per_node > 0
+    site_map, site_decisions = site.resolve_site(args, scheduler_name, need_gpu=need_gpu)
     if name_override is None:
         for line in site_decisions:
             print(f"  auto: {line}")
@@ -1518,6 +1522,22 @@ def _argv_set_flag(argv: list[str], flag: str, value: str | None) -> list[str]:
     return out
 
 
+def _job_wants_gpu(args) -> bool:
+    """Does this scheduler job need a GPU? --gpus wins; else the model card's GPU
+    count (resolved laptop-side, since the card isn't applied to args until after
+    delegation); else default True — HPC serving is GPU-bound, and the GPU
+    partition filter falls back to all partitions when none are identifiable."""
+    g = getattr(args, "gpus", None)
+    if g is not None:
+        return g > 0
+    from boxy import cards
+
+    card = cards.resolve_model_card(getattr(args, "model", "") or "")
+    if card is not None and card.gpus:
+        return card.gpus > 0
+    return True
+
+
 def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
     """Turnkey over --ssh (field failures, 2026-07): the delegated command runs
     the CLUSTER's boxy — which may predate turnkey — so site resolution never
@@ -1526,14 +1546,14 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
 
       * account — append `--account <val>` (from config/env, else a `mywcid`
         probe ON the cluster) so the batch script carries it.
-      * partition — when `--partition auto`, probe the cluster's partitions and
-        REPLACE 'auto' with the concrete soonest-start list; an older cluster
-        boxy would otherwise pass the literal 'auto' to sbatch ('invalid
-        partition'). A turnkey-aware cluster boxy just sees the concrete flag.
+      * partition — auto is the DEFAULT: probe the cluster's partitions and put a
+        concrete soonest-start (GPU-aware) list on the delegated command, so the
+        job starts wherever a GPU frees first instead of parking in one queue.
+        The literal 'auto'/'all' is resolved HERE — an older cluster boxy would
+        otherwise pass it to sbatch ('invalid partition').
 
     Explicit values win untouched. Opt out: BOXY_NO_REMOTE_ACCOUNT=1. Best-effort
-    throughout: any probe failure leaves that flag as-is (or drops an unresolved
-    'auto')."""
+    throughout: any probe failure leaves the site default in place."""
     if os.environ.get("BOXY_NO_REMOTE_ACCOUNT"):
         return raw_argv
     if not raw_argv or raw_argv[0] != "serve":
@@ -1547,27 +1567,27 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
     master_ok = remote.ensure_master(target) == 0
     host = target.split("@")[-1]
 
-    # --- partition: resolve `auto` to a concrete list over the cluster ---
-    # `--partition auto` on the argv, OR config site.partition=auto with no flag
-    # (BOXY_PARTITION=auto) — either way the literal 'auto' must be turned into a
-    # concrete list HERE, since the cluster's env/boxy can't be relied on to.
+    # --- partition: resolve auto/all to a concrete list over the cluster ---
+    # auto is the default (no flag); `all` offers every partition; `off`/a
+    # concrete name are left for the cluster boxy. A flag present on the argv is
+    # REPLACED in place; the default (no flag) is APPENDED.
     part = getattr(args, "partition", None)
-    flagged_auto = bool(part) and part.strip().lower() == "auto"
-    if flagged_auto or (part is None and site._wants_auto_partition(None)):
+    mode = site.partition_mode(part)
+    if mode in ("auto", "all"):
+        prefer_gpu = mode == "auto" and _job_wants_gpu(args)
         value, why = "", "no ssh master to probe partitions"
         if master_ok:
             rc, out = remote.ssh_capture(target, site.remote_partition_probe(scheduler), timeout=20)
-            value, why = site.rank_remote_partitions(out, scheduler) if rc == 0 else ("", why)
+            value, why = site.rank_remote_partitions(out, scheduler, prefer_gpu) if rc == 0 else ("", why)
+        flagged = bool(part)
         if value:
-            # replace the flag's value if present, else append it (config default)
-            raw_argv = (_argv_set_flag(raw_argv, "--partition", value) if flagged_auto
+            raw_argv = (_argv_set_flag(raw_argv, "--partition", value) if flagged
                         else [*raw_argv, "--partition", value])
             print(f"  auto: partition: {value} (via sinfo on {host}: {why})")
-        elif flagged_auto:
-            raw_argv = _argv_set_flag(raw_argv, "--partition", None)  # drop unresolved 'auto'
-            print(f"  auto: partition: could not pick on {target} ({why}) — "
-                  f"the scheduler's site default applies")
         else:
+            if flagged:
+                raw_argv = _argv_set_flag(raw_argv, "--partition", None)  # drop unresolved auto/all
+            # default (no flag): nothing to drop; the cluster's site default applies
             print(f"  auto: partition: could not pick on {target} ({why}) — "
                   f"the scheduler's site default applies")
 
@@ -2855,11 +2875,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="with --replicas K, after the replicas are READY start the built-in login-node "
                         "router on PORT (default 8000) presenting ONE OpenAI URL load-balanced across "
                         "them (least-outstanding). For production scale use `boxy router --emit`")
-    p.add_argument("--partition", default=None, metavar="NAME|LIST|auto",
+    p.add_argument("--partition", default=None, metavar="NAME|LIST|auto|all|off",
                    help="partition/queue for --scheduler jobs (Slurm --partition, Flux --queue). "
-                        "Pass a comma-list (Slurm starts in whichever frees first) or `auto` to let "
-                        "boxy pick the soonest-start set from sinfo/flux (set BOXY_PARTITION=auto to "
-                        "make it the default). Works over --ssh: `auto` is resolved on the cluster.")
+                        "DEFAULT is automatic: boxy picks the soonest-start partitions from sinfo, "
+                        "restricted to those with GPUs when the job needs one, so it starts wherever "
+                        "a GPU frees first (no flag needed). Override with a name/comma-list, `all` "
+                        "(every partition), or `off` (the scheduler's own default). Resolved on the "
+                        "cluster over --ssh; opt a fixed default via BOXY_PARTITION.")
     p.add_argument("--account", default=None,
                    help="account/bank for --scheduler jobs (Slurm --account, Flux --bank)")
     p.add_argument("--time", default=None,

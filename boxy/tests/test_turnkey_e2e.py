@@ -96,13 +96,14 @@ def cluster(tmp_path, monkeypatch):
     binp = tmp_path / "bin"
     binp.mkdir()
     _shim(binp, "mywcid", "#!/bin/bash\ncat <<'EOF'\n" + REAL_MYWCID + "EOF\n")
-    # fake sinfo for `--partition auto`: name / up-down / A/I/O/T nodes. Idle
-    # order is gpu(6) > short(5) > batch(2); down-pt is excluded.
+    # fake sinfo (-o "%R|%a|%F|%G"): name|up-down|A/I/O/T nodes|GRES. GPU
+    # partitions gpu(6 idle) and batch(2 idle); short is CPU-only; down-pt is
+    # down. GPU-aware auto -> "gpu,batch"; --partition all -> "gpu,short,batch".
     _shim(binp, "sinfo", "#!/bin/bash\ncat <<'EOF'\n"
-          "short    up   3/5/0/8\n"
-          "batch    up   8/2/0/10\n"
-          "gpu      up   2/6/0/8\n"
-          "down-pt  down 0/8/0/8\n"
+          "gpu|up|2/6/0/8|gpu:a100:8\n"
+          "short|up|3/5/0/8|(null)\n"
+          "batch|up|8/2/0/10|gpu:v100:4\n"
+          "down-pt|down|0/8/0/8|gpu:a100:8\n"
           "EOF\n")
     sbatch_log = tmp_path / "sbatch.log"
     sbatch_log.write_text("")
@@ -126,13 +127,16 @@ def _the_script(jobs_dir: Path) -> str:
 
 
 def test_login_node_submit_writes_account_into_the_script(cluster, capfd):
-    rc = main(["serve", MODEL, "--scheduler", "slurm"])
+    rc = main(["serve", MODEL, "--scheduler", "slurm"])   # NO --partition flag
     out = capfd.readouterr().out
     assert rc == 0
     # the turnkey promise: mywcid -> the batch script the scheduler actually ran
     script = _the_script(cluster["jobs"])
     assert "#SBATCH --account=fy140001" in script     # first account from the table
     assert "#SBATCH --gpus-per-node=1" in script      # 8B model card -> 1 GPU
+    # ...and the partition was auto-picked with NO flag (the "don't set it"
+    # default): a GPU job gets only GPU partitions, idle-first.
+    assert "#SBATCH --partition=gpu,batch" in script
     # ...and it was really submitted + followed to READY
     assert "--parsable" in cluster["sbatch_log"].read_text()
     assert "auto: account: fy140001 (via mywcid" in out
@@ -143,16 +147,30 @@ def test_login_node_submit_writes_account_into_the_script(cluster, capfd):
     assert rec["job"] == "12345" and rec["scheduler"] == "slurm"
 
 
-def test_login_node_partition_auto_writes_soonest_start_list(cluster, capfd):
-    # `--partition auto`: sinfo picks the soonest-start set (idle-first) and it
-    # lands in the batch script as a comma-list; Slurm then starts the job in
-    # whichever partition frees first.
-    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "auto"])
+def test_login_node_default_partition_is_gpu_aware_auto(cluster, capfd):
+    # bare serve (no --partition) auto-picks GPU partitions only; a job never
+    # parks in a CPU-only partition (the field 'stuck' failure).
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--dryrun"])
     out = capfd.readouterr().out
     assert rc == 0
-    script = _the_script(cluster["jobs"])
-    assert "#SBATCH --partition=gpu,short,batch" in script     # idle-first, down-pt dropped
-    assert "auto: partition: gpu,short,batch" in out or "soonest-start" in out
+    assert "#SBATCH --partition=gpu,batch" in out       # 'short' (CPU) excluded
+    assert "with GPUs" in out
+
+
+def test_login_node_partition_all_includes_cpu(cluster, capfd):
+    # power-user override: --partition all offers EVERY up partition.
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "all", "--dryrun"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "#SBATCH --partition=gpu,short,batch" in out
+
+
+def test_login_node_partition_off_uses_site_default(cluster, capfd):
+    # power-user override: --partition off emits no partition directive.
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "off", "--dryrun"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "#SBATCH --partition" not in out
 
 
 def test_login_node_flux_bank_and_single_queue(cluster, capfd):
@@ -205,20 +223,43 @@ def test_ssh_injects_locally_known_account(ssh, capfd, monkeypatch):
     assert "placed in the batch script" in cap.out        # the laptop-side decision line
 
 
+def test_ssh_default_partition_auto_no_flag(ssh, capfd, monkeypatch):
+    # No --partition at all over --ssh: boxy still auto-picks (GPU-aware) by
+    # probing sinfo on the cluster and APPENDING the concrete list.
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: partition: gpu,batch (via sinfo on hops" in cap.out
+    assert "--partition gpu,batch" in ssh["ssh_log"].read_text()
+    assert "#SBATCH --partition=gpu,batch" in cap.out
+
+
 def test_ssh_resolves_partition_auto_to_concrete_list(ssh, capfd, monkeypatch):
     # `--partition auto` must be resolved to a CONCRETE list laptop-side (via
     # sinfo on the cluster) before delegating — an older cluster boxy would pass
-    # the literal 'auto' to sbatch and get 'invalid partition'.
+    # the literal 'auto' to sbatch and get 'invalid partition'. GPU-aware.
     monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")            # keep account quiet/deterministic
     rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "auto",
                "--ssh", "user@hops", "--dryrun"])
     cap = capfd.readouterr()
     assert rc == 0
-    assert "auto: partition: gpu,short,batch (via sinfo on hops" in cap.out
+    assert "auto: partition: gpu,batch (via sinfo on hops" in cap.out
     ssh_log = ssh["ssh_log"].read_text()
-    assert "--partition gpu,short,batch" in ssh_log           # concrete list delegated
+    assert "--partition gpu,batch" in ssh_log                 # concrete GPU list delegated
     assert "--partition auto" not in ssh_log                  # literal 'auto' never sent
-    assert "#SBATCH --partition=gpu,short,batch" in cap.out    # remote script built with it
+    assert "#SBATCH --partition=gpu,batch" in cap.out         # remote script built with it
+
+
+def test_ssh_partition_all_includes_cpu(ssh, capfd, monkeypatch):
+    # power-user override survives delegation: --partition all -> every partition.
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "all",
+               "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "--partition gpu,short,batch" in ssh["ssh_log"].read_text()
+    assert "#SBATCH --partition=gpu,short,batch" in cap.out
 
 
 def test_ssh_partition_auto_from_config_default(ssh, capfd, monkeypatch):
@@ -229,9 +270,9 @@ def test_ssh_partition_auto_from_config_default(ssh, capfd, monkeypatch):
     rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
     cap = capfd.readouterr()
     assert rc == 0
-    assert "auto: partition: gpu,short,batch (via sinfo on hops" in cap.out
-    assert "--partition gpu,short,batch" in ssh["ssh_log"].read_text()
-    assert "#SBATCH --partition=gpu,short,batch" in cap.out
+    assert "auto: partition: gpu,batch (via sinfo on hops" in cap.out
+    assert "--partition gpu,batch" in ssh["ssh_log"].read_text()
+    assert "#SBATCH --partition=gpu,batch" in cap.out
 
 
 def test_ssh_probes_mywcid_on_the_cluster(ssh, capfd, monkeypatch):

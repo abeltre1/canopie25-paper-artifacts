@@ -198,7 +198,7 @@ def test_remote_checks_report_discovered_account():
                    "---------- ---------- ------------------------ ----------\n"
                    "     jdoe   fy140001   103732 system software        nd\n"
                    "     jdoe   fy260064   240928 genesis project        nd\n"),
-        "sinfo": "gpu up 2/6/0/8\nbatch up 8/2/0/10\n",  # gpu(6 idle) > batch(2)
+        "sinfo": "gpu|up|2/6/0/8|gpu:a100:8\nbatch|up|8/2/0/10|gpu:v100:4\n",  # gpu(6)>batch(2)
         "ghcr.io/v2": "200",
         "boxy --version": "",                        # boxy absent on the cluster
     })

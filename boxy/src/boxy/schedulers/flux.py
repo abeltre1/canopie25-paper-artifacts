@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 
 from boxy.location import Location
-from boxy.schedulers.base import Scheduler
+from boxy.schedulers.base import PartitionInfo, Scheduler
 
 
 def _to_fsd(value: str) -> str:
@@ -120,10 +120,12 @@ class FluxScheduler(Scheduler):
         # rows we can parse -> auto falls back to the site default.
         return ["flux", "queue", "list", "--no-header", "-o", "{name} {enabled}"]
 
-    def parse_partitions(self, stdout: str) -> list[tuple[str, int, bool]]:
-        # Flux exposes no cheap per-queue idle-node count, so idle is 0 for all
-        # (the caller keeps discovery order); enabled=false marks a down queue.
-        out: list[tuple[str, int, bool]] = []
+    def parse_partitions(self, stdout: str) -> list[PartitionInfo]:
+        # Flux exposes no cheap per-queue idle-node count or GRES, so idle is 0
+        # for all (the caller keeps discovery order) and has_gpu is unknown
+        # (left False -> the GPU filter is skipped for Flux, offering all queues);
+        # enabled=false marks a down queue.
+        out: list[PartitionInfo] = []
         for line in stdout.splitlines():
             cols = line.split()
             if not cols or cols[0] in ("QUEUE", "NAME"):
@@ -132,5 +134,5 @@ class FluxScheduler(Scheduler):
             enabled = True
             if len(cols) > 1:
                 enabled = cols[1].strip().lower() not in ("false", "no", "disabled", "0", "✗")
-            out.append((name, 0, enabled))
+            out.append(PartitionInfo(name, 0, enabled, False))
         return out

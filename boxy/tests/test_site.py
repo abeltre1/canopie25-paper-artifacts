@@ -127,75 +127,114 @@ def test_account_none_when_nothing_discovers(clean_env, monkeypatch):
     assert acct is None and "no account discovered" in why
 
 
-# ---- partition / time defaults ----------------------------------------------------
+# ---- time defaults ----------------------------------------------------------------
 
 
-def test_partition_and_time_defaults(clean_env, monkeypatch):
-    assert site.resolve_partition(None) == (None, "")
+def test_time_defaults(clean_env, monkeypatch):
     assert site.resolve_time(None) == (None, "")
-    monkeypatch.setenv("BOXY_PARTITION", "gpu")
     monkeypatch.setenv("BOXY_DEFAULT_TIME", "4:00:00")
-    assert site.resolve_partition(None)[0] == "gpu"
     assert site.resolve_time(None)[0] == "4:00:00"
 
 
-def test_explicit_partition_wins_over_auto_machinery(clean_env):
-    assert site.resolve_partition("gpu,short", "slurm") == ("gpu,short", "--partition")
+# ---- partition: auto is the DEFAULT (GPU-aware soonest-start) ----------------------
+
+from boxy.schedulers import get_scheduler  # noqa: E402
+from boxy.schedulers.base import PartitionInfo  # noqa: E402
+
+# sinfo -o "%R|%a|%F|%G": name | up/down | A/I/O/T nodes | GRES. gpu(6 idle,GPU),
+# short(5 idle,CPU-only), batch(2 idle,GPU), down-pt(down).
+SINFO = ("gpu|up|2/6/0/8|gpu:a100:8\n"
+         "short|up|3/5/0/8|(null)\n"
+         "batch|up|8/2/0/10|gpu:v100:4\n"
+         "down-pt|down|4/4/0/8|gpu:a100:8\n")
 
 
-# ---- --partition auto: soonest-start discovery ------------------------------------
-
-SINFO = ("short    up   3/5/0/8\n"        # 5 idle
-         "batch    up   8/2/0/10\n"       # 2 idle
-         "gpu      up   0/0/0/4\n"        # 0 idle
-         "down-pt  down 4/4/0/8\n")       # down -> excluded
-
-
-def test_slurm_parse_partitions_aggregates_idle():
-    from boxy.schedulers import get_scheduler
-
-    parts = dict((n, (idle, up)) for n, idle, up in get_scheduler("slurm").parse_partitions(SINFO))
-    assert parts["short"] == (5, True)
-    assert parts["gpu"] == (0, True)
-    assert parts["down-pt"][1] is False
+def test_slurm_parse_partitions_reads_idle_up_and_gpu():
+    parts = {p.name: p for p in get_scheduler("slurm").parse_partitions(SINFO)}
+    assert parts["gpu"].idle_nodes == 6 and parts["gpu"].has_gpu
+    assert parts["short"].has_gpu is False                 # (null) GRES -> CPU-only
+    assert parts["batch"].has_gpu is True
+    assert parts["down-pt"].up is False
 
 
-def test_rank_partitions_slurm_is_idle_first_comma_list():
-    parts = [("short", 5, True), ("batch", 2, True), ("gpu", 0, True), ("down-pt", 4, False)]
-    value, why = site.rank_partitions(parts, "slurm")
-    assert value == "short,batch,gpu"          # idle-first; the DOWN partition dropped
-    assert "soonest-start" in why and "short" in why
+def test_rank_gpu_job_offers_only_gpu_partitions():
+    parts = get_scheduler("slurm").parse_partitions(SINFO)
+    value, why = site.rank_partitions(parts, "slurm", prefer_gpu=True)
+    assert value == "gpu,batch"                            # CPU 'short' + DOWN dropped; idle-first
+    assert "with GPUs" in why
 
 
-def test_rank_partitions_flux_picks_single_best():
-    value, why = site.rank_partitions([("pdebug", 0, True), ("pbatch", 0, True)], "flux")
-    assert value == "pbatch"                    # one queue only, deterministic (name order)
-    assert "," not in value
+def test_rank_all_includes_cpu_partitions():
+    parts = get_scheduler("slurm").parse_partitions(SINFO)
+    value, _ = site.rank_partitions(parts, "slurm", prefer_gpu=False)
+    assert value == "gpu,short,batch"                      # every up partition, idle-first
 
 
-def test_rank_partitions_none_up_falls_back():
-    value, why = site.rank_partitions([("x", 0, False)], "slurm")
+def test_rank_gpu_falls_back_to_all_when_none_identified():
+    parts = [PartitionInfo("a", 3, True, False), PartitionInfo("b", 5, True, False)]
+    value, why = site.rank_partitions(parts, "slurm", prefer_gpu=True)
+    assert value == "b,a" and "no GPU partitions identified" in why
+
+
+def test_rank_flux_picks_single_best():
+    value, _ = site.rank_partitions([PartitionInfo("pdebug", 0, True), PartitionInfo("pbatch", 0, True)], "flux")
+    assert value == "pbatch" and "," not in value
+
+
+def test_rank_none_up_falls_back_to_site_default():
+    value, why = site.rank_partitions([PartitionInfo("x", 0, False)], "slurm")
     assert value == "" and "site default" in why
 
 
-def test_resolve_partition_auto_runs_sinfo(clean_env, tmp_path, monkeypatch):
+def _sinfo_shim(tmp_path, monkeypatch):
     _shim(tmp_path, "sinfo", "cat <<'EOF'\n" + SINFO + "EOF\n")
     monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
-    value, why = site.resolve_partition("auto", "slurm")
-    assert value == "short,batch,gpu"
-    assert "soonest-start" in why
 
 
-def test_resolve_partition_auto_from_config(clean_env, tmp_path, monkeypatch):
-    _shim(tmp_path, "sinfo", "cat <<'EOF'\n" + SINFO + "EOF\n")
-    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
-    monkeypatch.setenv("BOXY_PARTITION", "auto")           # config default = auto
-    assert site.resolve_partition(None, "slurm")[0] == "short,batch,gpu"
+def test_default_partition_is_auto_gpu_aware(clean_env, tmp_path, monkeypatch):
+    _sinfo_shim(tmp_path, monkeypatch)
+    # NO flag, GPU job -> boxy auto-picks GPU partitions (the "don't set it" default)
+    value, why = site.resolve_partition(None, "slurm", need_gpu=True)
+    assert value == "gpu,batch" and "with GPUs" in why
 
 
-def test_resolve_partition_auto_no_sinfo_degrades(clean_env, monkeypatch):
-    monkeypatch.setenv("PATH", "/nonexistent-dir-xyz")     # no sinfo anywhere
-    value, why = site.resolve_partition("auto", "slurm")
+def test_default_partition_cpu_job_offers_all(clean_env, tmp_path, monkeypatch):
+    _sinfo_shim(tmp_path, monkeypatch)
+    value, _ = site.resolve_partition(None, "slurm", need_gpu=False)
+    assert value == "gpu,short,batch"                      # no GPU filter for a CPU job
+
+
+def test_partition_all_flag_ignores_gpu_filter(clean_env, tmp_path, monkeypatch):
+    _sinfo_shim(tmp_path, monkeypatch)
+    value, _ = site.resolve_partition("all", "slurm", need_gpu=True)
+    assert value == "gpu,short,batch"
+
+
+def test_partition_off_uses_site_default(clean_env, tmp_path, monkeypatch):
+    _sinfo_shim(tmp_path, monkeypatch)                     # sinfo present, but off wins
+    assert site.resolve_partition("off", "slurm", need_gpu=True) == (None, "")
+
+
+def test_partition_explicit_name_wins(clean_env, tmp_path, monkeypatch):
+    _sinfo_shim(tmp_path, monkeypatch)
+    assert site.resolve_partition("m2000", "slurm", need_gpu=True) == ("m2000", "--partition")
+
+
+def test_partition_config_concrete_default(clean_env, tmp_path, monkeypatch):
+    _sinfo_shim(tmp_path, monkeypatch)
+    monkeypatch.setenv("BOXY_PARTITION", "gpu")            # pinned concrete default
+    assert site.resolve_partition(None, "slurm", need_gpu=True) == ("gpu", "config site.partition")
+
+
+def test_partition_config_off_disables_auto(clean_env, tmp_path, monkeypatch):
+    _sinfo_shim(tmp_path, monkeypatch)
+    monkeypatch.setenv("BOXY_PARTITION", "off")
+    assert site.resolve_partition(None, "slurm", need_gpu=True) == (None, "")
+
+
+def test_default_partition_no_sinfo_degrades_quietly(clean_env, tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path))              # no sinfo -> site default, no error
+    value, why = site.resolve_partition(None, "slurm", need_gpu=True)
     assert value is None and "site default" in why
 
 
