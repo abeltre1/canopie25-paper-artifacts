@@ -128,6 +128,23 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
             help="add ':z' to bind mounts for SELinux: auto (only when enforcing) "
                  "| always | never."),
 
+    # -- site defaults (turnkey: fill account/partition/time when flags absent) --
+    Setting("site.account", "BOXY_ACCOUNT", "",
+            help="Slurm account / Flux bank for job submission. Empty => auto-discover "
+                 "(site.account_command, then $SBATCH_ACCOUNT, then sacctmgr). --account wins."),
+    Setting("site.account_command", "BOXY_ACCOUNT_COMMAND", "mywcid",
+            help="site command that prints the user's charge account(s) (Sandia: mywcid). "
+                 "boxy takes the first account-looking token. Set empty to skip it."),
+    Setting("site.partition", "BOXY_PARTITION", "",
+            help="default Slurm partition / Flux queue when --partition is absent. "
+                 "Empty => let the scheduler use its site default."),
+    Setting("site.default_time", "BOXY_DEFAULT_TIME", "",
+            help="default walltime when --time is absent (Slurm colon notation, e.g. "
+                 "'4:00:00'; boxy converts it to Flux FSD). Empty => scheduler default."),
+    Setting("site.default_accelerator", "BOXY_DEFAULT_ACCELERATOR", "cuda",
+            help="accelerator assumed for a GPU job submitted from a GPU-less login node "
+                 "(where detection sees no device). --accelerator / a --location profile win."),
+
     # -- external binaries (test shims / site spellings) -----------------------
     Setting("binaries.ssh", "BOXY_SSH", "ssh", help="ssh binary."),
     Setting("binaries.oc", "BOXY_OC", "oc", help="OpenShift oc binary."),

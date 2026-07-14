@@ -365,8 +365,11 @@ def test_bare_flags_pass_to_the_active_scheduler(gguf, jobs_dir, capsys):
                "--account=fy260064", "--partition=short,batch", "--license=tscratch:1"])
     out = capsys.readouterr().out
     assert rc == 0
-    # SAME command; flux spellings chosen internally
-    assert "# flux: --queue=short,batch" in out and "# flux: --bank=fy260064" in out
+    # SAME command; flux spellings chosen internally. Flux's --queue takes ONE
+    # queue, so the Slurm-style comma list `short,batch` is trimmed to `short`
+    # (field failure: `--partition=short,batch` was rejected on Flux).
+    assert "# flux: --queue=short" in out and "# flux: --queue=short,batch" not in out
+    assert "# flux: --bank=fy260064" in out
     assert "# flux: --license=tscratch:1" in out
 
 

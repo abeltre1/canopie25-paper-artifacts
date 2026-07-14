@@ -229,15 +229,22 @@ def auto_location(
         accelerator = ramalama_shim.detect_accel()
         if scheduler in ("slurm", "flux"):
             if accelerator == "none" and gpus > 0:
-                raise RuntimeError(
-                    "submitting a GPU job from a node with no detectable GPU: boxy cannot guess "
-                    "the compute node's accelerator from here. Pass --accelerator cuda|rocm "
-                    "(or use a --location site profile, which pins it)."
+                # Turnkey: a GPU-less login node can't see the compute node's
+                # device, but a novice shouldn't hit a hard error. Default it
+                # (config site.default_accelerator, cuda) and say so; the compute
+                # node still autodetects the real device when the job runs.
+                from boxy import config
+
+                accelerator = config.get_str("site.default_accelerator") or "cuda"
+                decisions.append(
+                    f"accelerator: {accelerator} (no GPU on this login node — assuming the compute "
+                    f"node's; override with --accelerator or site.default_accelerator)"
                 )
-            decisions.append(
-                f"accelerator: {accelerator} (detected on THIS node — the compute node may differ; "
-                f"pass --accelerator or a --location profile to pin it)"
-            )
+            else:
+                decisions.append(
+                    f"accelerator: {accelerator} (detected on THIS node — the compute node may differ; "
+                    f"pass --accelerator or a --location profile to pin it)"
+                )
         else:
             decisions.append(f"accelerator: {accelerator} (autodetected)")
 

@@ -107,9 +107,21 @@ def test_gpus_and_nodes_require_scheduler(cpu_host):
         resolve.resolve("m.gguf", runtime="docker", nodes=2, require_exists=False)
 
 
-def test_gpu_job_from_cpu_login_node_needs_explicit_accelerator(cpu_host):
-    with pytest.raises(RuntimeError, match="--accelerator"):
-        resolve.resolve("hf://org/repo", runtime="podman", scheduler="slurm", gpus=4)
+def test_gpu_job_from_cpu_login_node_defaults_accelerator(cpu_host):
+    # Turnkey: a GPU-less login node no longer hard-errors; it assumes the
+    # compute node's accelerator (site.default_accelerator, default cuda) and
+    # says so — the compute node re-detects the real device when the job runs.
+    res = resolve.resolve("hf://org/repo", runtime="podman", scheduler="slurm",
+                          gpus=4, require_exists=False)
+    assert res.location.accelerator == "cuda"
+    assert any("no GPU on this login node" in d for d in res.decisions)
+
+
+def test_gpu_job_login_node_accelerator_default_is_configurable(cpu_host, monkeypatch):
+    monkeypatch.setenv("BOXY_DEFAULT_ACCELERATOR", "rocm")
+    res = resolve.resolve("hf://org/repo", runtime="podman", scheduler="slurm",
+                          gpus=4, require_exists=False)
+    assert res.location.accelerator == "rocm"
 
 
 def test_explicit_accelerator_pins_the_submission(cpu_host):
