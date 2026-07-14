@@ -1486,11 +1486,52 @@ def _delegate_remote(args, tunnel_ready: bool = False) -> int | None:
     target_short = target.split("@")[-1].split(".")[0]
     if target_short and target_short == socket.gethostname().split(".")[0]:
         return None
-    return remote.run_remote(target, getattr(args, "_raw_argv", []), tunnel_ready=tunnel_ready,
+    raw_argv = _inject_remote_account(args, target, getattr(args, "_raw_argv", []))
+    return remote.run_remote(target, raw_argv, tunnel_ready=tunnel_ready,
                              local_port=getattr(args, "local_port", None),
                              local_route=getattr(args, "route", "") or "",
                              share=getattr(args, "share", "") or "",
                              exposer_name=getattr(args, "exposer", None) or "relay")
+
+
+def _inject_remote_account(args, target: str, raw_argv: list[str]) -> list[str]:
+    """Turnkey over --ssh (field failure, 2026-07): the delegated command runs
+    the CLUSTER's boxy — which may predate turnkey — so `mywcid` would never run
+    and the batch script got no account. Resolve the account HERE, laptop-side:
+    prefer a locally-known value (config site.account / $SBATCH_ACCOUNT), else
+    probe `mywcid`/`sacctmgr` ON the cluster over the live ssh master, and append
+    `--account <val>` to the delegated argv — a flag every boxy version accepts,
+    so the cluster-built batch script carries the account either way. An explicit
+    --account wins untouched; a turnkey-aware cluster boxy sees the explicit flag
+    and stays silent (flags win). Opt out: BOXY_NO_REMOTE_ACCOUNT=1. Best-effort:
+    any failure just leaves the argv unchanged (today's degrade)."""
+    if os.environ.get("BOXY_NO_REMOTE_ACCOUNT"):
+        return raw_argv
+    if not raw_argv or raw_argv[0] != "serve":
+        return raw_argv
+    if getattr(args, "scheduler", None) not in ("slurm", "flux"):
+        return raw_argv
+    if getattr(args, "account", None):
+        return raw_argv  # explicit --account already rides the argv
+    from boxy import remote, site
+
+    acct, why = site.resolve_account(None)   # laptop-side config/env first
+    if not acct:
+        if remote.ensure_master(target) != 0:
+            return raw_argv  # run_remote will surface the connection error
+        rc, out = remote.ssh_capture(target, site.remote_account_probe(), timeout=20)
+        accounts = site.parse_accounts(out) if rc == 0 else []
+        if not accounts:
+            first = next((ln.strip()[:100] for ln in (out or "").splitlines() if ln.strip()), "")
+            detail = f" (probe answered: {first!r})" if first else ""
+            print(f"  auto: account: none discovered on {target}{detail} — the scheduler's "
+                  f"site default applies; pass --account if it rejects the job")
+            return raw_argv
+        acct = accounts[0]
+        extra = f"; also: {', '.join(accounts[1:3])}" if len(accounts) > 1 else ""
+        why = f"mywcid on {target.split('@')[-1]}{extra}"
+    print(f"  auto: account: {acct} (via {why} — placed in the batch script)")
+    return [*raw_argv, "--account", acct]
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
