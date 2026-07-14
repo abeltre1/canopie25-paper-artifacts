@@ -1,0 +1,6 @@
+# openai/gpt-oss-20b — MXFP4 MoE, fits a single 80GB-class GPU.
+[model]
+match = "openai/gpt-oss-20b*"
+engine = "vllm"
+gpus = 1
+min_vram_gb = 20

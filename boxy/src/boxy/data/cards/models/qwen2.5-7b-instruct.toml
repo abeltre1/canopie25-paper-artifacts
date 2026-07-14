@@ -1,0 +1,6 @@
+# Qwen/Qwen2.5-7B-Instruct — single GPU.
+[model]
+match = "Qwen/Qwen2.5-7B-Instruct*"
+engine = "vllm"
+gpus = 1
+min_vram_gb = 24

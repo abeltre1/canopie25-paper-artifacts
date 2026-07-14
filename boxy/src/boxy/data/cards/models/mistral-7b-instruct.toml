@@ -1,0 +1,6 @@
+# mistralai/Mistral-7B-Instruct (any revision) — single GPU.
+[model]
+match = "mistralai/Mistral-7B-Instruct*"
+engine = "vllm"
+gpus = 1
+min_vram_gb = 24

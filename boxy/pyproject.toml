@@ -55,7 +55,7 @@ version = { attr = "boxy.__version__" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-"boxy.data" = ["examples/**/*.toml", "examples/**/*.md"]
+"boxy.data" = ["examples/**/*.toml", "examples/**/*.md", "cards/**/*.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

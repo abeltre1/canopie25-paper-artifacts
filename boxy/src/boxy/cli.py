@@ -1472,6 +1472,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
             if scheduler_name is None and profile.scheduler in ("slurm", "flux"):
                 scheduler_name = profile.scheduler
         if scheduler_name in ("slurm", "flux"):
+            # Turnkey: fill --gpus/--nodes/--engine from the model's card (or the
+            # size heuristic) when the flags are absent — a novice types only the
+            # model name; explicit flags always win (cards.apply_to_args).
+            from boxy import cards
+
+            for line in cards.apply_to_args(args):
+                print(f"  auto: {line}")
             replicas = getattr(args, "replicas", 1) or 1
             if replicas > 1:
                 return _serve_replicas(args, scheduler_name, profile, replicas,

@@ -377,6 +377,21 @@ def resolve(
             resolved_port = default_port
             decisions.append(f"port: {resolved_port} ({engine} default; on the compute node)")
 
+    # Model-card engine args (e.g. max_model_len for the 70B cards) merge in at
+    # box.args level — the tack-on-last rule still lets explicit user args win.
+    # Only REAL cards contribute args (the size heuristic knows geometry, not
+    # flags). This runs wherever the box is actually built — locally AND on the
+    # compute node of a batch job (same wheel, same packaged cards) — so card
+    # args need no extra flag plumbing through the scheduler.
+    from boxy import cards as _cards
+
+    card = _cards.find_card(resolved_model)
+    card_args: dict = {}
+    if card and card.args:
+        card_args = dict(card.args)
+        kv = ", ".join(f"{k}={v}" for k, v in card_args.items())
+        decisions.append(f"engine args: {kv} ({card.label})")
+
     box_name = name or _slug(model)
     box = Box(
         name=box_name,
@@ -384,5 +399,6 @@ def resolve(
         engine=engine,
         model=resolved_model,
         ports=[resolved_port],
+        args=card_args,
     )
     return Resolution(box=box, location=location, decisions=decisions)

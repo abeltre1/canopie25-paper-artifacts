@@ -1,0 +1,6 @@
+# meta-llama/Llama-3.1-8B-Instruct — the workhorse 8B, single 80GB-class GPU.
+[model]
+match = "meta-llama/Llama-3.1-8B-Instruct*"
+engine = "vllm"
+gpus = 1
+min_vram_gb = 24

@@ -1,0 +1,9 @@
+# meta-llama/Llama-3.3-70B-Instruct — 70B needs ~140GB weights in fp16/bf16:
+# 4x80GB-class GPUs, tensor-parallel derived from the GPU count.
+[model]
+match = "meta-llama/Llama-3.3-70B-Instruct*"
+engine = "vllm"
+gpus = 4
+min_vram_gb = 140
+[model.args]
+max_model_len = 8192

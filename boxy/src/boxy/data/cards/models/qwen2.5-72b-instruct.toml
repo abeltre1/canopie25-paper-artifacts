@@ -1,0 +1,8 @@
+# Qwen/Qwen2.5-72B-Instruct — 72B: 4x80GB-class GPUs.
+[model]
+match = "Qwen/Qwen2.5-72B-Instruct*"
+engine = "vllm"
+gpus = 4
+min_vram_gb = 145
+[model.args]
+max_model_len = 8192
