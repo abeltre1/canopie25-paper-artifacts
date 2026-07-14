@@ -305,6 +305,53 @@ def test_ssh_partition_auto_from_config_default(ssh, capfd, monkeypatch):
     assert "#SBATCH --partition=gpu,batch" in cap.out
 
 
+def test_ssh_injects_unique_when_a_live_instance_is_on_the_cluster(ssh, capfd, monkeypatch):
+    # A live job of this model's name already runs on the cluster -> boxy injects
+    # --unique laptop-side so the (possibly OLD) cluster boxy starts an
+    # independent instance instead of blocking. Works without --unique typed.
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    _shim(ssh["bin"], "squeue", "#!/bin/bash\necho 111\n")   # a job with the name is LIVE
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: --unique" in cap.out and "already live on hops" in cap.out
+    assert "--unique" in ssh["ssh_log"].read_text()          # rode the delegated command
+
+
+def test_ssh_no_unique_when_nothing_live(ssh, capfd, monkeypatch):
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    _shim(ssh["bin"], "squeue", "#!/bin/bash\ntrue\n")       # no job with the name
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: --unique" not in cap.out
+    assert "--unique" not in ssh["ssh_log"].read_text()
+
+
+def test_ssh_power_user_unique_flag_is_respected_not_doubled(ssh, capfd, monkeypatch):
+    # explicit --unique still works and isn't duplicated by the auto-injection.
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    _shim(ssh["bin"], "squeue", "#!/bin/bash\necho 111\n")   # even with a live one
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--unique", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: --unique" not in cap.out                   # not re-injected
+    assert ssh["ssh_log"].read_text().count("--unique") == 1
+
+
+def test_ssh_forwards_proxy_to_the_cluster(ssh, capfd, monkeypatch):
+    # BOXY_PROXY (or ambient http(s)_proxy) is forwarded to the cluster job's
+    # pulls over --ssh, even if the login node's own env lacks it.
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("BOXY_PROXY", "http://proxy.corp:80")
+    monkeypatch.delenv("BOXY_NO_PROXY_PROPAGATE", raising=False)   # opt back in
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "### Proxy   forwarding http://proxy.corp:80" in cap.out
+    assert "https_proxy=http://proxy.corp:80" in ssh["ssh_log"].read_text()
+
+
 def test_ssh_probes_mywcid_on_the_cluster(ssh, capfd, monkeypatch):
     # The laptop knows NOTHING (local account command disabled, no env), so the
     # account is discovered by running `mywcid` ON the cluster over the ssh

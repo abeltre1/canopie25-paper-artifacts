@@ -24,6 +24,9 @@ def _isolate_config(monkeypatch, tmp_path):
     # remote CA propagation is opt-in per test: off by default so a delegated
     # command never tries to `cat >` a CA into the test runner's real $HOME.
     monkeypatch.setenv("BOXY_NO_CA_PROPAGATE", "1")
+    # ditto proxy forwarding: the CI/sandbox runner may export proxy vars, which
+    # would otherwise be injected into every delegated command; e2e tests opt in.
+    monkeypatch.setenv("BOXY_NO_PROXY_PROPAGATE", "1")
     # ditto remote account injection (a dev box may carry sacctmgr/mywcid,
     # making --ssh serve tests nondeterministic); e2e tests opt back in.
     monkeypatch.setenv("BOXY_NO_REMOTE_ACCOUNT", "1")

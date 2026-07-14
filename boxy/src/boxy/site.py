@@ -237,6 +237,22 @@ def remote_partition_probe(scheduler_name: str) -> str:
     return shlex.join(cmd) + " 2>/dev/null || true"
 
 
+def remote_jobname_live_probe(scheduler_name: str, name: str) -> str:
+    """Shell one-liner run on a cluster login node (over the ssh master) that
+    prints LIVE iff a scheduler job with job-name `name` is currently queued or
+    running for this user. Used to decide auto-unique laptop-side over --ssh, so
+    a second serve of a still-live model gets --unique injected and never blocks
+    on the cluster's (possibly older, pre-auto-unique) boxy singleton."""
+    import shlex
+
+    q = shlex.quote(name)
+    if scheduler_name == "flux":
+        return f'flux jobs -no "{{name}}" 2>/dev/null | grep -Fxq {q} && echo LIVE || true'
+    # slurm: -n filters by job name server-side; only queued/running jobs show,
+    # so any row means a genuinely live instance of this name.
+    return f'squeue -h -u "$USER" -n {q} -o %i 2>/dev/null | grep -q . && echo LIVE || true'
+
+
 # `--partition off|none|default|site` (or the same in config) opts OUT of auto
 # and uses the scheduler's own default partition.
 _PARTITION_OFF = {"off", "none", "default", "site", "false", "0"}

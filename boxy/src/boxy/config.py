@@ -60,6 +60,10 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
             help="Ray head port for multi-node (distributed) vLLM serving."),
     Setting("network.replica_port_base", "BOXY_REPLICA_PORT_BASE", 8000, int,
             help="first port for --replicas fan-out (replica N binds base+N)."),
+    Setting("network.proxy", "BOXY_PROXY", "",
+            help="corporate proxy URL for the job's image/model pulls. Empty => use the "
+                 "ambient http(s)_proxy env automatically (no --proxy needed); set this to "
+                 "pin one. Propagated to the compute node and, over --ssh, to the cluster."),
 
     # -- per-engine default ports ---------------------------------------------
     Setting("ports.vllm", "BOXY_PORT_VLLM", 8000, int,

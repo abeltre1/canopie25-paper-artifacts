@@ -59,9 +59,15 @@ choice (nothing is hidden, only the *work*):
   (the scheduler's own default); `BOXY_PARTITION` pins a fixed choice.
 - **auto-unique**: if a live instance of the same model already exists,
   re-running `boxy serve` starts an *independent* instance (its own job / log /
-  endpoint) instead of blocking — you never have to remember `--unique`. A
-  ready service still just reports its URL; opt back to the strict singleton
-  with `--no-auto-unique` / `BOXY_AUTO_UNIQUE=false`.
+  endpoint) instead of blocking — other users never have to remember `--unique`,
+  while power users can still pass it explicitly to force a fresh instance every
+  time. A ready service still just reports its URL; over `--ssh` it's decided
+  laptop-side so it works even against an older cluster boxy; opt back to the
+  strict singleton with `--no-auto-unique` / `BOXY_AUTO_UNIQUE=false`.
+- **proxy**: the corporate proxy for image/model pulls is picked up
+  automatically from your `http(s)_proxy` env (or config `network.proxy` /
+  `BOXY_PROXY`) and, over `--ssh`, forwarded to the cluster job — no `--proxy`
+  needed. Pass `--proxy URL` to pin one.
 
 Same command deploys anywhere — laptop (Podman/Docker), HPC (Apptainer/CharlieCloud
 + Slurm/Flux), cloud/OpenShift — because the scheduler and runtime are hidden

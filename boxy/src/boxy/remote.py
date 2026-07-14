@@ -45,6 +45,7 @@ ENV_SSH_BIN = "BOXY_SSH"            # override the ssh binary (tests: a local sh
 ENV_REMOTE_CMD = "BOXY_REMOTE_COMMAND"  # remote boxy spelling (default: "boxy")
 ENV_PERSIST = "BOXY_SSH_PERSIST"    # how long the master + its tunnels live idle
 ENV_NO_CA_PROP = "BOXY_NO_CA_PROPAGATE"  # opt out of copying the laptop CA to the cluster
+ENV_NO_PROXY_PROP = "BOXY_NO_PROXY_PROPAGATE"  # opt out of forwarding the laptop proxy env
 
 DEFAULT_PERSIST = "12h"  # one OTP+touch buys this much multiplexed access
 
@@ -223,16 +224,35 @@ def propagate_ca(host: str) -> str | None:
     return REMOTE_CA_PATH
 
 
-def _remote_command(argv: list[str], remote_ca: str | None = None) -> str:
+def remote_proxy_env() -> dict[str, str]:
+    """The proxy vars to FORWARD to the cluster over --ssh so its job's image/
+    model pulls reach the corporate proxy — even when the cluster's own env
+    doesn't have it (the laptop knows the proxy; the login node may not).
+    Config `network.proxy` wins, else the laptop's ambient http(s)_proxy env.
+    Empty when nothing is set or BOXY_NO_PROXY_PROPAGATE is set (tests opt out)."""
+    if os.environ.get(ENV_NO_PROXY_PROP):
+        return {}
+    from boxy import ramalama_shim
+
+    override = config.get_str("network.proxy")
+    return ramalama_shim.raw_proxy_env(override)
+
+
+def _remote_command(argv: list[str], remote_ca: str | None = None,
+                    proxy_env: dict[str, str] | None = None) -> str:
     """The command line run on the login node. `bash -lc` gives a LOGIN shell so
     the user's PATH/venv/modules load — the remote `boxy` must be installed there
     (spelling overridable: BOXY_REMOTE_COMMAND='source ~/venv/bin/activate && boxy').
     `remote_ca` (from propagate_ca) is injected as SSL_CERT_FILE so the cluster and
-    its job trust the laptop's interceptor CA; $HOME expands inside the login shell."""
+    its job trust the laptop's interceptor CA; `proxy_env` (from remote_proxy_env)
+    is injected so the cluster boxy inherits the proxy and bakes it into the job.
+    $HOME expands inside the login shell."""
     boxy_cmd = config.get("binaries.remote_command")
     prefix = f"{ENV_ACTIVE}=1"
     if remote_ca:
         prefix += f" SSL_CERT_FILE={remote_ca}"
+    for key, val in (proxy_env or {}).items():
+        prefix += f" {key}={shlex.quote(val)}"
     inner = f"{prefix} {boxy_cmd} {shlex.join(argv)}"
     return f"bash -lc {shlex.quote(inner)}"
 
@@ -312,10 +332,17 @@ def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False,
     remote_ca = propagate_ca(host)
     if remote_ca:
         print(f"### CA      copied your site CA -> {host}:{REMOTE_CA_PATH}  (remote SSL_CERT_FILE)")
+    # forward the laptop's proxy so the cluster job's image/model pulls reach it
+    # even if the login node's own env doesn't have it (turnkey --proxy).
+    proxy_env = remote_proxy_env()
+    if proxy_env.get("https_proxy") or proxy_env.get("http_proxy"):
+        print(f"### Proxy   forwarding {proxy_env.get('https_proxy') or proxy_env.get('http_proxy')} "
+              f"-> {host} (job image/model pulls)")
     # label what follows: everything below runs the CLUSTER's boxy install (keep
     # it as current as the local one: git pull + pip install -e on the login node).
     print(f"### Remote  {host}  $ boxy {shlex.join(argv)}")
-    cmd = [ssh_bin(), "-o", f"ControlPath={control_path()}", host, _remote_command(argv, remote_ca)]
+    cmd = [ssh_bin(), "-o", f"ControlPath={control_path()}", host,
+           _remote_command(argv, remote_ca, proxy_env)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     tunneled: set[tuple[str, int]] = set()
     stale = False

@@ -77,6 +77,42 @@ def test_remote_command_injects_ssl_cert_file():
     assert "SSL_CERT_FILE" not in remote._remote_command(["serve", "m"], None)
 
 
+# ---- proxy forwarding (--ssh from-anywhere) -----------------------------------
+
+
+def test_remote_command_injects_proxy_env():
+    cmd = remote._remote_command(["serve", "m"], None, {"https_proxy": "http://p:80"})
+    assert "https_proxy=http://p:80" in cmd
+    assert "http_proxy" not in remote._remote_command(["serve", "m"], None, {})
+
+
+def test_remote_proxy_env_prefers_config_then_ambient(monkeypatch):
+    monkeypatch.delenv(remote.ENV_NO_PROXY_PROP, raising=False)
+    for v in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("BOXY_PROXY", "http://cfg:8080")           # config wins
+    assert remote.remote_proxy_env()["https_proxy"] == "http://cfg:8080"
+    monkeypatch.delenv("BOXY_PROXY", raising=False)
+    monkeypatch.setenv("https_proxy", "http://ambient:3128")      # else ambient env
+    assert remote.remote_proxy_env()["https_proxy"] == "http://ambient:3128"
+
+
+def test_remote_proxy_env_opt_out(monkeypatch):
+    monkeypatch.setenv(remote.ENV_NO_PROXY_PROP, "1")
+    monkeypatch.setenv("BOXY_PROXY", "http://cfg:8080")
+    assert remote.remote_proxy_env() == {}
+
+
+def test_resolve_proxy_flag_beats_config(monkeypatch):
+    import argparse
+
+    from boxy import cli
+
+    monkeypatch.setenv("BOXY_PROXY", "http://cfg:8080")
+    assert cli._resolve_proxy(argparse.Namespace(proxy="http://flag:80")) == "http://flag:80"
+    assert cli._resolve_proxy(argparse.Namespace(proxy=None)) == "http://cfg:8080"
+
+
 def test_propagate_ca_copies_site_ca_over_the_master(shim, tmp_path, monkeypatch):
     # $HOME points at tmp so the "remote" `cat >` lands in a scratch tree, not the
     # runner's real home; propagation is opt-in (conftest disables it by default).

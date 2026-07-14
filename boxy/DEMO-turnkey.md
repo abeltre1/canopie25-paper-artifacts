@@ -147,8 +147,20 @@ $ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --scheduler slurm --ssh ambel
 
 - A service that's **already up and ready** still just reports its URL (no
   duplicate) — only a *pending/starting* instance triggers a fork.
-- Want the old strict behavior (refuse if one exists)? `--no-auto-unique` or
-  `BOXY_AUTO_UNIQUE=false`.
+- **Power users** keep full control: pass `--unique` to force a fresh instance
+  every time; `--no-auto-unique` / `BOXY_AUTO_UNIQUE=false` restores the strict
+  refuse-if-one-exists behavior.
+- Over `--ssh` the decision is made **laptop-side** (boxy checks `squeue`/`flux
+  jobs` on the cluster for a live job of that name), so `--unique` is injected
+  into the delegated command and this works **even against an older cluster
+  boxy** — no cluster update required.
+
+### The proxy comes along automatically
+
+If your shell exports `http(s)_proxy` (or you set `BOXY_PROXY=http://proxy.<org>:80`
+once), boxy carries it into the job's image/model pulls and, over `--ssh`,
+forwards it to the cluster — you'll see `### Proxy forwarding http://proxy.<org>:80`.
+No `--proxy` flag needed; pass one only to override.
 
 ---
 

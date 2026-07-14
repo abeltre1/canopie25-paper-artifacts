@@ -804,26 +804,40 @@ def _inner_serve_command(args, model: str, name: str, *, port: int | None = None
     return shlex.join(inner)
 
 
+def _resolve_proxy(args) -> str:
+    """The explicit proxy URL to propagate, turnkey-style: `--proxy` wins, else
+    config `network.proxy` / $BOXY_PROXY. Empty => fall back to the ambient
+    http(s)_proxy env (captured by raw_proxy_env), so a login node that already
+    exports a proxy needs no flag and no config at all."""
+    flag = getattr(args, "proxy", "") or ""
+    if flag:
+        return flag
+    from boxy import config
+
+    return config.get_str("network.proxy")
+
+
 def _proxy_prefix(args) -> str:
     """`env VAR=val ...` prefix for the COMPUTE-NODE command, so its host-side
     `podman pull` (and the inner boxy) reach the corporate proxy — the usual fix
-    for a ghcr.io 403 on an isolated compute node. `--proxy URL` wins; otherwise
-    the submitter's proxy env is carried over. '' when nothing is configured."""
+    for a ghcr.io 403 on an isolated compute node. `--proxy` / config
+    network.proxy wins; otherwise the submitter's ambient proxy env is carried
+    over automatically. '' when nothing is configured."""
     from boxy import ramalama_shim
 
-    proxies = ramalama_shim.raw_proxy_env(getattr(args, "proxy", "") or "")
+    proxies = ramalama_shim.raw_proxy_env(_resolve_proxy(args))
     if not proxies:
         return ""
     return "env " + " ".join(f"{k}={shlex.quote(v)}" for k, v in proxies.items()) + " "
 
 
 def _apply_proxy_env(args) -> None:
-    """Export `--proxy` into THIS process's env so the LOGIN-NODE model download
-    (RamaLama / huggingface_hub, run in-process during resolve_model) reaches the
-    corporate proxy too — not just the compute-node command (_proxy_prefix).
-    Field gap: `serve --proxy` proxied the ghcr image pull on the compute node
-    but NOT the HF model pull on the login node. Idempotent; no-op without --proxy."""
-    proxy = getattr(args, "proxy", "") or ""
+    """Export the resolved proxy (--proxy / config network.proxy) into THIS
+    process's env so the LOGIN-NODE model download (RamaLama / huggingface_hub,
+    run in-process during resolve_model) reaches the corporate proxy too — and,
+    over --ssh, so run_remote's ambient-env capture forwards it to the cluster.
+    Idempotent; no-op when nothing beyond the ambient env is configured."""
+    proxy = _resolve_proxy(args)
     if not proxy:
         return
     for key, val in ramalama_shim.raw_proxy_env(proxy).items():
@@ -1637,6 +1651,27 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
             print(f"  auto: account: {acct} (via {why} — placed in the batch script)")
             raw_argv = [*raw_argv, "--account", acct]
 
+    # --- auto-unique: if a job with this model's name is already LIVE on the
+    # cluster, inject --unique so the cluster's boxy (even an old one that lacks
+    # auto-unique) starts an independent instance instead of blocking. Runs the
+    # decision HERE because over --ssh the singleton check runs on the cluster.
+    if (master_ok and _auto_unique(args) and "--unique" not in raw_argv
+            and getattr(args, "model", None)):
+        from boxy import resolve
+
+        try:
+            _, base_name, _ = resolve.resolve_submission(
+                args.model, scheduler, name=getattr(args, "name", None), require_exists=False)
+        except Exception:  # noqa: BLE001 — never block delegation on name resolution
+            base_name = ""
+        if base_name:
+            rc, out = remote.ssh_capture(
+                target, site.remote_jobname_live_probe(scheduler, base_name), timeout=20)
+            if rc == 0 and "LIVE" in out:
+                print(f"  auto: --unique ({base_name} is already live on {host} — "
+                      f"starting an independent instance)")
+                raw_argv = [*raw_argv, "--unique"]
+
     return raw_argv
 
 
@@ -1652,10 +1687,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
         except ValueError as e:
             raise UsageError(str(e))
         print(f"  auto: system: {args.system} (built-in system card)")
+    # resolve the proxy into env BEFORE delegating so run_remote forwards it to
+    # the cluster over --ssh (a --proxy/config proxy known only on the laptop
+    # otherwise never reaches the cluster job).
+    _apply_proxy_env(args)  # --proxy / config reaches the login-node model pull AND the delegated cmd
     rc = _delegate_remote(args, tunnel_ready=True)
     if rc is not None:
         return rc
-    _apply_proxy_env(args)  # --proxy reaches the login-node model pull, not just the job
     _apply_bind_host_env(args)  # --bind-host wins over env/file/default for this serve
     if getattr(args, "share", None):
         raise UsageError("--share needs the laptop tunnel (`boxy serve ... --ssh user@login "
@@ -2854,8 +2892,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--proxy", default=None, metavar="URL",
                    help="corporate proxy (e.g. http://proxy.example.com:80) applied to BOTH the "
                         "login-node model download (Hugging Face) AND the compute node's image pull + "
-                        "in-container downloads. Omit to auto-use your http_proxy/https_proxy env. "
-                        "Fixes ghcr.io/huggingface.co 403 on nodes that must egress through a proxy")
+                        "in-container downloads. USUALLY UNNEEDED: boxy auto-uses your "
+                        "http_proxy/https_proxy env (or config network.proxy / BOXY_PROXY) and, over "
+                        "--ssh, forwards it to the cluster. Fixes ghcr.io/huggingface.co 403 on nodes "
+                        "that must egress through a proxy")
     p.add_argument("--agentless", action="store_true",
                    help="emit a SELF-CONTAINED batch script (podman + a shared-FS endpoint write, no boxy "
                         "on the compute node). Requires --accelerator/--image (hardware can't be detected "
