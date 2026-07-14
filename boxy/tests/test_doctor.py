@@ -176,15 +176,50 @@ def test_remote_checks_healthy_cluster_all_ok():
     run = _fake_run({
         "podman docker apptainer": "podman\n",
         "sbatch flux srun": "sbatch\nsrun\n",
+        "mywcid": "WCID: fy260064  (Genesis)\n",     # account discoverable here
         "nvidia-smi": "cuda\n",
         "https_proxy": "||\n",
         "ghcr.io/v2": "307",                        # a redirect (reachable) — the hops case
+        "boxy --version": "boxy 0.1.0\n",
         "boxy/jobs": "/home/u/.local/share/boxy/jobs/hops/\n",
     })
     results = doctor.remote_checks(run)
     assert all(x.status == doctor.OK for x in results)
     ghcr = next(x for x in results if x.name == "image registry ghcr.io")
     assert "reachable" in ghcr.detail and "pre-pull" in ghcr.detail  # 307 -> reachable, not a WARN
+
+
+def test_remote_checks_report_discovered_account():
+    run = _fake_run({
+        "podman docker apptainer": "podman\n",
+        "sbatch flux srun": "sbatch\n",
+        # the real mywcid table: the account is fy140001, not the description id
+        "mywcid": ("      User    Account                  Description     Parent\n"
+                   "---------- ---------- ------------------------ ----------\n"
+                   "     jdoe   fy140001   103732 system software        nd\n"
+                   "     jdoe   fy260064   240928 genesis project        nd\n"),
+        "ghcr.io/v2": "200",
+        "boxy --version": "",                        # boxy absent on the cluster
+    })
+    r = {x.name: x for x in doctor.remote_checks(run)}
+    assert r["account discovery"].status == doctor.OK
+    assert "fy140001" in r["account discovery"].detail          # first account, not 103732
+    assert "fy260064" in r["account discovery"].detail          # alternative named
+    assert r["cluster boxy"].status == doctor.OK
+    assert "not installed" in r["cluster boxy"].detail          # absent -> covered by injection
+
+
+def test_remote_checks_warn_when_no_account_parses():
+    run = _fake_run({
+        "podman docker apptainer": "apptainer\n",
+        "sbatch flux srun": "flux\n",
+        "mywcid": "mywcid: command not found\n",     # nothing account-shaped
+        "ghcr.io/v2": "200",
+        "boxy --version": "boxy 0.1.0\n",
+    })
+    r = {x.name: x for x in doctor.remote_checks(run)}
+    assert r["account discovery"].status == doctor.WARN
+    assert "--account" in r["account discovery"].fix
 
 
 def test_cmd_doctor_remote_audit_no_cluster_boxy(monkeypatch, capsys):

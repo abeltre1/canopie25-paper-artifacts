@@ -282,6 +282,27 @@ def remote_checks(run) -> list[Result]:
         out.append(Result("scheduler", WARN, "no sbatch/flux found on the login node",
                           "confirm you're on a real login node; some sites gate the scheduler behind a module"))
 
+    # THE turnkey promise: can boxy discover the charge account here? Run the
+    # SAME probe (`mywcid || sacctmgr`) the --ssh serve path uses and parse it,
+    # so the user verifies account resolution BEFORE serving — the field failure
+    # was a silent no-account batch script the scheduler then rejected.
+    from boxy import site
+
+    rc_acct, acct_out = run(site.remote_account_probe())
+    accounts = site.parse_accounts(acct_out) if rc_acct == 0 else []
+    if accounts:
+        extra = f" (also: {', '.join(accounts[1:3])})" if len(accounts) > 1 else ""
+        out.append(Result("account discovery", OK,
+                          f"{accounts[0]}{extra} — turnkey will place `--account={accounts[0]}` in the "
+                          "batch script (override with --account / BOXY_ACCOUNT)"))
+    else:
+        first = next((ln.strip()[:80] for ln in (acct_out or "").splitlines() if ln.strip()), "")
+        detail = f"; the probe answered: {first!r}" if first else ""
+        out.append(Result("account discovery", WARN,
+                          f"no account parsed from mywcid/sacctmgr on the login node{detail}",
+                          "pass --account <wcid> (or export BOXY_ACCOUNT); the scheduler's site default "
+                          "applies otherwise and may reject the job"))
+
     _, accel = run("if command -v nvidia-smi >/dev/null; then echo cuda; "
                    "elif command -v rocminfo >/dev/null; then echo rocm; else echo none; fi")
     a = accel.strip() or "none"
@@ -315,6 +336,21 @@ def remote_checks(run) -> list[Result]:
     else:
         out.append(Result("image registry ghcr.io", WARN, f"could not probe ({code or 'no curl'})",
                           "install curl or check the login node's egress; a pull may still work via the proxy"))
+
+    # Is boxy even installed on the cluster, and is it turnkey-aware? The --ssh
+    # serve path injects `--account` laptop-side precisely so an OLDER cluster
+    # boxy still gets the account — report the version so the user knows whether
+    # the injection is load-bearing or the cluster resolves it on its own.
+    rc_ver, ver = run("boxy --version 2>/dev/null || echo absent")
+    ver = (ver.strip().splitlines() or [""])[0]
+    if rc_ver != 0 or not ver or ver == "absent":
+        out.append(Result("cluster boxy", OK,
+                          "not installed — fine: `--ssh` delegation resolves the account laptop-side and "
+                          "passes it as --account (no boxy needed on the cluster to serve turnkey)"))
+    else:
+        out.append(Result("cluster boxy", OK,
+                          f"{ver} — a --ssh serve still injects --account laptop-side, so an older "
+                          "cluster boxy without turnkey is covered"))
 
     _, jobs_ls = run("ls -d ~/.local/share/boxy/jobs/*/ 2>/dev/null | tr '\\n' ' '")
     if jobs_ls.strip():
