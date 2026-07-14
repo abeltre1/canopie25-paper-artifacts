@@ -62,6 +62,14 @@ layered diagram of where that hiding happens, and drop your own cards in
 Power users keep full control: pass any flag and it wins; `--dryrun` prints the
 whole plan (batch script included) with zero network.
 
+**[`DEMO-turnkey.md`](DEMO-turnkey.md)** is the one-command-per-target runbook:
+the exact `auto: account:` output to expect on laptop / Slurm / Flux / cloud, a
+prove-it checklist mapped to automated tests, and how the account from `mywcid`
+reaches the batch script even when the cluster's boxy predates turnkey (it is
+resolved laptop-side and injected as `--account` over `--ssh`). Verify a real
+cluster first with `boxy doctor --ssh <login>` — it reports the discovered
+account with no boxy installed there.
+
 ## How boxy decides (v2 resolution rules)
 
 | Decision | Rule |
