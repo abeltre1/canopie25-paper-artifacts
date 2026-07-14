@@ -78,3 +78,29 @@ class SlurmScheduler(Scheduler):
         if state in ("COMPLETED", "CANCELLED", "FAILED", "TIMEOUT", "PREEMPTED", "NODE_FAIL", "OUT_OF_MEMORY"):
             return "DONE"
         return "UNKNOWN"
+
+    def partitions_command(self) -> list[str]:
+        # %R = partition name (no default `*` marker), %a = up/down,
+        # %F = nodes as allocated/idle/other/total — the idle count ranks the
+        # soonest-start pick. `-h` drops the header.
+        return ["sinfo", "-h", "-o", "%R %a %F"]
+
+    def parse_partitions(self, stdout: str) -> list[tuple[str, int, bool]]:
+        # sinfo prints a partition on several lines (one per node-state group);
+        # %F is the whole-partition A/I/O/T on each, so aggregate by name (max
+        # idle seen, up if any line is up).
+        agg: dict[str, list] = {}
+        for line in stdout.splitlines():
+            cols = line.split()
+            if len(cols) < 3:
+                continue
+            name, avail, nodes = cols[0], cols[1], cols[2]
+            bits = nodes.split("/")
+            idle = int(bits[1]) if len(bits) >= 2 and bits[1].isdigit() else 0
+            up = avail.lower().startswith("up")
+            if name in agg:
+                agg[name][0] = max(agg[name][0], idle)
+                agg[name][1] = agg[name][1] or up
+            else:
+                agg[name] = [idle, up]
+        return [(n, v[0], v[1]) for n, v in agg.items()]

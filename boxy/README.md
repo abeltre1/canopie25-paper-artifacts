@@ -51,7 +51,10 @@ choice (nothing is hidden, only the *work*):
   `--system slurm-cuda | flux-rocm | laptop-podman | cloud-aws-gpu | openshift-gpu`
   (3 per type; the cloud ones drive SkyPilot via `boxy generate sky`).
 - **site discovery** fills `--account` from `mywcid` / `$SBATCH_ACCOUNT` /
-  `sacctmgr`, plus partition/time defaults.
+  `sacctmgr`, plus partition/time defaults. `--partition auto` (or
+  `BOXY_PARTITION=auto`) picks the **soonest-start** partition set from
+  `sinfo`/`flux queue list` — Slurm submits to them all and starts wherever
+  frees first; a comma-list like `--partition gpu,short` does the same by hand.
 
 Same command deploys anywhere — laptop (Podman/Docker), HPC (Apptainer/CharlieCloud
 + Slurm/Flux), cloud/OpenShift — because the scheduler and runtime are hidden

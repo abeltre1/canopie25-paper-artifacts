@@ -96,6 +96,14 @@ def cluster(tmp_path, monkeypatch):
     binp = tmp_path / "bin"
     binp.mkdir()
     _shim(binp, "mywcid", "#!/bin/bash\ncat <<'EOF'\n" + REAL_MYWCID + "EOF\n")
+    # fake sinfo for `--partition auto`: name / up-down / A/I/O/T nodes. Idle
+    # order is gpu(6) > short(5) > batch(2); down-pt is excluded.
+    _shim(binp, "sinfo", "#!/bin/bash\ncat <<'EOF'\n"
+          "short    up   3/5/0/8\n"
+          "batch    up   8/2/0/10\n"
+          "gpu      up   2/6/0/8\n"
+          "down-pt  down 0/8/0/8\n"
+          "EOF\n")
     sbatch_log = tmp_path / "sbatch.log"
     sbatch_log.write_text("")
     _shim(binp, "sbatch", FAKE_SBATCH)
@@ -133,6 +141,18 @@ def test_login_node_submit_writes_account_into_the_script(cluster, capfd):
     rec = json.loads((cluster["jobs"] / [p.name for p in cluster["jobs"].glob("*.json")
                                          if not p.name.endswith(".endpoint.json")][0]).read_text())
     assert rec["job"] == "12345" and rec["scheduler"] == "slurm"
+
+
+def test_login_node_partition_auto_writes_soonest_start_list(cluster, capfd):
+    # `--partition auto`: sinfo picks the soonest-start set (idle-first) and it
+    # lands in the batch script as a comma-list; Slurm then starts the job in
+    # whichever partition frees first.
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "auto"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    script = _the_script(cluster["jobs"])
+    assert "#SBATCH --partition=gpu,short,batch" in script     # idle-first, down-pt dropped
+    assert "auto: partition: gpu,short,batch" in out or "soonest-start" in out
 
 
 def test_login_node_flux_bank_and_single_queue(cluster, capfd):
@@ -183,6 +203,22 @@ def test_ssh_injects_locally_known_account(ssh, capfd, monkeypatch):
     assert "--account fy260064" in ssh_log                # ...carrying the account
     assert "#SBATCH --account=fy260064" in cap.out        # remote boxy put it in the script
     assert "placed in the batch script" in cap.out        # the laptop-side decision line
+
+
+def test_ssh_resolves_partition_auto_to_concrete_list(ssh, capfd, monkeypatch):
+    # `--partition auto` must be resolved to a CONCRETE list laptop-side (via
+    # sinfo on the cluster) before delegating — an older cluster boxy would pass
+    # the literal 'auto' to sbatch and get 'invalid partition'.
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")            # keep account quiet/deterministic
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "auto",
+               "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: partition: gpu,short,batch (via sinfo on hops" in cap.out
+    ssh_log = ssh["ssh_log"].read_text()
+    assert "--partition gpu,short,batch" in ssh_log           # concrete list delegated
+    assert "--partition auto" not in ssh_log                  # literal 'auto' never sent
+    assert "#SBATCH --partition=gpu,short,batch" in cap.out    # remote script built with it
 
 
 def test_ssh_probes_mywcid_on_the_cluster(ssh, capfd, monkeypatch):

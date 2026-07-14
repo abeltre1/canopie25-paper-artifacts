@@ -112,3 +112,25 @@ class FluxScheduler(Scheduler):
         if state == "INACTIVE":
             return "DONE"
         return "UNKNOWN"
+
+    def partitions_command(self) -> list[str]:
+        # Flux 'partitions' are named queues. Multi-queue is optional (many
+        # clusters run one anonymous queue), so this is best-effort; `{enabled}`
+        # lets us skip disabled queues. Older flux without -o just yields no
+        # rows we can parse -> auto falls back to the site default.
+        return ["flux", "queue", "list", "--no-header", "-o", "{name} {enabled}"]
+
+    def parse_partitions(self, stdout: str) -> list[tuple[str, int, bool]]:
+        # Flux exposes no cheap per-queue idle-node count, so idle is 0 for all
+        # (the caller keeps discovery order); enabled=false marks a down queue.
+        out: list[tuple[str, int, bool]] = []
+        for line in stdout.splitlines():
+            cols = line.split()
+            if not cols or cols[0] in ("QUEUE", "NAME"):
+                continue
+            name = cols[0]
+            enabled = True
+            if len(cols) > 1:
+                enabled = cols[1].strip().lower() not in ("false", "no", "disabled", "0", "✗")
+            out.append((name, 0, enabled))
+        return out

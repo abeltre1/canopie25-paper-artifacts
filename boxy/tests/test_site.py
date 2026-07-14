@@ -139,6 +139,66 @@ def test_partition_and_time_defaults(clean_env, monkeypatch):
     assert site.resolve_time(None)[0] == "4:00:00"
 
 
+def test_explicit_partition_wins_over_auto_machinery(clean_env):
+    assert site.resolve_partition("gpu,short", "slurm") == ("gpu,short", "--partition")
+
+
+# ---- --partition auto: soonest-start discovery ------------------------------------
+
+SINFO = ("short    up   3/5/0/8\n"        # 5 idle
+         "batch    up   8/2/0/10\n"       # 2 idle
+         "gpu      up   0/0/0/4\n"        # 0 idle
+         "down-pt  down 4/4/0/8\n")       # down -> excluded
+
+
+def test_slurm_parse_partitions_aggregates_idle():
+    from boxy.schedulers import get_scheduler
+
+    parts = dict((n, (idle, up)) for n, idle, up in get_scheduler("slurm").parse_partitions(SINFO))
+    assert parts["short"] == (5, True)
+    assert parts["gpu"] == (0, True)
+    assert parts["down-pt"][1] is False
+
+
+def test_rank_partitions_slurm_is_idle_first_comma_list():
+    parts = [("short", 5, True), ("batch", 2, True), ("gpu", 0, True), ("down-pt", 4, False)]
+    value, why = site.rank_partitions(parts, "slurm")
+    assert value == "short,batch,gpu"          # idle-first; the DOWN partition dropped
+    assert "soonest-start" in why and "short" in why
+
+
+def test_rank_partitions_flux_picks_single_best():
+    value, why = site.rank_partitions([("pdebug", 0, True), ("pbatch", 0, True)], "flux")
+    assert value == "pbatch"                    # one queue only, deterministic (name order)
+    assert "," not in value
+
+
+def test_rank_partitions_none_up_falls_back():
+    value, why = site.rank_partitions([("x", 0, False)], "slurm")
+    assert value == "" and "site default" in why
+
+
+def test_resolve_partition_auto_runs_sinfo(clean_env, tmp_path, monkeypatch):
+    _shim(tmp_path, "sinfo", "cat <<'EOF'\n" + SINFO + "EOF\n")
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    value, why = site.resolve_partition("auto", "slurm")
+    assert value == "short,batch,gpu"
+    assert "soonest-start" in why
+
+
+def test_resolve_partition_auto_from_config(clean_env, tmp_path, monkeypatch):
+    _shim(tmp_path, "sinfo", "cat <<'EOF'\n" + SINFO + "EOF\n")
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    monkeypatch.setenv("BOXY_PARTITION", "auto")           # config default = auto
+    assert site.resolve_partition(None, "slurm")[0] == "short,batch,gpu"
+
+
+def test_resolve_partition_auto_no_sinfo_degrades(clean_env, monkeypatch):
+    monkeypatch.setenv("PATH", "/nonexistent-dir-xyz")     # no sinfo anywhere
+    value, why = site.resolve_partition("auto", "slurm")
+    assert value is None and "site default" in why
+
+
 # ---- Flux single-queue guard ------------------------------------------------------
 
 

@@ -1486,7 +1486,7 @@ def _delegate_remote(args, tunnel_ready: bool = False) -> int | None:
     target_short = target.split("@")[-1].split(".")[0]
     if target_short and target_short == socket.gethostname().split(".")[0]:
         return None
-    raw_argv = _inject_remote_account(args, target, getattr(args, "_raw_argv", []))
+    raw_argv = _inject_remote_site(args, target, getattr(args, "_raw_argv", []))
     return remote.run_remote(target, raw_argv, tunnel_ready=tunnel_ready,
                              local_port=getattr(args, "local_port", None),
                              local_route=getattr(args, "route", "") or "",
@@ -1494,44 +1494,94 @@ def _delegate_remote(args, tunnel_ready: bool = False) -> int | None:
                              exposer_name=getattr(args, "exposer", None) or "relay")
 
 
-def _inject_remote_account(args, target: str, raw_argv: list[str]) -> list[str]:
-    """Turnkey over --ssh (field failure, 2026-07): the delegated command runs
-    the CLUSTER's boxy — which may predate turnkey — so `mywcid` would never run
-    and the batch script got no account. Resolve the account HERE, laptop-side:
-    prefer a locally-known value (config site.account / $SBATCH_ACCOUNT), else
-    probe `mywcid`/`sacctmgr` ON the cluster over the live ssh master, and append
-    `--account <val>` to the delegated argv — a flag every boxy version accepts,
-    so the cluster-built batch script carries the account either way. An explicit
-    --account wins untouched; a turnkey-aware cluster boxy sees the explicit flag
-    and stays silent (flags win). Opt out: BOXY_NO_REMOTE_ACCOUNT=1. Best-effort:
-    any failure just leaves the argv unchanged (today's degrade)."""
+def _argv_set_flag(argv: list[str], flag: str, value: str | None) -> list[str]:
+    """Return argv with `flag`'s value set to `value` in place (handles both
+    `--flag V` and `--flag=V`), or the flag+value REMOVED when value is None.
+    Used to rewrite a delegated `--partition auto` into a concrete list (or drop
+    it) so an older cluster boxy never receives the literal word 'auto'."""
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == flag:
+            if value is not None:
+                out += [flag, value]
+            i += 2  # skip the flag AND its separate value token
+            continue
+        if tok.startswith(flag + "="):
+            if value is not None:
+                out.append(f"{flag}={value}")
+            i += 1
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
+def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
+    """Turnkey over --ssh (field failures, 2026-07): the delegated command runs
+    the CLUSTER's boxy — which may predate turnkey — so site resolution never
+    happens there. Resolve it HERE, laptop-side, against the live ssh master and
+    rewrite the delegated argv:
+
+      * account — append `--account <val>` (from config/env, else a `mywcid`
+        probe ON the cluster) so the batch script carries it.
+      * partition — when `--partition auto`, probe the cluster's partitions and
+        REPLACE 'auto' with the concrete soonest-start list; an older cluster
+        boxy would otherwise pass the literal 'auto' to sbatch ('invalid
+        partition'). A turnkey-aware cluster boxy just sees the concrete flag.
+
+    Explicit values win untouched. Opt out: BOXY_NO_REMOTE_ACCOUNT=1. Best-effort
+    throughout: any probe failure leaves that flag as-is (or drops an unresolved
+    'auto')."""
     if os.environ.get("BOXY_NO_REMOTE_ACCOUNT"):
         return raw_argv
     if not raw_argv or raw_argv[0] != "serve":
         return raw_argv
-    if getattr(args, "scheduler", None) not in ("slurm", "flux"):
+    scheduler = getattr(args, "scheduler", None)
+    if scheduler not in ("slurm", "flux"):
         return raw_argv
-    if getattr(args, "account", None):
-        return raw_argv  # explicit --account already rides the argv
     from boxy import remote, site
 
-    acct, why = site.resolve_account(None)   # laptop-side config/env first
-    if not acct:
-        if remote.ensure_master(target) != 0:
-            return raw_argv  # run_remote will surface the connection error
-        rc, out = remote.ssh_capture(target, site.remote_account_probe(), timeout=20)
-        accounts = site.parse_accounts(out) if rc == 0 else []
-        if not accounts:
-            first = next((ln.strip()[:100] for ln in (out or "").splitlines() if ln.strip()), "")
-            detail = f" (probe answered: {first!r})" if first else ""
-            print(f"  auto: account: none discovered on {target}{detail} — the scheduler's "
-                  f"site default applies; pass --account if it rejects the job")
-            return raw_argv
-        acct = accounts[0]
-        extra = f"; also: {', '.join(accounts[1:3])}" if len(accounts) > 1 else ""
-        why = f"mywcid on {target.split('@')[-1]}{extra}"
-    print(f"  auto: account: {acct} (via {why} — placed in the batch script)")
-    return [*raw_argv, "--account", acct]
+    # one master for every probe below (idempotent; run_remote reuses it)
+    master_ok = remote.ensure_master(target) == 0
+    host = target.split("@")[-1]
+
+    # --- partition: resolve `auto` to a concrete list over the cluster ---
+    part = getattr(args, "partition", None)
+    if part and part.strip().lower() == "auto":
+        value, why = "", "no ssh master to probe partitions"
+        if master_ok:
+            rc, out = remote.ssh_capture(target, site.remote_partition_probe(scheduler), timeout=20)
+            value, why = site.rank_remote_partitions(out, scheduler) if rc == 0 else ("", why)
+        if value:
+            raw_argv = _argv_set_flag(raw_argv, "--partition", value)
+            print(f"  auto: partition: {value} (via sinfo on {host}: {why})")
+        else:
+            raw_argv = _argv_set_flag(raw_argv, "--partition", None)  # drop unresolved 'auto'
+            print(f"  auto: partition: could not pick on {target} ({why}) — "
+                  f"the scheduler's site default applies")
+
+    # --- account: append --account unless one was given explicitly ---
+    if not getattr(args, "account", None):
+        acct, why = site.resolve_account(None)   # laptop-side config/env first
+        if not acct and master_ok:
+            rc, out = remote.ssh_capture(target, site.remote_account_probe(), timeout=20)
+            accounts = site.parse_accounts(out) if rc == 0 else []
+            if accounts:
+                acct = accounts[0]
+                extra = f"; also: {', '.join(accounts[1:3])}" if len(accounts) > 1 else ""
+                why = f"mywcid on {host}{extra}"
+            else:
+                first = next((ln.strip()[:100] for ln in (out or "").splitlines() if ln.strip()), "")
+                detail = f" (probe answered: {first!r})" if first else ""
+                print(f"  auto: account: none discovered on {target}{detail} — the scheduler's "
+                      f"site default applies; pass --account if it rejects the job")
+        if acct:
+            print(f"  auto: account: {acct} (via {why} — placed in the batch script)")
+            raw_argv = [*raw_argv, "--account", acct]
+
+    return raw_argv
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -2796,8 +2846,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="with --replicas K, after the replicas are READY start the built-in login-node "
                         "router on PORT (default 8000) presenting ONE OpenAI URL load-balanced across "
                         "them (least-outstanding). For production scale use `boxy router --emit`")
-    p.add_argument("--partition", default=None,
-                   help="partition/queue for --scheduler jobs (Slurm --partition, Flux --queue)")
+    p.add_argument("--partition", default=None, metavar="NAME|LIST|auto",
+                   help="partition/queue for --scheduler jobs (Slurm --partition, Flux --queue). "
+                        "Pass a comma-list (Slurm starts in whichever frees first) or `auto` to let "
+                        "boxy pick the soonest-start set from sinfo/flux (set BOXY_PARTITION=auto to "
+                        "make it the default). Works over --ssh: `auto` is resolved on the cluster.")
     p.add_argument("--account", default=None,
                    help="account/bank for --scheduler jobs (Slurm --account, Flux --bank)")
     p.add_argument("--time", default=None,

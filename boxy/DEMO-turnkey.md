@@ -100,6 +100,37 @@ runs locally.
 $ boxy serve <model> --scheduler slurm --account fy260064 --ssh ambelt@hops
 ```
 
+### Get it running first — pick the soonest-start partition
+
+Don't know or care which partition is emptiest? Let boxy choose:
+
+```console
+$ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --scheduler slurm --partition auto --ssh ambelt@hops
+  auto: partition: gpu,short,batch (via sinfo on hops: auto → 3 partitions, soonest-start (most idle: gpu (6 nodes)))
+  auto: account: fy140001 (via mywcid on hops …)
+### Batch script (…):
+    #SBATCH --partition=gpu,short,batch     <-- Slurm starts the job wherever frees FIRST
+```
+
+- `--partition auto` runs `sinfo` (on the cluster, over the same SSH session)
+  and submits to **every up partition, idle-first**. Slurm's own scheduler then
+  starts the job in whichever can run it soonest — that's native Slurm
+  multi-partition behavior, so there's no polling or guesswork.
+- Prefer a specific shortlist? Pass it yourself: `--partition gpu,short` — same
+  soonest-start semantics, just your set.
+- Make it the default for every job: `export BOXY_PARTITION=auto`.
+- Flux takes **one** queue, so `auto` picks the single best queue (`--queue=…`).
+- Over `--ssh`, `auto` is resolved to the concrete list **before** delegating,
+  so it works even against a cluster whose boxy predates this feature (it never
+  sees the literal word `auto`).
+
+Verify what `auto` would choose on a real cluster, no serving:
+
+```console
+$ boxy doctor --ssh ambelt@hops
+  partitions   [OK] --partition auto → gpu,short,batch (soonest-start; Slurm starts in whichever frees first)
+```
+
 ---
 
 ## 3. HPC over Flux — from your laptop
@@ -145,6 +176,7 @@ Run these against the real systems; each maps to an automated test here.
 | 0 | `boxy doctor --ssh ambelt@hops` | `account discovery: OK fy140001 …` | `test_doctor.py::test_remote_checks_report_discovered_account` |
 | 1 | `boxy serve <8B> --scheduler slurm --ssh ambelt@hops` | `auto: account: fy140001 (via mywcid on hops …)` then `#SBATCH --account=fy140001` | `test_turnkey_e2e.py::test_ssh_probes_mywcid_on_the_cluster` |
 | 2 | on hops: `boxy serve <8B> --scheduler slurm` | `#SBATCH --account=fy140001` in the submitted script | `test_turnkey_e2e.py::test_login_node_submit_writes_account_into_the_script` |
+| 2b | `boxy serve <8B> --scheduler slurm --partition auto --ssh ambelt@hops` | `#SBATCH --partition=<idle-first list>` — starts wherever frees first | `test_turnkey_e2e.py::test_ssh_resolves_partition_auto_to_concrete_list` |
 | 3 | `boxy serve <8B> --scheduler flux --ssh ambelt@eldorado` | `# flux: --bank=fy140001`, one queue | `test_turnkey_e2e.py::test_login_node_flux_bank_and_single_queue` |
 | 4 | `boxy list --ssh ambelt@hops` | the job as `RUNNING`, then its endpoint | submit/follow loop in `_serve_submission` |
 

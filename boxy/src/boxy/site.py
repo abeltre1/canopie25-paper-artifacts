@@ -158,12 +158,96 @@ def remote_account_probe() -> str:
             f"sacctmgr -nP show assoc user=$USER format=account 2>/dev/null || true")
 
 
-def resolve_partition(explicit: str | None) -> tuple[str | None, str]:
-    if explicit:
+def discover_partitions(scheduler_name: str) -> list[tuple[str, int, bool]]:
+    """(name, idle_nodes, is_up) per partition on THIS host — best-effort, []
+    if the scheduler can't enumerate them or the tool is missing/errors."""
+    from boxy.schedulers import get_scheduler
+
+    try:
+        sched = get_scheduler(scheduler_name)
+    except (ValueError, KeyError):
+        return []
+    cmd = sched.partitions_command()
+    if not cmd:
+        return []
+    try:
+        return sched.parse_partitions(_run(cmd))
+    except Exception:  # noqa: BLE001 — discovery must never break a submission
+        return []
+
+
+def rank_partitions(parts: list[tuple[str, int, bool]], scheduler_name: str) -> tuple[str, str]:
+    """Turn discovered partitions into the `--partition auto` value + provenance.
+    Slurm gets ALL up partitions as a comma-list (idle-first) so its own
+    scheduler starts the job in whichever frees soonest — the native
+    soonest-start behavior. Flux's --queue takes ONE, so pick the single best
+    (idle-first, then name). ('' , reason) when nothing usable was found."""
+    up = [(n, idle) for (n, idle, is_up) in parts if is_up]
+    if not up:
+        tool = "sinfo" if scheduler_name == "slurm" else "flux queue list"
+        return "", f"auto requested but no partitions discovered ({tool}) — using the scheduler's site default"
+    up.sort(key=lambda t: (-t[1], t[0]))  # most idle first, then name (deterministic)
+    names = [n for n, _ in up]
+    if scheduler_name == "flux":
+        return names[0], f"auto → {names[0]} (soonest-start queue of {len(names)}; flux queue list)"
+    top_idle = up[0][1]
+    note = (f"most idle: {names[0]} ({top_idle} nodes)" if top_idle
+            else "none idle now — Slurm queues it to whichever frees first")
+    return ",".join(names), f"auto → {len(names)} partitions, soonest-start ({note})"
+
+
+def rank_remote_partitions(stdout: str, scheduler_name: str) -> tuple[str, str]:
+    """rank_partitions for output captured on a REMOTE login node (--ssh): parse
+    with the scheduler's own parser, then rank. Used to resolve `--partition
+    auto` to a concrete list before delegating (an older cluster boxy would pass
+    the literal word 'auto' to sbatch and get 'invalid partition')."""
+    from boxy.schedulers import get_scheduler
+
+    try:
+        parts = get_scheduler(scheduler_name).parse_partitions(stdout)
+    except Exception:  # noqa: BLE001
+        parts = []
+    return rank_partitions(parts, scheduler_name)
+
+
+def remote_partition_probe(scheduler_name: str) -> str:
+    """The shell one-liner run on a cluster login node (over the ssh master) to
+    list partitions for `--partition auto`. `true` when the scheduler can't
+    enumerate (auto then degrades to the site default)."""
+    import shlex
+
+    from boxy.schedulers import get_scheduler
+
+    try:
+        cmd = get_scheduler(scheduler_name).partitions_command()
+    except (ValueError, KeyError):
+        cmd = []
+    if not cmd:
+        return "true"
+    return shlex.join(cmd) + " 2>/dev/null || true"
+
+
+def _wants_auto_partition(explicit: str | None) -> bool:
+    """True when the user asked boxy to PICK the partition: `--partition auto`,
+    or config `site.partition = auto` with no flag."""
+    if explicit is not None:
+        return explicit.strip().lower() == "auto"
+    return config.get_str("site.partition").strip().lower() == "auto"
+
+
+def resolve_partition(explicit: str | None, scheduler_name: str = "slurm") -> tuple[str | None, str]:
+    """(value, provenance). `--partition auto` (or config `site.partition=auto`)
+    discovers partitions and picks the soonest-start set; an explicit
+    partition/queue always wins; otherwise the config default or None."""
+    if explicit and explicit.strip().lower() != "auto":
         return explicit, "--partition"
-    cfg = config.get_str("site.partition").strip()
-    if cfg:
-        return cfg, "config site.partition"
+    if _wants_auto_partition(explicit):
+        value, why = rank_partitions(discover_partitions(scheduler_name), scheduler_name)
+        return (value or None), why
+    if not explicit:
+        cfg = config.get_str("site.partition").strip()
+        if cfg:  # a non-'auto' config default (auto handled above)
+            return cfg, "config site.partition"
     return None, ""
 
 
@@ -193,7 +277,7 @@ def resolve_site(args, scheduler_name: str) -> tuple[dict, list[str]]:
     else:
         decisions.append(f"account: {why}")
 
-    part, pwhy = resolve_partition(getattr(args, "partition", None))
+    part, pwhy = resolve_partition(getattr(args, "partition", None), scheduler_name)
     if part:
         if scheduler_name == "flux" and "," in part:
             first = part.split(",")[0].strip()

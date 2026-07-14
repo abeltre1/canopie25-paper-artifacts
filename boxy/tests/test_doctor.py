@@ -198,6 +198,7 @@ def test_remote_checks_report_discovered_account():
                    "---------- ---------- ------------------------ ----------\n"
                    "     jdoe   fy140001   103732 system software        nd\n"
                    "     jdoe   fy260064   240928 genesis project        nd\n"),
+        "sinfo": "gpu up 2/6/0/8\nbatch up 8/2/0/10\n",  # gpu(6 idle) > batch(2)
         "ghcr.io/v2": "200",
         "boxy --version": "",                        # boxy absent on the cluster
     })
@@ -205,6 +206,8 @@ def test_remote_checks_report_discovered_account():
     assert r["account discovery"].status == doctor.OK
     assert "fy140001" in r["account discovery"].detail          # first account, not 103732
     assert "fy260064" in r["account discovery"].detail          # alternative named
+    assert r["partitions"].status == doctor.OK
+    assert "gpu,batch" in r["partitions"].detail                # idle-first soonest-start set
     assert r["cluster boxy"].status == doctor.OK
     assert "not installed" in r["cluster boxy"].detail          # absent -> covered by injection
 

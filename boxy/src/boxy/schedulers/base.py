@@ -119,3 +119,18 @@ class Scheduler(ABC):
     def interpret_state(self, stdout: str) -> str:
         """Normalize scheduler output to PENDING | RUNNING | DONE | UNKNOWN."""
         raise NotImplementedError
+
+    # ---- partition discovery (the `--partition auto` soonest-start pick) ----
+
+    def partitions_command(self) -> list[str]:
+        """Command that LISTS the schedulable partitions/queues, used by
+        `--partition auto` to submit where the job starts soonest. Empty list =
+        this scheduler can't enumerate them (auto then falls back to the site
+        default)."""
+        return []
+
+    def parse_partitions(self, stdout: str) -> list[tuple[str, int, bool]]:
+        """Parse partitions_command() output into (name, idle_nodes, is_up) —
+        idle_nodes ranks the soonest-start pick, is_up filters out down ones.
+        Best-effort: a line that doesn't parse is skipped, never raised."""
+        return []

@@ -303,6 +303,18 @@ def remote_checks(run) -> list[Result]:
                           "pass --account <wcid> (or export BOXY_ACCOUNT); the scheduler's site default "
                           "applies otherwise and may reject the job"))
 
+    # Which partitions can `--partition auto` choose from? Run the SAME sinfo
+    # probe and rank it, so the user sees the soonest-start set before serving.
+    if "sbatch" in sub or not any(s in sub for s in ("sbatch", "flux")):
+        rc_part, part_out = run(site.remote_partition_probe("slurm"))
+        value, _why = site.rank_remote_partitions(part_out, "slurm") if rc_part == 0 else ("", "")
+        if value:
+            out.append(Result("partitions", OK,
+                              f"--partition auto → {value} (soonest-start; Slurm starts in whichever frees first)"))
+        else:
+            out.append(Result("partitions", OK,
+                              "sinfo listed none (single-partition site?) — omit --partition to use the default"))
+
     _, accel = run("if command -v nvidia-smi >/dev/null; then echo cuda; "
                    "elif command -v rocminfo >/dev/null; then echo rocm; else echo none; fi")
     a = accel.strip() or "none"
