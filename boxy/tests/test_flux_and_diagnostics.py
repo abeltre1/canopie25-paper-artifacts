@@ -142,14 +142,30 @@ def test_same_scheduler_unknown_still_blocks(gguf, jobs_dir, monkeypatch, capsys
     assert "Not resubmitting" in err and "scheduler unreachable" in err
 
 
-def test_matching_scheduler_record_message_unchanged(gguf, jobs_dir, monkeypatch, capsys):
+def test_no_auto_unique_keeps_singleton_block_message(gguf, jobs_dir, monkeypatch, capsys):
+    # With auto-unique disabled, a live same-scheduler job still hard-blocks
+    # (the strict singleton) with the unchanged guidance message.
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "flux", "job": "f123"})
+    from boxy import cli
+    monkeypatch.setattr(cli, "_job_state", lambda s, j: "RUNNING")
+    rc = main(["serve", str(gguf), "--scheduler", "flux", "--no-auto-unique",
+               "--dryrun", "--name", "boxy-m"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "already submitted as flux job f123" in err
+
+
+def test_auto_unique_default_forks_on_live_scheduler_job(gguf, jobs_dir, monkeypatch, capsys):
+    # DEFAULT (no flag): a live same-scheduler instance is not blocked — boxy
+    # forks a fresh independent instance instead.
     jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "flux", "job": "f123"})
     from boxy import cli
     monkeypatch.setattr(cli, "_job_state", lambda s, j: "RUNNING")
     rc = main(["serve", str(gguf), "--scheduler", "flux", "--dryrun", "--name", "boxy-m"])
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert "already submitted as flux job f123" in err
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "starting an independent instance" in out
+    assert "# flux: --job-name=boxy-m-" in out            # forked, not the base 'boxy-m'
 
 
 # ---- --unique: launch multiple of the same model ----------------------------

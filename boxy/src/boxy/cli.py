@@ -700,6 +700,18 @@ def _unique_instance_name(base: str) -> str:
     return f"{base}-{stamp}-{secrets.token_hex(6)}"
 
 
+def _auto_unique(args) -> bool:
+    """Turnkey: when a LIVE instance of this model already holds the name, start
+    an independent instance instead of blocking. On by default; opt out with
+    --no-auto-unique, BOXY_AUTO_UNIQUE=false, or config serve.auto_unique=false
+    to keep the strict singleton (a re-run reports 'already submitted')."""
+    if getattr(args, "no_auto_unique", False):
+        return False
+    from boxy import config
+
+    return config.get_bool("serve.auto_unique")
+
+
 def _job_state(scheduler, job_id: str) -> str:
     """PENDING | RUNNING | DONE | UNKNOWN. A scheduler that cannot be REACHED
     (controller down, squeue missing) must be UNKNOWN, never DONE: squeue's
@@ -1045,14 +1057,29 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
                 print(f"boxy: cannot determine the state of {rec_sched_name} job "
                       f"{record['job']} ({name}) — scheduler unreachable? Not resubmitting. "
                       f"Retry when it answers, or boxy stop {name}.", file=sys.stderr)
-            elif mismatch:
+                return 1
+            if mismatch:
                 print(f"boxy: {name} is already submitted as a {rec_sched_name} job "
                       f"({record['job']}, {state}), but you requested {scheduler_name}. "
                       f"Stop it first: boxy stop {name}.", file=sys.stderr)
+                return 1
+            # Same scheduler, a live (PENDING/RUNNING) instance already holds this
+            # name. Turnkey default: don't block — fork a fresh independent instance
+            # (its own job/log/endpoint). Explicit --unique already renamed above;
+            # opt out with --no-auto-unique / BOXY_AUTO_UNIQUE=false to keep the
+            # strict singleton.
+            if name_override is None and _auto_unique(args):
+                forked = _unique_instance_name(name)
+                print(f"  auto: name: {forked} ({name} is already {rec_sched_name} job "
+                      f"{record['job']} / {state} — starting an independent instance; "
+                      f"stop either with `boxy stop <name>`)")
+                name = forked
+                record = None  # fall through and submit under the fresh name
             else:
                 print(f"boxy: {name} is already submitted as {rec_sched_name} job {record['job']} "
-                      f"({state}) — watch: boxy list; stop: boxy stop {name}", file=sys.stderr)
-            return 1
+                      f"({state}) — watch: boxy list; stop: boxy stop {name} "
+                      f"(--unique starts a second instance)", file=sys.stderr)
+                return 1
         elif not args.dryrun:
             jobs.remove(name)  # stale record from a finished job (S6: dryrun must not mutate)
 
@@ -2852,7 +2879,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unique", action="store_true",
                    help="append a unique suffix to the name so you can launch MULTIPLE instances of "
                         "the same model at once (each gets its own job, log, and endpoint) instead of "
-                        "reusing/blocking on the single deterministic name")
+                        "reusing/blocking on the single deterministic name. NOTE: by default boxy "
+                        "already does this automatically when a live instance exists — this just forces "
+                        "a fresh instance every time")
+    p.add_argument("--no-auto-unique", dest="no_auto_unique", action="store_true",
+                   help="restore the strict singleton: if a live instance of the model exists, refuse "
+                        "instead of auto-starting an independent one (also BOXY_AUTO_UNIQUE=false)")
     p.add_argument("--replicas", type=int, default=1, metavar="K",
                    help="data-parallel: submit K independent instances of the model, each its own "
                         "batch job named <base>-r0..r{K-1} with its own endpoint/log/port. Requires "

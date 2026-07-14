@@ -186,6 +186,36 @@ def test_login_node_flux_bank_and_single_queue(cluster, capfd):
     assert "ONE queue" in cap.err                       # the guard warned
 
 
+# ---- auto-unique: never block on a live instance (start an independent one) --------
+
+
+def test_auto_unique_forks_when_a_live_instance_exists(cluster, capfd, monkeypatch):
+    from boxy import jobs, resolve
+
+    _, name, _ = resolve.resolve_submission(MODEL, "slurm", require_exists=False)
+    # a live PENDING instance already holds the deterministic name, no endpoint yet
+    jobs.write_record(name, {"name": name, "scheduler": "slurm", "job": "111", "model": MODEL})
+    _shim(cluster["bin"], "squeue", "#!/bin/bash\necho PENDING\n")   # _job_state -> PENDING
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--dryrun"])   # NO --unique
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "starting an independent instance" in out
+    assert f"--job-name={name}-" in out                 # forked unique name, not the base
+    assert f"#SBATCH --job-name={name}\n" not in out    # the base name was NOT reused
+
+
+def test_no_auto_unique_restores_singleton_block(cluster, capfd):
+    from boxy import jobs, resolve
+
+    _, name, _ = resolve.resolve_submission(MODEL, "slurm", require_exists=False)
+    jobs.write_record(name, {"name": name, "scheduler": "slurm", "job": "111", "model": MODEL})
+    _shim(cluster["bin"], "squeue", "#!/bin/bash\necho RUNNING\n")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--no-auto-unique", "--dryrun"])
+    err = capfd.readouterr().err
+    assert rc == 1
+    assert "already submitted" in err                   # strict singleton preserved
+
+
 # ---- from the laptop over --ssh: the account is injected into the delegated cmd --
 
 

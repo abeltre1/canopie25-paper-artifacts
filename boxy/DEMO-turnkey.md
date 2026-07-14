@@ -133,6 +133,23 @@ $ boxy doctor --ssh ambelt@hops
   partitions   [OK] --partition auto → gpu,batch (soonest-start; Slurm starts in whichever frees first)
 ```
 
+### Run it again — you get a second instance, not a wall
+
+Re-running the same command while one is already live doesn't block; boxy starts
+an **independent** instance (its own job / log / endpoint). You never type
+`--unique`:
+
+```console
+$ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --scheduler slurm --ssh ambelt@hops
+  auto: name: boxy-llama-3.1-8b-instruct-0714-203155-9f2c (boxy-llama-3.1-8b-instruct is already
+        slurm job 1786916 / RUNNING — starting an independent instance; stop either with `boxy stop <name>`)
+```
+
+- A service that's **already up and ready** still just reports its URL (no
+  duplicate) — only a *pending/starting* instance triggers a fork.
+- Want the old strict behavior (refuse if one exists)? `--no-auto-unique` or
+  `BOXY_AUTO_UNIQUE=false`.
+
 ---
 
 ## 3. HPC over Flux — from your laptop

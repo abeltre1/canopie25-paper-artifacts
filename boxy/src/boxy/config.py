@@ -136,8 +136,13 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
             help="site command that prints the user's charge account(s) (Sandia: mywcid). "
                  "boxy takes the first account-looking token. Set empty to skip it."),
     Setting("site.partition", "BOXY_PARTITION", "",
-            help="default Slurm partition / Flux queue when --partition is absent. "
-                 "Empty => let the scheduler use its site default."),
+            help="default Slurm partition / Flux queue. Empty => AUTO: boxy picks the "
+                 "soonest-start GPU partitions from sinfo. Also accepts 'all' (every "
+                 "partition), 'off' (the scheduler's own default), or a name/comma-list."),
+    Setting("serve.auto_unique", "BOXY_AUTO_UNIQUE", "true",
+            help="when a live instance of the same model already exists, start an "
+                 "independent instance instead of blocking (turnkey). Set false to "
+                 "restore the strict singleton (re-run reports 'already submitted')."),
     Setting("site.default_time", "BOXY_DEFAULT_TIME", "",
             help="default walltime when --time is absent (Slurm colon notation, e.g. "
                  "'4:00:00'; boxy converts it to Flux FSD). Empty => scheduler default."),

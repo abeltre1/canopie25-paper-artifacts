@@ -57,6 +57,11 @@ choice (nothing is hidden, only the *work*):
   frees first instead of parking in one queue. Override with `--partition
   <name|list>`, `--partition all` (include CPU partitions), or `--partition off`
   (the scheduler's own default); `BOXY_PARTITION` pins a fixed choice.
+- **auto-unique**: if a live instance of the same model already exists,
+  re-running `boxy serve` starts an *independent* instance (its own job / log /
+  endpoint) instead of blocking — you never have to remember `--unique`. A
+  ready service still just reports its URL; opt back to the strict singleton
+  with `--no-auto-unique` / `BOXY_AUTO_UNIQUE=false`.
 
 Same command deploys anywhere — laptop (Podman/Docker), HPC (Apptainer/CharlieCloud
 + Slurm/Flux), cloud/OpenShift — because the scheduler and runtime are hidden
