@@ -239,23 +239,33 @@ def remote_partition_probe(scheduler_name: str) -> str:
 
 def remote_jobname_live_probe(scheduler_name: str, name: str) -> str:
     """Shell one-liner run on a cluster login node (over the ssh master) that
-    prints LIVE iff a scheduler job with job-name `name` is currently queued or
-    running for this user. Used to decide auto-unique laptop-side over --ssh, so
-    a second serve of a still-live model gets --unique injected and never blocks
-    on the cluster's (possibly older, pre-auto-unique) boxy singleton."""
+    prints LIVE iff a scheduler job with job-name `name` is currently PENDING
+    (queued, nothing serving yet) for this user. Used to decide auto-unique
+    laptop-side over --ssh: a second serve while one is still queued gets
+    --unique injected so it never blocks on the cluster's (possibly older)
+    singleton. A RUNNING job is deliberately NOT matched — something is already
+    serving at that name, so the cluster boxy reports its endpoint instead of
+    silently duplicating a live GPU allocation (adversarial-review finding).
+    `grep -Fxq --` stops a job name beginning with '-' from being read as an
+    option."""
     import shlex
 
     q = shlex.quote(name)
     if scheduler_name == "flux":
-        return f'flux jobs -no "{{name}}" 2>/dev/null | grep -Fxq {q} && echo LIVE || true'
-    # slurm: -n filters by job name server-side; only queued/running jobs show,
-    # so any row means a genuinely live instance of this name.
-    return f'squeue -h -u "$USER" -n {q} -o %i 2>/dev/null | grep -q . && echo LIVE || true'
+        # --filter=pending: only queued jobs; old flux without it errors -> no
+        # LIVE -> the cluster boxy handles it (safe degrade).
+        return (f'flux jobs --filter=pending -no "{{name}}" 2>/dev/null '
+                f'| grep -Fxq -- {q} && echo LIVE || true')
+    # slurm: -t restricts to queued states; -n filters by job name server-side.
+    return (f'squeue -h -u "$USER" -n {q} -t PENDING,CONFIGURING -o %i 2>/dev/null '
+            f'| grep -q . && echo LIVE || true')
 
 
-# `--partition off|none|default|site` (or the same in config) opts OUT of auto
-# and uses the scheduler's own default partition.
-_PARTITION_OFF = {"off", "none", "default", "site", "false", "0"}
+# `--partition off|none` (or the same in config) opts OUT of auto and uses the
+# scheduler's own default partition. Kept to two rarely-real partition names so a
+# site partition literally named `default`/`site` isn't shadowed (adversarial-
+# review finding); a partition genuinely named `off`/`none` is vanishingly rare.
+_PARTITION_OFF = {"off", "none"}
 
 
 def partition_mode(explicit: str | None) -> str:

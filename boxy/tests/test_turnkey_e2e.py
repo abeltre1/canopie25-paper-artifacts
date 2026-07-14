@@ -339,6 +339,33 @@ def test_ssh_power_user_unique_flag_is_respected_not_doubled(ssh, capfd, monkeyp
     assert ssh["ssh_log"].read_text().count("--unique") == 1
 
 
+def test_ssh_injects_card_max_model_len_after_separator(ssh, capfd, monkeypatch):
+    # the model card's engine args (--max-model-len, so vLLM doesn't OOM on the
+    # 128K default) are injected AFTER `--`, while boxy flags (account/partition)
+    # stay BEFORE it — even against an OLD cluster boxy that won't apply the card.
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: engine args: --max-model-len 8192" in cap.out
+    log = ssh["ssh_log"].read_text()
+    assert "-- --max-model-len 8192" in log                 # engine args after --
+    # boxy flags land BEFORE the `--` separator (not passed to vLLM)
+    assert log.index("--account") < log.index(" -- ")
+    assert log.index("--partition") < log.index(" -- ")
+
+
+def test_ssh_user_engine_args_win_over_card(ssh, capfd, monkeypatch):
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun",
+               "--", "--max-model-len", "4096"])
+    capfd.readouterr()
+    assert rc == 0
+    log = ssh["ssh_log"].read_text()
+    # card 8192 FIRST then the user's 4096 -> vLLM last-wins -> user's 4096
+    assert log.index("8192") < log.index("4096")
+
+
 def test_ssh_forwards_proxy_to_the_cluster(ssh, capfd, monkeypatch):
     # BOXY_PROXY (or ambient http(s)_proxy) is forwarded to the cluster job's
     # pulls over --ssh, even if the login node's own env lacks it.

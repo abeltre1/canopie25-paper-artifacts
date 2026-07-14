@@ -156,8 +156,8 @@ def test_no_auto_unique_keeps_singleton_block_message(gguf, jobs_dir, monkeypatc
 
 
 def test_auto_unique_default_forks_on_live_scheduler_job(gguf, jobs_dir, monkeypatch, capsys):
-    # DEFAULT (no flag): a live same-scheduler instance is not blocked — boxy
-    # forks a fresh independent instance instead.
+    # DEFAULT (no flag): a live same-scheduler instance with NOTHING serving yet
+    # (no endpoint published) is not blocked — boxy forks a fresh instance.
     jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "flux", "job": "f123"})
     from boxy import cli
     monkeypatch.setattr(cli, "_job_state", lambda s, j: "RUNNING")
@@ -166,6 +166,23 @@ def test_auto_unique_default_forks_on_live_scheduler_job(gguf, jobs_dir, monkeyp
     out = capsys.readouterr().out
     assert "starting an independent instance" in out
     assert "# flux: --job-name=boxy-m-" in out            # forked, not the base 'boxy-m'
+
+
+def test_auto_unique_does_not_duplicate_when_endpoint_published(gguf, jobs_dir, monkeypatch, capsys):
+    # Adversarial-review regression: a RUNNING instance that already published an
+    # endpoint must NOT be forked into a duplicate GPU job just because the 2s
+    # readiness probe was slow — report the live endpoint instead.
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "flux", "job": "f123"})
+    jobs.write_endpoint("boxy-m", 8000, "f123")           # server came up (endpoint published)
+    from boxy import cli, readiness
+    monkeypatch.setattr(cli, "_job_state", lambda s, j: "RUNNING")
+    monkeypatch.setattr(readiness, "wait_ready", lambda *a, **k: None)  # transient probe miss
+    rc = main(["serve", str(gguf), "--scheduler", "flux", "--dryrun", "--name", "boxy-m"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ALREADY SERVING" in out
+    assert "starting an independent instance" not in out  # NOT forked
+    assert "# flux: --job-name=boxy-m-" not in out        # no second job built
 
 
 # ---- --unique: launch multiple of the same model ----------------------------

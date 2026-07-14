@@ -116,9 +116,11 @@ class FluxScheduler(Scheduler):
     def partitions_command(self) -> list[str]:
         # Flux 'partitions' are named queues. Multi-queue is optional (many
         # clusters run one anonymous queue), so this is best-effort; `{enabled}`
-        # lets us skip disabled queues. Older flux without -o just yields no
+        # lets us skip disabled queues. Pipe-delimited so an EMPTY name (the
+        # anonymous-queue case) doesn't shift columns and fabricate a phantom
+        # queue named after the enabled flag. Older flux without -o yields no
         # rows we can parse -> auto falls back to the site default.
-        return ["flux", "queue", "list", "--no-header", "-o", "{name} {enabled}"]
+        return ["flux", "queue", "list", "--no-header", "-o", "{name}|{enabled}"]
 
     def parse_partitions(self, stdout: str) -> list[PartitionInfo]:
         # Flux exposes no cheap per-queue idle-node count or GRES, so idle is 0
@@ -127,10 +129,12 @@ class FluxScheduler(Scheduler):
         # enabled=false marks a down queue.
         out: list[PartitionInfo] = []
         for line in stdout.splitlines():
-            cols = line.split()
-            if not cols or cols[0] in ("QUEUE", "NAME"):
+            if not line.strip() or line.split("|", 1)[0].strip() in ("QUEUE", "NAME"):
                 continue
-            name = cols[0]
+            cols = line.split("|")
+            name = cols[0].strip()
+            if not name:
+                continue  # anonymous/default queue emits an empty name — not selectable here
             enabled = True
             if len(cols) > 1:
                 enabled = cols[1].strip().lower() not in ("false", "no", "disabled", "0", "✗")

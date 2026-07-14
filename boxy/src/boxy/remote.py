@@ -235,7 +235,14 @@ def remote_proxy_env() -> dict[str, str]:
     from boxy import ramalama_shim
 
     override = config.get_str("network.proxy")
-    return ramalama_shim.raw_proxy_env(override)
+    env = ramalama_shim.raw_proxy_env(override)
+    # Only forward when there's an ACTUAL http/https proxy. Forwarding the
+    # laptop's no_proxy ALONE (no proxy set) would silently override the
+    # cluster's own no_proxy and route its internal registry/hosts through a
+    # proxy that isn't even there (adversarial-review finding).
+    if not (env.get("https_proxy") or env.get("http_proxy")):
+        return {}
+    return env
 
 
 def _remote_command(argv: list[str], remote_ca: str | None = None,

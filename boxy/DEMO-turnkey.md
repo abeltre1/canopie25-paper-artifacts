@@ -218,6 +218,37 @@ side (the sandbox has no real scheduler).
 
 ---
 
+## Troubleshooting: the server crashes at startup (vLLM `KeyboardInterrupt: terminated`)
+
+If the job log ends with a vLLM `KeyboardInterrupt: terminated` cascade and a
+`leaked semaphore` warning, the engine-core worker **died during startup** — the
+real error is *above* that cascade in the log (`boxy logs <name>`), almost always
+a **GPU OOM while profiling the KV cache**. vLLM defaults to the model's full
+context (128K for Llama-3.1), which doesn't fit a single 24–40GB GPU.
+
+boxy's model cards now cap this automatically — every packaged single-GPU vLLM
+card sets `max_model_len = 8192`, and boxy places `--max-model-len 8192` in the
+job (and injects it over `--ssh` so even an older cluster boxy gets it). You'll
+see it in the `auto:` lines:
+
+```
+  auto: engine args: --max-model-len 8192 (card 'llama-3.1-8b-instruct')
+```
+
+Knobs if you need more context or hit OOM anyway:
+
+- **More context on a big GPU**: `boxy serve <model> --scheduler slurm --ssh … -- --max-model-len 32768`
+  (your `--` args always win over the card's).
+- **Tight memory**: add `-- --gpu-memory-utilization 0.85` or `-- --enforce-eager`.
+- **Land on a bigger GPU**: the default `--partition auto` already prefers GPU
+  partitions; pin one with `--partition <name>` if your cluster mixes GPU sizes.
+
+The command holds until the server is **READY** (or reports the failure with the
+log tail) — it doesn't detach early. Re-running while an instance is already
+serving reports its URL instead of launching a duplicate.
+
+---
+
 ## Optional: update the cluster's boxy
 
 You do **not** need this — `--ssh` injection covers an old cluster boxy. But if

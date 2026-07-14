@@ -1077,11 +1077,22 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
                       f"({record['job']}, {state}), but you requested {scheduler_name}. "
                       f"Stop it first: boxy stop {name}.", file=sys.stderr)
                 return 1
-            # Same scheduler, a live (PENDING/RUNNING) instance already holds this
-            # name. Turnkey default: don't block — fork a fresh independent instance
-            # (its own job/log/endpoint). Explicit --unique already renamed above;
-            # opt out with --no-auto-unique / BOXY_AUTO_UNIQUE=false to keep the
-            # strict singleton.
+            # A PUBLISHED endpoint means a server already came up at this name.
+            # Never fork a duplicate GPU job just because the 2s readiness probe
+            # above was slow (busy server mid-generation, login->compute latency)
+            # — point the user at the live endpoint instead (adversarial-review
+            # finding: transient probe failure must not spawn a second allocation).
+            if endpoint:
+                print(f"### ALREADY SERVING  {endpoint['url']}/v1   "
+                      f"({rec_sched_name} job {record['job']}, {state}; readiness probe was slow — "
+                      f"the server may still be loading its weights)")
+                print(f"###   check: curl -s {endpoint['url']}/v1/models    stop: boxy stop {name}")
+                print("###   (--unique starts an independent second instance)")
+                return 0
+            # No endpoint published yet (queued / still starting, nothing serving).
+            # Turnkey default: don't block — fork a fresh independent instance.
+            # Explicit --unique already renamed above; opt out with --no-auto-unique
+            # / BOXY_AUTO_UNIQUE=false to keep the strict singleton.
             if name_override is None and _auto_unique(args):
                 forked = _unique_instance_name(name)
                 print(f"  auto: name: {forked} ({name} is already {rec_sched_name} job "
@@ -1348,10 +1359,19 @@ def _serve_replicas(args, scheduler_name: str, profile, replicas: int, router_po
     base_loc = (profile if profile is not None
                 else Location(name="auto", scheduler=scheduler_name, resources=Resources()))
     scheduler = get_scheduler(scheduler_name)
+    # Route through the SAME site resolver as the single-serve path so
+    # --partition auto/all/off (and the auto default) work for replicas too —
+    # else the magic keywords reach sbatch verbatim ('invalid partition') and a
+    # GPU replicas job can park in the site-default CPU partition (review find).
+    from boxy import site
+
+    site_map, site_decisions = site.resolve_site(args, scheduler_name, need_gpu=gpus_per_node > 0)
+    for line in site_decisions:
+        print(f"  auto: {line}")
     site_args = list(base_loc.scheduler_args)
-    for kind, value in (("partition", args.partition), ("account", args.account), ("time", args.time)):
-        if value:
-            site_args.append(scheduler.site_directive(kind, value))
+    for kind in ("partition", "account", "time"):
+        if site_map.get(kind):
+            site_args.append(scheduler.site_directive(kind, site_map[kind]))
     site_args += list(getattr(args, "scheduler_args", None) or [])
     dynamic = getattr(args, "dynamic_flags", [])
     site_args += [scheduler.dynamic_directive(k, v) for k, v in _dynamic_for(dynamic, scheduler_name)]
@@ -1602,11 +1622,21 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
     scheduler = getattr(args, "scheduler", None)
     if scheduler not in ("slurm", "flux"):
         return raw_argv
-    from boxy import remote, site
+    from boxy import cards, remote, resolve, site
 
     # one master for every probe below (idempotent; run_remote reuses it)
     master_ok = remote.ensure_master(target) == 0
     host = target.split("@")[-1]
+
+    # Split any user engine args (after `--`) off the boxy side. boxy-flag
+    # injections (account/partition/unique) go on `head`; card engine args go on
+    # the engine side — else an appended --account would land AFTER `--` and be
+    # passed to vLLM.
+    if "--" in raw_argv:
+        sep = raw_argv.index("--")
+        head, user_tail, had_sep = list(raw_argv[:sep]), list(raw_argv[sep + 1:]), True
+    else:
+        head, user_tail, had_sep = list(raw_argv), [], False
 
     # --- partition: resolve auto/all to a concrete list over the cluster ---
     # auto is the default (no flag); `all` offers every partition; `off`/a
@@ -1622,12 +1652,12 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
             value, why = site.rank_remote_partitions(out, scheduler, prefer_gpu) if rc == 0 else ("", why)
         flagged = bool(part)
         if value:
-            raw_argv = (_argv_set_flag(raw_argv, "--partition", value) if flagged
-                        else [*raw_argv, "--partition", value])
+            head = (_argv_set_flag(head, "--partition", value) if flagged
+                    else [*head, "--partition", value])
             print(f"  auto: partition: {value} (via sinfo on {host}: {why})")
         else:
             if flagged:
-                raw_argv = _argv_set_flag(raw_argv, "--partition", None)  # drop unresolved auto/all
+                head = _argv_set_flag(head, "--partition", None)  # drop unresolved auto/all
             # default (no flag): nothing to drop; the cluster's site default applies
             print(f"  auto: partition: could not pick on {target} ({why}) — "
                   f"the scheduler's site default applies")
@@ -1649,16 +1679,14 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
                       f"site default applies; pass --account if it rejects the job")
         if acct:
             print(f"  auto: account: {acct} (via {why} — placed in the batch script)")
-            raw_argv = [*raw_argv, "--account", acct]
+            head = [*head, "--account", acct]
 
     # --- auto-unique: if a job with this model's name is already LIVE on the
     # cluster, inject --unique so the cluster's boxy (even an old one that lacks
     # auto-unique) starts an independent instance instead of blocking. Runs the
     # decision HERE because over --ssh the singleton check runs on the cluster.
-    if (master_ok and _auto_unique(args) and "--unique" not in raw_argv
+    if (master_ok and _auto_unique(args) and "--unique" not in head
             and getattr(args, "model", None)):
-        from boxy import resolve
-
         try:
             _, base_name, _ = resolve.resolve_submission(
                 args.model, scheduler, name=getattr(args, "name", None), require_exists=False)
@@ -1670,9 +1698,23 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
             if rc == 0 and "LIVE" in out:
                 print(f"  auto: --unique ({base_name} is already live on {host} — "
                       f"starting an independent instance)")
-                raw_argv = [*raw_argv, "--unique"]
+                head = [*head, "--unique"]
 
-    return raw_argv
+    # --- engine args from the model card (e.g. --max-model-len so vLLM doesn't
+    # OOM profiling the full 128K context). Injected AFTER `--` so even an OLD
+    # cluster boxy — which won't apply the card itself — passes them to the
+    # engine. Card flags first; the user's own post-`--` args win (last-wins).
+    engine_tail = list(user_tail)
+    if getattr(args, "model", None):
+        card = cards.resolve_model_card(args.model)
+        flags = cards.engine_flags(card.args) if (card and card.args) else []
+        if flags:
+            engine_tail = flags + engine_tail
+            print(f"  auto: engine args: {' '.join(flags)} (card '{card.label}' — placed after --)")
+
+    if had_sep or engine_tail:
+        return [*head, "--", *engine_tail]
+    return head
 
 
 def cmd_serve(args: argparse.Namespace) -> int:

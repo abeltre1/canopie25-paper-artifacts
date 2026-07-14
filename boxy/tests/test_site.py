@@ -181,6 +181,23 @@ def test_rank_flux_picks_single_best():
     assert value == "pbatch" and "," not in value
 
 
+def test_flux_parse_partitions_pipe_and_empty_name():
+    # pipe-delimited so an anonymous (empty-name) queue doesn't fabricate a
+    # phantom queue named after the enabled flag.
+    out = get_scheduler("flux").parse_partitions("pbatch|True\n|True\npdebug|False\n")
+    names = {p.name: p.up for p in out}
+    assert names == {"pbatch": True, "pdebug": False}   # empty-name row skipped
+
+
+def test_partition_mode_does_not_shadow_real_named_partitions():
+    # a site partition literally named 'default'/'site' must be treated as a
+    # concrete name, not the off keyword.
+    assert site.partition_mode("default") == "set"
+    assert site.partition_mode("site") == "set"
+    assert site.partition_mode("off") == "off"
+    assert site.partition_mode("none") == "off"
+
+
 def test_rank_none_up_falls_back_to_site_default():
     value, why = site.rank_partitions([PartitionInfo("x", 0, False)], "slurm")
     assert value == "" and "site default" in why
