@@ -221,6 +221,19 @@ def test_ssh_resolves_partition_auto_to_concrete_list(ssh, capfd, monkeypatch):
     assert "#SBATCH --partition=gpu,short,batch" in cap.out    # remote script built with it
 
 
+def test_ssh_partition_auto_from_config_default(ssh, capfd, monkeypatch):
+    # BOXY_PARTITION=auto with NO --partition flag must still be resolved over
+    # --ssh: there's no flag to rewrite, so the concrete list is appended.
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("BOXY_PARTITION", "auto")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: partition: gpu,short,batch (via sinfo on hops" in cap.out
+    assert "--partition gpu,short,batch" in ssh["ssh_log"].read_text()
+    assert "#SBATCH --partition=gpu,short,batch" in cap.out
+
+
 def test_ssh_probes_mywcid_on_the_cluster(ssh, capfd, monkeypatch):
     # The laptop knows NOTHING (local account command disabled, no env), so the
     # account is discovered by running `mywcid` ON the cluster over the ssh

@@ -1548,17 +1548,26 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
     host = target.split("@")[-1]
 
     # --- partition: resolve `auto` to a concrete list over the cluster ---
+    # `--partition auto` on the argv, OR config site.partition=auto with no flag
+    # (BOXY_PARTITION=auto) — either way the literal 'auto' must be turned into a
+    # concrete list HERE, since the cluster's env/boxy can't be relied on to.
     part = getattr(args, "partition", None)
-    if part and part.strip().lower() == "auto":
+    flagged_auto = bool(part) and part.strip().lower() == "auto"
+    if flagged_auto or (part is None and site._wants_auto_partition(None)):
         value, why = "", "no ssh master to probe partitions"
         if master_ok:
             rc, out = remote.ssh_capture(target, site.remote_partition_probe(scheduler), timeout=20)
             value, why = site.rank_remote_partitions(out, scheduler) if rc == 0 else ("", why)
         if value:
-            raw_argv = _argv_set_flag(raw_argv, "--partition", value)
+            # replace the flag's value if present, else append it (config default)
+            raw_argv = (_argv_set_flag(raw_argv, "--partition", value) if flagged_auto
+                        else [*raw_argv, "--partition", value])
             print(f"  auto: partition: {value} (via sinfo on {host}: {why})")
-        else:
+        elif flagged_auto:
             raw_argv = _argv_set_flag(raw_argv, "--partition", None)  # drop unresolved 'auto'
+            print(f"  auto: partition: could not pick on {target} ({why}) — "
+                  f"the scheduler's site default applies")
+        else:
             print(f"  auto: partition: could not pick on {target} ({why}) — "
                   f"the scheduler's site default applies")
 
