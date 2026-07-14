@@ -105,6 +105,30 @@ def test_apply_uses_heuristic_for_unknown_model():
     assert any("heuristic" in ln for ln in lines)
 
 
+def test_apply_merges_card_engine_args():
+    # the 8B card caps context so vLLM doesn't OOM profiling the 128K window
+    a = _args("hf://meta-llama/Llama-3.1-8B-Instruct")
+    a.args = None
+    lines = cards.apply_to_args(a)
+    assert a.args == ["--max-model-len", "8192"]
+    assert any("engine args" in ln and "--max-model-len 8192" in ln for ln in lines)
+
+
+def test_apply_card_engine_args_user_wins():
+    a = _args("hf://meta-llama/Llama-3.1-8B-Instruct")
+    a.args = ["--max-model-len", "32768"]           # user override
+    cards.apply_to_args(a)
+    # card flag FIRST, user AFTER -> the engine's argparse last-wins -> 32768
+    assert a.args == ["--max-model-len", "8192", "--max-model-len", "32768"]
+
+
+def test_engine_flags_bool_and_scalar():
+    assert cards.engine_flags({"max_model_len": 8192}) == ["--max-model-len", "8192"]
+    assert cards.engine_flags({"enforce_eager": True}) == ["--enforce-eager"]
+    assert cards.engine_flags({"enforce_eager": False}) == []
+    assert cards.engine_flags({}) == []
+
+
 def test_apply_no_card_no_size_is_a_noop():
     a = _args("someorg/whisper-large-v3")
     assert cards.apply_to_args(a) == []

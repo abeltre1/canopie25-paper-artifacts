@@ -4,3 +4,7 @@ match = "Qwen/Qwen2.5-7B-Instruct*"
 engine = "vllm"
 gpus = 1
 min_vram_gb = 24
+[model.args]
+# Qwen2.5 advertises a large context; cap KV-cache profiling so it fits a
+# 24-40GB GPU (override with `-- --max-model-len N`).
+max_model_len = 8192

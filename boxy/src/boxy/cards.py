@@ -283,4 +283,28 @@ def apply_to_args(args) -> list[str]:
     if getattr(args, "engine", None) is None and card.engine:
         args.engine = card.engine
         decisions.append(f"engine: {card.engine} ({card.label})")
+    # engine args from the card (e.g. max_model_len so vLLM doesn't profile KV
+    # cache for the model's full 128K context and OOM). Card flags go FIRST so
+    # the user's own post-`--` engine args, appended after, win (last-wins in the
+    # engine's argparse). Field failure: bare 8B serve OOM'd because this table
+    # was never applied.
+    flags = engine_flags(card.args)
+    if flags:
+        args.args = flags + list(getattr(args, "args", None) or [])
+        decisions.append(f"engine args: {' '.join(flags)} ({card.label})")
     return decisions
+
+
+def engine_flags(card_args: dict) -> list[str]:
+    """Turn a card's [model.args] table into engine CLI flags:
+    {max_model_len: 8192} -> ['--max-model-len', '8192']; a True bool -> a bare
+    '--flag' (store_true), False -> omitted. Underscores become dashes."""
+    out: list[str] = []
+    for key, val in (card_args or {}).items():
+        flag = f"--{str(key).replace('_', '-')}"
+        if isinstance(val, bool):
+            if val:
+                out.append(flag)
+        else:
+            out += [flag, str(val)]
+    return out

@@ -4,3 +4,6 @@ match = "openai/gpt-oss-20b*"
 engine = "vllm"
 gpus = 1
 min_vram_gb = 20
+[model.args]
+# cap KV-cache profiling so the MoE fits its single GPU (override for more).
+max_model_len = 8192
