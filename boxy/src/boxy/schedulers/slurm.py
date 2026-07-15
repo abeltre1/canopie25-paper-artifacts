@@ -6,18 +6,39 @@ from boxy.location import Location
 from boxy.schedulers.base import PartitionInfo, Scheduler
 
 
+# Site GRES convention auto-detected from `sinfo` over --ssh (set by the CLI just
+# before rendering; consulted only when site.gpu_directive is 'auto'). Process-
+# global for one invocation; reset between tests (conftest).
+_AUTO_GRES = {"form": "", "type": ""}
+
+
+def set_auto_gres(form: str, gtype: str) -> None:
+    _AUTO_GRES["form"], _AUTO_GRES["type"] = (form or ""), (gtype or "")
+
+
+def reset_auto_gres() -> None:
+    _AUTO_GRES["form"], _AUTO_GRES["type"] = "", ""
+
+
 def _gpu_flag(n: int) -> str | None:
-    """The GPU request flag for N GPUs/node in the site's GRES convention
-    (config site.gpu_directive / site.gpu_type). None to omit. Sites differ:
-    '--gpus-per-node=N' works on most modern Slurm, but many reject it with
-    'Invalid generic resource (gres) specification' and want '--gres=gpu:N'
-    (optionally typed, gpu:a100:N). One env var adapts boxy to any of them."""
+    """The GPU request flag for N GPUs/node in the site's GRES convention. None to
+    omit. Sites differ: '--gpus-per-node=N' works on most modern Slurm, but many
+    reject it with 'Invalid generic resource (gres) specification' and want
+    '--gres=gpu:N' (optionally typed, gpu:a100:N).
+
+    config site.gpu_directive: 'auto' (default) uses the form auto-detected from
+    the cluster's `sinfo` GRES (set_auto_gres), falling back to --gpus-per-node
+    when nothing was detected; or pin 'gres'/'gpus'/'gpus-per-node'/'none'.
+    config site.gpu_type pins the GRES type (else the detected one)."""
     if n <= 0:
         return None
     from boxy import config
 
-    form = (config.get_str("site.gpu_directive") or "gpus-per-node").strip().lower()
+    form = (config.get_str("site.gpu_directive") or "auto").strip().lower()
     gtype = config.get_str("site.gpu_type").strip()
+    if form == "auto":
+        form = _AUTO_GRES["form"] or "gpus-per-node"
+        gtype = gtype or _AUTO_GRES["type"]
     typed = f"{gtype}:{n}" if gtype else str(n)     # a100:2  /  2
     if form == "none":
         return None
@@ -25,7 +46,7 @@ def _gpu_flag(n: int) -> str | None:
         return f"--gres=gpu:{typed}"                # --gres=gpu:a100:2 / --gres=gpu:2
     if form == "gpus":
         return f"--gpus={typed}"
-    return f"--gpus-per-node={typed}"               # default
+    return f"--gpus-per-node={typed}"               # default fallback
 
 
 class SlurmScheduler(Scheduler):

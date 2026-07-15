@@ -1210,6 +1210,23 @@ def _serve_agentless_ssh(args, target: str) -> int:
         if scheduler_name == "flux" and "," in part:
             part = part.split(",")[0].strip()
         site_args.append(scheduler.site_directive("partition", part))
+
+    # GPU request form: auto-detect the site's GRES convention from sinfo over SSH
+    # so a cluster that rejects --gpus-per-node (field: kahuna) gets --gres=gpu:
+    # [type:]N with NO flag. Only when the form is 'auto' and the job wants GPUs.
+    if (scheduler_name == "slurm" and need_gpu
+            and config.get_str("site.gpu_directive").strip().lower() == "auto"):
+        from boxy.schedulers import slurm as _slurm
+
+        grc, gout = remote.ssh_capture(target, site.remote_partition_probe("slurm"), timeout=20)
+        sel = ({p.strip() for p in part.split(",")}
+               if part and site.partition_mode(part) == "set" else None)
+        form, gtype = site.gpu_request_from_gres(gout if grc == 0 else "", sel)
+        if form:
+            _slurm.set_auto_gres(form, gtype)
+            shown = f"--gres=gpu:{gtype + ':' if gtype else ''}N"
+            print(f"  auto: gpu request: {shown} (detected Slurm GRES on {host})")
+
     t, twhy = site.resolve_time(getattr(args, "time", None))
     if t:
         site_args.append(scheduler.site_directive("time", t))

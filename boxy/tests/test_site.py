@@ -411,3 +411,37 @@ def test_remote_scheduler_probe_probes_system_flux_socket_and_level():
     assert "scontrol ping" in probe and "slurm-ctld" in probe   # authoritative slurm signal
     assert "sinfo -h" in probe and "slurm-live" in probe
     assert probe.rstrip().endswith("true")   # never non-zero exit -> ssh_capture stays quiet
+
+
+# ---- GPU GRES convention auto-detected from sinfo (field: kahuna) -------------------
+
+
+def test_gpu_request_from_gres_single_type():
+    sinfo = "gpu|up|2/6/0/8|gpu:a100:8\nbatch|up|8/2/0/10|gpu:a100:4\n"
+    assert site.gpu_request_from_gres(sinfo) == ("gres", "a100")
+
+
+def test_gpu_request_from_gres_untyped():
+    sinfo = "gpu|up|2/6/0/8|gpu:8\n"
+    assert site.gpu_request_from_gres(sinfo) == ("gres", "")
+
+
+def test_gpu_request_from_gres_mixed_types_drops_the_type():
+    sinfo = "gpu|up|2/6/0/8|gpu:a100:8\nbatch|up|8/2/0/10|gpu:v100:4\n"
+    assert site.gpu_request_from_gres(sinfo) == ("gres", "")
+
+
+def test_gpu_request_from_gres_restricted_to_selected_partitions():
+    sinfo = "gpu|up|2/6/0/8|gpu:a100:8\nbatch|up|8/2/0/10|gpu:v100:4\n"
+    # only the 'gpu' partition -> its single a100 type
+    assert site.gpu_request_from_gres(sinfo, {"gpu"}) == ("gres", "a100")
+
+
+def test_gpu_request_from_gres_none_when_no_gpu():
+    sinfo = "cpu|up|1/9/0/10|(null)\n"
+    assert site.gpu_request_from_gres(sinfo) == ("", "")
+
+
+def test_gpu_request_from_gres_socket_suffix():
+    # sinfo may append a socket affinity suffix — still parses the type
+    assert site.gpu_request_from_gres("gpu|up|1/1/0/2|gpu:h100:8(S:0-1)\n") == ("gres", "h100")

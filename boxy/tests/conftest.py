@@ -37,6 +37,11 @@ def _isolate_config(monkeypatch, tmp_path):
     # tests exercise the DELEGATION path; keep that the test default and let the
     # agentless tests opt in with BOXY_AGENTLESS_SSH=true (mirrors the opt-outs above).
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "false")
+    # the Slurm GRES auto-detect override is process-global; clear it so a value
+    # set by one --ssh agentless test can't leak into the next (default 'auto').
+    from boxy.schedulers import slurm as _slurm
+
+    _slurm.reset_auto_gres()
     config.reset()
     yield
     config.reset()

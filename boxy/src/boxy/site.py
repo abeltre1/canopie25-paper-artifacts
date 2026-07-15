@@ -351,6 +351,39 @@ def remote_jobname_live_probe(scheduler_name: str, name: str) -> str:
             f'| grep -q . && echo LIVE || true')
 
 
+# A `gpu` GRES token in sinfo's %G column: `gpu:a100:8`, `gpu:8`, with an optional
+# `(S:0-1)` socket suffix. Group 1 = the type (a100) when present.
+_GPU_GRES_RE = re.compile(r"\bgpu:(?:([A-Za-z0-9_.+-]+):)?\d+", re.IGNORECASE)
+
+
+def gpu_request_from_gres(sinfo_text: str, partitions: set[str] | None = None) -> tuple[str, str]:
+    """Auto-detect the site's GPU request convention from Slurm's reported GRES
+    (`sinfo -h -o "%R|%a|%F|%G"`). A cluster that lists a `gpu` GRES wants
+    `--gres=gpu:[type:]N` — the portable form — because `--gpus-per-node` is
+    rejected on some sites ('Invalid generic resource (gres) specification', field
+    report: kahuna). Returns:
+      ('gres', '<type>') — a single gpu TYPE spans the target partitions (safest:
+                           some sites REQUIRE the type),
+      ('gres', '')       — gpu GRES present but untyped or types differ (let Slurm
+                           pick the type on the assigned node),
+      ('', '')           — no gpu GRES reported: keep boxy's default (--gpus-per-node).
+    `partitions` restricts the scan to the ones being submitted to (else all)."""
+    types: set[str] = set()
+    saw_gpu = False
+    for line in (sinfo_text or "").splitlines():
+        cols = line.split("|")
+        if partitions is not None and cols and cols[0].strip() not in partitions:
+            continue
+        gres = cols[3] if len(cols) > 3 else line   # %R|%a|%F|%G, else scan the whole line
+        for m in _GPU_GRES_RE.finditer(gres):
+            saw_gpu = True
+            if m.group(1) and m.group(1).lower() != "null":
+                types.add(m.group(1))
+    if not saw_gpu:
+        return "", ""
+    return ("gres", next(iter(types))) if len(types) == 1 else ("gres", "")
+
+
 # `--partition off|none` (or the same in config) opts OUT of auto and uses the
 # scheduler's own default partition. Kept to two rarely-real partition names so a
 # site partition literally named `default`/`site` isn't shadowed (adversarial-
