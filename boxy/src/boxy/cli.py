@@ -1118,6 +1118,15 @@ def _is_gres_error(text: str) -> bool:
     return "gres" in low or "generic resource" in low
 
 
+def _looks_like_pull_block(text: str) -> bool:
+    """True when a job log shows a blocked/failed container-image pull (compute
+    node can't reach the registry — Docker Hub/ghcr 403, Zscaler block, air-gap)."""
+    low = (text or "").lower()
+    return ("pinging container registry" in low or "initializing source docker://" in low
+            or "initializing source" in low and "403" in low
+            or ("registry" in low and ("403" in low or "denied" in low)))
+
+
 def _gres_fallback_forms(gtype: str) -> list[tuple[str, str]]:
     """The GPU-request forms to try, in order, when a site REJECTS the GPU line
     ('Invalid generic resource (gres) specification' — field: kahuna). Most
@@ -1429,9 +1438,25 @@ def _serve_agentless_ssh(args, target: str) -> int:
             if state == "DONE":
                 print(f"boxy: job {job_id} ended before the server became ready; last log lines:",
                       file=sys.stderr)
-                _, tail = remote.ssh_capture(target, f"tail -n 40 {shlex.quote(log_remote)} 2>/dev/null || true",
+                _, tail = remote.ssh_capture(target, f"tail -n 60 {shlex.quote(log_remote)} 2>/dev/null || true",
                                              timeout=20)
                 print(tail, file=sys.stderr)
+                # turn a raw compute-node failure (blocked image pull, OOM, bad
+                # image tag, …) into a plain-language fix instead of a bare trace.
+                _print_diagnosis(tail)
+                if _looks_like_pull_block(tail):
+                    try:
+                        from boxy import ramalama_shim
+                        img = box.image or ramalama_shim.default_image(box.engine, location.accelerator)
+                    except Exception:
+                        img = box.image or ""
+                    if img:
+                        print(f"###   fastest fix on {host}: pre-pull the image where the network "
+                              f"works, then rerun (compute nodes share $HOME's podman store, so the "
+                              f"pull is reused with NO re-download):\n"
+                              f"###     ssh {target} podman pull {img}\n"
+                              f"###   or point boxy at a reachable mirror: --registry <site-mirror> "
+                              f"(or --proxy <url> if your proxy allows the registry).", file=sys.stderr)
                 return 1
             rc, epj = remote.ssh_capture(target, f"cat {shlex.quote(ep_remote)} 2>/dev/null || true", timeout=15)
             ep = None

@@ -262,6 +262,28 @@ def test_diagnose_vllm_weights_not_initialized():
     assert "llama.cpp" in hint
 
 
+def test_diagnose_dockerhub_403_registry_block():
+    # the field failure: an agentless vLLM job on hops dies pulling from Docker Hub
+    # (Zscaler 403). boxy must recognize it and point at the fixes.
+    log = ('Trying to pull docker.io/vllm/vllm-openai:latest...\n'
+           'Error: initializing source docker://vllm/vllm-openai:latest: pinging container '
+           'registry registry-1.docker.io: StatusCode: 403, "<html>...Zs...')
+    hint = diagnostics.diagnose(log)
+    assert hint is not None
+    assert "registry blocked" in hint.lower()
+    assert "Zscaler" in hint or "air-gapped" in hint
+    assert "--registry" in hint            # names the mirror fix
+    assert "pre-pull" in hint.lower()      # and the login-node pre-pull fix
+
+
+def test_looks_like_pull_block_recognizes_the_field_error():
+    from boxy.cli import _looks_like_pull_block
+    assert _looks_like_pull_block(
+        "initializing source docker://vllm/vllm-openai: pinging container registry "
+        "registry-1.docker.io: StatusCode: 403")
+    assert not _looks_like_pull_block("vllm: Application startup complete.")
+
+
 def test_diagnose_missing_python_package():
     log = ("ImportError: This modeling file requires the following packages that were not found "
            "in your environment: open_clip. Run `pip install open_clip`")
