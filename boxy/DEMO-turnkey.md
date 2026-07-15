@@ -38,7 +38,7 @@ boxy doctor — remote audit of ambelt@hops (no boxy required on the cluster)
 
 doctor
   container runtime          [OK] podman
-  scheduler                  [OK] will submit via: slurm — detected (slurm is the live scheduler)
+  scheduler                  [OK] will submit via: slurm — detected (Slurm is live — sinfo listed partitions)
   account discovery          [OK] fy140001 (also: fy140252, fy260064) — turnkey will place
                                   `--account=fy140001` in the batch script
   accelerator (login node)   [OK] none (login nodes often have no GPU — pin --accelerator)
@@ -77,7 +77,7 @@ so the whole command is just the model and the host.
 
 ```console
 $ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --ssh ambelt@hops
-  auto: scheduler: slurm (via detected (slurm is the live scheduler) on hops)
+  auto: scheduler: slurm (via detected (Slurm is live — sinfo listed partitions) on hops)
   auto: partition: gpu,batch (via sinfo on hops: 2 partitions with GPUs, soonest-start)
   auto: account: fy140001 (via mywcid on hops; also: fy140252, fy260064 — placed in the batch script)
   auto: time: 30:00 (via config site.default_time — the scheduler stops the job at this walltime)
@@ -115,21 +115,28 @@ without the flag from the login node.
 
 **How the scheduler is detected (robust across a mixed fleet).** boxy does **not**
 guess from which binaries exist — a Flux system often ships Slurm-compat
-`sbatch`/`sinfo` shims, so "binary present" is a lie. Instead it probes which
-control plane is **actually live** over `--ssh`:
+`sbatch`/`sinfo`/`scontrol` shims that *proxy to Flux*, so "binary present" (even
+"`sinfo` answers") is a lie. It probes which control plane is **live** over `--ssh`
+and applies one rule:
 
-- **Flux live** — a Flux broker answers (`flux resource list` / `flux uptime`).
-- **Slurm live** — `sinfo` returns at least one real partition.
+- **A reachable Flux broker wins.** `flux resource list` / `uptime` succeeding
+  means Flux runs the machine; any slurm commands that also answer are compat
+  shims — submitting through them returns *Flux* job ids (`f2c5JAAU8BR1`) that
+  `squeue` can't track. So boxy picks **flux** and submits via `flux batch` /
+  tracks via `flux jobs`.
+- **Otherwise Slurm** — a real `slurmctld` (`scontrol ping` → "is UP") or `sinfo`
+  partitions.
 
-The live scheduler wins over dead shims, so a Flux system with slurm shims (e.g.
-`eldorado`) is correctly detected as **flux**. The decision line says why, e.g.
-`auto: scheduler: flux (via detected (flux is the live scheduler; slurm binaries
-exist but its control plane didn't respond) on eldorado)`. Verify any cluster
-first with `boxy doctor --ssh <host>` — its `scheduler` line reports the same
-`will submit via: …` pick.
+So `eldorado` (a Flux system whose slurm shims answer too) is correctly detected
+as **flux**. The decision line says why:
+`auto: scheduler: flux (via detected (Flux broker is live — Flux runs this machine;
+slurm commands also answered but on a Flux system those are compat shims that proxy
+to Flux. Pass --scheduler slurm / set BOXY_SCHEDULER=slurm if this cluster's primary
+really is Slurm))`. Verify any cluster first with `boxy doctor --ssh <host>` — its
+`scheduler` line reports the same `will submit via: …` pick.
 
-**Pin it** to skip the probe or for a genuinely dual-live site (boxy defaults to
-slurm and says so): `--scheduler flux`, or `export BOXY_SCHEDULER=flux`.
+**Pin it** to skip the probe or for the rare cluster whose primary boxy guessed
+wrong: `--scheduler slurm|flux`, or `export BOXY_SCHEDULER=slurm|flux`.
 `--scheduler none` / `BOXY_SCHEDULER=none` keeps it a direct serve. `--here`
 serves directly on the node you're on (no submission).
 
@@ -211,7 +218,7 @@ only if the cluster ALSO has `sbatch`, where boxy defaults to slurm):
 
 ```console
 $ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --ssh ambelt@eldorado
-  auto: scheduler: flux (via detected (flux is the live scheduler; slurm shims idle) on eldorado)
+  auto: scheduler: flux (via detected (Flux broker is live) on eldorado)
   auto: account: fy140001 (via mywcid on eldorado; …)
 ### Batch script (…):
     #!/bin/bash
@@ -249,7 +256,7 @@ Run these against the real systems; each maps to an automated test here.
 | # | Command | Expect | Automated proof |
 |---|---------|--------|-----------------|
 | 0 | `boxy doctor --ssh ambelt@hops` | `account discovery: OK fy140001 …` | `test_doctor.py::test_remote_checks_report_discovered_account` |
-| 1 | `boxy serve <8B> --ssh ambelt@hops` (no `--scheduler`) | `auto: scheduler: slurm (via detected (slurm is the live scheduler) on hops)`, then `#SBATCH --account=fy140001` | `test_turnkey_e2e.py::test_ssh_auto_detects_scheduler_when_flag_absent` |
+| 1 | `boxy serve <8B> --ssh ambelt@hops` (no `--scheduler`) | `auto: scheduler: slurm (via detected (Slurm is live …) on hops)`, then `#SBATCH --account=fy140001` | `test_turnkey_e2e.py::test_ssh_auto_detects_scheduler_when_flag_absent` |
 | 1b | `boxy serve <8B> --scheduler slurm --ssh ambelt@hops` | `auto: account: fy140001 (via mywcid on hops …)` then `#SBATCH --account=fy140001` | `test_turnkey_e2e.py::test_ssh_probes_mywcid_on_the_cluster` |
 | 2 | on hops: `BOXY_SCHEDULER=slurm boxy serve <8B>` (no `--scheduler`) | `auto: scheduler: slurm (via config site.scheduler)`, `#SBATCH --account=fy140001` | `test_turnkey_e2e.py::test_login_node_scheduler_from_config` |
 | 2b | `boxy serve <8B> --scheduler slurm --partition auto --ssh ambelt@hops` | `#SBATCH --partition=<idle-first list>` — starts wherever frees first | `test_turnkey_e2e.py::test_ssh_resolves_partition_auto_to_concrete_list` |

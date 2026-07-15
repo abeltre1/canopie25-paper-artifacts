@@ -330,29 +330,40 @@ def test_pick_scheduler_none_detected(clean_env):
 
 
 def test_pick_scheduler_live_flux_beats_dead_slurm_shims(clean_env):
-    # the eldorado case: a Flux system with slurm-compat binaries. flux's control
-    # plane answers (flux-live); slurm's does NOT (sbatch present but sinfo empty
-    # -> no slurm-live). The live scheduler wins over the dead shims.
+    # a Flux system with slurm-compat binaries. flux's broker answers (flux-live);
+    # slurm's control plane does NOT (sbatch present, no sinfo/scontrol). Flux wins.
     sched, why = site.pick_scheduler("flux-bin\nflux-live\nslurm-bin", None)
+    assert sched == "flux" and "Flux broker is live" in why
+
+
+def test_pick_scheduler_flux_wins_when_slurm_shims_also_answer(clean_env):
+    # THE eldorado case: a Flux system whose slurm compat layer is complete enough
+    # that sinfo answers too (slurm-live). A live Flux broker is authoritative — a
+    # reachable broker means Flux runs the machine and the slurm commands proxy to
+    # it (submitting via them yields Flux job ids slurm can't track). Flux wins,
+    # and the reason names the compat shims + the override.
+    sched, why = site.pick_scheduler("flux-bin\nflux-live\nslurm-bin\nslurm-live", None)
     assert sched == "flux"
-    assert "flux is the live scheduler" in why and "didn't respond" in why
+    assert "Flux broker is live" in why and "compat shims" in why and "BOXY_SCHEDULER=slurm" in why
 
 
 def test_pick_scheduler_live_slurm_beats_dead_flux(clean_env):
     # mirror: a Slurm site that also has the flux tool installed (nested jobs) but
     # no running flux instance. slurm partitions are visible -> slurm.
     sched, why = site.pick_scheduler("slurm-bin\nslurm-live\nflux-bin", None)
-    assert sched == "slurm" and "slurm is the live scheduler" in why
+    assert sched == "slurm" and "Slurm is live" in why
+
+
+def test_pick_scheduler_real_slurmctld_is_authoritative(clean_env):
+    # a real slurmctld answering `scontrol ping` is the strongest Slurm signal.
+    sched, why = site.pick_scheduler("slurm-bin\nslurm-ctld", None)
+    assert sched == "slurm" and "scontrol ping" in why
 
 
 def test_pick_scheduler_sole_live(clean_env):
     assert site.pick_scheduler("flux-bin\nflux-live", None)[0] == "flux"
     assert site.pick_scheduler("slurm-bin\nslurm-live", None)[0] == "slurm"
-
-
-def test_pick_scheduler_both_live_defaults_slurm_loudly(clean_env):
-    sched, why = site.pick_scheduler("flux-live\nslurm-live", None)
-    assert sched == "slurm" and "both" in why and "BOXY_SCHEDULER=flux" in why
+    assert site.pick_scheduler("slurm-bin\nslurm-ctld", None)[0] == "slurm"
 
 
 def test_pick_scheduler_both_bin_no_live_defaults_slurm_loudly(clean_env):
@@ -363,9 +374,9 @@ def test_pick_scheduler_both_bin_no_live_defaults_slurm_loudly(clean_env):
 
 
 def test_pick_scheduler_config_still_overrides_liveness(clean_env, monkeypatch):
-    monkeypatch.setenv("BOXY_SCHEDULER", "flux")
-    # even with slurm live, an explicit config pins flux (power-user escape hatch)
-    assert site.pick_scheduler("slurm-bin\nslurm-live", None) == ("flux", "config site.scheduler")
+    monkeypatch.setenv("BOXY_SCHEDULER", "slurm")
+    # even with a live Flux broker, explicit config pins slurm (power-user escape)
+    assert site.pick_scheduler("flux-bin\nflux-live\nslurm-bin", None) == ("slurm", "config site.scheduler")
 
 
 def test_remote_scheduler_probe_checks_liveness_not_just_presence():
@@ -373,5 +384,6 @@ def test_remote_scheduler_probe_checks_liveness_not_just_presence():
     assert "command -v flux" in probe and "command -v sbatch" in probe
     # liveness probes, not bare binary presence
     assert "flux resource list" in probe and "flux-live" in probe
+    assert "scontrol ping" in probe and "slurm-ctld" in probe   # authoritative slurm signal
     assert "sinfo -h" in probe and "slurm-live" in probe
     assert probe.rstrip().endswith("true")   # never non-zero exit -> ssh_capture stays quiet

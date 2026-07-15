@@ -407,17 +407,19 @@ def test_ssh_auto_detects_scheduler_when_flag_absent(ssh, capfd, monkeypatch):
     cap = capfd.readouterr()
     assert rc == 0
     # sinfo returns partitions on the fake cluster -> slurm's control plane is LIVE
-    assert "auto: scheduler: slurm (via detected (slurm is the live scheduler) on hops)" in cap.out
+    sched_line = next(ln for ln in cap.out.splitlines() if "auto: scheduler:" in ln)
+    assert "slurm" in sched_line and "Slurm is live" in sched_line
     ssh_log = ssh["ssh_log"].read_text()
     assert "--scheduler slurm" in ssh_log                  # injected into the delegation
     assert "#SBATCH --account=fy260064" in cap.out         # the remote boxy built a batch job
 
 
 def test_ssh_flux_system_with_slurm_shims_detects_flux(ssh, capfd, monkeypatch):
-    # The eldorado field case: a FLUX system that also ships slurm-compat binaries.
-    # sbatch is on PATH but sinfo returns NOTHING (slurm isn't the live scheduler);
-    # flux's control plane answers. Detection must pick FLUX, not be fooled by the
-    # slurm shims into injecting --scheduler slurm. This is the misidentification fix.
+    # The eldorado field case: a FLUX system whose slurm-compat layer is COMPLETE
+    # enough that `sinfo` answers too (both flux-live AND slurm-live fire) and its
+    # `sbatch` shim returns Flux job ids squeue can't track. A reachable Flux broker
+    # is authoritative: detection must pick FLUX and NOT be defeated by the working
+    # slurm shims. This is the misidentification fix.
     monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
     # flux present & live: `flux resource list` (and friends) exit 0; queue list
     # feeds the partition probe; `flux jobs` reports nothing live (auto-unique).
@@ -430,15 +432,15 @@ def test_ssh_flux_system_with_slurm_shims_detects_flux(ssh, capfd, monkeypatch):
           "  *) : ;;\n"
           "esac\n"
           "exit 0\n")
-    # slurm shims exist but the control plane is DEAD: sinfo returns no partitions.
-    _shim(ssh["bin"], "sinfo", "#!/bin/bash\ntrue\n")
+    # NB: the fixture's `sinfo` STILL returns partitions (slurm-live also fires) —
+    # exactly like eldorado; flux must win anyway.
     rc = main(["serve", MODEL, "--ssh", "user@eldorado", "--dryrun"])   # no --scheduler
     cap = capfd.readouterr()
     assert rc == 0
-    # the scheduler decision line names flux and explains the slurm shims were seen
-    # but didn't answer — no silent guess.
+    # the scheduler line names flux and explains the slurm shims are compat proxies.
     sched_line = next(ln for ln in cap.out.splitlines() if "auto: scheduler:" in ln)
-    assert "flux is the live scheduler" in sched_line and "didn't respond" in sched_line
+    assert "flux" in sched_line and "Flux broker is live" in sched_line
+    assert "compat shims" in sched_line                    # the slurm shims are named, not chosen
     ssh_log = ssh["ssh_log"].read_text()
     assert "--scheduler flux" in ssh_log                   # flux injected, NOT slurm
     assert "--scheduler slurm" not in ssh_log

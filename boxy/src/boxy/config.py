@@ -154,9 +154,10 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
                  "for long serving sessions. Empty => the scheduler's own default."),
     Setting("site.scheduler", "BOXY_SCHEDULER", "auto",
             help="scheduler for a cluster serve when --scheduler is absent: 'auto' detects the "
-                 "one whose control plane is actually LIVE over --ssh (a live Flux instance vs. "
-                 "dead slurm-compat shims, not just which binary exists), or pin "
-                 "'slurm'/'flux'/'none'. --scheduler always wins."),
+                 "LIVE control plane over --ssh — a reachable Flux broker wins (Flux runs the "
+                 "machine; slurm-compat sbatch/sinfo shims proxy to it), else a real slurmctld / "
+                 "sinfo => slurm. Not a guess from which binary exists. Pin 'slurm'/'flux'/'none' "
+                 "if a cluster's primary differs; --scheduler always wins."),
     Setting("site.default_accelerator", "BOXY_DEFAULT_ACCELERATOR", "cuda",
             help="accelerator assumed for a GPU job submitted from a GPU-less login node "
                  "(where detection sees no device). --accelerator / a --location profile win."),

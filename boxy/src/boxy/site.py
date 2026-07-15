@@ -241,20 +241,28 @@ def remote_scheduler_probe() -> str:
     """Shell one-liner run on a cluster login node (over the ssh master) to
     auto-detect `--scheduler`. It reports which scheduler is ACTUALLY OPERATIONAL,
     not merely installed — because a Flux system commonly ships Slurm-compat
-    binaries (`sbatch`/`sinfo` wrappers), and a Slurm site may have the `flux`
-    tool present for nested jobs. Guessing from binary presence misidentifies
-    those (field report: `eldorado`, a Flux system with slurm shims, was called
-    slurm). For each scheduler it emits a `-bin` token (binary on PATH) and, only
-    when its control plane actually answers, a `-live` token:
-      * flux-live  — a Flux broker responds (`flux resource list`/`uptime`/size)
-      * slurm-live — `sinfo` returns at least one real partition
-    pick_scheduler() ranks `-live` over `-bin`, so a live Flux instance wins over
-    dead slurm shims. Robust across a mixed fleet with no per-cluster config."""
+    binaries (`sbatch`/`sinfo`/`scontrol` wrappers that PROXY to Flux), and a
+    Slurm site may have the `flux` tool present for nested jobs. Guessing from
+    binary presence misidentifies those (field report: `eldorado`, a Flux system
+    whose `sbatch` shim returns FLUX job ids — `f2c5JAAU8BR1` — that squeue can't
+    track). Emitted tokens:
+      * flux-bin / slurm-bin — the binary is on PATH
+      * flux-live  — a Flux BROKER answers (`flux resource list`/`uptime`/size).
+                     On a login node this is the SYSTEM instance == Flux runs the
+                     machine; slurm shims here proxy to it, so Flux is authoritative.
+      * slurm-ctld — a REAL slurmctld answers `scontrol ping` ("... is UP"). This
+                     is the authoritative Slurm signal (a Flux `scontrol` shim
+                     usually can't fake a live controller).
+      * slurm-live — `sinfo` returns a partition (weaker: a good Flux compat layer
+                     can answer this too, which is why flux-live outranks it).
+    pick_scheduler() ranks flux-live first: a live Flux broker wins over slurm
+    shims. Robust across a mixed fleet with no per-cluster config."""
     return (
         "if command -v flux >/dev/null 2>&1; then echo flux-bin; "
         "  { flux resource list >/dev/null 2>&1 || flux uptime >/dev/null 2>&1 "
         "    || flux getattr size >/dev/null 2>&1; } && echo flux-live; fi; "
         "if command -v sbatch >/dev/null 2>&1; then echo slurm-bin; "
+        "  scontrol ping 2>/dev/null | grep -qi 'is UP' && echo slurm-ctld; "
         "  sinfo -h -o %R 2>/dev/null | grep -q . && echo slurm-live; fi; "
         "true"
     )
@@ -262,19 +270,23 @@ def remote_scheduler_probe() -> str:
 
 def pick_scheduler(available: str, explicit: str | None = None) -> tuple[str | None, str]:
     """(scheduler, why) from an explicit flag, config site.scheduler, else the
-    OPERATIONAL evidence in `available` (whitespace text of tokens from
-    remote_scheduler_probe: `flux-live`/`slurm-live` = control plane answered,
-    `flux-bin`/`slurm-bin` or a bare `flux`/`slurm` = binary only).
+    OPERATIONAL evidence in `available` (whitespace tokens from
+    remote_scheduler_probe).
 
     Ranking (explicit flag > config > evidence):
-      * exactly one scheduler LIVE          -> that one (the dead binaries of the
-                                               other are ignored — the eldorado fix)
-      * both live                           -> slurm default, loud override note
-      * no liveness signal, one binary      -> that one
-      * no liveness signal, both binaries   -> slurm default, loud override note
-      * nothing                             -> None (a direct/local serve)
-    A bare `flux`/`slurm` token (no `-bin`/`-live` suffix) is treated as binary-
-    only, so older callers/tests that pass plain names still work."""
+      * flux-live present                 -> FLUX. A reachable Flux broker means
+                                             Flux runs the machine; if slurm commands
+                                             also answered they are compat shims that
+                                             proxy to Flux (submitting via them yields
+                                             Flux job ids slurm tools can't track —
+                                             the eldorado failure). Override with
+                                             --scheduler slurm / BOXY_SCHEDULER=slurm.
+      * a real slurmctld / sinfo (no flux)-> SLURM.
+      * no liveness, one binary           -> that one.
+      * no liveness, both binaries        -> slurm default, loud override note.
+      * nothing                           -> None (a direct/local serve).
+    A bare `flux`/`slurm` token (no `-bin`/`-live` suffix) counts as binary-only,
+    so older callers/tests that pass plain names still work."""
     if explicit in ("slurm", "flux"):
         return explicit, "--scheduler"
     cfg = config.get_str("site.scheduler").strip().lower()
@@ -284,18 +296,21 @@ def pick_scheduler(available: str, explicit: str | None = None) -> tuple[str | N
         return None, "config site.scheduler=none"
 
     toks = set((available or "").split())
-    live = [s for s in ("flux", "slurm") if f"{s}-live" in toks]
+    flux_live = "flux-live" in toks
+    slurm_live = "slurm-ctld" in toks or "slurm-live" in toks
     bins = [s for s in ("flux", "slurm") if s in toks or f"{s}-bin" in toks]
 
-    if len(live) == 1:
-        sched = live[0]
-        other = "slurm" if sched == "flux" else "flux"
-        why = f"detected ({sched} is the live scheduler"
-        why += f"; {other} binaries exist but its control plane didn't respond)" if other in bins else ")"
-        return sched, why
-    if len(live) == 2:
-        return "slurm", ("detected (both flux and slurm control planes are live — defaulting to "
-                         "slurm; set BOXY_SCHEDULER=flux or pass --scheduler to override)")
+    if flux_live:
+        # a live Flux broker is authoritative — even if slurm commands answered.
+        if slurm_live:
+            return "flux", ("detected (Flux broker is live — Flux runs this machine; slurm "
+                            "commands also answered but on a Flux system those are compat shims "
+                            "that proxy to Flux. Pass --scheduler slurm / set BOXY_SCHEDULER=slurm "
+                            "if this cluster's primary really is Slurm)")
+        return "flux", "detected (Flux broker is live)"
+    if slurm_live:
+        how = "slurmctld responded to scontrol ping" if "slurm-ctld" in toks else "sinfo listed partitions"
+        return "slurm", f"detected (Slurm is live — {how})"
     if len(bins) == 1:
         return bins[0], "detected"
     if len(bins) == 2:
