@@ -74,9 +74,8 @@ def model_from_log(log_path: str | os.PathLike | None) -> str | None:
     return m.group(1) if m else None
 
 
-def probe_once(url: str, timeout: float = 2.0) -> str | None:
-    """One direct (proxy-bypassing) GET {url}/v1/models. Returns the served model
-    id if the server answers as an OpenAI endpoint, else None."""
+def _model_id_from_models(url: str, timeout: float) -> str | None:
+    """Served model id from GET {url}/v1/models, or None."""
     try:
         with _no_proxy_opener().open(f"{url}/v1/models", timeout=timeout) as resp:
             data = json.load(resp)
@@ -89,6 +88,29 @@ def probe_once(url: str, timeout: float = 2.0) -> str | None:
     except (urllib.error.URLError, OSError, json.JSONDecodeError, http.client.HTTPException):
         pass
     return None
+
+
+def health_ok(url: str, timeout: float = 2.0) -> bool:
+    """True if GET {url}/health returns 2xx. `/health` is the canonical readiness
+    endpoint for both vLLM and llama.cpp — a cheap 200 the instant the server can
+    serve, lighter and less ambiguous than parsing /v1/models. Proxy-bypassed."""
+    try:
+        with _no_proxy_opener().open(f"{url}/health", timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as e:
+        return 200 <= e.code < 300  # unlikely, but a 2xx HTTPError still means "up"
+    except (urllib.error.URLError, OSError, http.client.HTTPException):
+        return False
+
+
+def probe_once(url: str, timeout: float = 2.0) -> str | None:
+    """One direct (proxy-bypassing) readiness probe. Ready = GET {url}/health is
+    2xx (the canonical endpoint) OR — for servers without /health — /v1/models
+    returns a model list. Returns the served model id (from /v1/models when it
+    answers), else 'ready' when only /health confirmed it, else None."""
+    if health_ok(url, timeout):
+        return _model_id_from_models(url, timeout) or "ready"
+    return _model_id_from_models(url, timeout)
 
 
 def wait_ready(

@@ -108,9 +108,11 @@ def read_record(name: str) -> dict | None:
         return None
 
 
-def write_endpoint_file(path: str | Path, name: str, port: int, job_id: str = "") -> Path:
+def write_endpoint_file(path: str | Path, name: str, port: int, job_id: str = "",
+                        ready: bool = False, model: str = "") -> Path:
     """Atomic (tmp + rename): the login-side poller must never see a torn
-    write over NFS-ish filesystems (r2 audit)."""
+    write over NFS-ish filesystems (r2 audit). `ready`/`model` are set once the
+    compute node's OWN localhost /health probe passes (see mark_endpoint_ready)."""
     host = socket.gethostname()
     path = Path(path)
     tmp = path.with_suffix(".tmp")
@@ -120,7 +122,32 @@ def write_endpoint_file(path: str | Path, name: str, port: int, job_id: str = ""
         "port": port,
         "url": f"http://{host}:{port}",
         "job": job_id,
+        "ready": ready,
+        "model": model,
     }) + "\n")
+    os.replace(tmp, path)
+    return path
+
+
+def mark_endpoint_ready(path: str | Path, model: str = "") -> Path | None:
+    """Rewrite an existing endpoint file with ready=true (+ served model), atomically.
+    Called ON THE COMPUTE NODE after its own `localhost:port/health` probe passes —
+    the AUTHORITATIVE readiness signal, free of the login node's proxy/cross-node
+    routing issues (field report: the server was up on cronus5 but the login-node
+    probe to http://cronus5:8000 went through the corporate proxy and never
+    resolved). Best-effort: returns None if the file isn't there yet."""
+    path = Path(path)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    data["ready"] = True
+    if model:
+        data["model"] = model
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data) + "\n")
     os.replace(tmp, path)
     return path
 

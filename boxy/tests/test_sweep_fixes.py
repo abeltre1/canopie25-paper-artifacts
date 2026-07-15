@@ -236,25 +236,12 @@ def test_ready_timeout_zero_means_dont_wait(gguf, monkeypatch, capsys):
 # ---- readiness robustness (finding 26) ----
 
 def test_readiness_survives_non_openai_responders(monkeypatch):
-    import json as _json
-
-    class FakeResp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def read(self):
-            return b"[]"
-
-    responses = iter([_json.loads("[]"), {"data": ["notadict"]}, {"data": [{"id": "ok"}]}])
-
-    def fake_load(resp):
-        return next(responses)
-
-    monkeypatch.setattr("boxy.readiness.urllib.request.urlopen", lambda *a, **kw: FakeResp())
-    monkeypatch.setattr("boxy.readiness.json.load", fake_load)
+    # junk /v1/models responders are 'not ready' (None), never a crash; readiness
+    # resolves once a proper model id appears. Drives the wait_ready loop with the
+    # per-poll results (/health absent so it falls through to /v1/models).
+    results = iter([None, None, "ok"])   # []-array, {"data":["notadict"]}, then a real id
+    monkeypatch.setattr("boxy.readiness.health_ok", lambda *a, **k: False)
+    monkeypatch.setattr("boxy.readiness._model_id_from_models", lambda *a, **k: next(results))
     monkeypatch.setattr("boxy.readiness.time.sleep", lambda s: None)
     assert readiness.wait_ready("http://x", timeout_s=30) == "ok"  # was: AttributeError
 

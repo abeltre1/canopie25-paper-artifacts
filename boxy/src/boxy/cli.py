@@ -739,6 +739,35 @@ def _job_state(scheduler, job_id: str) -> str:
 _SCHED_READY_FLOOR = 1200.0
 
 
+def _start_local_health_watch(port: int, endpoint_file, model_hint: str = "") -> None:
+    """On the node that RUNS the server (a compute node in a batch job), poll
+    `http://localhost:port/health` in a background daemon thread and, the moment
+    it answers, flip the shared-FS endpoint file to ready (mark_endpoint_ready).
+
+    This is the ideal readiness probe — same host as the server, so it never hits
+    the corporate proxy or a compute-node-not-routable-from-login-node wall that
+    the submitting boxy's own probe does. The submitting loop just watches the
+    file. Best-effort and self-terminating: it stops on first success, and dies
+    with the process when the foreground container exits."""
+    import threading
+    import time
+
+    from boxy import jobs, readiness
+
+    url = f"http://127.0.0.1:{port}"
+
+    def _run() -> None:
+        # the job walltime bounds this; a daemon thread also dies with the process.
+        for _ in range(200000):
+            mid = readiness.probe_once(url, timeout=2)
+            if mid:
+                jobs.mark_endpoint_ready(endpoint_file, model=(mid if mid != "ready" else model_hint))
+                return
+            time.sleep(3)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def _last_log_line(path, maxlen: int = 140) -> str:
     """The last non-empty line of a job log, truncated — shown live during the
     readiness wait so a long load reads as progress, not a silent spinner."""
@@ -1364,17 +1393,23 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
                                     else max(args.ready_timeout, _SCHED_READY_FLOOR))
                     ready_deadline = time.time() + max(ready_window, 0.0)
                     print(f"###   server starting on {endpoint['host']} — waiting up to "
-                          f"{ready_window / 60:.0f} min for readiness at {url}/v1/models "
-                          f"(Ctrl-C detaches; the job keeps loading)")
-                # readiness = the /v1/models probe answers (proxy-bypassed) OR the
-                # engine's own "server is up" line in the log — the latter is
-                # authoritative when the probe can't reach the compute node (a
-                # corporate proxy in the env, or the port bound only inside the
-                # container / not routable from the login node). Field report:
-                # vLLM logged "Application startup complete." on cronus5 but
-                # http://cronus5:8000 was unreachable, so boxy looped forever.
-                model_id = readiness.wait_ready(url, timeout_s=3, interval_s=1,
-                                                log_path=jobs.resolve_log(name, job_id))
+                          f"{ready_window / 60:.0f} min for readiness ({url}/health, checked on "
+                          f"the compute node) (Ctrl-C detaches; the job keeps loading)")
+                # readiness, in order of authority:
+                #  1) the endpoint file's `ready` flag — set by the COMPUTE node's
+                #     own localhost:port/health probe (no proxy, no cross-node
+                #     routing). This is the ideal signal and needs no probe here.
+                #  2) our own /health|/v1/models probe (proxy-bypassed).
+                #  3) the engine's "server is up" line in the shared-FS log.
+                # (2)+(3) cover a compute node running an OLDER boxy that doesn't
+                # write the ready flag. Field report: vLLM logged "Application
+                # startup complete." on cronus5 but http://cronus5:8000 was
+                # unreachable from the login node, so boxy looped forever.
+                if endpoint.get("ready"):
+                    model_id = endpoint.get("model") or "ready"
+                else:
+                    model_id = readiness.wait_ready(url, timeout_s=3, interval_s=1,
+                                                    log_path=jobs.resolve_log(name, job_id))
                 if model_id:
                     print(f"### READY  {url}/v1   (model: {model_id}, {scheduler_name} job {job_id})")
                     print(f"###   try:   curl -s {url}/v1/models")
@@ -2143,6 +2178,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
         jobs.write_endpoint_file(
             args.endpoint_file, name=cname, port=port,
             job_id=os.environ.get("SLURM_JOB_ID") or os.environ.get("FLUX_JOB_ID", ""))
+        # THIS node is where the server runs, so it is the ideal prober: poll
+        # localhost:port/health (no proxy, no cross-node routing) and flip the
+        # shared-FS endpoint to ready — the submitting boxy then reports READY
+        # without ever probing this compute node over the network.
+        _start_local_health_watch(port, args.endpoint_file, model_hint=args.model or "")
 
     if not detach:
         if deployment.location.scheduler == "none":
