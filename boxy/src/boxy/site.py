@@ -238,18 +238,43 @@ def remote_partition_probe(scheduler_name: str) -> str:
 
 
 def remote_scheduler_probe() -> str:
-    """Shell one-liner run on a cluster login node (over the ssh master) that
-    prints which batch schedulers are installed there — used to auto-detect
-    `--scheduler` so a novice serving over --ssh types only the model name."""
-    return ("command -v flux   >/dev/null 2>&1 && echo flux;   "
-            "command -v sbatch >/dev/null 2>&1 && echo slurm;  true")
+    """Shell one-liner run on a cluster login node (over the ssh master) to
+    auto-detect `--scheduler`. It reports which scheduler is ACTUALLY OPERATIONAL,
+    not merely installed — because a Flux system commonly ships Slurm-compat
+    binaries (`sbatch`/`sinfo` wrappers), and a Slurm site may have the `flux`
+    tool present for nested jobs. Guessing from binary presence misidentifies
+    those (field report: `eldorado`, a Flux system with slurm shims, was called
+    slurm). For each scheduler it emits a `-bin` token (binary on PATH) and, only
+    when its control plane actually answers, a `-live` token:
+      * flux-live  — a Flux broker responds (`flux resource list`/`uptime`/size)
+      * slurm-live — `sinfo` returns at least one real partition
+    pick_scheduler() ranks `-live` over `-bin`, so a live Flux instance wins over
+    dead slurm shims. Robust across a mixed fleet with no per-cluster config."""
+    return (
+        "if command -v flux >/dev/null 2>&1; then echo flux-bin; "
+        "  { flux resource list >/dev/null 2>&1 || flux uptime >/dev/null 2>&1 "
+        "    || flux getattr size >/dev/null 2>&1; } && echo flux-live; fi; "
+        "if command -v sbatch >/dev/null 2>&1; then echo slurm-bin; "
+        "  sinfo -h -o %R 2>/dev/null | grep -q . && echo slurm-live; fi; "
+        "true"
+    )
 
 
 def pick_scheduler(available: str, explicit: str | None = None) -> tuple[str | None, str]:
-    """(scheduler, why) from an explicit flag, config site.scheduler, or the set
-    of schedulers `available` (newline text with 'flux'/'slurm'). 'auto' (the
-    default) detects: the sole one present, else — if both — the config-preferred
-    or slurm. None when none is detectable (fall back to a direct/local serve)."""
+    """(scheduler, why) from an explicit flag, config site.scheduler, else the
+    OPERATIONAL evidence in `available` (whitespace text of tokens from
+    remote_scheduler_probe: `flux-live`/`slurm-live` = control plane answered,
+    `flux-bin`/`slurm-bin` or a bare `flux`/`slurm` = binary only).
+
+    Ranking (explicit flag > config > evidence):
+      * exactly one scheduler LIVE          -> that one (the dead binaries of the
+                                               other are ignored — the eldorado fix)
+      * both live                           -> slurm default, loud override note
+      * no liveness signal, one binary      -> that one
+      * no liveness signal, both binaries   -> slurm default, loud override note
+      * nothing                             -> None (a direct/local serve)
+    A bare `flux`/`slurm` token (no `-bin`/`-live` suffix) is treated as binary-
+    only, so older callers/tests that pass plain names still work."""
     if explicit in ("slurm", "flux"):
         return explicit, "--scheduler"
     cfg = config.get_str("site.scheduler").strip().lower()
@@ -257,11 +282,26 @@ def pick_scheduler(available: str, explicit: str | None = None) -> tuple[str | N
         return cfg, "config site.scheduler"
     if cfg == "none":
         return None, "config site.scheduler=none"
-    found = [s for s in ("flux", "slurm") if s in (available or "").split()]
-    if len(found) == 1:
-        return found[0], "detected"
-    if len(found) == 2:
-        return "slurm", "detected (both flux+slurm — defaulting to slurm; set BOXY_SCHEDULER=flux to override)"
+
+    toks = set((available or "").split())
+    live = [s for s in ("flux", "slurm") if f"{s}-live" in toks]
+    bins = [s for s in ("flux", "slurm") if s in toks or f"{s}-bin" in toks]
+
+    if len(live) == 1:
+        sched = live[0]
+        other = "slurm" if sched == "flux" else "flux"
+        why = f"detected ({sched} is the live scheduler"
+        why += f"; {other} binaries exist but its control plane didn't respond)" if other in bins else ")"
+        return sched, why
+    if len(live) == 2:
+        return "slurm", ("detected (both flux and slurm control planes are live — defaulting to "
+                         "slurm; set BOXY_SCHEDULER=flux or pass --scheduler to override)")
+    if len(bins) == 1:
+        return bins[0], "detected"
+    if len(bins) == 2:
+        return "slurm", ("detected (both flux+slurm binaries present but neither control plane "
+                         "responded — defaulting to slurm; set BOXY_SCHEDULER=flux or pass "
+                         "--scheduler to override)")
     return None, "no scheduler detected"
 
 

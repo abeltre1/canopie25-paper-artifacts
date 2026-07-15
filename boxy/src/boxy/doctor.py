@@ -274,10 +274,25 @@ def remote_checks(run) -> list[Result]:
     else:
         out.append(Result("container runtime", OK, ", ".join(present)))
 
-    _, subs = run("for c in sbatch flux srun; do command -v $c >/dev/null && echo $c; done")
-    sub = subs.split()
-    if any(s in sub for s in ("sbatch", "flux")):
-        out.append(Result("scheduler", OK, ", ".join(sub)))
+    # Scheduler: run the SAME operational probe the --ssh serve path uses, so the
+    # doctor reports which scheduler boxy will ACTUALLY submit to — not merely what
+    # binaries exist. A Flux system with slurm-compat shims (field case: eldorado)
+    # would otherwise read as "sbatch, flux" and mislead; here it reads "flux (live)".
+    from boxy import site
+
+    _, sched_out = run(site.remote_scheduler_probe())
+    picked, why = site.pick_scheduler(sched_out, None)
+    toks = set((sched_out or "").split())
+    present = [s for s in ("flux", "slurm") if s in toks or f"{s}-bin" in toks]
+    if picked in ("slurm", "flux"):
+        out.append(Result("scheduler", OK,
+                          f"will submit via: {picked} — {why}"
+                          + (f" (binaries present: {', '.join(present)})" if len(present) > 1 else "")))
+    elif present:
+        out.append(Result("scheduler", WARN,
+                          f"binaries present ({', '.join(present)}) but no control plane responded",
+                          "confirm you're on a real login node with a live scheduler, or pass --scheduler / "
+                          "set BOXY_SCHEDULER"))
     else:
         out.append(Result("scheduler", WARN, "no sbatch/flux found on the login node",
                           "confirm you're on a real login node; some sites gate the scheduler behind a module"))
@@ -286,8 +301,6 @@ def remote_checks(run) -> list[Result]:
     # SAME probe (`mywcid || sacctmgr`) the --ssh serve path uses and parse it,
     # so the user verifies account resolution BEFORE serving — the field failure
     # was a silent no-account batch script the scheduler then rejected.
-    from boxy import site
-
     rc_acct, acct_out = run(site.remote_account_probe())
     accounts = site.parse_accounts(acct_out) if rc_acct == 0 else []
     if accounts:
@@ -303,17 +316,19 @@ def remote_checks(run) -> list[Result]:
                           "pass --account <wcid> (or export BOXY_ACCOUNT); the scheduler's site default "
                           "applies otherwise and may reject the job"))
 
-    # Which partitions can `--partition auto` choose from? Run the SAME sinfo
-    # probe and rank it, so the user sees the soonest-start set before serving.
-    if "sbatch" in sub or not any(s in sub for s in ("sbatch", "flux")):
-        rc_part, part_out = run(site.remote_partition_probe("slurm"))
-        value, _why = site.rank_remote_partitions(part_out, "slurm") if rc_part == 0 else ("", "")
+    # Which partitions can `--partition auto` choose from? Probe the PICKED
+    # scheduler's partitions and rank them, so the user sees the soonest-start set
+    # before serving — sinfo for Slurm, `flux queue list` for a Flux system.
+    if picked in ("slurm", "flux"):
+        rc_part, part_out = run(site.remote_partition_probe(picked))
+        value, _why = site.rank_remote_partitions(part_out, picked) if rc_part == 0 else ("", "")
         if value:
-            out.append(Result("partitions", OK,
-                              f"--partition auto → {value} (soonest-start; Slurm starts in whichever frees first)"))
+            hint = ("soonest-start; Slurm starts in whichever frees first" if picked == "slurm"
+                    else "Flux queue")
+            out.append(Result("partitions", OK, f"--partition auto → {value} ({hint})"))
         else:
             out.append(Result("partitions", OK,
-                              "sinfo listed none (single-partition site?) — omit --partition to use the default"))
+                              "none listed (single-partition/queue site?) — omit --partition to use the default"))
 
     _, accel = run("if command -v nvidia-smi >/dev/null; then echo cuda; "
                    "elif command -v rocminfo >/dev/null; then echo rocm; else echo none; fi")

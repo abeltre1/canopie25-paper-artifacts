@@ -326,7 +326,52 @@ def test_pick_scheduler_none_detected(clean_env):
     assert site.pick_scheduler("", None) == (None, "no scheduler detected")
 
 
-def test_remote_scheduler_probe_is_shell_safe():
+# ---- operational (liveness) detection: the eldorado misidentification fix -----------
+
+
+def test_pick_scheduler_live_flux_beats_dead_slurm_shims(clean_env):
+    # the eldorado case: a Flux system with slurm-compat binaries. flux's control
+    # plane answers (flux-live); slurm's does NOT (sbatch present but sinfo empty
+    # -> no slurm-live). The live scheduler wins over the dead shims.
+    sched, why = site.pick_scheduler("flux-bin\nflux-live\nslurm-bin", None)
+    assert sched == "flux"
+    assert "flux is the live scheduler" in why and "didn't respond" in why
+
+
+def test_pick_scheduler_live_slurm_beats_dead_flux(clean_env):
+    # mirror: a Slurm site that also has the flux tool installed (nested jobs) but
+    # no running flux instance. slurm partitions are visible -> slurm.
+    sched, why = site.pick_scheduler("slurm-bin\nslurm-live\nflux-bin", None)
+    assert sched == "slurm" and "slurm is the live scheduler" in why
+
+
+def test_pick_scheduler_sole_live(clean_env):
+    assert site.pick_scheduler("flux-bin\nflux-live", None)[0] == "flux"
+    assert site.pick_scheduler("slurm-bin\nslurm-live", None)[0] == "slurm"
+
+
+def test_pick_scheduler_both_live_defaults_slurm_loudly(clean_env):
+    sched, why = site.pick_scheduler("flux-live\nslurm-live", None)
+    assert sched == "slurm" and "both" in why and "BOXY_SCHEDULER=flux" in why
+
+
+def test_pick_scheduler_both_bin_no_live_defaults_slurm_loudly(clean_env):
+    # neither control plane responded -> can't prove which is real; default slurm
+    # but say so loudly (the honest fallback, not a silent guess).
+    sched, why = site.pick_scheduler("flux-bin\nslurm-bin", None)
+    assert sched == "slurm" and "neither control plane responded" in why
+
+
+def test_pick_scheduler_config_still_overrides_liveness(clean_env, monkeypatch):
+    monkeypatch.setenv("BOXY_SCHEDULER", "flux")
+    # even with slurm live, an explicit config pins flux (power-user escape hatch)
+    assert site.pick_scheduler("slurm-bin\nslurm-live", None) == ("flux", "config site.scheduler")
+
+
+def test_remote_scheduler_probe_checks_liveness_not_just_presence():
     probe = site.remote_scheduler_probe()
     assert "command -v flux" in probe and "command -v sbatch" in probe
+    # liveness probes, not bare binary presence
+    assert "flux resource list" in probe and "flux-live" in probe
+    assert "sinfo -h" in probe and "slurm-live" in probe
     assert probe.rstrip().endswith("true")   # never non-zero exit -> ssh_capture stays quiet

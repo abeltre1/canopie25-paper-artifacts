@@ -153,8 +153,9 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
                  "NOTE: the scheduler KILLS the served job at the walltime, so raise this "
                  "for long serving sessions. Empty => the scheduler's own default."),
     Setting("site.scheduler", "BOXY_SCHEDULER", "auto",
-            help="scheduler for a cluster serve when --scheduler is absent: 'auto' detects "
-                 "it (flux/sbatch on the cluster over --ssh, or on PATH locally), or pin "
+            help="scheduler for a cluster serve when --scheduler is absent: 'auto' detects the "
+                 "one whose control plane is actually LIVE over --ssh (a live Flux instance vs. "
+                 "dead slurm-compat shims, not just which binary exists), or pin "
                  "'slurm'/'flux'/'none'. --scheduler always wins."),
     Setting("site.default_accelerator", "BOXY_DEFAULT_ACCELERATOR", "cuda",
             help="accelerator assumed for a GPU job submitted from a GPU-less login node "

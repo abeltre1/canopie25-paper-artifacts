@@ -406,10 +406,43 @@ def test_ssh_auto_detects_scheduler_when_flag_absent(ssh, capfd, monkeypatch):
     rc = main(["serve", MODEL, "--ssh", "user@hops", "--dryrun"])   # no --scheduler
     cap = capfd.readouterr()
     assert rc == 0
-    assert "auto: scheduler: slurm (via detected on hops)" in cap.out
+    # sinfo returns partitions on the fake cluster -> slurm's control plane is LIVE
+    assert "auto: scheduler: slurm (via detected (slurm is the live scheduler) on hops)" in cap.out
     ssh_log = ssh["ssh_log"].read_text()
     assert "--scheduler slurm" in ssh_log                  # injected into the delegation
     assert "#SBATCH --account=fy260064" in cap.out         # the remote boxy built a batch job
+
+
+def test_ssh_flux_system_with_slurm_shims_detects_flux(ssh, capfd, monkeypatch):
+    # The eldorado field case: a FLUX system that also ships slurm-compat binaries.
+    # sbatch is on PATH but sinfo returns NOTHING (slurm isn't the live scheduler);
+    # flux's control plane answers. Detection must pick FLUX, not be fooled by the
+    # slurm shims into injecting --scheduler slurm. This is the misidentification fix.
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    # flux present & live: `flux resource list` (and friends) exit 0; queue list
+    # feeds the partition probe; `flux jobs` reports nothing live (auto-unique).
+    _shim(ssh["bin"], "flux",
+          "#!/bin/bash\n"
+          'case "$1" in\n'
+          "  resource|uptime|getattr) exit 0 ;;\n"
+          '  queue) echo "pbatch|true" ;;\n'
+          "  jobs) : ;;\n"
+          "  *) : ;;\n"
+          "esac\n"
+          "exit 0\n")
+    # slurm shims exist but the control plane is DEAD: sinfo returns no partitions.
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\ntrue\n")
+    rc = main(["serve", MODEL, "--ssh", "user@eldorado", "--dryrun"])   # no --scheduler
+    cap = capfd.readouterr()
+    assert rc == 0
+    # the scheduler decision line names flux and explains the slurm shims were seen
+    # but didn't answer — no silent guess.
+    sched_line = next(ln for ln in cap.out.splitlines() if "auto: scheduler:" in ln)
+    assert "flux is the live scheduler" in sched_line and "didn't respond" in sched_line
+    ssh_log = ssh["ssh_log"].read_text()
+    assert "--scheduler flux" in ssh_log                   # flux injected, NOT slurm
+    assert "--scheduler slurm" not in ssh_log
+    assert "# flux: --bank=" in cap.out                    # a Flux batch script was built
 
 
 def test_ssh_scheduler_config_wins_over_detection(ssh, capfd, monkeypatch):
