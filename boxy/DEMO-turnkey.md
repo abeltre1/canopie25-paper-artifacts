@@ -113,7 +113,7 @@ $ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --ssh ambelt@hops
     #!/bin/bash
     #SBATCH --job-name=boxy-llama-3.1-8b-instruct
     #SBATCH --nodes=1
-    #SBATCH --gres=gpu:a100:1           <-- GRES form + type auto-detected from sinfo
+    #SBATCH --gpus-per-node=1           <-- proven default; auto-recovers to --gres if rejected
     #SBATCH --partition=gpu,batch       <-- from sinfo, soonest-start, no flag typed
     #SBATCH --account=fy140001          <-- from mywcid, no flag typed
     #SBATCH --time=30:00                <-- 30-min default, no flag typed
@@ -131,21 +131,22 @@ $ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --ssh ambelt@hops
 ###   stop:  boxy stop boxy-llama-3.1-8b-instruct
 ```
 
-> **The GPU request form is auto-detected — and auto-recovered.** Sites spell the
-> GPU request differently and some reject `--gpus-per-node` outright (`sbatch:
-> error: Invalid generic resource (gres) specification`, field report: kahuna).
-> Two layers handle this with no flag:
-> 1. **Detect:** boxy probes `sinfo -o %G` (over `--ssh` or locally) and picks the
->    convention from the reported GRES — a single GPU type across your partitions →
->    typed `--gres=gpu:<type>:N`; mixed/untyped → `--gres=gpu:N`; none reported →
->    `--gpus-per-node=N`. Shown on the `auto: gpu request:` line.
-> 2. **Recover:** if the site still rejects the GPU line at submit, boxy
->    **re-renders with the portable `--gres=gpu:[type:]N` form and resubmits by
->    itself** (`retrying with --gres=gpu:N … accepted (auto-recovered)`) — you do
->    nothing. It cycles typed → untyped → `--gpus` until one is accepted.
+> **The GPU request self-heals — without changing a working cluster.** boxy uses
+> the proven `--gpus-per-node=N` by default (what works on hops/eldorado). It does
+> **not** pre-emptively rewrite that on a cluster that's already fine. But some
+> sites reject it (`sbatch: error: Invalid generic resource (gres) specification`,
+> field report: kahuna) — so if a submit is rejected for the GPU line, boxy
+> **re-renders with the portable `--gres=gpu:[type:]N` form (the type probed from
+> `sinfo`) and resubmits by itself**, cycling typed → untyped → `--gpus` until one
+> is accepted:
 >
-> To pin the form and skip both, `export BOXY_GPU_DIRECTIVE=gres|gpus|gpus-per-node|none`
-> (and optionally `BOXY_GPU_TYPE=a100`).
+> ```
+> boxy: the site rejected the GPU request; retrying with --gres=gpu:N ...
+> ### GPU request accepted as --gres=gpu:N (auto-recovered).
+> ```
+>
+> You do nothing. To pin a form and skip the self-heal, `export
+> BOXY_GPU_DIRECTIVE=gres|gpus|gpus-per-node|none` (and optionally `BOXY_GPU_TYPE=a100`).
 
 > **Choosing your WCID (charge account).** When `mywcid` lists several accounts
 > and you didn't pass `--account`, boxy shows an inline menu (on a terminal) so you

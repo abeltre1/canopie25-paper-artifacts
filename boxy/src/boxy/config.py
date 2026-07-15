@@ -169,11 +169,12 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
                  "NOTE: the scheduler KILLS the served job at the walltime, so raise this "
                  "for long serving sessions. Empty => the scheduler's own default."),
     Setting("site.gpu_directive", "BOXY_GPU_DIRECTIVE", "auto",
-            help="how Slurm asks for GPUs (sites differ): 'auto' (default) detects it from the "
-                 "cluster's sinfo GRES over --ssh — a site that reports a `gpu` GRES gets "
-                 "--gres=gpu:[type:]N (portable), else --gpus-per-node=N. Pin 'gres'/'gpus'/"
-                 "'gpus-per-node'/'none' to override (use 'gres' if sbatch says 'Invalid generic "
-                 "resource (gres) specification')."),
+            help="how Slurm asks for GPUs (sites differ): 'auto' (default) uses the proven "
+                 "--gpus-per-node=N and, IF a site rejects it at submit ('Invalid generic "
+                 "resource (gres) specification'), auto-recovers by resubmitting with the "
+                 "portable --gres=gpu:[type:]N (type probed from sinfo) — so a working cluster "
+                 "is never changed pre-emptively. Pin 'gres'/'gpus'/'gpus-per-node'/'none' to "
+                 "force one form (disables the self-heal)."),
     Setting("site.gpu_type", "BOXY_GPU_TYPE", "",
             help="GPU type token in the GRES request (e.g. 'a100', 'h100'): boxy emits gpu:<type>:N. "
                  "Empty => auto-detected from sinfo (or untyped). Find it with `sinfo -o %G`."),

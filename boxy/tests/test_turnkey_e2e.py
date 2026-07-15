@@ -639,53 +639,37 @@ def test_ssh_agentless_flux_bank_and_engine_pull(ssh, capfd, monkeypatch):
 # ---- agentless: the Slurm GPU request FORM is auto-detected from sinfo GRES --------
 
 
-def test_ssh_agentless_auto_detects_typed_gres(ssh, capfd, monkeypatch):
-    # A cluster whose target partitions all advertise ONE gpu type -> the portable,
-    # TYPED --gres=gpu:<type>:N (some sites reject --gpus-per-node; kahuna field
-    # report). No env var: the form is read off sinfo over SSH, laptop-side.
+def test_ssh_agentless_default_gpu_request_is_gpus_per_node(ssh, capfd, monkeypatch):
+    # A WORKING cluster is NEVER changed pre-emptively: even though the fixture's
+    # sinfo advertises a GPU type, the default 'auto' emits the proven
+    # --gpus-per-node (what works on hops/eldorado). The portable --gres form is
+    # only used REACTIVELY, if the site rejects this at submit (see the recovery
+    # tests). This is the fix for hops flipping to --gres=gpu:h100:1 unexpectedly.
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
     monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
-    # every GPU partition is a100 -> a single type spans the selection
     _shim(ssh["bin"], "sinfo", "#!/bin/bash\ncat <<'EOF'\n"
-          "gpu|up|2/6/0/8|gpu:a100:8\n"
-          "short|up|3/5/0/8|(null)\n"
-          "batch|up|8/2/0/10|gpu:a100:4\n"
+          "gpu|up|2/6/0/8|gpu:h100:8\n"
+          "batch|up|8/2/0/10|gpu:h100:4\n"
           "EOF\n")
     rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
     cap = capfd.readouterr()
     assert rc == 0
-    assert "Agentless (no boxy on the cluster)" in cap.out
-    assert "#SBATCH --gres=gpu:a100:1" in cap.out          # typed, from sinfo
-    assert "#SBATCH --gpus-per-node" not in cap.out         # NOT the default form
-    assert "auto: gpu request: --gres=gpu:a100:N (detected Slurm GRES on hops)" in cap.out
+    assert "#SBATCH --gpus-per-node=1" in cap.out           # unchanged working form
+    assert "--gres=gpu" not in cap.out                      # NOT pre-emptively switched
+    assert "auto: gpu request:" not in cap.out              # no proactive decision line
 
 
-def test_ssh_agentless_mixed_gres_types_drops_the_type(ssh, capfd, monkeypatch):
-    # The default fixture's GPU partitions differ (gpu:a100, batch:v100). When the
-    # selected partitions span more than one type, boxy emits UNTYPED --gres=gpu:N
-    # and lets Slurm pick the type on the assigned node.
+def test_ssh_agentless_pinned_gpu_directive_forces_gres(ssh, capfd, monkeypatch):
+    # BOXY_GPU_DIRECTIVE pins the form explicitly (escape hatch): 'gres' emits
+    # --gres=gpu:N with no probing and no self-heal.
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
     monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("BOXY_GPU_DIRECTIVE", "gres")
     rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
     cap = capfd.readouterr()
     assert rc == 0
-    assert "#SBATCH --gres=gpu:1" in cap.out                # untyped (a100 + v100)
-    assert "gpu:a100:" not in cap.out and "gpu:v100:" not in cap.out
-    assert "auto: gpu request: --gres=gpu:N (detected Slurm GRES on hops)" in cap.out
-
-
-def test_ssh_agentless_pinned_gpu_directive_wins_over_auto(ssh, capfd, monkeypatch):
-    # BOXY_GPU_DIRECTIVE pins the form explicitly: auto-detection is skipped and the
-    # pinned convention is used verbatim (escape hatch if sinfo GRES misleads).
-    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
-    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
-    monkeypatch.setenv("BOXY_GPU_DIRECTIVE", "gpus-per-node")
-    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
-    cap = capfd.readouterr()
-    assert rc == 0
-    assert "#SBATCH --gpus-per-node=1" in cap.out
-    assert "--gres=gpu" not in cap.out
-    assert "auto: gpu request:" not in cap.out              # detection skipped when pinned
+    assert "#SBATCH --gres=gpu:1" in cap.out
+    assert "--gpus-per-node" not in cap.out
 
 
 # ---- interactive WCID picker: the chosen account lands in the batch script ----------

@@ -1127,6 +1127,23 @@ def _looks_like_pull_block(text: str) -> bool:
             or ("registry" in low and ("403" in low or "denied" in low)))
 
 
+def _local_gpu_type() -> str:
+    """Best-effort GPU TYPE token from LOCAL sinfo (login node), so a local
+    auto-recovery tries typed --gres=gpu:<type>:N before the untyped form. ''
+    when sinfo is missing/errors or reports no single type."""
+    from boxy import site
+    from boxy.schedulers import get_scheduler
+
+    try:
+        p = subprocess.run(get_scheduler("slurm").partitions_command(),
+                           capture_output=True, text=True, timeout=15)
+        out = p.stdout if p.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+        return ""
+    _, gtype = site.gpu_request_from_gres(out)
+    return gtype
+
+
 def _gres_fallback_forms(gtype: str) -> list[tuple[str, str]]:
     """The GPU-request forms to try, in order, when a site REJECTS the GPU line
     ('Invalid generic resource (gres) specification' — field: kahuna). Most
@@ -1307,23 +1324,10 @@ def _serve_agentless_ssh(args, target: str) -> int:
             part = part.split(",")[0].strip()
         site_args.append(scheduler.site_directive("partition", part))
 
-    # GPU request form: auto-detect the site's GRES convention from sinfo over SSH
-    # so a cluster that rejects --gpus-per-node (field: kahuna) gets --gres=gpu:
-    # [type:]N with NO flag. Only when the form is 'auto' and the job wants GPUs.
-    detected_gtype = ""
-    if (scheduler_name == "slurm" and need_gpu
-            and config.get_str("site.gpu_directive").strip().lower() == "auto"):
-        from boxy.schedulers import slurm as _slurm
-
-        grc, gout = remote.ssh_capture(target, site.remote_partition_probe("slurm"), timeout=20)
-        sel = ({p.strip() for p in part.split(",")}
-               if part and site.partition_mode(part) == "set" else None)
-        form, gtype = site.gpu_request_from_gres(gout if grc == 0 else "", sel)
-        detected_gtype = gtype
-        if form:
-            _slurm.set_auto_gres(form, gtype)
-            shown = f"--gres=gpu:{gtype + ':' if gtype else ''}N"
-            print(f"  auto: gpu request: {shown} (detected Slurm GRES on {host})")
+    # GPU request form: keep the proven default (--gpus-per-node, what works on
+    # hops/eldorado/…). We DON'T proactively change a working cluster's directive;
+    # if a site rejects it at submit (field: kahuna), the submit block below
+    # auto-recovers to the portable --gres form. See _gpu_flag / _gres_fallback_forms.
 
     t, twhy = site.resolve_time(getattr(args, "time", None))
     if t:
@@ -1371,12 +1375,17 @@ def _serve_agentless_ssh(args, target: str) -> int:
     # kahuna) and want --gres=gpu:[type:]N. Instead of telling the user to set an
     # env var and rerun, re-render with the portable forms and RESUBMIT until one
     # is accepted. Only when the form is 'auto' (else the user pinned it on purpose).
-    if (rc != 0 and scheduler_name == "slurm" and need_gpu
-            and ("gres" in out.lower() or "generic resource" in out.lower())
+    if (rc != 0 and scheduler_name == "slurm" and need_gpu and _is_gres_error(out)
             and config.get_str("site.gpu_directive").strip().lower() == "auto"):
         from boxy.schedulers import slurm as _slurm
 
-        for gform, gtype in _gres_fallback_forms(detected_gtype):
+        # probe the site's GPU type NOW (best-effort) so a site that REQUIRES a
+        # typed --gres=gpu:<type>:N is tried before the untyped form.
+        grc, gout = remote.ssh_capture(target, site.remote_partition_probe("slurm"), timeout=20)
+        sel = ({p.strip() for p in part.split(",")}
+               if part and site.partition_mode(part) == "set" else None)
+        _, probed_type = site.gpu_request_from_gres(gout, sel) if grc == 0 else ("", "")
+        for gform, gtype in _gres_fallback_forms(probed_type):
             _slurm.set_auto_gres(gform, gtype)
             try:
                 script_text = deploy.render_agentless_script(
@@ -1721,7 +1730,7 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
         from boxy import deploy
         from boxy.schedulers import slurm as _slurm
 
-        for gform, gtype in _gres_fallback_forms(""):
+        for gform, gtype in _gres_fallback_forms(_local_gpu_type()):
             _slurm.set_auto_gres(gform, gtype)
             try:
                 if getattr(args, "agentless", False):

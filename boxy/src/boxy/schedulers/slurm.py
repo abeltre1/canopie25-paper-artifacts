@@ -26,10 +26,10 @@ def _gpu_flag(n: int) -> str | None:
     reject it with 'Invalid generic resource (gres) specification' and want
     '--gres=gpu:N' (optionally typed, gpu:a100:N).
 
-    config site.gpu_directive: 'auto' (default) uses the form auto-detected from
-    the cluster's `sinfo` GRES (set_auto_gres), falling back to --gpus-per-node
-    when nothing was detected; or pin 'gres'/'gpus'/'gpus-per-node'/'none'.
-    config site.gpu_type pins the GRES type (else the detected one)."""
+    config site.gpu_directive: 'auto' (default) uses --gpus-per-node (the proven
+    default); the CLI's submit path auto-recovers to --gres=gpu:[type:]N via
+    set_auto_gres ONLY if the site rejects it. Or pin 'gres'/'gpus'/'gpus-per-node'
+    /'none'. config site.gpu_type pins the GRES type (else the probed one)."""
     if n <= 0:
         return None
     from boxy import config
