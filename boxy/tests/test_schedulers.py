@@ -35,3 +35,38 @@ def test_no_modules_no_wrap(hops):
 def test_alloc_commands(hops, eldorado):
     assert get_scheduler("slurm").alloc_command(hops) == ["salloc", "--nodes=2", "--gpus-per-node=4"]
     assert get_scheduler("flux").alloc_command(eldorado) == ["flux", "alloc", "-N2", "--gpus-per-node=4"]
+
+
+# ---- site GRES convention: --gpus-per-node vs --gres=gpu:N (field: kahuna) ----------
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("directive,gtype,expected", [
+    ("gpus-per-node", "", "--gpus-per-node=4"),          # default
+    ("gres",          "", "--gres=gpu:4"),               # the portable form kahuna wanted
+    ("gres",     "a100", "--gres=gpu:a100:4"),           # typed GRES
+    ("gpus",          "", "--gpus=4"),
+    ("gpus-per-node", "h100", "--gpus-per-node=h100:4"),
+])
+def test_slurm_gpu_directive_forms(hops, monkeypatch, directive, gtype, expected):
+    # a config env adapts the GPU request to any site's GRES convention — the
+    # batch directive, the srun prefix, and salloc all follow it.
+    from boxy import config
+
+    monkeypatch.setenv("BOXY_GPU_DIRECTIVE", directive)
+    monkeypatch.setenv("BOXY_GPU_TYPE", gtype)
+    config.reset()
+    sched = get_scheduler("slurm")
+    assert f"#SBATCH {expected}" in sched.resource_directives(hops)
+    assert expected in sched.launch_prefix(hops)
+    assert expected in sched.alloc_command(hops)
+
+
+def test_slurm_gpu_directive_none_omits_the_request(hops, monkeypatch):
+    from boxy import config
+
+    monkeypatch.setenv("BOXY_GPU_DIRECTIVE", "none")
+    config.reset()
+    sched = get_scheduler("slurm")
+    assert not any("gpu" in ln.lower() or "gres" in ln.lower() for ln in sched.resource_directives(hops))

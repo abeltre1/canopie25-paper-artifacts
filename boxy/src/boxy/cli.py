@@ -1252,6 +1252,20 @@ def _serve_agentless_ssh(args, target: str) -> int:
     rc, out = remote.ssh_capture(target, f"cd {shlex.quote(rhome)} && {submit_cmd}", timeout=60)
     if rc != 0:
         print(f"boxy: submit failed on {host}:\n{out.strip()}", file=sys.stderr)
+        low = out.lower()
+        if "gres" in low or "generic resource" in low:
+            print("boxy: hint: this site's Slurm rejected the GPU request line. Sites spell it "
+                  "differently — try the portable GRES form:\n"
+                  "        export BOXY_GPU_DIRECTIVE=gres        # emits --gres=gpu:N\n"
+                  "  and, if it needs a GPU TYPE (see `sinfo -o %G` on the cluster):\n"
+                  "        export BOXY_GPU_TYPE=<a100|h100|...>  # emits gpu:<type>:N\n"
+                  "  then rerun. (Other forms: BOXY_GPU_DIRECTIVE=gpus | none.)", file=sys.stderr)
+        elif "account" in low or "invalid account" in low:
+            print("boxy: hint: the account was rejected — pass --account <wcid> or export "
+                  "BOXY_ACCOUNT.", file=sys.stderr)
+        elif "partition" in low:
+            print("boxy: hint: the partition was rejected — try --partition <name> "
+                  "(list them: `sinfo -s` on the cluster) or --partition off.", file=sys.stderr)
         return 1
     job_id = scheduler.parse_job_id(out)
     print(f"### Submitted {scheduler_name} job {job_id}  ({name})")

@@ -131,6 +131,13 @@ $ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --ssh ambelt@hops
 ###   stop:  boxy stop boxy-llama-3.1-8b-instruct
 ```
 
+> **`sbatch: error: Invalid generic resource (gres) specification`?** Sites spell
+> the GPU request differently. boxy defaults to `--gpus-per-node=N`; this cluster
+> wants the portable GRES form. Fix it once on your laptop:
+> `export BOXY_GPU_DIRECTIVE=gres` (emits `--gres=gpu:N`), and if it needs a GPU
+> **type** (check `sinfo -o %G` on the cluster) `export BOXY_GPU_TYPE=a100`
+> (emits `gpu:a100:N`). Other forms: `BOXY_GPU_DIRECTIVE=gpus | none`.
+
 While the model loads, boxy prints a **live progress line** every ~10 s — an
 elapsed clock, the current phase (QUEUED → STARTING → PULLING IMAGE → LOADING
 WEIGHTS → CAPTURING CUDA GRAPHS → SERVER STARTING → READY), and a bar parsed from

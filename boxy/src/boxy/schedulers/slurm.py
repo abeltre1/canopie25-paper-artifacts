@@ -6,6 +6,28 @@ from boxy.location import Location
 from boxy.schedulers.base import PartitionInfo, Scheduler
 
 
+def _gpu_flag(n: int) -> str | None:
+    """The GPU request flag for N GPUs/node in the site's GRES convention
+    (config site.gpu_directive / site.gpu_type). None to omit. Sites differ:
+    '--gpus-per-node=N' works on most modern Slurm, but many reject it with
+    'Invalid generic resource (gres) specification' and want '--gres=gpu:N'
+    (optionally typed, gpu:a100:N). One env var adapts boxy to any of them."""
+    if n <= 0:
+        return None
+    from boxy import config
+
+    form = (config.get_str("site.gpu_directive") or "gpus-per-node").strip().lower()
+    gtype = config.get_str("site.gpu_type").strip()
+    typed = f"{gtype}:{n}" if gtype else str(n)     # a100:2  /  2
+    if form == "none":
+        return None
+    if form == "gres":
+        return f"--gres=gpu:{typed}"                # --gres=gpu:a100:2 / --gres=gpu:2
+    if form == "gpus":
+        return f"--gpus={typed}"
+    return f"--gpus-per-node={typed}"               # default
+
+
 class SlurmScheduler(Scheduler):
     name = "slurm"
     launcher = "srun"
@@ -13,8 +35,9 @@ class SlurmScheduler(Scheduler):
     def launch_prefix(self, location: Location) -> list[str]:
 
         prefix = [self.launcher, f"--nodes={location.resources.nodes}"]
-        if location.resources.gpus_per_node:
-            prefix.append(f"--gpus-per-node={location.resources.gpus_per_node}")
+        gpu = _gpu_flag(location.resources.gpus_per_node)
+        if gpu:
+            prefix.append(gpu)
         for arg in location.scheduler_args:
             # split only the single-char "-X value" spelling; everything else
             # is ONE token (shlex.split choked on values with apostrophes)
@@ -30,8 +53,9 @@ class SlurmScheduler(Scheduler):
     def alloc_command(self, location: Location) -> list[str]:
         """Interactive allocation (paper: 0-alloc-compute-node.sh)."""
         cmd = ["salloc", f"--nodes={location.resources.nodes}"]
-        if location.resources.gpus_per_node:
-            cmd.append(f"--gpus-per-node={location.resources.gpus_per_node}")
+        gpu = _gpu_flag(location.resources.gpus_per_node)
+        if gpu:
+            cmd.append(gpu)
         return cmd
 
     # ---- batch submission ----
@@ -41,8 +65,9 @@ class SlurmScheduler(Scheduler):
 
     def resource_directives(self, location: Location, distributed: bool = False) -> list[str]:
         lines = [f"#SBATCH --nodes={location.resources.nodes}"]
-        if location.resources.gpus_per_node:
-            lines.append(f"#SBATCH --gpus-per-node={location.resources.gpus_per_node}")
+        gpu = _gpu_flag(location.resources.gpus_per_node)
+        if gpu:
+            lines.append(f"#SBATCH {gpu}")
         if distributed:
             # one Ray launcher (srun task) per node
             lines.append("#SBATCH --ntasks-per-node=1")

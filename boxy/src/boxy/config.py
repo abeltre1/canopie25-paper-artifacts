@@ -162,6 +162,15 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
                  "'30:00' = 30 min, '4:00:00' = 4 h; boxy converts it to Flux FSD). "
                  "NOTE: the scheduler KILLS the served job at the walltime, so raise this "
                  "for long serving sessions. Empty => the scheduler's own default."),
+    Setting("site.gpu_directive", "BOXY_GPU_DIRECTIVE", "gpus-per-node",
+            help="how Slurm asks for GPUs (sites differ): 'gpus-per-node' (--gpus-per-node=N, "
+                 "default), 'gres' (--gres=gpu:N — the older/most-portable form; use this if "
+                 "sbatch says 'Invalid generic resource (gres) specification'), 'gpus' (--gpus=N), "
+                 "or 'none' (omit — GPUs come from the partition / whole-node alloc)."),
+    Setting("site.gpu_type", "BOXY_GPU_TYPE", "",
+            help="GPU type token some sites REQUIRE in the GRES request (e.g. 'a100', 'h100', "
+                 "'volta'): boxy emits gpu:<type>:N. Empty => untyped (gpu:N). Find the name with "
+                 "`sinfo -o %G` on the cluster."),
     Setting("site.scheduler", "BOXY_SCHEDULER", "auto",
             help="scheduler for a cluster serve when --scheduler is absent: 'auto' detects the "
                  "LIVE control plane over --ssh — a reachable Flux broker wins (Flux runs the "
