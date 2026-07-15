@@ -270,6 +270,78 @@ def test_ready_line_triggers_port_forward(shim, capfd, monkeypatch):
     assert "CTL forward -L 8090:cn042:8090" in shim.read_text()
 
 
+def test_waiting_line_starts_laptop_takeover_and_suppresses_spam(shim, capfd, monkeypatch):
+    # An OLD cluster boxy names the endpoint ("server starting on … http://cn5:8000/…")
+    # then loops "### still waiting" forever (its own probe blocked by the proxy).
+    # The laptop takes readiness over: the takeover fires with the parsed endpoint,
+    # and the repetitive spam is swallowed. (Stub the takeover so no real polling.)
+    seen = {}
+
+    def _stub(host, node, port, log_box, *rest):
+        seen["node"], seen["port"], seen["box"] = node, port, log_box  # keep the shared list
+        rest[-2].set()   # ready_evt
+
+    monkeypatch.setattr(remote, "_laptop_readiness_takeover", _stub)
+    monkeypatch.setenv(
+        remote.ENV_REMOTE_CMD,
+        'printf "###   server starting on cn5 — waiting for readiness at http://cn5:8000/v1/models\\n"; '
+        'printf "###   still waiting (job 40507: RUNNING); log: /shared/x-40507.log\\n"; '
+        'printf "###   still waiting (job 40507: RUNNING); log: /shared/x-40507.log\\n"; :')
+    rc = remote.run_remote("user@login1", ["serve", "m"], tunnel_ready=True)
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert seen["node"] == "cn5" and seen["port"] == 8000
+    # the log path prints AFTER the trigger line; the takeover shares the mutable
+    # box, so it's populated by the time the stream ends.
+    assert seen["box"][0] == "/shared/x-40507.log"
+    assert "server starting on cn5" in out          # the trigger line is shown
+    assert "still waiting" not in out               # ...but the spam is suppressed
+
+
+def test_laptop_takeover_reports_ready_via_localhost_health(monkeypatch, capfd):
+    import threading
+
+    monkeypatch.setattr(remote, "_pick_local_port", lambda lp, rp: 8123)
+    monkeypatch.setattr(remote, "add_forward", lambda *a: 0)            # tunnel ok
+    monkeypatch.setattr("boxy.readiness.probe_once", lambda url, timeout=3: "m")  # /health OK
+
+    class _Proc:
+        def __init__(self):
+            self.terminated = False
+
+        def terminate(self):
+            self.terminated = True
+
+    proc, evt = _Proc(), threading.Event()
+    remote._laptop_readiness_takeover("user@login1", "cn5", 8000, [""], None, "",
+                                      "", "relay", False, evt, proc)
+    out = capfd.readouterr().out
+    assert evt.is_set() and proc.terminated                       # loop stopped, job kept
+    assert "### READY   http://127.0.0.1:8123/v1" in out
+    assert "confirmed via localhost:8123/health" in out
+    assert "### LOCAL   http://127.0.0.1:8123/v1" in out          # the READY -> LOCAL sequence
+
+
+def test_laptop_takeover_falls_back_to_log_when_no_tunnel(monkeypatch, capfd):
+    import threading
+
+    monkeypatch.setattr(remote, "_pick_local_port", lambda lp, rp: 8123)
+    monkeypatch.setattr(remote, "add_forward", lambda *a: 1)              # tunnel fails
+    monkeypatch.setattr("boxy.readiness.probe_once", lambda *a, **k: None)
+    monkeypatch.setattr(remote, "ssh_capture", lambda host, cmd, timeout=15: (0, "BOXY_READY\n"))
+
+    class _Proc:
+        def terminate(self):
+            pass
+
+    evt = threading.Event()
+    remote._laptop_readiness_takeover("user@login1", "cn5", 8000, ["/shared/x.log"], None, "",
+                                      "", "relay", False, evt, _Proc())
+    out = capfd.readouterr().out
+    assert evt.is_set()
+    assert "### READY   http://cn5:8000/v1" in out and "per the job log" in out
+
+
 def test_already_serving_banner_also_tunnels(shim, capfd, monkeypatch):
     # Rerunning the same model reconnects to the live job: the ALREADY SERVING
     # banner must open the tunnel exactly like a fresh READY.

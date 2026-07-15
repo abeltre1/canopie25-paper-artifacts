@@ -66,6 +66,18 @@ def control_persist() -> str:
 # ALREADY SERVING reconnect (rerunning the same model finds the live job).
 READY_RE = re.compile(r"###\s+(?:READY|ALREADY SERVING)\s+http://([^:/\s]+):(\d+)")
 
+# The remote boxy prints this the moment the compute node starts serving, BEFORE
+# it has confirmed readiness — e.g. "server starting on cronus5 — waiting ... at
+# http://cronus5:8000/...". The laptop latches onto the host:port here and takes
+# readiness over ITSELF (tunnel + localhost/health), so an old cluster boxy that
+# loops "still waiting" forever (its own probe blocked by the proxy / not routable
+# to the compute node) can't stop us from reporting READY + the chisel URL.
+WAITING_RE = re.compile(r"(?:server starting on|waiting).*?http://([^:/\s]+):(\d+)")
+# The job log path the remote boxy prints — a shared-FS fallback readiness signal.
+LOG_RE = re.compile(r"log:\s*(/\S+\.log)")
+# the remote boxy's repetitive "still waiting" spam — suppressed once WE own readiness.
+STILLWAIT_RE = re.compile(r"###\s+still waiting|waiting for the job to start and the server")
+
 # the remote boxy rejecting a subcommand/flag the local one just sent means the
 # CLUSTER's install is older than the laptop's (field report: `boxy logs --ssh
 # clusterA` -> "invalid choice: 'logs'") — say so instead of a bare usage error.
@@ -318,6 +330,102 @@ def add_forward(host: str, local_port: int, remote_host: str, remote_port: int) 
                           capture_output=True, text=True).returncode
 
 
+def _pick_local_port(local_port: int | None, remote_port: int) -> int:
+    """The laptop-side port for the forward: a user-pinned --port when free (stable
+    URL), else the remote port when free, else any free one (a stale forward on
+    that port never blocks the tunnel — field report: podman gvproxy on 8090)."""
+    want = local_port or remote_port
+    if _local_port_free(want):
+        return want
+    lport = _free_local_port()
+    if local_port:
+        print(f"warning: local port {local_port} is in use — using {lport} instead", file=sys.stderr)
+    return lport
+
+
+def _announce_tunnel(lport: int, node: str, port: int, host: str, local_route: str,
+                     share: str, exposer_name: str, share_auto: bool) -> None:
+    """Print the LOCAL url and, if asked, the ROUTE / SHARE (chisel) url. A share
+    failure NEVER takes the tunnel down (degrades to the local route)."""
+    print(f"### LOCAL   http://127.0.0.1:{lport}/v1   "
+          f"(tunnel over the SSH session; persists ~{control_persist()})")
+    if local_route:
+        rurl, rnote = route_url(local_route, lport)
+        print(f"### ROUTE   {rurl}   (browser UI: {rurl[:-2]})")
+        if rnote:
+            print(f"###   {rnote}")
+    elif not share:
+        print(f"###   browser: open http://127.0.0.1:{lport}/   "
+              f"(llama.cpp serves a web UI there; vLLM exposes only /v1)")
+    if share and not config.get_bool("share.enabled"):
+        rurl, _ = route_url(share, lport)
+        print(f"### ROUTE   {rurl}   (team sharing disabled; local tunnel only — "
+              f"enable with BOXY_SHARE_ENABLED=1)")
+    elif share:
+        try:
+            from boxy.exposers import get_exposer
+            surl, snote = get_exposer(exposer_name).expose(share, lport)
+            print(f"### SHARE   {surl}   (browser UI: {surl[:-2]})")
+            if snote:
+                print(f"###   {snote}")
+        except Exception as e:  # the tunnel must never die because the share failed
+            rurl, _ = route_url(share, lport)
+            if share_auto:
+                print(f"### ROUTE   {rurl}   (no team relay reachable — local tunnel "
+                      f"only; `boxy generate relay` to set one up, or BOXY_AUTO_SHARE=false)")
+            else:
+                print(f"warning: share failed — {e}", file=sys.stderr)
+                print(f"### ROUTE   {rurl}   (local-only fallback)")
+    print(f"###   close: ssh -O cancel -L {lport}:{node}:{port} "
+          f"-o ControlPath={control_path()} {host}")
+
+
+def _laptop_readiness_takeover(host, node, port, log_box, local_port, local_route,
+                               share, exposer_name, share_auto, ready_evt, proc) -> None:
+    """Own readiness FROM THE LAPTOP so an old cluster boxy's blocked probe can't
+    stall us. Open the tunnel to the compute node's port immediately, then confirm
+    the server via `http://127.0.0.1:<lport>/health` THROUGH that tunnel (the
+    unauthenticated readiness endpoint, checked as localhost from the laptop — the
+    port it reaches is the serving node's; falls back to /v1/models) or, as a
+    shared-FS fallback, the engine's "server is up" line in the job log (grepped
+    over the ssh master; `log_box[0]` is filled in by the stream reader as the
+    remote prints it). On readiness, print READY + the tunnel/chisel urls and stop
+    the remote loop. The JOB keeps running regardless."""
+    import time
+
+    from boxy import readiness
+
+    lport = _pick_local_port(local_port, port)
+    if add_forward(host, lport, node, port) != 0:
+        lport = 0  # couldn't forward; fall back to log-only readiness
+
+    for _ in range(100000):
+        if ready_evt.is_set():
+            return
+        ready = bool(lport) and readiness.probe_once(f"http://127.0.0.1:{lport}", timeout=3) is not None
+        if not ready and log_box[0]:
+            rc, out = ssh_capture(
+                host, f"grep -Eq 'Application startup complete|server is listening|Uvicorn running on' "
+                      f"{shlex.quote(log_box[0])} 2>/dev/null && echo BOXY_READY || true", timeout=15)
+            ready = rc == 0 and "BOXY_READY" in out
+        if ready:
+            ready_evt.set()
+            if lport:
+                print(f"\n### READY   http://127.0.0.1:{lport}/v1   "
+                      f"(confirmed via localhost:{lport}/health through the tunnel)")
+                _announce_tunnel(lport, node, port, host, local_route, share, exposer_name, share_auto)
+            else:
+                print(f"\n### READY   http://{node}:{port}/v1   (server is up per the job log; "
+                      f"the login node couldn't forward a tunnel — tunnel manually: "
+                      f"ssh -L {port}:{node}:{port} {host})")
+            try:
+                proc.terminate()  # stop the old cluster boxy's "still waiting" loop; the JOB keeps running
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        time.sleep(5)
+
+
 def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False,
                local_port: int | None = None, local_route: str = "",
                share: str = "", exposer_name: str = "relay", share_auto: bool = False) -> int:
@@ -357,70 +465,62 @@ def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False,
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     tunneled: set[tuple[str, int]] = set()
     stale = False
+    import threading
+
+    ready_evt = threading.Event()
+    takeover_started = False
+    log_box = [""]  # the job-log path, filled in as the remote prints it (shared with the takeover thread)
     assert proc.stdout is not None
     for line in proc.stdout:
         if NOISE_RE.search(line):
             continue  # drop login-node rootless-podman noise (see NOISE_RE)
-        print(line, end="")
         stale = stale or bool(STALE_RE.search(line))
+        # Laptop-side readiness takeover: the moment the remote serve names its
+        # compute-node endpoint (WAITING_RE, printed BEFORE readiness), start
+        # confirming readiness OURSELVES over the tunnel (localhost/health) + the
+        # shared-FS log — so an old cluster boxy that loops "still waiting" forever
+        # can't stop us reporting READY + the chisel url.
         if tunnel_ready:
-            m = READY_RE.search(line)
-            if m and (m.group(1), int(m.group(2))) not in tunneled:
-                node, port = m.group(1), int(m.group(2))
+            lm = LOG_RE.search(line)
+            if lm:
+                log_box[0] = lm.group(1)  # for the fallback; the remote prints this in its wait lines
+        if tunnel_ready and not takeover_started:
+            rm = READY_RE.search(line)
+            if rm and (rm.group(1), int(rm.group(2))) not in tunneled:
+                # the remote ALREADY confirmed readiness (fresh READY / ALREADY
+                # SERVING reconnect) — forward + announce synchronously, no poll.
+                node, port = rm.group(1), int(rm.group(2))
                 tunneled.add((node, port))
-                # a user-pinned --port wins (stable URL); else reuse the remote
-                # port when free, else pick any free one so a leftover forward on
-                # that port (field report: stale podman gvproxy on 8090) never
-                # blocks the tunnel.
-                want = local_port or port
-                if _local_port_free(want):
-                    lport = want
-                else:
-                    lport = _free_local_port()
-                    if local_port:
-                        print(f"warning: local port {local_port} is in use — using {lport} instead",
-                              file=sys.stderr)
+                print(line, end="")
+                lport = _pick_local_port(local_port, port)
                 if add_forward(host, lport, node, port) == 0:
-                    print(f"### LOCAL   http://127.0.0.1:{lport}/v1   "
-                          f"(tunnel over the SSH session; persists ~{control_persist()})")
-                    if local_route:
-                        rurl, rnote = route_url(local_route, lport)
-                        print(f"### ROUTE   {rurl}   (browser UI: {rurl[:-2]})")
-                        if rnote:
-                            print(f"###   {rnote}")
-                    elif not share:
-                        print(f"###   browser: open http://127.0.0.1:{lport}/   "
-                              f"(llama.cpp serves a web UI there; vLLM exposes only /v1)")
-                    if share and not config.get_bool("share.enabled"):
-                        # team sharing turned off (e.g. relay client not yet
-                        # installed/approved): a deliberate state, not a failure —
-                        # keep the local tunnel and say so calmly.
-                        rurl, _ = route_url(share, lport)
-                        print(f"### ROUTE   {rurl}   (team sharing disabled; local tunnel only — "
-                              f"enable with BOXY_SHARE_ENABLED=1)")
-                    elif share:
-                        try:
-                            from boxy.exposers import get_exposer
-                            surl, snote = get_exposer(exposer_name).expose(share, lport)
-                            print(f"### SHARE   {surl}   (browser UI: {surl[:-2]})")
-                            if snote:
-                                print(f"###   {snote}")
-                        except Exception as e:  # the tunnel must never die because the share failed
-                            rurl, _ = route_url(share, lport)
-                            if share_auto:
-                                # auto-share is opportunistic — a missing relay is
-                                # not an error; keep the local tunnel and say so softly.
-                                print(f"### ROUTE   {rurl}   (no team relay reachable — local tunnel "
-                                      f"only; `boxy generate relay` to set one up, or BOXY_AUTO_SHARE=false)")
-                            else:
-                                print(f"warning: share failed — {e}", file=sys.stderr)
-                                print(f"### ROUTE   {rurl}   (local-only fallback)")
-                    print(f"###   close: ssh -O cancel -L {lport}:{node}:{port} "
-                          f"-o ControlPath={control_path()} {host}")
+                    _announce_tunnel(lport, node, port, host, local_route, share, exposer_name, share_auto)
                 else:
                     print(f"warning: could not forward local port {lport} (in use?) — "
                           f"tunnel manually: ssh -L {lport}:{node}:{port} {host}", file=sys.stderr)
+                continue
+            wm = WAITING_RE.search(line)
+            if wm and (wm.group(1), int(wm.group(2))) not in tunneled:
+                # the remote named the endpoint but is NOT ready yet and may loop
+                # "still waiting" forever (its own probe blocked) — take readiness
+                # over ourselves from the laptop.
+                node, port = wm.group(1), int(wm.group(2))
+                tunneled.add((node, port))
+                takeover_started = True
+                print(line, end="")
+                threading.Thread(
+                    target=_laptop_readiness_takeover,
+                    args=(host, node, port, log_box, local_port, local_route,
+                          share, exposer_name, share_auto, ready_evt, proc),
+                    daemon=True).start()
+                continue
+        # once WE own readiness, swallow the remote loop's repetitive spam
+        if takeover_started and STILLWAIT_RE.search(line):
+            continue
+        print(line, end="")
     rc = proc.wait()
+    if ready_evt.is_set():
+        return 0  # we reported READY + the tunnel/chisel; the job keeps running
     if rc != 0 and stale:
         print(f"boxy: hint: {host} rejected a command this boxy knows — the CLUSTER's boxy "
               f"install is older than yours. Update it there (git pull in the boxy checkout, "

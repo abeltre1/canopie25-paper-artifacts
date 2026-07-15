@@ -115,19 +115,29 @@ instant the server answers, so it never over-waits); raise it with
 and detach immediately. Over `--ssh` the wait is raised on the delegated command
 too, so an **older cluster boxy doesn't give up at 180 s** on a still-loading model.
 
-**Readiness is detected where the server actually runs.** The compute node polls
-its own **`http://localhost:PORT/health`** — the canonical, **unauthenticated**
-readiness endpoint for both vLLM and llama.cpp (200 the instant it can serve, no
-API key even when the model API is gated) — and flips a `ready` flag on the
-shared-FS endpoint file. The submitting boxy just watches that file, so it never
-has to reach the compute node over the network at all. Two fallbacks cover a
-compute node running an older boxy: a direct `/health` / `/v1/models` probe that
-**bypasses the corporate proxy** (routing it through `http(s)_proxy` — which boxy
-propagates for pulls — is what made it loop forever in the field), and the
-engine's own "server is up" line in the job log (`Application startup complete.`
-for vLLM, `server is listening` for llama.cpp). The moment readiness fires, boxy
-prints `### READY … /v1`, the laptop opens the SSH tunnel (`### LOCAL …`), and —
-with team sharing on — the chisel URL (`### SHARE https://…`).
+**Readiness is checked via `/health`, and the LAPTOP owns it** so an old cluster
+boxy can't stall you. The moment the cluster boxy names the compute-node endpoint
+(`server starting on cronus5 … http://cronus5:8000/…`), your laptop opens the SSH
+tunnel and confirms the server itself by polling **`http://localhost:<localport>/health`
+through that tunnel** — the canonical, **unauthenticated** readiness endpoint for
+both vLLM and llama.cpp (200 the instant it can serve, no API key even when the
+model API is gated), checked as `localhost` from your laptop where the forwarded
+port reaches the serving node. It does **not** depend on the cluster boxy's own
+probe (which the field report showed looping "still waiting" forever because its
+`http://cronus5:8000/v1/models` GET went through the corporate proxy). Fallbacks:
+the compute node also flips a `ready` flag on the shared-FS endpoint file after
+its own localhost `/health`, and boxy reads the engine's "server is up" line from
+the job log (`Application startup complete.` / `server is listening`). The instant
+readiness fires, the sequence is exactly:
+
+```
+### READY   http://127.0.0.1:<localport>/v1   (confirmed via localhost/health through the tunnel)
+### LOCAL   http://127.0.0.1:<localport>/v1   (tunnel over the SSH session)
+### SHARE   https://<name>-boxy.apps.<cluster>/v1   (chisel — team URL)
+```
+
+and the "still waiting" spam stops. This works **without updating the cluster's
+boxy** — it's all laptop-side.
 
 On a login node directly (no `--ssh`), `mywcid`/`sinfo` run locally. The
 scheduler is **not** auto-probed there (bare `boxy serve MODEL` keeps the
