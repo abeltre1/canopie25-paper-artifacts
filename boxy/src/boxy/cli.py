@@ -1366,7 +1366,15 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
                     print(f"###   server starting on {endpoint['host']} — waiting up to "
                           f"{ready_window / 60:.0f} min for readiness at {url}/v1/models "
                           f"(Ctrl-C detaches; the job keeps loading)")
-                model_id = readiness.wait_ready(url, timeout_s=3, interval_s=1)
+                # readiness = the /v1/models probe answers (proxy-bypassed) OR the
+                # engine's own "server is up" line in the log — the latter is
+                # authoritative when the probe can't reach the compute node (a
+                # corporate proxy in the env, or the port bound only inside the
+                # container / not routable from the login node). Field report:
+                # vLLM logged "Application startup complete." on cronus5 but
+                # http://cronus5:8000 was unreachable, so boxy looped forever.
+                model_id = readiness.wait_ready(url, timeout_s=3, interval_s=1,
+                                                log_path=jobs.resolve_log(name, job_id))
                 if model_id:
                     print(f"### READY  {url}/v1   (model: {model_id}, {scheduler_name} job {job_id})")
                     print(f"###   try:   curl -s {url}/v1/models")

@@ -115,6 +115,16 @@ instant the server answers, so it never over-waits); raise it with
 and detach immediately. Over `--ssh` the wait is raised on the delegated command
 too, so an **older cluster boxy doesn't give up at 180 s** on a still-loading model.
 
+**Readiness is detected two ways** so it can't hang once the server is actually
+up: (1) a direct `GET /v1/models` that **bypasses the corporate proxy** — the
+compute node is internal, and routing that probe through `http(s)_proxy` (which
+boxy propagates for pulls) is what made it loop forever in the field; (2) the
+engine's own "server is up" line in the job log (`Application startup complete.`
+for vLLM, `server is listening` for llama.cpp) — the authoritative signal when
+the endpoint isn't routable from the login node at all. The moment either fires,
+boxy prints `### READY … /v1`, the laptop opens the SSH tunnel (`### LOCAL …`),
+and — with team sharing on — the chisel URL (`### SHARE https://…`).
+
 On a login node directly (no `--ssh`), `mywcid`/`sinfo` run locally. The
 scheduler is **not** auto-probed there (bare `boxy serve MODEL` keeps the
 login-node guard, which prints a clear "add `--scheduler` / `--here`" message so
