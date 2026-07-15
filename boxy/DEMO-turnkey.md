@@ -14,17 +14,43 @@ expect, and a prove-it checklist. Every string below is copied from a real run
 
 ---
 
-## The field failure this fixes
+## Zero install on the HPC — fully agentless over `--ssh` (default)
+
+> "I've never installed it on the cluster. We should not require installing it on
+> the HPC system."
+
+`boxy serve <model> --ssh <cluster>` installs **nothing** on the HPC — no boxy,
+no Python, no RamaLama. Your laptop does everything over the one SSH session:
+
+1. detects the live scheduler + resolves the site (`mywcid` account, `sinfo`
+   partition, walltime) over SSH,
+2. renders a **self-contained `podman run` batch script** — the engine pulls the
+   model at container start (`vllm serve meta-llama/Llama-3.1-8B-Instruct`), so no
+   RamaLama on the cluster,
+3. writes + `sbatch`/`flux batch`-submits it over the same SSH master,
+4. polls the shared-FS endpoint file and confirms readiness via
+   `localhost/health` **through the tunnel**, then prints `### READY → ### LOCAL →
+   ### SHARE`.
+
+The compute node runs only `podman` + a two-line endpoint write. Nothing to
+install, ever. Use `--delegate` (or `BOXY_SSH_DELEGATE=1`) to run the cluster's
+own boxy instead — needed for `--replicas` / `--distributed` / `--box`, which the
+agentless path doesn't cover yet. A pre-staged shared-FS model path (or `--image`)
+is served as-is; an `s3://` model still needs staging first.
+
+---
+
+## The earlier field failure this also fixes
 
 > "you should have gotten the account number using `mywcid` from the HPC system
 > and placed it in the batch script to make it work. I didn't see that work."
 
-Root cause: `boxy serve … --ssh <cluster>` delegates the **whole** command to
-the *cluster's* boxy, which may predate turnkey — so `mywcid` never ran and the
-script carried no account. The fix resolves the account **laptop-side** and
-injects it as `--account` into the delegated command (a flag every boxy version
-accepts), so the cluster-built script gets the account no matter how old the
-cluster's boxy is. On the login node itself, boxy runs `mywcid` directly.
+Root cause: `boxy serve … --ssh <cluster>` used to delegate the **whole** command
+to the *cluster's* boxy, which may predate turnkey — so `mywcid` never ran and the
+script carried no account. Now the script is rendered **laptop-side** (agentless)
+with the account/partition/time already resolved over SSH, so it can't be missing.
+On the `--delegate` path, the account is still injected as `--account` so even an
+old cluster boxy gets it.
 
 ---
 

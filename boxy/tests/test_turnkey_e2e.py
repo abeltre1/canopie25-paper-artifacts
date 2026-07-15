@@ -581,3 +581,56 @@ def test_ssh_no_auto_share_when_disabled(ssh, capfd, monkeypatch):
     cap = capfd.readouterr()
     assert rc == 0
     assert "auto: share:" not in cap.out
+
+
+# ---- fully agentless over --ssh: NOTHING installed on the HPC ----------------------
+
+
+def test_ssh_agentless_default_renders_self_contained_script(ssh, capfd, monkeypatch):
+    # THE turnkey promise: `boxy serve <hf model> --ssh host` with NO boxy on the
+    # cluster. The laptop renders a self-contained podman batch script (engine
+    # pulls the model), with the site directives resolved over SSH — no delegation.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")   # production default; conftest opts the suite out
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "Agentless (no boxy on the cluster)" in cap.out
+    # the engine pulls the bare repo id at container start (no RamaLama on the cluster)
+    assert "the engine downloads it at container start" in cap.out
+    assert "serve meta-llama/Llama-3.1-8B-Instruct" in cap.out
+    assert "podman run" in cap.out
+    # site directives resolved laptop-side over SSH and baked into the script
+    assert "#SBATCH --account=fy260064" in cap.out
+    assert "#SBATCH --partition=gpu,batch" in cap.out
+    assert "#SBATCH --time=30:00" in cap.out
+    assert "sbatch --parsable" in cap.out
+    # NOT the delegated path — the cluster's boxy is never invoked
+    assert "$ boxy serve" not in cap.out
+    assert "RUN user@hops" not in ssh["ssh_log"].read_text() or "boxy serve" not in ssh["ssh_log"].read_text()
+
+
+def test_ssh_delegate_flag_forces_the_cluster_boxy(ssh, capfd, monkeypatch):
+    # --delegate opts out of agentless and runs the cluster's own boxy (the old
+    # path) — for --replicas/--distributed/--box, or a cluster that has boxy.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--delegate", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "Agentless (no boxy on the cluster)" not in cap.out
+    assert "$ boxy serve" in cap.out                       # delegated to the cluster boxy
+    assert "--delegate" not in ssh["ssh_log"].read_text()  # laptop-only flag, not forwarded
+
+
+def test_ssh_agentless_flux_bank_and_engine_pull(ssh, capfd, monkeypatch):
+    # Flux system: the agentless script uses `# flux:` directives (--bank) and the
+    # single queue, still engine-pulling the model.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "flux", "--ssh", "user@eldorado", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "Agentless (no boxy on the cluster)" in cap.out
+    assert "# flux: --bank=fy260064" in cap.out
+    assert "serve meta-llama/Llama-3.1-8B-Instruct" in cap.out

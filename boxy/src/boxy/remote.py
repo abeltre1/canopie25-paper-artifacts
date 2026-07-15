@@ -180,6 +180,8 @@ def remote_argv(raw_argv: list[str]) -> list[str]:
         if tok in ("--ssh", "--route", "--share", "--exposer"):
             skip = True
             continue
+        if tok == "--delegate":
+            continue  # laptop-side only (agentless-vs-delegate switch); old cluster boxy doesn't know it
         if tok.startswith(("--ssh=", "--route=", "--share=", "--exposer=")):
             continue
         out.append(tok)
@@ -328,6 +330,59 @@ def add_forward(host: str, local_port: int, remote_host: str, remote_port: int) 
     return subprocess.run([ssh_bin(), "-O", "forward", "-L", spec,
                            "-o", f"ControlPath={control_path()}", host],
                           capture_output=True, text=True).returncode
+
+
+def push_file(host: str, remote_path: str, content: str) -> int:
+    """Write `content` to `remote_path` on host over the LIVE master (cat >, no
+    re-auth), creating the parent dir. `remote_path` is used UNQUOTED so a leading
+    $HOME expands remote-side — pass a boxy-controlled path (a job-name slug), never
+    user free-text. Returns the ssh rc (0 = written)."""
+    proc = subprocess.run(
+        [ssh_bin(), "-o", f"ControlPath={control_path()}", host,
+         f'mkdir -p "$(dirname {remote_path})" && cat > {remote_path}'],
+        input=content.encode(), capture_output=True)
+    if proc.returncode != 0:
+        print(f"warning: could not write {remote_path} on {host}: "
+              f"{(proc.stderr or b'').decode(errors='replace')[:200]}", file=sys.stderr)
+    return proc.returncode
+
+
+def await_ready_and_tunnel(host: str, node: str, port: int, log_path: str,
+                           local_port: int | None, local_route: str, share: str,
+                           exposer_name: str, share_auto: bool, timeout_s: float = 1800.0) -> bool:
+    """Block until the served endpoint is ready, then print READY -> LOCAL -> SHARE.
+    Used by the fully-agentless --ssh serve (no boxy on the cluster): the laptop
+    opens the tunnel to the compute node's `node:port` and confirms readiness via
+    `http://127.0.0.1:<lport>/health` THROUGH it (unauthenticated; checked as
+    localhost from the laptop where the forward reaches the serving node), falling
+    back to the engine's "server is up" line in the job log grepped over the master.
+    Returns True on ready, False on timeout."""
+    import time
+
+    from boxy import readiness
+
+    lport = _pick_local_port(local_port, port)
+    if add_forward(host, lport, node, port) != 0:
+        lport = 0  # couldn't forward — fall back to log-only, user tunnels manually
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        ready = bool(lport) and readiness.probe_once(f"http://127.0.0.1:{lport}", timeout=3) is not None
+        if not ready and log_path:
+            rc, out = ssh_capture(
+                host, f"grep -Eq 'Application startup complete|server is listening|Uvicorn running on' "
+                      f"{shlex.quote(log_path)} 2>/dev/null && echo BOXY_READY || true", timeout=15)
+            ready = rc == 0 and "BOXY_READY" in out
+        if ready:
+            if lport:
+                print(f"### READY   http://127.0.0.1:{lport}/v1   "
+                      f"(confirmed via localhost:{lport}/health through the tunnel)")
+                _announce_tunnel(lport, node, port, host, local_route, share, exposer_name, share_auto)
+            else:
+                print(f"### READY   http://{node}:{port}/v1   (server is up per the job log; "
+                      f"couldn't forward a tunnel — tunnel manually: ssh -L {port}:{node}:{port} {host})")
+            return True
+        time.sleep(5)
+    return False
 
 
 def _pick_local_port(local_port: int | None, remote_port: int) -> int:

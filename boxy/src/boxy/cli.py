@@ -1107,6 +1107,211 @@ def _submission_hint(stderr: str) -> str:
     return ""
 
 
+AGENTLESS_REMOTE_SUBDIR = ".local/share/boxy/agentless"
+
+
+def _serve_agentless_ssh(args, target: str) -> int:
+    """Fully AGENTLESS serve over --ssh: NOTHING is installed on the HPC system —
+    no boxy, no Python, no RamaLama. The laptop does everything over the one ssh
+    master: detect the scheduler + resolve the site (account/partition/time),
+    render a self-contained `podman run` batch script, write + submit it, then
+    poll the shared-FS endpoint file and confirm readiness via the tunnel
+    (localhost/health). The compute node runs only podman + a bash endpoint-write.
+
+    Model: an hf:// (transport-URI) model is pulled by the ENGINE at container
+    start (`vllm serve <repo>` over the forwarded proxy); a shared-FS path is
+    mounted as-is; s3:// needs staging first."""
+    import json
+    import time
+    from dataclasses import replace as dc_replace
+
+    from boxy import cards, deploy, jobs, remote, resolve, site
+    from boxy.schedulers import get_scheduler
+
+    host = target.split("@")[-1]
+    if remote.ensure_master(target) != 0:
+        print(f"boxy: could not open an SSH session to {target} — check the host, your VPN, "
+              f"and that you completed any OTP/YubiKey prompt", file=sys.stderr)
+        return 1
+
+    # 1) scheduler — liveness-detect over the master unless pinned
+    scheduler_name = getattr(args, "scheduler", None)
+    if scheduler_name not in ("slurm", "flux"):
+        rc, avail = remote.ssh_capture(target, site.remote_scheduler_probe(), timeout=20)
+        detected, why = site.pick_scheduler(avail if rc == 0 else "", None)
+        if detected not in ("slurm", "flux"):
+            print(f"boxy: no live scheduler detected on {host} ({why}) — pass --scheduler slurm|flux",
+                  file=sys.stderr)
+            return 1
+        scheduler_name = detected
+        print(f"  auto: scheduler: {detected} (via {why} on {host})")
+    args.scheduler = scheduler_name  # pin it so _resolve_or_load doesn't trip the login-node guard
+    scheduler = get_scheduler(scheduler_name)
+
+    # 2) model card -> gpus/engine/args (all laptop-side; nothing needed on the cluster)
+    for line in cards.apply_to_args(args):
+        print(f"  auto: {line}")
+
+    # 3) box + location, accelerator/runtime PINNED so no local hardware probe runs
+    args.runtime = args.runtime or "podman"
+    try:
+        box, location, _dec = _resolve_or_load(args)
+    except UsageError as e:
+        print(f"boxy: {e}", file=sys.stderr)
+        return 2
+    accel = args.accelerator or location.accelerator or config.get_str("site.default_accelerator")
+    location = dc_replace(location, scheduler=scheduler_name, accelerator=accel,
+                          runtime=(args.runtime or "podman"))
+
+    _, name, _ = resolve.resolve_submission(args.model, scheduler_name,
+                                            name=getattr(args, "name", None), require_exists=False)
+
+    # 4) model handling: engine-pull for a transport URI, mount for a path
+    engine_pull = box.model_is_transport_uri and not box.model_is_s3
+    if engine_pull:
+        bare = box.model.split("://", 1)[1]
+        box = dc_replace(box, model=bare)
+        print(f"  auto: model: {args.model} — the engine downloads it at container start "
+              f"(no RamaLama on the cluster)")
+    box = dc_replace(box, name=name, image=(args.image or box.image))
+
+    # carry the corporate proxy (for the in-container model/image pull) and, if the
+    # laptop has it, the HF token for gated repos — INTO the container env. The
+    # token lands in the batch script on the shared FS, so the script is written
+    # mode 600 (below); prefer exporting HF_TOKEN on the cluster if that worries you.
+    extra_env = dict(remote.remote_proxy_env())
+    hf_tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if hf_tok and engine_pull:
+        extra_env["HF_TOKEN"] = hf_tok
+    if extra_env:
+        box = dc_replace(box, env={**box.env, **extra_env})
+
+    # 5) site over ssh: account (config/env, else mywcid on the cluster), partition
+    #    (sinfo/flux queue on the cluster), time (config default). Explicit flags win.
+    site_args = list(location.scheduler_args)
+    acct, awhy = site.resolve_account(getattr(args, "account", None))
+    if not acct:
+        rc, out = remote.ssh_capture(target, site.remote_account_probe(), timeout=20)
+        accts = site.parse_accounts(out) if rc == 0 else []
+        if accts:
+            acct, awhy = accts[0], f"mywcid on {host}"
+    if acct:
+        site_args.append(scheduler.site_directive("account", acct))
+        print(f"  auto: account: {acct} (via {awhy})")
+    need_gpu = _job_wants_gpu(args)
+    part = getattr(args, "partition", None)
+    if site.partition_mode(part) in ("auto", "all"):
+        rc, out = remote.ssh_capture(target, site.remote_partition_probe(scheduler_name), timeout=20)
+        value, pwhy = site.rank_remote_partitions(out, scheduler_name, need_gpu) if rc == 0 else ("", "")
+        if value:
+            part = value
+            print(f"  auto: partition: {value} (via {scheduler_name} on {host}: {pwhy})")
+    if part and site.partition_mode(part) not in ("off",):
+        if scheduler_name == "flux" and "," in part:
+            part = part.split(",")[0].strip()
+        site_args.append(scheduler.site_directive("partition", part))
+    t, twhy = site.resolve_time(getattr(args, "time", None))
+    if t:
+        site_args.append(scheduler.site_directive("time", t))
+        print(f"  auto: time: {t} (via {twhy} — the scheduler stops the job at this walltime)")
+    site_args += list(args.scheduler_args or [])
+
+    # 6) remote paths on the CLUSTER's shared $HOME (discover it — shlex.quote in the
+    #    renderer would freeze a literal $HOME, so we need the real absolute path).
+    rc, rhome = remote.ssh_capture(target, 'printf %s "$HOME"', timeout=15)
+    rhome = rhome.strip() if rc == 0 and rhome.strip() else f"/home/{target.split('@')[0]}"
+    rdir = f"{rhome}/{AGENTLESS_REMOTE_SUBDIR}/{host}"
+    script_remote = f"{rdir}/{name}.sh"
+    ep_remote = f"{rdir}/{name}.endpoint.json"
+    tok = scheduler.output_token or ""
+    log_remote = f"{rdir}/{name}{('-' + tok) if tok else ''}.log"
+
+    # 7) render the self-contained script LAPTOP-side
+    try:
+        script_text = deploy.render_agentless_script(
+            box, location, scheduler_name, name, ep_remote, log_remote, site_args,
+            proxy_prefix="", port=args.port, engine_pulls_model=engine_pull)
+    except deploy.AgentlessError as e:
+        print(f"boxy: agentless: {e}", file=sys.stderr)
+        return 2
+
+    print("### Agentless (no boxy on the cluster): a self-contained podman batch script, "
+          "submitted + polled from your laptop over SSH.")
+    print(f"### Batch script ({script_remote}):")
+    for line in script_text.rstrip().splitlines():
+        print(f"    {line}")
+    submit_cmd = shlex.join(scheduler.submit_command(script_remote))
+    print(f"### Submit Command (on {host}):\n    {submit_cmd}")
+    if args.dryrun:
+        return 0
+
+    # 8) write the script (mode 600 — it may carry HF_TOKEN) + submit, over the master
+    if remote.push_file(target, script_remote, script_text) != 0:
+        return 1
+    remote.ssh_capture(target, f"chmod 600 {shlex.quote(script_remote)}", timeout=10)
+    rc, out = remote.ssh_capture(target, f"cd {shlex.quote(rhome)} && {submit_cmd}", timeout=60)
+    if rc != 0:
+        print(f"boxy: submit failed on {host}:\n{out.strip()}", file=sys.stderr)
+        return 1
+    job_id = scheduler.parse_job_id(out)
+    print(f"### Submitted {scheduler_name} job {job_id}  ({name})")
+    jobs.write_record(name, {"name": name, "scheduler": scheduler_name, "job": job_id,
+                             "model": args.model, "submitted_from": "agentless-ssh",
+                             "target": target, "endpoint_remote": ep_remote, "log": log_remote})
+
+    # 9) poll the shared-FS endpoint file over the master; the moment it names the
+    #    compute node, hand off to the tunnel + localhost/health readiness.
+    print("### Waiting for the job to start and the server to become ready ... "
+          "(Ctrl-C detaches; the job keeps running)")
+    ready_window = (args.ready_timeout if args.ready_timeout and args.ready_timeout > 0
+                    else max(getattr(args, "ready_timeout", 0) or 0, _SCHED_READY_FLOOR))
+    deadline = time.time() + 24 * 3600
+    last_state = None
+    try:
+        while time.time() < deadline:
+            rc, st = remote.ssh_capture(target, shlex.join(scheduler.state_command(job_id)), timeout=20)
+            state = scheduler.interpret_state(st) if rc == 0 else "UNKNOWN"
+            if state != last_state:
+                print(f"###   job {job_id}: {state}", flush=True)
+                last_state = state
+            if state == "DONE":
+                print(f"boxy: job {job_id} ended before the server became ready; last log lines:",
+                      file=sys.stderr)
+                _, tail = remote.ssh_capture(target, f"tail -n 40 {shlex.quote(log_remote)} 2>/dev/null || true",
+                                             timeout=20)
+                print(tail, file=sys.stderr)
+                return 1
+            rc, epj = remote.ssh_capture(target, f"cat {shlex.quote(ep_remote)} 2>/dev/null || true", timeout=15)
+            ep = None
+            if rc == 0 and epj.strip():
+                try:
+                    ep = json.loads(epj)
+                except ValueError:
+                    ep = None
+            if ep and ep.get("host") and ep.get("port"):
+                print(f"###   server starting on {ep['host']} — confirming readiness from your laptop "
+                      f"(localhost/health through the tunnel)")
+                ok = remote.await_ready_and_tunnel(
+                    target, ep["host"], int(ep["port"]), log_remote,
+                    getattr(args, "local_port", None), getattr(args, "route", "") or "",
+                    getattr(args, "share", "") or "", getattr(args, "exposer", None) or "relay",
+                    getattr(args, "share_auto", False), timeout_s=ready_window)
+                if ok:
+                    print(f"###   stop: boxy stop {name} --ssh {target}")
+                    return 0
+                print(f"### DETACHED — {scheduler_name} job {job_id} is RUNNING but not ready within "
+                      f"{ready_window / 60:.0f} min; the SERVER IS NOT DEAD.\n"
+                      f"###   watch: ssh {target} tail -f {log_remote}\n"
+                      f"###   stop:  boxy stop {name} --ssh {target}", file=sys.stderr)
+                return 1
+            time.sleep(5)
+    except KeyboardInterrupt:
+        print(f"\n### Detached — {scheduler_name} job {job_id} keeps running on {host}.")
+        print(f"###   stop: boxy stop {name} --ssh {target}")
+        return 0
+    return 1
+
+
 def _serve_submission(args, scheduler_name: str, profile, name_override: str | None = None,
                       follow: bool = True) -> int:
     """The seamless scheduler path: generate a batch script, submit it, follow
@@ -1725,6 +1930,29 @@ def _delegate_remote(args, tunnel_ready: bool = False) -> int | None:
     target_short = target.split("@")[-1].split(".")[0]
     if target_short and target_short == socket.gethostname().split(".")[0]:
         return None
+
+    # Fully-agentless serve is the DEFAULT over --ssh — NOTHING is installed on the
+    # HPC. A batch-eligible model serve (not --foreground/--box/--here, single
+    # instance) is rendered + submitted + polled from the laptop. Opt out with
+    # --delegate / BOXY_SSH_DELEGATE=1 to run the cluster's own boxy (needed for
+    # --replicas / --distributed / --box, which the agentless path doesn't cover yet).
+    if (getattr(args, "subcommand", None) == "serve"
+            and bool(getattr(args, "model", None))
+            and not getattr(args, "foreground", False)
+            and not getattr(args, "box", None)
+            and not getattr(args, "here", False)
+            and (getattr(args, "replicas", 1) or 1) == 1
+            and getattr(args, "distributed", None) is not True
+            and not getattr(args, "delegate", False)
+            and not os.environ.get("BOXY_SSH_DELEGATE")
+            and config.get_bool("serve.agentless_ssh")):
+        share_name, share_auto = _auto_share_name(args)
+        args.share, args.share_auto = share_name, share_auto
+        if share_auto and share_name:
+            print(f"  auto: share: {share_name} (publishing a team URL once ready — no relay "
+                  f"degrades to the local tunnel; BOXY_AUTO_SHARE=false to skip)")
+        return _serve_agentless_ssh(args, target)
+
     raw_argv = _inject_remote_site(args, target, getattr(args, "_raw_argv", []))
     share_name, share_auto = _auto_share_name(args)
     if share_auto and share_name:
@@ -3304,6 +3532,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "OpenShift relay (everyone-URL, zero teammate setup); stop: boxy unshare NAME")
     p.add_argument("--exposer", choices=["relay", "hosts"], default="relay",
                    help="which pluggable exposer --share uses (default relay)")
+    p.add_argument("--delegate", action="store_true",
+                   help="with --ssh: run the CLUSTER's own boxy instead of the default fully-"
+                        "agentless flow (needs boxy installed there; also BOXY_SSH_DELEGATE=1). "
+                        "Use for --replicas/--distributed/--box, which agentless doesn't cover yet.")
     p.add_argument("--dryrun", action="store_true", help="print the command instead of executing it")
     p.add_argument("args", nargs="*", help="extra engine args (put them after --)")
     p.set_defaults(func=cmd_serve)

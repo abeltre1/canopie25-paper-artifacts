@@ -148,6 +148,11 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
             help="default Slurm partition / Flux queue. Empty => AUTO: boxy picks the "
                  "soonest-start GPU partitions from sinfo. Also accepts 'all' (every "
                  "partition), 'off' (the scheduler's own default), or a name/comma-list."),
+    Setting("serve.agentless_ssh", "BOXY_AGENTLESS_SSH", "true",
+            help="over --ssh, serve a model with NOTHING installed on the HPC (no boxy/Python/"
+                 "RamaLama): the laptop renders a self-contained podman batch script, submits + "
+                 "polls it over SSH. Set false (or --delegate / BOXY_SSH_DELEGATE=1) to run the "
+                 "cluster's own boxy instead (needed for --replicas/--distributed/--box)."),
     Setting("serve.auto_unique", "BOXY_AUTO_UNIQUE", "true",
             help="when a live instance of the same model already exists, start an "
                  "independent instance instead of blocking (turnkey). Set false to "

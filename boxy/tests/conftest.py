@@ -33,6 +33,10 @@ def _isolate_config(monkeypatch, tmp_path):
     # ditto auto-share: off by default so every --ssh serve test doesn't emit a
     # team-URL decision line / attempt a relay; the auto-share test opts back in.
     monkeypatch.setenv("BOXY_AUTO_SHARE", "false")
+    # agentless-over-ssh is the production DEFAULT, but the existing --ssh e2e
+    # tests exercise the DELEGATION path; keep that the test default and let the
+    # agentless tests opt in with BOXY_AGENTLESS_SSH=true (mirrors the opt-outs above).
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "false")
     config.reset()
     yield
     config.reset()

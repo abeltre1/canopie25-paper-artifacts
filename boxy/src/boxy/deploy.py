@@ -188,18 +188,24 @@ class AgentlessError(RuntimeError):
 
 def render_agentless_script(box: Box, location: Location, scheduler_name: str, name: str,
                             endpoint_file: str, log_file: str, site_args: list[str],
-                            proxy_prefix: str = "", port: int | None = None) -> str:
+                            proxy_prefix: str = "", port: int | None = None,
+                            engine_pulls_model: bool = False) -> str:
     """A FULLY SELF-CONTAINED batch script — no boxy/Python/RamaLama on the
     cluster. The compute node runs only `podman run` (resolved HERE) plus a
     bash endpoint-write to the shared FS; the laptop submits it and polls that
-    file. Requires the two agentless boundaries (SPEC §8c): the model must be a
-    staged shared-FS path (transport-URI pulls need RamaLama), and the
-    accelerator/image must be pinned (resolution can't run on the compute node).
+    file. The accelerator/image must be pinned (resolution can't run on the
+    compute node).
+
+    The model: normally a PRE-STAGED shared-FS path. With `engine_pulls_model`
+    (the caller has rewritten box.model to a bare repo id), the ENGINE itself
+    downloads it at container start — vLLM `vllm serve <repo>` pulls from
+    HuggingFace over the forwarded proxy — so no RamaLama on the cluster. An s3
+    model still needs staging.
 
     The container command is resolved with a scheduler='none' overlay so it is
     the plain foreground `podman run` (no srun); the REAL scheduler supplies
     only the batch directives."""
-    if box.model_is_transport_uri or box.model_is_s3:
+    if box.model_is_s3 or (box.model_is_transport_uri and not engine_pulls_model):
         raise AgentlessError(
             f"agentless needs a PRE-STAGED model on the shared filesystem, not {box.model!r} — "
             "a transport-URI/s3 pull requires RamaLama on the cluster. Stage it first "
