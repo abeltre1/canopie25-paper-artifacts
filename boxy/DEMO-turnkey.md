@@ -113,7 +113,7 @@ $ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --ssh ambelt@hops
     #!/bin/bash
     #SBATCH --job-name=boxy-llama-3.1-8b-instruct
     #SBATCH --nodes=1
-    #SBATCH --gpus-per-node=1
+    #SBATCH --gres=gpu:a100:1           <-- GRES form + type auto-detected from sinfo
     #SBATCH --partition=gpu,batch       <-- from sinfo, soonest-start, no flag typed
     #SBATCH --account=fy140001          <-- from mywcid, no flag typed
     #SBATCH --time=30:00                <-- 30-min default, no flag typed
@@ -131,12 +131,15 @@ $ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --ssh ambelt@hops
 ###   stop:  boxy stop boxy-llama-3.1-8b-instruct
 ```
 
-> **`sbatch: error: Invalid generic resource (gres) specification`?** Sites spell
-> the GPU request differently. boxy defaults to `--gpus-per-node=N`; this cluster
-> wants the portable GRES form. Fix it once on your laptop:
-> `export BOXY_GPU_DIRECTIVE=gres` (emits `--gres=gpu:N`), and if it needs a GPU
-> **type** (check `sinfo -o %G` on the cluster) `export BOXY_GPU_TYPE=a100`
-> (emits `gpu:a100:N`). Other forms: `BOXY_GPU_DIRECTIVE=gpus | none`.
+> **The GPU request form is auto-detected.** Sites spell the GPU request
+> differently and some reject `--gpus-per-node` outright (`sbatch: error: Invalid
+> generic resource (gres) specification`, field report: kahuna). Over `--ssh` boxy
+> probes `sinfo -o %G` laptop-side and picks the convention from the reported GRES:
+> a single GPU type across your partitions → typed `--gres=gpu:<type>:N`; mixed or
+> untyped → `--gres=gpu:N`; no GPU GRES reported → `--gpus-per-node=N`. You'll see
+> the choice on the `auto: gpu request:` decision line — no flag needed. To override
+> the detection, pin it: `export BOXY_GPU_DIRECTIVE=gres|gpus|gpus-per-node|none`
+> (and optionally `BOXY_GPU_TYPE=a100`).
 
 While the model loads, boxy prints a **live progress line** every ~10 s — an
 elapsed clock, the current phase (QUEUED → STARTING → PULLING IMAGE → LOADING
