@@ -555,3 +555,29 @@ def test_login_node_scheduler_from_config(cluster, capfd, monkeypatch):
     script = _the_script(cluster["jobs"])
     assert "#SBATCH --account=fy140001" in script
     assert "#SBATCH --time=30:00" in script
+
+
+# ---- --share is abstracted: a team URL is published automatically over --ssh ------
+
+
+def test_ssh_auto_share_derives_alias(ssh, capfd, monkeypatch):
+    # NO --share: a served model over --ssh auto-publishes a team URL whose alias is
+    # derived from the model's instance name (turnkey). The decision line is printed
+    # laptop-side; the delegated command is NOT changed (share is a laptop concern).
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("BOXY_AUTO_SHARE", "true")   # conftest turns it off for the suite
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    # dots are sanitized to dashes so the alias is a valid relay DNS label
+    assert "auto: share: llama-3-1-8b-instruct" in cap.out
+    assert "--share" not in ssh["ssh_log"].read_text()   # share is handled laptop-side, not delegated
+
+
+def test_ssh_no_auto_share_when_disabled(ssh, capfd, monkeypatch):
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("BOXY_AUTO_SHARE", "false")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: share:" not in cap.out

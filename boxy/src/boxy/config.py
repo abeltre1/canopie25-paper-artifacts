@@ -101,6 +101,11 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
             help="whether `--share` publishes a team URL. Set false to turn team "
                  "sharing off (e.g. until the relay client is installed/approved); "
                  "the local tunnel and --route still work."),
+    Setting("serve.auto_share", "BOXY_AUTO_SHARE", True, _as_bool,
+            help="over --ssh, auto-publish a team URL for the served model without "
+                 "typing --share (turnkey) — the alias is derived from the model's "
+                 "instance name. Best-effort: no relay => it degrades quietly to the "
+                 "local tunnel. --share <alias> pins a name; set false to opt out."),
     Setting("relay.namespace", "BOXY_RELAY_NAMESPACE", "boxy-relay",
             help="OpenShift namespace the share relay lives in."),
     Setting("relay.client_mode", "BOXY_RELAY_CLIENT_MODE", "auto",

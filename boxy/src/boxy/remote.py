@@ -255,7 +255,11 @@ def _remote_command(argv: list[str], remote_ca: str | None = None,
     is injected so the cluster boxy inherits the proxy and bakes it into the job.
     $HOME expands inside the login shell."""
     boxy_cmd = config.get("binaries.remote_command")
-    prefix = f"{ENV_ACTIVE}=1"
+    # PYTHONUNBUFFERED: the cluster boxy's stdout is a PIPE over ssh, so Python
+    # block-buffers it and the readiness/progress lines don't stream — they arrive
+    # in a lump (or only at exit). Forcing unbuffered makes progress appear live,
+    # for ANY cluster boxy version (field report: "not showing how it's progressing").
+    prefix = f"{ENV_ACTIVE}=1 PYTHONUNBUFFERED=1"
     if remote_ca:
         prefix += f" SSL_CERT_FILE={remote_ca}"
     for key, val in (proxy_env or {}).items():
@@ -316,7 +320,7 @@ def add_forward(host: str, local_port: int, remote_host: str, remote_port: int) 
 
 def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False,
                local_port: int | None = None, local_route: str = "",
-               share: str = "", exposer_name: str = "relay") -> int:
+               share: str = "", exposer_name: str = "relay", share_auto: bool = False) -> int:
     """Run the user's boxy command on `host`, streaming output live. With
     `tunnel_ready`, watch for the '### READY http://node:port' banner and
     forward that endpoint back, then print the local URL — the model is reachable
@@ -402,9 +406,15 @@ def run_remote(host: str, raw_argv: list[str], tunnel_ready: bool = False,
                             if snote:
                                 print(f"###   {snote}")
                         except Exception as e:  # the tunnel must never die because the share failed
-                            print(f"warning: share failed — {e}", file=sys.stderr)
                             rurl, _ = route_url(share, lport)
-                            print(f"### ROUTE   {rurl}   (local-only fallback)")
+                            if share_auto:
+                                # auto-share is opportunistic — a missing relay is
+                                # not an error; keep the local tunnel and say so softly.
+                                print(f"### ROUTE   {rurl}   (no team relay reachable — local tunnel "
+                                      f"only; `boxy generate relay` to set one up, or BOXY_AUTO_SHARE=false)")
+                            else:
+                                print(f"warning: share failed — {e}", file=sys.stderr)
+                                print(f"### ROUTE   {rurl}   (local-only fallback)")
                     print(f"###   close: ssh -O cancel -L {lport}:{node}:{port} "
                           f"-o ControlPath={control_path()} {host}")
                 else:

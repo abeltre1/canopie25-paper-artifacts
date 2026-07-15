@@ -30,6 +30,9 @@ def _isolate_config(monkeypatch, tmp_path):
     # ditto remote account injection (a dev box may carry sacctmgr/mywcid,
     # making --ssh serve tests nondeterministic); e2e tests opt back in.
     monkeypatch.setenv("BOXY_NO_REMOTE_ACCOUNT", "1")
+    # ditto auto-share: off by default so every --ssh serve test doesn't emit a
+    # team-URL decision line / attempt a relay; the auto-share test opts back in.
+    monkeypatch.setenv("BOXY_AUTO_SHARE", "false")
     config.reset()
     yield
     config.reset()

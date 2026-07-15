@@ -77,6 +77,12 @@ def test_remote_command_injects_ssl_cert_file():
     assert "SSL_CERT_FILE" not in remote._remote_command(["serve", "m"], None)
 
 
+def test_remote_command_is_unbuffered():
+    # the cluster boxy's stdout is a pipe over ssh -> Python block-buffers it and
+    # the readiness/progress lines don't stream. PYTHONUNBUFFERED forces live output.
+    assert "PYTHONUNBUFFERED=1" in remote._remote_command(["serve", "m"], None)
+
+
 # ---- proxy forwarding (--ssh from-anywhere) -----------------------------------
 
 

@@ -1334,7 +1334,7 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
             endpoint = jobs.read_endpoint(name)
             endpoint_seen = endpoint_seen or bool(endpoint)
             if state != last_state:
-                print(f"###   [{_fmt_elapsed(time.time() - t_start)}] job {job_id}: {state}")
+                print(f"###   [{_fmt_elapsed(time.time() - t_start)}] job {job_id}: {state}", flush=True)
                 last_state = state
                 last_note = time.time()
             elif time.time() - last_note >= 10:
@@ -1350,7 +1350,7 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
                     tail = _last_log_line(jobs.resolve_log(name, job_id), maxlen=80)
                     if tail:
                         line += f"  ›  {tail}"
-                print(f"{line}   (job {job_id})")
+                print(f"{line}   (job {job_id})", flush=True)
                 last_note = time.time()
             if endpoint:
                 url = endpoint["url"]
@@ -1683,11 +1683,43 @@ def _delegate_remote(args, tunnel_ready: bool = False) -> int | None:
     if target_short and target_short == socket.gethostname().split(".")[0]:
         return None
     raw_argv = _inject_remote_site(args, target, getattr(args, "_raw_argv", []))
+    share_name, share_auto = _auto_share_name(args)
+    if share_auto and share_name:
+        print(f"  auto: share: {share_name} (publishing a team URL — no relay degrades to the "
+              f"local tunnel; set BOXY_AUTO_SHARE=false to skip)")
     return remote.run_remote(target, raw_argv, tunnel_ready=tunnel_ready,
                              local_port=getattr(args, "local_port", None),
                              local_route=getattr(args, "route", "") or "",
-                             share=getattr(args, "share", "") or "",
+                             share=share_name, share_auto=share_auto,
                              exposer_name=getattr(args, "exposer", None) or "relay")
+
+
+def _auto_share_name(args) -> tuple[str, bool]:
+    """(share_alias, is_auto). Turnkey: over --ssh a served model auto-publishes a
+    team URL so the user need not type --share (config serve.auto_share, default
+    on). Explicit --share always wins. Skipped for a direct serve (--foreground/
+    --box) or when sharing is disabled. The alias is derived from the model's
+    instance name (sanitized for the relay hostname). Best-effort downstream: a
+    missing relay degrades to the local tunnel (run_remote catches it)."""
+    explicit = getattr(args, "share", None)
+    if explicit:
+        return explicit, False
+    if not getattr(args, "model", None) or getattr(args, "foreground", False) or getattr(args, "box", None):
+        return "", False
+    if not config.get_bool("share.enabled") or not config.get_bool("serve.auto_share"):
+        return "", False
+    base = ""
+    try:
+        from boxy import resolve
+
+        _, base, _ = resolve.resolve_submission(
+            args.model, getattr(args, "scheduler", None) or "slurm",
+            name=getattr(args, "name", None), require_exists=False)
+    except Exception:  # noqa: BLE001 — never block the serve on name resolution
+        base = ""
+    # relay hostnames are DNS labels: lowercase alnum + dashes, <= 40 chars.
+    alias = re.sub(r"[^a-z0-9-]+", "-", (base or "").removeprefix("boxy-").lower()).strip("-")[:40].strip("-")
+    return (alias, True) if alias else ("", False)
 
 
 def _argv_set_flag(argv: list[str], flag: str, value: str | None) -> list[str]:
