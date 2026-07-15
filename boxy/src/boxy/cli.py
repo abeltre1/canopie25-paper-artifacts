@@ -731,6 +731,28 @@ def _job_state(scheduler, job_id: str) -> str:
     return scheduler.interpret_state(result.stdout)
 
 
+# Minimum time to wait for a scheduler-submitted server to answer once the job
+# is RUNNING — a compute-node image pull + LLM weight-load + CUDA-graph capture
+# routinely takes 10-20 min (the old 180s default gave up mid-load). A crash
+# short-circuits this via the state==DONE check, so the floor only ever applies
+# to genuinely-slow loads; --ready-timeout / BOXY_READY_TIMEOUT raise it further.
+_SCHED_READY_FLOOR = 1200.0
+
+
+def _last_log_line(path, maxlen: int = 140) -> str:
+    """The last non-empty line of a job log, truncated — shown live during the
+    readiness wait so a long load reads as progress, not a silent spinner."""
+    try:
+        with open(path, errors="replace") as fh:
+            lines = [ln.strip() for ln in fh.read().splitlines() if ln.strip()]
+    except OSError:
+        return ""
+    if not lines:
+        return ""
+    last = lines[-1]
+    return last if len(last) <= maxlen else last[:maxlen - 1] + "…"
+
+
 def _dump_file_tail(path, tail: int = 30) -> str:
     """Print the tail of a job log file and return the captured text for
     diagnosis."""
@@ -1209,7 +1231,7 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
     print("### Waiting for the job to start and the server to become ready ... "
           "(Ctrl-C detaches; the job keeps running)")
 
-    last_state, ready_deadline = None, None
+    last_state, ready_deadline, ready_window = None, None, 0.0
     last_note = time.time()
     unknown_streak = 0
     try:
@@ -1229,15 +1251,27 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
                 last_state = state
                 last_note = time.time()
             elif time.time() - last_note > 30:
-                print(f"###   still waiting (job {job_id}: {state}); log: {expected_log}")
+                # show the tail of the job log so a long weight-load is visible
+                # progress ("Loading safetensors 40%…"), not a silent spinner.
+                progress = _last_log_line(jobs.resolve_log(name, job_id))
+                tail = f"  ›  {progress}" if progress else f"; log: {expected_log}"
+                print(f"###   still loading (job {job_id}: {state}){tail}")
                 last_note = time.time()
             endpoint = jobs.read_endpoint(name)
             if endpoint:
                 url = endpoint["url"]
                 if ready_deadline is None:
-                    ready_deadline = time.time() + args.ready_timeout
-                    print(f"###   server starting on {endpoint['host']} — "
-                          f"waiting for readiness at {url}/v1/models")
+                    # LLM weight-load + CUDA-graph capture legitimately takes many
+                    # minutes; never give up on a RUNNING job before this window
+                    # (a CRASH is caught immediately by the state==DONE check, so a
+                    # generous floor only ever waits on genuinely-slow loads).
+                    # --ready-timeout 0 (submit-and-detach) is respected as-is.
+                    ready_window = (args.ready_timeout if args.ready_timeout <= 0
+                                    else max(args.ready_timeout, _SCHED_READY_FLOOR))
+                    ready_deadline = time.time() + max(ready_window, 0.0)
+                    print(f"###   server starting on {endpoint['host']} — waiting up to "
+                          f"{ready_window / 60:.0f} min for readiness at {url}/v1/models "
+                          f"(Ctrl-C detaches; the job keeps loading)")
                 model_id = readiness.wait_ready(url, timeout_s=3, interval_s=1)
                 if model_id:
                     print(f"### READY  {url}/v1   (model: {model_id}, {scheduler_name} job {job_id})")
@@ -1246,9 +1280,12 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
                     print(f"###   stop:  boxy stop {name}")
                     return 0
                 if time.time() > ready_deadline:
-                    print(f"boxy: server not ready within {args.ready_timeout:.0f}s (job still {state}). "
-                          f"Large models load slowly — watch the log:\n  tail -f {expected_log}\n"
-                          f"  then: curl -s {url}/v1/models ; stop: boxy stop {name}", file=sys.stderr)
+                    print(f"### DETACHED — {scheduler_name} job {job_id} is still RUNNING and loading "
+                          f"(waited {ready_window / 60:.0f} min); boxy stopped watching but the SERVER IS NOT DEAD.\n"
+                          f"###   reconnect: boxy open {name}   (add --ssh <host> from your laptop)\n"
+                          f"###   watch:     tail -f {expected_log}\n"
+                          f"###   wait longer next time: --ready-timeout 1800  (or export BOXY_READY_TIMEOUT=1800)\n"
+                          f"###   stop:      boxy stop {name}", file=sys.stderr)
                     return 1
             if state == "DONE":
                 print(f"boxy: job {job_id} ended before the server became ready; last log lines:",
@@ -1710,7 +1747,7 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
         flags = cards.engine_flags(card.args) if (card and card.args) else []
         if flags:
             engine_tail = flags + engine_tail
-            print(f"  auto: engine args: {' '.join(flags)} (card '{card.label}' — placed after --)")
+            print(f"  auto: engine args: {' '.join(flags)} ({card.label} — placed after --)")
 
     if had_sep or engine_tail:
         return [*head, "--", *engine_tail]

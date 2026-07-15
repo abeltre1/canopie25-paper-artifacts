@@ -590,3 +590,14 @@ def test_boxy_logs_newest_named_and_diagnosed(jobs_dir, monkeypatch, capsys):
     rc = main(["logs", "nope"])              # helpful error
     assert rc == 2
     assert "boxy-tiny-99.log" in capsys.readouterr().err
+
+
+def test_last_log_line_shows_progress(tmp_path):
+    from boxy import cli
+    log = tmp_path / "job.log"
+    log.write_text("Starting vLLM…\n\nLoading safetensors checkpoint shards: 40% 2/5\n\n")
+    assert cli._last_log_line(log) == "Loading safetensors checkpoint shards: 40% 2/5"
+    assert cli._last_log_line(tmp_path / "missing.log") == ""
+    long = "x" * 500
+    (tmp_path / "long.log").write_text(long + "\n")
+    assert cli._last_log_line(tmp_path / "long.log").endswith("…") and len(cli._last_log_line(tmp_path / "long.log")) <= 140

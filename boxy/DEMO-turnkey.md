@@ -218,6 +218,62 @@ side (the sandbox has no real scheduler).
 
 ---
 
+## Full progression: one command → a served, team-shared model (with chisel)
+
+Add `--share <name>` to publish an **everyone-URL** through the OpenShift chisel
+relay once the model is up (teammates need nothing installed). The whole
+deployment, start to finish:
+
+```console
+$ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --scheduler flux --ssh ambelt@eldorado --share llama8b
+Enter OTP Token Value: ······
+  auto: partition: pbatch (via flux queue list on eldorado)
+  auto: account: FY140001 (via mywcid on eldorado; also: FY140252, FY260064 — placed in the batch script)
+  auto: engine args: --max-model-len 8192 (packaged card 'llama-3.1-8b-instruct' — placed after --)
+### CA      copied your site CA -> ambelt@eldorado:$HOME/.local/share/boxy/store/laptop-ca.crt  (remote SSL_CERT_FILE)
+### Remote  ambelt@eldorado  $ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --scheduler flux --account FY140001 -- --max-model-len 8192
+
+  auto: model: hf://meta-llama/Llama-3.1-8B-Instruct (transport URI — pulled via RamaLama)
+  auto: scheduler: flux (submitting a batch job — detaches once READY)
+### Submitted flux job f2c2yFbcbaAK  (boxy-llama-3.1-8b-instruct)
+### Waiting for the job to start and the server to become ready ... (Ctrl-C detaches; the job keeps running)
+###   job f2c2yFbcbaAK: RUNNING
+###   server starting on eldo1001 — waiting up to 20 min for readiness at http://eldo1001:8000/v1/models (Ctrl-C detaches; the job keeps loading)
+###   still loading (job f2c2yFbcbaAK: RUNNING)  ›  Pulling vllm/vllm-openai ... 43%
+###   still loading (job f2c2yFbcbaAK: RUNNING)  ›  Loading safetensors checkpoint shards: 2/5
+###   still loading (job f2c2yFbcbaAK: RUNNING)  ›  Capturing CUDA graph shapes: 18/35
+### READY  http://eldo1001:8000/v1   (model: meta-llama/Llama-3.1-8B-Instruct, flux job f2c2yFbcbaAK)
+###   try:   curl -s http://eldo1001:8000/v1/models
+###   stop:  boxy stop boxy-llama-3.1-8b-instruct
+### LOCAL   http://127.0.0.1:8000/v1   (tunnel over the SSH session; persists ~12h)
+### SHARE   https://llama8b-boxy.apps.eldorado.example.gov/v1   (browser UI: https://llama8b-boxy.apps.eldorado.example.gov/)
+```
+
+Three URLs, three audiences — all from that one command:
+
+| URL | Who | How |
+|---|---|---|
+| `http://eldo1001:8000/v1` | on the cluster | direct compute-node endpoint |
+| `http://127.0.0.1:8000/v1` | **you**, on your laptop | auto SSH tunnel (no setup) |
+| `https://llama8b-boxy.apps.…/v1` | **your team** | chisel relay everyone-URL (nothing installed) |
+
+```console
+# you (laptop):
+$ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"model":"meta-llama/Llama-3.1-8B-Instruct","messages":[{"role":"user","content":"hi"}]}'
+
+# a teammate (anywhere, nothing installed):
+$ curl -s https://llama8b-boxy.apps.eldorado.example.gov/v1/models
+```
+
+The chisel relay is deployed **once per cluster** (`boxy generate relay … | oc apply`,
+see `DEMO-chisel.md`); after that every `--share` just publishes. The progress
+lines (`› Loading safetensors …`) are the live tail of the job log, and boxy now
+waits up to **20 min** for the weights to load before detaching (raise it with
+`--ready-timeout 1800`), so a slow load no longer ends the command early.
+
+---
+
 ## Troubleshooting: the server crashes at startup (vLLM `KeyboardInterrupt: terminated`)
 
 If the job log ends with a vLLM `KeyboardInterrupt: terminated` cascade and a
