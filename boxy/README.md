@@ -32,15 +32,24 @@ quirks (modules, tuning, offline mode, GPU counts) are pinned once and reused.
 ## Turnkey: one command, from laptop to cluster
 
 A user with **zero SLURM/container knowledge** serves a model with one command —
-no `--gpus`, `--account`, `--partition`, `--time`, `--accelerator`:
+no `--scheduler`, `--gpus`, `--account`, `--partition`, `--time`, `--accelerator`:
 
 ```bash
-boxy serve meta-llama/Llama-3.3-70B-Instruct --scheduler slurm
+boxy serve meta-llama/Llama-3.3-70B-Instruct --ssh user@login   # from your laptop
+#   auto: scheduler: slurm (via detected on login)     <- flux/sbatch probed on the cluster; no flag
 #   auto: gpus: 4 per node (model card 'llama-3.3-70b-instruct', 80GB-class GPUs)
 #   auto: engine: vllm (model card)
 #   auto: account: fy260064 (via mywcid)
+#   auto: partition: gpu,batch (via sinfo, soonest-start)
+#   auto: time: 30:00 (default walltime — the scheduler stops the job then)
 #   ...submits a 4-GPU vLLM job, waits for READY, prints the endpoint.
 ```
+
+`--scheduler slurm|flux` still forces it explicitly. Auto-detection of the
+scheduler is on for the `--ssh`-to-a-cluster path; **on a login node directly**
+(no `--ssh`) set `BOXY_SCHEDULER=slurm|flux` (or pass `--scheduler`) to submit
+without the flag — the bare default there keeps the login-node guard, and
+`--here` serves directly on the current node.
 
 boxy fills the gaps from **cards** and **site discovery**, and still prints every
 choice (nothing is hidden, only the *work*):
@@ -96,7 +105,8 @@ account with no boxy installed there.
 | runtime | first of podman > docker > apptainer that is **actually working** (probed, not just on PATH) |
 | image | per engine+accelerator, from RamaLama's own plugin maps where possible; `--image` overrides. Every reference then resolves through `registries.py`: `--registry HOST/path` sends all images to one registry, `[location.image_mirrors]` rewrites per-registry (`"docker.io" = "registry.site.gov/dockerhub"`, `"*"` catch-all) — see RUNBOOK §0.97 |
 | port | engine default (vLLM 8000, llama.cpp 8090), advanced to the next free port when busy |
-| scheduler | **never invoked implicitly.** Inside an allocation: run direct, foreground. On a login node: refuse (see below). `--scheduler slurm\|flux` **submits a batch job**: boxy writes the sbatch/`flux batch` script (any `--slurm-*`/`--flux-*` flag passes through), the job re-runs boxy on the compute node, the endpoint arrives over the shared FS, and boxy prints READY and detaches. `--foreground` = attached srun/flux-run instead. |
+| scheduler | **auto-detected (turnkey).** Inside an allocation: run direct, foreground. On a login node (or over `--ssh`) with `flux`/`sbatch` present, boxy detects it and **submits a batch job** — no `--scheduler` needed (`BOXY_SCHEDULER`/`site.scheduler` pins it; both present ⇒ slurm; `--here` keeps a direct serve; `none` disables). `--scheduler slurm\|flux` still forces it explicitly. Either way boxy writes the sbatch/`flux batch` script (any `--slurm-*`/`--flux-*` flag passes through), the job re-runs boxy on the compute node, the endpoint arrives over the shared FS, and boxy prints READY and detaches. `--foreground` = attached srun/flux-run instead. |
+| walltime | `--time` (Slurm colon notation, e.g. `4:00:00`); default **30 min** (`site.default_time`/`BOXY_DEFAULT_TIME`), injected into every batch job. **The scheduler kills the served job at the walltime** — raise it for long sessions; set empty for the scheduler's own default. |
 
 **Registry origin policy:** boxy only pulls from an allowlist of registries —
 default `hf` (huggingface.co) and `ollama` (registry.ollama.ai). ModelScope

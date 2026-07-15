@@ -1656,14 +1656,38 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
         return raw_argv
     if not raw_argv or raw_argv[0] != "serve":
         return raw_argv
+    # Auto-detection only applies to the seamless model-submission path. A direct
+    # serve (--foreground / --box / --here) or one with no model is left untouched,
+    # so a remote host that merely HAS a scheduler isn't turned into a batch job.
     scheduler = getattr(args, "scheduler", None)
-    if scheduler not in ("slurm", "flux"):
+    eligible = bool(getattr(args, "model", None)) and not getattr(args, "foreground", False) \
+        and not getattr(args, "box", None) and not getattr(args, "here", False)
+    if scheduler not in ("slurm", "flux") and not eligible:
         return raw_argv
     from boxy import cards, remote, resolve, site
 
     # one master for every probe below (idempotent; run_remote reuses it)
     master_ok = remote.ensure_master(target) == 0
     host = target.split("@")[-1]
+
+    # --- scheduler: auto is the DEFAULT (no --scheduler). Detect it over the ssh
+    # master (flux/sbatch on the cluster) so a novice serving over --ssh types
+    # only the model name; config site.scheduler or an explicit --scheduler win.
+    # The detected value is INJECTED as --scheduler so an older cluster boxy —
+    # which can't auto-detect — still submits a batch job. None detectable (or
+    # config=none) => leave the delegated command a direct/local serve.
+    inject_scheduler = None
+    if scheduler not in ("slurm", "flux"):
+        avail = ""
+        if master_ok:
+            rc, avail = remote.ssh_capture(target, site.remote_scheduler_probe(), timeout=20)
+            avail = avail if rc == 0 else ""
+        detected, why = site.pick_scheduler(avail, None)
+        if detected in ("slurm", "flux"):
+            scheduler = inject_scheduler = detected
+            print(f"  auto: scheduler: {detected} (via {why} on {host})")
+        else:
+            return raw_argv
 
     # Split any user engine args (after `--`) off the boxy side. boxy-flag
     # injections (account/partition/unique) go on `head`; card engine args go on
@@ -1674,6 +1698,11 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
         head, user_tail, had_sep = list(raw_argv[:sep]), list(raw_argv[sep + 1:]), True
     else:
         head, user_tail, had_sep = list(raw_argv), [], False
+
+    # inject the detected scheduler so the (possibly old) cluster boxy submits a
+    # batch job rather than a direct serve.
+    if inject_scheduler:
+        head = [*head, "--scheduler", inject_scheduler]
 
     # --- partition: resolve auto/all to a concrete list over the cluster ---
     # auto is the default (no flag); `all` offers every partition; `off`/a
@@ -1717,6 +1746,16 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
         if acct:
             print(f"  auto: account: {acct} (via {why} — placed in the batch script)")
             head = [*head, "--account", acct]
+
+    # --- time: inject the config default walltime (30 min) unless --time was
+    # given, so the served job carries a walltime even against an OLD cluster
+    # boxy whose default lives laptop-side. NOTE: the scheduler KILLS the job at
+    # the walltime — raise BOXY_DEFAULT_TIME / pass --time for long sessions.
+    if not getattr(args, "time", None) and "--time" not in head:
+        t, twhy = site.resolve_time(None)
+        if t:
+            print(f"  auto: time: {t} (via {twhy} — the scheduler stops the job at this walltime)")
+            head = [*head, "--time", t]
 
     # --- auto-unique: if a job with this model's name is already LIVE on the
     # cluster, inject --unique so the cluster's boxy (even an old one that lacks
@@ -1789,6 +1828,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
             profile = Location.from_toml(args.location)
             if scheduler_name is None and profile.scheduler in ("slurm", "flux"):
                 scheduler_name = profile.scheduler
+        # Turnkey on the login node itself (no --ssh, no --location scheduler):
+        # honor an EXPLICIT config BOXY_SCHEDULER=slurm|flux so `boxy serve MODEL`
+        # submits a batch job without the flag. We deliberately do NOT probe PATH
+        # under the default 'auto' here: locally the login-node guard already
+        # gives a clear "add --scheduler / --here" message, and silently
+        # submitting on any host that merely has sbatch would surprise a direct
+        # serve. Over --ssh (where the target IS a cluster) auto-probing is on.
+        if scheduler_name is None and not getattr(args, "here", False):
+            cfg_sched = config.get_str("site.scheduler").strip().lower()
+            if cfg_sched in ("slurm", "flux"):
+                scheduler_name = cfg_sched
+                print(f"  auto: scheduler: {cfg_sched} (via config site.scheduler)")
         if scheduler_name in ("slurm", "flux"):
             # Turnkey: fill --gpus/--nodes/--engine from the model's card (or the
             # size heuristic) when the flags are absent — a novice types only the

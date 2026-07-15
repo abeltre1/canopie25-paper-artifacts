@@ -1,9 +1,12 @@
 # boxy turnkey — one command per target
 
-The turnkey promise: **you supply a model name and a scheduler; boxy fills in
-everything a job needs to be accepted** — the GPU count and engine (from the
-model card), and the charge account (from `mywcid`) placed into the batch
-script. No hand-written sbatch/flux directives, no `--account`, no TOML.
+The turnkey promise: **you supply a model name (and, over `--ssh`, a host);
+boxy fills in everything a job needs to be accepted** — the scheduler
+(auto-detected: `flux`/`sbatch` on the cluster), the GPU count and engine (from
+the model card), the charge account (from `mywcid`), a soonest-start partition
+(from `sinfo`), and a 30-minute default walltime — all placed into the batch
+script. No `--scheduler`, no hand-written sbatch/flux directives, no `--account`,
+no `--partition`, no TOML. Every abstraction has a power-user flag that wins.
 
 This runbook is the one-command story for each target, the exact output to
 expect, and a prove-it checklist. Every string below is copied from a real run
@@ -69,18 +72,25 @@ still supplies the GPU count, engine, and port.
 
 ## 2. HPC over Slurm (the headline case) — from your laptop
 
+You don't even type `--scheduler`: boxy probes the cluster and finds `sbatch`,
+so the whole command is just the model and the host.
+
 ```console
-$ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --scheduler slurm --ssh ambelt@hops
+$ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --ssh ambelt@hops
+  auto: scheduler: slurm (via detected on hops)
+  auto: partition: gpu,batch (via sinfo on hops: 2 partitions with GPUs, soonest-start)
   auto: account: fy140001 (via mywcid on hops; also: fy140252, fy260064 — placed in the batch script)
+  auto: time: 30:00 (via config site.default_time — the scheduler stops the job at this walltime)
   auto: gpus: 1 per node (packaged card 'llama-3.1-8b-instruct')
   auto: engine: vllm (packaged card 'llama-3.1-8b-instruct')
-  auto: scheduler: slurm (submitting a batch job — detaches once READY)
 ### Batch script (…/boxy-llama-3.1-8b-instruct.sh):
     #!/bin/bash
     #SBATCH --job-name=boxy-llama-3.1-8b-instruct
     #SBATCH --nodes=1
     #SBATCH --gpus-per-node=1
+    #SBATCH --partition=gpu,batch       <-- from sinfo, soonest-start, no flag typed
     #SBATCH --account=fy140001          <-- from mywcid, no flag typed
+    #SBATCH --time=30:00                <-- 30-min default, no flag typed
     #SBATCH --output=…-%j.log
     …
 ### Submitted slurm job 1786916  (boxy-llama-3.1-8b-instruct)
@@ -90,9 +100,23 @@ $ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --scheduler slurm --ssh ambel
 ###   stop:  boxy stop boxy-llama-3.1-8b-instruct
 ```
 
-On a login node directly (no `--ssh`), the line reads
-`auto: account: fy140001 (via mywcid; also: …)` — same result, `mywcid` just
-runs locally.
+On a login node directly (no `--ssh`), `mywcid`/`sinfo` run locally. The
+scheduler is **not** auto-probed there (bare `boxy serve MODEL` keeps the
+login-node guard, which prints a clear "add `--scheduler` / `--here`" message so
+an LLM is never served on a shared login node by accident) — set
+`export BOXY_SCHEDULER=slurm` once, or pass `--scheduler slurm`, to submit
+without the flag from the login node.
+
+> **Walltime caps the serve.** The 30-minute default is a *hard stop*: the
+> scheduler kills the served job at `--time`. For a longer session pass
+> `--time 4:00:00` (Slurm notation; boxy converts it to Flux FSD) or set
+> `export BOXY_DEFAULT_TIME=4:00:00`. Set `BOXY_DEFAULT_TIME=` (empty) to fall
+> back to the scheduler's own default instead.
+
+**Pin the scheduler** if a cluster has both `flux` and `sbatch` (boxy defaults
+to slurm) or to skip the probe: `--scheduler flux`, or `export
+BOXY_SCHEDULER=flux`. `--scheduler none` / `BOXY_SCHEDULER=none` keeps it a
+direct serve. `--here` serves directly on the node you're on (no submission).
 
 **Override anytime** — an explicit flag always wins, and boxy stays silent:
 
@@ -166,8 +190,13 @@ No `--proxy` flag needed; pass one only to override.
 
 ## 3. HPC over Flux — from your laptop
 
+On a Flux-only cluster you don't type `--scheduler` either — boxy finds `flux`
+on the login node and picks it (pin `--scheduler flux` / `BOXY_SCHEDULER=flux`
+only if the cluster ALSO has `sbatch`, where boxy defaults to slurm):
+
 ```console
-$ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --scheduler flux --ssh ambelt@eldorado
+$ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --ssh ambelt@eldorado
+  auto: scheduler: flux (via detected on eldorado)
   auto: account: fy140001 (via mywcid on eldorado; …)
 ### Batch script (…):
     #!/bin/bash
@@ -205,10 +234,12 @@ Run these against the real systems; each maps to an automated test here.
 | # | Command | Expect | Automated proof |
 |---|---------|--------|-----------------|
 | 0 | `boxy doctor --ssh ambelt@hops` | `account discovery: OK fy140001 …` | `test_doctor.py::test_remote_checks_report_discovered_account` |
-| 1 | `boxy serve <8B> --scheduler slurm --ssh ambelt@hops` | `auto: account: fy140001 (via mywcid on hops …)` then `#SBATCH --account=fy140001` | `test_turnkey_e2e.py::test_ssh_probes_mywcid_on_the_cluster` |
-| 2 | on hops: `boxy serve <8B> --scheduler slurm` | `#SBATCH --account=fy140001` in the submitted script | `test_turnkey_e2e.py::test_login_node_submit_writes_account_into_the_script` |
+| 1 | `boxy serve <8B> --ssh ambelt@hops` (no `--scheduler`) | `auto: scheduler: slurm (via detected on hops)`, then `#SBATCH --account=fy140001` | `test_turnkey_e2e.py::test_ssh_auto_detects_scheduler_when_flag_absent` |
+| 1b | `boxy serve <8B> --scheduler slurm --ssh ambelt@hops` | `auto: account: fy140001 (via mywcid on hops …)` then `#SBATCH --account=fy140001` | `test_turnkey_e2e.py::test_ssh_probes_mywcid_on_the_cluster` |
+| 2 | on hops: `BOXY_SCHEDULER=slurm boxy serve <8B>` (no `--scheduler`) | `auto: scheduler: slurm (via config site.scheduler)`, `#SBATCH --account=fy140001` | `test_turnkey_e2e.py::test_login_node_scheduler_from_config` |
 | 2b | `boxy serve <8B> --scheduler slurm --partition auto --ssh ambelt@hops` | `#SBATCH --partition=<idle-first list>` — starts wherever frees first | `test_turnkey_e2e.py::test_ssh_resolves_partition_auto_to_concrete_list` |
-| 3 | `boxy serve <8B> --scheduler flux --ssh ambelt@eldorado` | `# flux: --bank=fy140001`, one queue | `test_turnkey_e2e.py::test_login_node_flux_bank_and_single_queue` |
+| 2c | `boxy serve <8B> --ssh ambelt@hops` (no `--time`) | `auto: time: 30:00 …`, `#SBATCH --time=30:00` | `test_turnkey_e2e.py::test_ssh_injects_default_walltime` |
+| 3 | `boxy serve <8B> --ssh ambelt@eldorado` (Flux auto-detected) | `# flux: --bank=fy140001`, one queue | `test_turnkey_e2e.py::test_login_node_flux_bank_and_single_queue` |
 | 4 | `boxy list --ssh ambelt@hops` | the job as `RUNNING`, then its endpoint | submit/follow loop in `_serve_submission` |
 
 The account resolution and its placement in the batch script are proven

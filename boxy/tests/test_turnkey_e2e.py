@@ -393,3 +393,101 @@ def test_ssh_probes_mywcid_on_the_cluster(ssh, capfd, monkeypatch):
     ssh_log = ssh["ssh_log"].read_text()
     assert "--account fy140001" in ssh_log                # injected into the delegation
     assert "#SBATCH --account=fy140001" in cap.out        # ...and into the remote script
+
+
+# ---- scheduler is abstracted: no --scheduler needed over --ssh --------------------
+
+
+def test_ssh_auto_detects_scheduler_when_flag_absent(ssh, capfd, monkeypatch):
+    # NO --scheduler at all: boxy probes the cluster (sbatch on PATH) over the ssh
+    # master and INJECTS --scheduler slurm, so even an OLD cluster boxy submits a
+    # batch job. A novice types only the model + the host.
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--ssh", "user@hops", "--dryrun"])   # no --scheduler
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: scheduler: slurm (via detected on hops)" in cap.out
+    ssh_log = ssh["ssh_log"].read_text()
+    assert "--scheduler slurm" in ssh_log                  # injected into the delegation
+    assert "#SBATCH --account=fy260064" in cap.out         # the remote boxy built a batch job
+
+
+def test_ssh_scheduler_config_wins_over_detection(ssh, capfd, monkeypatch):
+    # config BOXY_SCHEDULER pins the scheduler without probing PATH — the decision
+    # line names the provenance so it's auditable.
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("BOXY_SCHEDULER", "slurm")
+    rc = main(["serve", MODEL, "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: scheduler: slurm (via config site.scheduler on hops)" in cap.out
+    assert "--scheduler slurm" in ssh["ssh_log"].read_text()
+
+
+def test_ssh_explicit_scheduler_not_re_injected(ssh, capfd, monkeypatch):
+    # power user pins --scheduler: no auto line, and it's not duplicated on the
+    # delegated argv.
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    # no laptop-side injection line (the delegated boxy still prints its own
+    # "auto: scheduler: slurm (submitting a batch job …)" — that's not ours)
+    assert "auto: scheduler: slurm (via" not in cap.out
+    assert ssh["ssh_log"].read_text().count("--scheduler slurm") == 1
+
+
+def test_ssh_here_stays_a_direct_serve(ssh, capfd, monkeypatch):
+    # --here is an explicit "serve directly on that node": scheduler auto-detection
+    # must NOT turn it into a batch job even though sbatch is on the host.
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    main(["serve", MODEL, "--here", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert "auto: scheduler:" not in cap.out
+    assert "--scheduler" not in ssh["ssh_log"].read_text()
+
+
+# ---- default walltime (30 min) is abstracted too ----------------------------------
+
+
+def test_ssh_injects_default_walltime(ssh, capfd, monkeypatch):
+    # NO --time: the 30-min default rides the delegated command so the served job
+    # carries a walltime even against an OLD cluster boxy (whose default is
+    # laptop-side). The decision line warns the scheduler stops the job then.
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: time: 30:00" in cap.out
+    assert "stops the job at this walltime" in cap.out
+    assert "--time 30:00" in ssh["ssh_log"].read_text()
+    assert "#SBATCH --time=30:00" in cap.out
+
+
+def test_ssh_explicit_time_wins(ssh, capfd, monkeypatch):
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--time", "2:00:00",
+               "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: time:" not in cap.out                    # not injected over an explicit flag
+    ssh_log = ssh["ssh_log"].read_text()
+    assert "--time 2:00:00" in ssh_log and "--time 30:00" not in ssh_log
+
+
+# ---- login node itself: scheduler auto-detected on PATH ---------------------------
+
+
+def test_login_node_scheduler_from_config(cluster, capfd, monkeypatch):
+    # On the login node itself, an explicit BOXY_SCHEDULER submits a batch job
+    # with NO --scheduler flag (the default 'auto' deliberately does NOT probe
+    # PATH locally — the login-node guard handles that with a clear message). The
+    # script on disk carries the mywcid account and the 30-min default walltime.
+    monkeypatch.setenv("BOXY_SCHEDULER", "slurm")
+    rc = main(["serve", MODEL])                            # no --scheduler flag
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: scheduler: slurm (via config site.scheduler)" in cap.out
+    script = _the_script(cluster["jobs"])
+    assert "#SBATCH --account=fy140001" in script
+    assert "#SBATCH --time=30:00" in script

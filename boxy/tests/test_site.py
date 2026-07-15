@@ -75,7 +75,7 @@ def _shim(tmp_path, name, body):
 @pytest.fixture
 def clean_env(monkeypatch):
     for v in ("SBATCH_ACCOUNT", "SLURM_ACCOUNT", "BOXY_ACCOUNT", "BOXY_PARTITION",
-              "BOXY_DEFAULT_TIME"):
+              "BOXY_DEFAULT_TIME", "BOXY_SCHEDULER"):
         monkeypatch.delenv(v, raising=False)
 
 
@@ -131,9 +131,14 @@ def test_account_none_when_nothing_discovers(clean_env, monkeypatch):
 
 
 def test_time_defaults(clean_env, monkeypatch):
-    assert site.resolve_time(None) == (None, "")
+    # the default walltime is 30 min (turnkey: the job always carries one, so it
+    # never blocks on a missing --time); an explicit config value overrides it.
+    assert site.resolve_time(None) == ("30:00", "config site.default_time")
     monkeypatch.setenv("BOXY_DEFAULT_TIME", "4:00:00")
     assert site.resolve_time(None)[0] == "4:00:00"
+    monkeypatch.setenv("BOXY_DEFAULT_TIME", "")   # explicit empty => scheduler's own default
+    assert site.resolve_time(None) == (None, "")
+    assert site.resolve_time("2:00:00") == ("2:00:00", "--time")   # explicit --time wins
 
 
 # ---- partition: auto is the DEFAULT (GPU-aware soonest-start) ----------------------
@@ -285,3 +290,43 @@ def test_zero_account_flag_uses_mywcid_in_batch_script(clean_env, tmp_path, monk
     assert "auto: account: fy260064 (via mywcid)" in out
     assert "#SBATCH --account=fy260064" in out            # ...reached the batch script
     assert "#SBATCH --gpus-per-node=1" in out             # 8B card -> 1 GPU (turnkey T1)
+
+
+# ---- scheduler is abstracted: auto-detect + config precedence ---------------------
+
+
+def test_pick_scheduler_explicit_flag_wins(clean_env):
+    assert site.pick_scheduler("flux\nslurm", "flux") == ("flux", "--scheduler")
+    assert site.pick_scheduler("", "slurm") == ("slurm", "--scheduler")
+
+
+def test_pick_scheduler_config_beats_detection(clean_env, monkeypatch):
+    monkeypatch.setenv("BOXY_SCHEDULER", "flux")
+    # config pins flux even though only slurm is present in `available`
+    assert site.pick_scheduler("slurm", None) == ("flux", "config site.scheduler")
+
+
+def test_pick_scheduler_config_none_disables(clean_env, monkeypatch):
+    monkeypatch.setenv("BOXY_SCHEDULER", "none")
+    assert site.pick_scheduler("slurm", None) == (None, "config site.scheduler=none")
+
+
+def test_pick_scheduler_auto_detects_sole_present(clean_env):
+    # default config is 'auto' -> detect the one that's present
+    assert site.pick_scheduler("slurm", None) == ("slurm", "detected")
+    assert site.pick_scheduler("flux", None) == ("flux", "detected")
+
+
+def test_pick_scheduler_both_present_defaults_slurm(clean_env):
+    sched, why = site.pick_scheduler("flux\nslurm", None)
+    assert sched == "slurm" and "both" in why
+
+
+def test_pick_scheduler_none_detected(clean_env):
+    assert site.pick_scheduler("", None) == (None, "no scheduler detected")
+
+
+def test_remote_scheduler_probe_is_shell_safe():
+    probe = site.remote_scheduler_probe()
+    assert "command -v flux" in probe and "command -v sbatch" in probe
+    assert probe.rstrip().endswith("true")   # never non-zero exit -> ssh_capture stays quiet

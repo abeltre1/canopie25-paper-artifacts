@@ -147,9 +147,15 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
             help="when a live instance of the same model already exists, start an "
                  "independent instance instead of blocking (turnkey). Set false to "
                  "restore the strict singleton (re-run reports 'already submitted')."),
-    Setting("site.default_time", "BOXY_DEFAULT_TIME", "",
+    Setting("site.default_time", "BOXY_DEFAULT_TIME", "30:00",
             help="default walltime when --time is absent (Slurm colon notation, e.g. "
-                 "'4:00:00'; boxy converts it to Flux FSD). Empty => scheduler default."),
+                 "'30:00' = 30 min, '4:00:00' = 4 h; boxy converts it to Flux FSD). "
+                 "NOTE: the scheduler KILLS the served job at the walltime, so raise this "
+                 "for long serving sessions. Empty => the scheduler's own default."),
+    Setting("site.scheduler", "BOXY_SCHEDULER", "auto",
+            help="scheduler for a cluster serve when --scheduler is absent: 'auto' detects "
+                 "it (flux/sbatch on the cluster over --ssh, or on PATH locally), or pin "
+                 "'slurm'/'flux'/'none'. --scheduler always wins."),
     Setting("site.default_accelerator", "BOXY_DEFAULT_ACCELERATOR", "cuda",
             help="accelerator assumed for a GPU job submitted from a GPU-less login node "
                  "(where detection sees no device). --accelerator / a --location profile win."),

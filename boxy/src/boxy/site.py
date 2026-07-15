@@ -237,27 +237,50 @@ def remote_partition_probe(scheduler_name: str) -> str:
     return shlex.join(cmd) + " 2>/dev/null || true"
 
 
+def remote_scheduler_probe() -> str:
+    """Shell one-liner run on a cluster login node (over the ssh master) that
+    prints which batch schedulers are installed there — used to auto-detect
+    `--scheduler` so a novice serving over --ssh types only the model name."""
+    return ("command -v flux   >/dev/null 2>&1 && echo flux;   "
+            "command -v sbatch >/dev/null 2>&1 && echo slurm;  true")
+
+
+def pick_scheduler(available: str, explicit: str | None = None) -> tuple[str | None, str]:
+    """(scheduler, why) from an explicit flag, config site.scheduler, or the set
+    of schedulers `available` (newline text with 'flux'/'slurm'). 'auto' (the
+    default) detects: the sole one present, else — if both — the config-preferred
+    or slurm. None when none is detectable (fall back to a direct/local serve)."""
+    if explicit in ("slurm", "flux"):
+        return explicit, "--scheduler"
+    cfg = config.get_str("site.scheduler").strip().lower()
+    if cfg in ("slurm", "flux"):
+        return cfg, "config site.scheduler"
+    if cfg == "none":
+        return None, "config site.scheduler=none"
+    found = [s for s in ("flux", "slurm") if s in (available or "").split()]
+    if len(found) == 1:
+        return found[0], "detected"
+    if len(found) == 2:
+        return "slurm", "detected (both flux+slurm — defaulting to slurm; set BOXY_SCHEDULER=flux to override)"
+    return None, "no scheduler detected"
+
+
 def remote_jobname_live_probe(scheduler_name: str, name: str) -> str:
     """Shell one-liner run on a cluster login node (over the ssh master) that
-    prints LIVE iff a scheduler job with job-name `name` is currently PENDING
-    (queued, nothing serving yet) for this user. Used to decide auto-unique
-    laptop-side over --ssh: a second serve while one is still queued gets
-    --unique injected so it never blocks on the cluster's (possibly older)
-    singleton. A RUNNING job is deliberately NOT matched — something is already
-    serving at that name, so the cluster boxy reports its endpoint instead of
-    silently duplicating a live GPU allocation (adversarial-review finding).
-    `grep -Fxq --` stops a job name beginning with '-' from being read as an
-    option."""
+    prints LIVE iff a scheduler job with job-name `name` is currently queued OR
+    running for this user. Used to decide auto-unique laptop-side over --ssh: a
+    second serve while one is live gets --unique injected, so the user is NEVER
+    forced to type --unique even against the cluster's (possibly older,
+    pre-auto-unique) boxy singleton. `grep -Fxq --` / `-n` stop a job name
+    beginning with '-' from being read as an option."""
     import shlex
 
     q = shlex.quote(name)
     if scheduler_name == "flux":
-        # --filter=pending: only queued jobs; old flux without it errors -> no
-        # LIVE -> the cluster boxy handles it (safe degrade).
-        return (f'flux jobs --filter=pending -no "{{name}}" 2>/dev/null '
-                f'| grep -Fxq -- {q} && echo LIVE || true')
-    # slurm: -t restricts to queued states; -n filters by job name server-side.
-    return (f'squeue -h -u "$USER" -n {q} -t PENDING,CONFIGURING -o %i 2>/dev/null '
+        return (f'flux jobs -no "{{name}}" 2>/dev/null | grep -Fxq -- {q} '
+                f'&& echo LIVE || true')
+    # slurm: -n filters by job name server-side; any active (pending/running) row.
+    return (f'squeue -h -u "$USER" -n {q} -o %i 2>/dev/null '
             f'| grep -q . && echo LIVE || true')
 
 
