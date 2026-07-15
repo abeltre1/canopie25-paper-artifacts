@@ -1110,6 +1110,34 @@ def _submission_hint(stderr: str) -> str:
 AGENTLESS_REMOTE_SUBDIR = ".local/share/boxy/agentless"
 
 
+def _is_gres_error(text: str) -> bool:
+    """True when a scheduler's rejection is about the GPU/GRES request line
+    ('Invalid generic resource (gres) specification' and kin) — the signal to
+    auto-retry with a different GPU request form."""
+    low = (text or "").lower()
+    return "gres" in low or "generic resource" in low
+
+
+def _gres_fallback_forms(gtype: str) -> list[tuple[str, str]]:
+    """The GPU-request forms to try, in order, when a site REJECTS the GPU line
+    ('Invalid generic resource (gres) specification' — field: kahuna). Most
+    portable first: a typed `--gres=gpu:<type>:N` when sinfo named a type (some
+    sites REQUIRE the type), then untyped `--gres=gpu:N`, then `--gpus=N`. Used to
+    auto-recover without the user setting BOXY_GPU_DIRECTIVE by hand."""
+    forms: list[tuple[str, str]] = []
+    if gtype:
+        forms.append(("gres", gtype))
+    forms.append(("gres", ""))
+    forms.append(("gpus", ""))
+    seen: set = set()
+    ordered: list[tuple[str, str]] = []
+    for f in forms:
+        if f not in seen:
+            seen.add(f)
+            ordered.append(f)
+    return ordered
+
+
 def _pick_mode(args) -> str:
     """The interactive-picker mode for this serve: --pick-account/--no-pick-account
     (a tri-state store_true/false, default None) override config site.pick_account
@@ -1273,6 +1301,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
     # GPU request form: auto-detect the site's GRES convention from sinfo over SSH
     # so a cluster that rejects --gpus-per-node (field: kahuna) gets --gres=gpu:
     # [type:]N with NO flag. Only when the form is 'auto' and the job wants GPUs.
+    detected_gtype = ""
     if (scheduler_name == "slurm" and need_gpu
             and config.get_str("site.gpu_directive").strip().lower() == "auto"):
         from boxy.schedulers import slurm as _slurm
@@ -1281,6 +1310,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
         sel = ({p.strip() for p in part.split(",")}
                if part and site.partition_mode(part) == "set" else None)
         form, gtype = site.gpu_request_from_gres(gout if grc == 0 else "", sel)
+        detected_gtype = gtype
         if form:
             _slurm.set_auto_gres(form, gtype)
             shown = f"--gres=gpu:{gtype + ':' if gtype else ''}N"
@@ -1326,16 +1356,48 @@ def _serve_agentless_ssh(args, target: str) -> int:
         return 1
     remote.ssh_capture(target, f"chmod 600 {shlex.quote(script_remote)}", timeout=10)
     rc, out = remote.ssh_capture(target, f"cd {shlex.quote(rhome)} && {submit_cmd}", timeout=60)
+
+    # AUTO-RECOVER from a rejected GPU request line: some sites reject
+    # --gpus-per-node ('Invalid generic resource (gres) specification' — field:
+    # kahuna) and want --gres=gpu:[type:]N. Instead of telling the user to set an
+    # env var and rerun, re-render with the portable forms and RESUBMIT until one
+    # is accepted. Only when the form is 'auto' (else the user pinned it on purpose).
+    if (rc != 0 and scheduler_name == "slurm" and need_gpu
+            and ("gres" in out.lower() or "generic resource" in out.lower())
+            and config.get_str("site.gpu_directive").strip().lower() == "auto"):
+        from boxy.schedulers import slurm as _slurm
+
+        for gform, gtype in _gres_fallback_forms(detected_gtype):
+            _slurm.set_auto_gres(gform, gtype)
+            try:
+                script_text = deploy.render_agentless_script(
+                    box, location, scheduler_name, name, ep_remote, log_remote, site_args,
+                    proxy_prefix="", port=args.port, engine_pulls_model=engine_pull)
+            except deploy.AgentlessError:
+                break
+            shown = (f"--gres=gpu:{gtype + ':' if gtype else ''}N" if gform == "gres"
+                     else "--gpus=N")
+            print(f"boxy: the site rejected the GPU request; retrying with {shown} ...",
+                  file=sys.stderr)
+            if remote.push_file(target, script_remote, script_text) != 0:
+                break
+            remote.ssh_capture(target, f"chmod 600 {shlex.quote(script_remote)}", timeout=10)
+            rc, out = remote.ssh_capture(target, f"cd {shlex.quote(rhome)} && {submit_cmd}", timeout=60)
+            if rc == 0:
+                print(f"### GPU request accepted as {shown} (auto-recovered).")
+                break
+
     if rc != 0:
         print(f"boxy: submit failed on {host}:\n{out.strip()}", file=sys.stderr)
         low = out.lower()
         if "gres" in low or "generic resource" in low:
-            print("boxy: hint: this site's Slurm rejected the GPU request line. Sites spell it "
-                  "differently — try the portable GRES form:\n"
-                  "        export BOXY_GPU_DIRECTIVE=gres        # emits --gres=gpu:N\n"
+            print("boxy: hint: this site's Slurm rejected every GPU request form boxy tried "
+                  "(--gpus-per-node, --gres=gpu:[type:]N, --gpus). Pin one explicitly if you "
+                  "know the site's spelling:\n"
+                  "        export BOXY_GPU_DIRECTIVE=gres        # --gres=gpu:N\n"
                   "  and, if it needs a GPU TYPE (see `sinfo -o %G` on the cluster):\n"
-                  "        export BOXY_GPU_TYPE=<a100|h100|...>  # emits gpu:<type>:N\n"
-                  "  then rerun. (Other forms: BOXY_GPU_DIRECTIVE=gpus | none.)", file=sys.stderr)
+                  "        export BOXY_GPU_TYPE=<a100|h100|...>  # gpu:<type>:N\n"
+                  "  (Other forms: BOXY_GPU_DIRECTIVE=gpus | none.)", file=sys.stderr)
         elif "account" in low or "invalid account" in low:
             print("boxy: hint: the account was rejected — pass --account <wcid> or export "
                   "BOXY_ACCOUNT.", file=sys.stderr)
@@ -1623,6 +1685,37 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
     jobs.script_path(name).write_text(script_text)
     jobs.endpoint_path(name).unlink(missing_ok=True)
     result = subprocess.run(submit, capture_output=True, text=True)
+
+    # AUTO-RECOVER from a rejected GPU request line (a site that wants
+    # --gres=gpu:[type:]N, not --gpus-per-node — field: kahuna): re-render with the
+    # portable forms and RESUBMIT until one is accepted, rather than making the
+    # user set BOXY_GPU_DIRECTIVE and rerun. Only when the form is auto (else pinned).
+    if (result.returncode != 0 and scheduler_name == "slurm" and need_gpu
+            and _is_gres_error(result.stderr + result.stdout)
+            and config.get_str("site.gpu_directive").strip().lower() == "auto"):
+        from boxy import deploy
+        from boxy.schedulers import slurm as _slurm
+
+        for gform, gtype in _gres_fallback_forms(""):
+            _slurm.set_auto_gres(gform, gtype)
+            try:
+                if getattr(args, "agentless", False):
+                    script_text = deploy.render_agentless_script(
+                        box, aloc, scheduler_name, name, str(jobs.endpoint_path(name)),
+                        output_log, site_args, proxy_prefix=_proxy_prefix(args), port=args.port)
+                else:
+                    script_text = scheduler.batch_script(inner, location, name, output_log,
+                                                         site_args, distributed=want_distributed)
+            except deploy.AgentlessError:
+                break
+            jobs.script_path(name).write_text(script_text)
+            shown = f"--gres=gpu:{gtype + ':' if gtype else ''}N" if gform == "gres" else "--gpus=N"
+            print(f"boxy: the site rejected the GPU request; retrying with {shown} ...", file=sys.stderr)
+            result = subprocess.run(submit, capture_output=True, text=True)
+            if result.returncode == 0:
+                print(f"### GPU request accepted as {shown} (auto-recovered).")
+                break
+
     if result.returncode != 0:
         err = result.stderr.strip() or result.stdout.strip()
         print(f"boxy: submission failed: {err}", file=sys.stderr)

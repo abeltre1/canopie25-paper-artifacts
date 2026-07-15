@@ -131,14 +131,20 @@ $ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --ssh ambelt@hops
 ###   stop:  boxy stop boxy-llama-3.1-8b-instruct
 ```
 
-> **The GPU request form is auto-detected.** Sites spell the GPU request
-> differently and some reject `--gpus-per-node` outright (`sbatch: error: Invalid
-> generic resource (gres) specification`, field report: kahuna). Over `--ssh` boxy
-> probes `sinfo -o %G` laptop-side and picks the convention from the reported GRES:
-> a single GPU type across your partitions → typed `--gres=gpu:<type>:N`; mixed or
-> untyped → `--gres=gpu:N`; no GPU GRES reported → `--gpus-per-node=N`. You'll see
-> the choice on the `auto: gpu request:` decision line — no flag needed. To override
-> the detection, pin it: `export BOXY_GPU_DIRECTIVE=gres|gpus|gpus-per-node|none`
+> **The GPU request form is auto-detected — and auto-recovered.** Sites spell the
+> GPU request differently and some reject `--gpus-per-node` outright (`sbatch:
+> error: Invalid generic resource (gres) specification`, field report: kahuna).
+> Two layers handle this with no flag:
+> 1. **Detect:** boxy probes `sinfo -o %G` (over `--ssh` or locally) and picks the
+>    convention from the reported GRES — a single GPU type across your partitions →
+>    typed `--gres=gpu:<type>:N`; mixed/untyped → `--gres=gpu:N`; none reported →
+>    `--gpus-per-node=N`. Shown on the `auto: gpu request:` line.
+> 2. **Recover:** if the site still rejects the GPU line at submit, boxy
+>    **re-renders with the portable `--gres=gpu:[type:]N` form and resubmits by
+>    itself** (`retrying with --gres=gpu:N … accepted (auto-recovered)`) — you do
+>    nothing. It cycles typed → untyped → `--gpus` until one is accepted.
+>
+> To pin the form and skip both, `export BOXY_GPU_DIRECTIVE=gres|gpus|gpus-per-node|none`
 > (and optionally `BOXY_GPU_TYPE=a100`).
 
 > **Choosing your WCID (charge account).** When `mywcid` lists several accounts

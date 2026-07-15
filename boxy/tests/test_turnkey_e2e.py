@@ -745,3 +745,63 @@ def test_wcid_env_bypasses_the_menu(cluster, capfd, monkeypatch):
     out = capfd.readouterr().out
     assert rc == 0
     assert "#SBATCH --account=fy260064" in out               # $WCID, no menu
+
+
+# ---- GPU request auto-recovery: a site that rejects --gpus-per-node -----------------
+
+# a picky Slurm: rejects any script asking with --gpus-per-node ('Invalid generic
+# resource (gres) specification', field: kahuna), accepts the portable --gres form.
+GRES_PICKY_SBATCH = r"""#!/bin/bash
+echo "$@" >> "$SBATCH_LOG"
+script="${!#}"
+if grep -q -- '--gpus-per-node' "$script"; then
+  echo "sbatch: error: Invalid generic resource (gres) specification" >&2
+  exit 1
+fi
+ep="${script%.sh}.endpoint.json"
+host="$(hostname)"
+printf '{"name":"x","host":"%s","port":8000,"url":"http://%s:8000","job":"12345"}\n' \
+       "$host" "$host" > "$ep"
+echo "12345"
+"""
+
+
+def test_gres_fallback_forms_order():
+    from boxy.cli import _gres_fallback_forms
+    # a known type is tried first (some sites require it), then untyped, then --gpus
+    assert _gres_fallback_forms("a100") == [("gres", "a100"), ("gres", ""), ("gpus", "")]
+    assert _gres_fallback_forms("") == [("gres", ""), ("gpus", "")]
+
+
+def test_login_node_auto_recovers_from_gres_rejection(cluster, capfd, monkeypatch):
+    # Same recovery when boxy submits ON the login node: the picky sbatch rejects
+    # --gpus-per-node, boxy re-renders with --gres=gpu:N and resubmits itself.
+    _shim(cluster["bin"], "sbatch", GRES_PICKY_SBATCH)
+    rc = main(["serve", MODEL, "--scheduler", "slurm"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "retrying with --gres=gpu:N" in cap.err
+    assert "GPU request accepted as --gres=gpu:N (auto-recovered)" in cap.out
+    script = _the_script(cluster["jobs"])
+    assert "--gres=gpu:1" in script and "--gpus-per-node" not in script
+
+
+def test_ssh_agentless_auto_recovers_from_gres_rejection(ssh, capfd, monkeypatch):
+    # THE kahuna fix: sinfo shows no gpu GRES so the first script uses
+    # --gpus-per-node, which this site rejects. boxy must re-render with the
+    # portable --gres=gpu:N and RESUBMIT on its own — no env var, no rerun.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("HOME", str(ssh["tmp"] / "home"))     # keep pushed scripts in tmp
+    (ssh["tmp"] / "home").mkdir(exist_ok=True)
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\ncat <<'EOF'\ngpu|up|2/6/0/8|(null)\nEOF\n")
+    _shim(ssh["bin"], "sbatch", GRES_PICKY_SBATCH)
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", lambda *a, **k: True)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "gpu", "--ssh", "user@hops"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "retrying with --gres=gpu:N" in cap.err
+    assert "GPU request accepted as --gres=gpu:N (auto-recovered)" in cap.out
+    # and the accepted submission really used the portable form
+    submits = ssh["sbatch_log"].read_text()
+    assert submits.count("--parsable") >= 2                   # first (rejected) + retry
