@@ -753,6 +753,89 @@ def _last_log_line(path, maxlen: int = 140) -> str:
     return last if len(last) <= maxlen else last[:maxlen - 1] + "…"
 
 
+# Ordered phase markers scanned in the job log (most-progressed match wins). Each
+# maps a regex to (phase-label, optional fraction group spec). The engines
+# (vLLM/llama.cpp) and the container runtime print these as a big model loads;
+# surfacing them turns the readiness wait into a real progress display instead of
+# a silent spinner (field request). group spec: ("pct", i) => group i is 0-100;
+# ("ratio", n, d) => groups n/d; None => no fraction (indeterminate phase).
+_PROGRESS_MARKERS: tuple[tuple[str, str, object], ...] = (
+    (r"Application startup complete|Uvicorn running on|Started server process|"
+     r"llama server listening|HTTP server listening", "server starting", None),
+    (r"Capturing CUDA graph.*?(\d+)\s*%", "capturing CUDA graphs", ("pct", 1)),
+    (r"Loading safetensors checkpoint shards:\s*(\d+)\s*%.*?(\d+)/(\d+)",
+     "loading weights", ("ratio", 2, 3)),
+    (r"Loading safetensors checkpoint shards:\s*(\d+)\s*%", "loading weights", ("pct", 1)),
+    (r"load_tensors:|llama_model_loader:\s*loaded|loading model", "loading weights", None),
+    (r"(?:Downloading|Fetching).*?(\d+)\s*%", "downloading model", ("pct", 1)),
+    (r"Copying (?:blob|config)|Pulling|Storing signatures|Writing manifest",
+     "pulling container image", None),
+    (r"Automatically detected platform|Initializing (?:an? )?LLM engine|"
+     r"vLLM API server version|Started engine", "engine init", None),
+)
+
+
+def _parse_load_progress(path, scan: int = 200) -> tuple[str, float | None]:
+    """Scan the tail of a job log and return (phase-label, fraction|None) for the
+    most-progressed recognizable marker — the readiness-wait progress signal. Pure
+    (regex over the file text); ('', None) when nothing is recognized."""
+    try:
+        with open(path, errors="replace") as fh:
+            text = "\n".join(fh.read().splitlines()[-scan:])
+    except OSError:
+        return "", None
+    best_rank, best = -1, ("", None)
+    for rank, (pat, label, spec) in enumerate(_PROGRESS_MARKERS):
+        m = None
+        for m in re.finditer(pat, text):  # last occurrence in the tail
+            pass
+        if not m:
+            continue
+        frac: float | None = None
+        try:
+            if spec and spec[0] == "pct":
+                frac = max(0.0, min(1.0, int(m.group(spec[1])) / 100.0))
+            elif spec and spec[0] == "ratio":
+                num, den = int(m.group(spec[1])), int(m.group(spec[2]))
+                frac = max(0.0, min(1.0, num / den)) if den else None
+        except (ValueError, ZeroDivisionError, IndexError):
+            frac = None
+        # a later marker in the list = a later phase; prefer it (server starting
+        # ranks 0 but is terminal-most — handled by putting it first so it wins).
+        if rank == 0:  # 'server starting' is the most-progressed signal
+            return label, frac
+        if rank > best_rank:
+            best_rank, best = rank, (label, frac)
+    return best
+
+
+def _progress_bar(frac: float | None, width: int = 14) -> str:
+    """A compact ASCII meter: `[############----]  72%`, or an indeterminate
+    `[· · · · · ]` when the fraction is unknown."""
+    if frac is None:
+        return "[· · · · · ·]"
+    frac = max(0.0, min(1.0, frac))
+    filled = round(frac * width)
+    return f"[{'#' * filled}{'-' * (width - filled)}] {frac * 100:3.0f}%"
+
+
+def _fmt_elapsed(secs: float) -> str:
+    secs = int(max(0.0, secs))
+    return f"{secs // 60:d}:{secs % 60:02d}"
+
+
+def _phase_for(state: str, endpoint_seen: bool, marker: str) -> str:
+    """Human phase for the progress line, from the scheduler job state, whether the
+    endpoint file exists yet, and any log marker."""
+    if state in ("PENDING", "CONFIGURING"):
+        return "QUEUED"
+    if marker:
+        return marker.upper()
+    if endpoint_seen:
+        return "LOADING"
+    return "STARTING"
+
+
 def _dump_file_tail(path, tail: int = 30) -> str:
     """Print the tail of a job log file and return the captured text for
     diagnosis."""
@@ -1231,9 +1314,11 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
     print("### Waiting for the job to start and the server to become ready ... "
           "(Ctrl-C detaches; the job keeps running)")
 
+    t_start = time.time()
     last_state, ready_deadline, ready_window = None, None, 0.0
     last_note = time.time()
     unknown_streak = 0
+    endpoint_seen = False
     try:
         while True:
             state = _job_state(scheduler, job_id)
@@ -1246,18 +1331,27 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
                       f"  status: boxy list    log: {expected_log}\n"
                       f"  stop:   boxy stop {name}", file=sys.stderr)
                 return 1
+            endpoint = jobs.read_endpoint(name)
+            endpoint_seen = endpoint_seen or bool(endpoint)
             if state != last_state:
-                print(f"###   job {job_id}: {state}")
+                print(f"###   [{_fmt_elapsed(time.time() - t_start)}] job {job_id}: {state}")
                 last_state = state
                 last_note = time.time()
-            elif time.time() - last_note > 30:
-                # show the tail of the job log so a long weight-load is visible
-                # progress ("Loading safetensors 40%…"), not a silent spinner.
-                progress = _last_log_line(jobs.resolve_log(name, job_id))
-                tail = f"  ›  {progress}" if progress else f"; log: {expected_log}"
-                print(f"###   still loading (job {job_id}: {state}){tail}")
+            elif time.time() - last_note >= 10:
+                # a live progress line: elapsed clock + phase + a bar parsed from
+                # the engine/container log (weight-load %, CUDA-graph capture, image
+                # pull), so a long load reads as forward motion, not a silent spinner.
+                marker, frac = _parse_load_progress(jobs.resolve_log(name, job_id))
+                phase = _phase_for(state, endpoint_seen, marker)
+                line = f"###   [{_fmt_elapsed(time.time() - t_start)}] {phase}"
+                if frac is not None:
+                    line += f"  {_progress_bar(frac)}"
+                else:
+                    tail = _last_log_line(jobs.resolve_log(name, job_id), maxlen=80)
+                    if tail:
+                        line += f"  ›  {tail}"
+                print(f"{line}   (job {job_id})")
                 last_note = time.time()
-            endpoint = jobs.read_endpoint(name)
             if endpoint:
                 url = endpoint["url"]
                 if ready_deadline is None:
@@ -1756,6 +1850,19 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
         if t:
             print(f"  auto: time: {t} (via {twhy} — the scheduler stops the job at this walltime)")
             head = [*head, "--time", t]
+
+    # --- readiness timeout: raise the delegated boxy's readiness wait so an OLD
+    # cluster boxy (whose default is only 180s) doesn't give up while a big model
+    # is still loading — the field failure "server not ready within 180s (job
+    # still RUNNING)". boxy reports READY the instant the endpoint answers, so a
+    # large ceiling never over-waits; it only stops a premature give-up. Injected
+    # unless the user set --ready-timeout (0 = submit-and-detach) themselves.
+    if not any(t == "--ready-timeout" or t.startswith("--ready-timeout=") for t in head) \
+            and getattr(args, "ready_timeout", None) != 0:
+        floor = int(_SCHED_READY_FLOOR)
+        print(f"  auto: ready-timeout: {floor // 60} min (waits for the model to finish loading; "
+              f"boxy prints READY the moment the server answers)")
+        head = [*head, "--ready-timeout", str(floor)]
 
     # --- auto-unique: if a job with this model's name is already LIVE on the
     # cluster, inject --unique so the cluster's boxy (even an old one that lacks

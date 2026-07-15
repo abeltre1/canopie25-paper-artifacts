@@ -159,7 +159,7 @@ def _fake_run(mapping):
 def test_remote_checks_flag_ghcr_403_and_missing_runtime():
     run = _fake_run({
         "podman docker apptainer": "",             # no container runtime
-        "flux resource list": "slurm-bin\nslurm-live\n",   # slurm control plane is live
+        "instance-level": "slurm-bin\nslurm-live\n",   # scheduler probe -> slurm live   # slurm control plane is live
         "nvidia-smi": "cuda\n",
         "https_proxy": "http://proxy.site.gov:80||\n",
         "ghcr.io/v2": "403",                        # the field-reported blocker
@@ -175,7 +175,7 @@ def test_remote_checks_flag_ghcr_403_and_missing_runtime():
 def test_remote_checks_healthy_cluster_all_ok():
     run = _fake_run({
         "podman docker apptainer": "podman\n",
-        "flux resource list": "slurm-bin\nslurm-live\n",   # slurm control plane is live
+        "instance-level": "slurm-bin\nslurm-live\n",   # scheduler probe -> slurm live   # slurm control plane is live
         "mywcid": "WCID: fy260064  (Genesis)\n",     # account discoverable here
         "nvidia-smi": "cuda\n",
         "https_proxy": "||\n",
@@ -192,7 +192,7 @@ def test_remote_checks_healthy_cluster_all_ok():
 def test_remote_checks_report_discovered_account():
     run = _fake_run({
         "podman docker apptainer": "podman\n",
-        "flux resource list": "slurm-bin\nslurm-live\n",   # slurm control plane is live
+        "instance-level": "slurm-bin\nslurm-live\n",   # scheduler probe -> slurm live   # slurm control plane is live
         # the real mywcid table: the account is fy140001, not the description id
         "mywcid": ("      User    Account                  Description     Parent\n"
                    "---------- ---------- ------------------------ ----------\n"

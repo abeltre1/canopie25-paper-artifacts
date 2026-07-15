@@ -95,10 +95,25 @@ $ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --ssh ambelt@hops
     …
 ### Submitted slurm job 1786916  (boxy-llama-3.1-8b-instruct)
 ### Waiting for the job to start and the server to become ready …
+###   [0:14] job 1786916: RUNNING
+###   [1:20] PULLING CONTAINER IMAGE  ›  Copying blob sha256:… 
+###   [3:05] LOADING WEIGHTS  [########------]  57%
+###   [4:40] CAPTURING CUDA GRAPHS  [############--]  86%
+###   [5:02] SERVER STARTING  ›  INFO: Application startup complete.
 ### READY  http://hops-gpu07:8000/v1   (model: …, slurm job 1786916)
 ###   tunnel: ssh -L 8000:hops-gpu07:8000 hops
 ###   stop:  boxy stop boxy-llama-3.1-8b-instruct
 ```
+
+While the model loads, boxy prints a **live progress line** every ~10 s — an
+elapsed clock, the current phase (QUEUED → STARTING → PULLING IMAGE → LOADING
+WEIGHTS → CAPTURING CUDA GRAPHS → SERVER STARTING → READY), and a bar parsed from
+the engine/container log — so a multi-minute load reads as forward motion, not a
+silent spinner. boxy waits up to ~20 min for readiness (it prints READY the
+instant the server answers, so it never over-waits); raise it with
+`--ready-timeout <sec>` / `BOXY_READY_TIMEOUT`, or `--ready-timeout 0` to submit
+and detach immediately. Over `--ssh` the wait is raised on the delegated command
+too, so an **older cluster boxy doesn't give up at 180 s** on a still-loading model.
 
 On a login node directly (no `--ssh`), `mywcid`/`sinfo` run locally. The
 scheduler is **not** auto-probed there (bare `boxy serve MODEL` keeps the
@@ -119,13 +134,19 @@ guess from which binaries exist — a Flux system often ships Slurm-compat
 "`sinfo` answers") is a lie. It probes which control plane is **live** over `--ssh`
 and applies one rule:
 
-- **A reachable Flux broker wins.** `flux resource list` / `uptime` succeeding
-  means Flux runs the machine; any slurm commands that also answer are compat
-  shims — submitting through them returns *Flux* job ids (`f2c5JAAU8BR1`) that
-  `squeue` can't track. So boxy picks **flux** and submits via `flux batch` /
-  tracks via `flux jobs`.
+- **A reachable SYSTEM Flux broker wins.** Flux runs the machine; any slurm
+  commands that also answer are compat shims — submitting through them returns
+  *Flux* job ids (`f2c5JAAU8BR1`) that `squeue` can't track. So boxy picks
+  **flux** and submits via `flux batch` / tracks via `flux jobs`. boxy reaches the
+  system instance via its well-known socket (`local:///run/flux/local`) **even
+  when a bare ssh has no `FLUX_URI`** (no profile sourced), and uses
+  `flux getattr instance-level` to tell the **system** instance (level 0,
+  authoritative) from a personal **nested** one (level ≥1, e.g. a `flux alloc`
+  under Slurm — *not* authoritative).
 - **Otherwise Slurm** — a real `slurmctld` (`scontrol ping` → "is UP") or `sinfo`
-  partitions.
+  partitions. A real slurmctld outranks a merely nested flux instance, so a Slurm
+  cluster where you happen to have a personal flux running is still detected as
+  Slurm.
 
 So `eldorado` (a Flux system whose slurm shims answer too) is correctly detected
 as **flux**. The decision line says why:

@@ -360,6 +360,27 @@ def test_pick_scheduler_real_slurmctld_is_authoritative(clean_env):
     assert sched == "slurm" and "scontrol ping" in why
 
 
+def test_pick_scheduler_nested_flux_loses_to_real_slurmctld(clean_env):
+    # adversarial-review finding: a REAL Slurm cluster where the user has a personal
+    # NESTED flux instance (flux-nested, instance-level >= 1) reachable in a fresh
+    # ssh. A nested instance is NOT the machine's scheduler — a live slurmctld wins.
+    sched, why = site.pick_scheduler("flux-bin\nflux-nested\nslurm-bin\nslurm-ctld\nslurm-live", None)
+    assert sched == "slurm"
+    assert "nested Flux" in why and "Slurm runs this machine" in why
+
+
+def test_pick_scheduler_nested_flux_only_is_used(clean_env):
+    # a personal flux instance is the only reachable scheduler (no slurm) -> use it.
+    assert site.pick_scheduler("flux-bin\nflux-nested", None) == ("flux", "detected (a Flux instance is reachable)")
+
+
+def test_pick_scheduler_system_flux_beats_slurmctld_shim(clean_env):
+    # adversarial-review finding: a Flux system whose compat layer fakes even
+    # `scontrol ping` (slurm-ctld). A live SYSTEM flux broker still wins.
+    sched, why = site.pick_scheduler("flux-bin\nflux-live\nslurm-bin\nslurm-ctld\nslurm-live", None)
+    assert sched == "flux" and "compat shims" in why
+
+
 def test_pick_scheduler_sole_live(clean_env):
     assert site.pick_scheduler("flux-bin\nflux-live", None)[0] == "flux"
     assert site.pick_scheduler("slurm-bin\nslurm-live", None)[0] == "slurm"
@@ -379,11 +400,14 @@ def test_pick_scheduler_config_still_overrides_liveness(clean_env, monkeypatch):
     assert site.pick_scheduler("flux-bin\nflux-live\nslurm-bin", None) == ("slurm", "config site.scheduler")
 
 
-def test_remote_scheduler_probe_checks_liveness_not_just_presence():
+def test_remote_scheduler_probe_probes_system_flux_socket_and_level():
     probe = site.remote_scheduler_probe()
     assert "command -v flux" in probe and "command -v sbatch" in probe
-    # liveness probes, not bare binary presence
-    assert "flux resource list" in probe and "flux-live" in probe
+    # reaches the SYSTEM flux instance even without FLUX_URI, via the well-known
+    # system socket, and distinguishes it from a nested instance by level.
+    assert "local:///run/flux/local" in probe
+    assert "instance-level" in probe
+    assert "flux-live" in probe and "flux-nested" in probe
     assert "scontrol ping" in probe and "slurm-ctld" in probe   # authoritative slurm signal
     assert "sinfo -h" in probe and "slurm-live" in probe
     assert probe.rstrip().endswith("true")   # never non-zero exit -> ssh_capture stays quiet

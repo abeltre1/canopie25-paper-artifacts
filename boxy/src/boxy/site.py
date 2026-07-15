@@ -240,31 +240,38 @@ def remote_partition_probe(scheduler_name: str) -> str:
 def remote_scheduler_probe() -> str:
     """Shell one-liner run on a cluster login node (over the ssh master) to
     auto-detect `--scheduler`. It reports which scheduler is ACTUALLY OPERATIONAL,
-    not merely installed — because a Flux system commonly ships Slurm-compat
-    binaries (`sbatch`/`sinfo`/`scontrol` wrappers that PROXY to Flux), and a
-    Slurm site may have the `flux` tool present for nested jobs. Guessing from
-    binary presence misidentifies those (field report: `eldorado`, a Flux system
-    whose `sbatch` shim returns FLUX job ids — `f2c5JAAU8BR1` — that squeue can't
-    track). Emitted tokens:
-      * flux-bin / slurm-bin — the binary is on PATH
-      * flux-live  — a Flux BROKER answers (`flux resource list`/`uptime`/size).
-                     On a login node this is the SYSTEM instance == Flux runs the
-                     machine; slurm shims here proxy to it, so Flux is authoritative.
-      * slurm-ctld — a REAL slurmctld answers `scontrol ping` ("... is UP"). This
-                     is the authoritative Slurm signal (a Flux `scontrol` shim
-                     usually can't fake a live controller).
-      * slurm-live — `sinfo` returns a partition (weaker: a good Flux compat layer
-                     can answer this too, which is why flux-live outranks it).
-    pick_scheduler() ranks flux-live first: a live Flux broker wins over slurm
-    shims. Robust across a mixed fleet with no per-cluster config."""
+    not merely installed — a Flux system commonly ships Slurm-compat `sbatch`/
+    `sinfo`/`scontrol` wrappers that PROXY to Flux (field report: `eldorado`,
+    whose `sbatch` shim returns FLUX job ids — `f2c5JAAU8BR1` — squeue can't
+    track), and a Slurm site may run a personal NESTED flux instance. Emitted
+    tokens:
+      * flux-bin / slurm-bin — the binary is on PATH.
+      * flux-live   — the SYSTEM Flux instance is reachable (`instance-level` 0).
+                      Probed via the well-known system socket FIRST
+                      (`local:///run/flux/local`) so a non-interactive ssh that
+                      lacks FLUX_URI (no profile sourced) still finds it, then via
+                      the ambient env. System Flux == Flux runs the machine, so it
+                      is authoritative over slurm compat shims.
+      * flux-nested — only a NON-system flux instance is reachable (instance-level
+                      >= 1, e.g. a personal `flux alloc` under Slurm). NOT
+                      authoritative: a real Slurm controller outranks it.
+      * slurm-ctld  — a REAL slurmctld answers `scontrol ping` ("... is UP").
+      * slurm-live  — `sinfo` returns a partition (weaker: a Flux compat layer can
+                      answer this too, so flux-live outranks it).
+    pick_scheduler() ranks a live SYSTEM Flux broker first. Robust across a mixed
+    fleet with no per-cluster config."""
     return (
-        "if command -v flux >/dev/null 2>&1; then echo flux-bin; "
-        "  { flux resource list >/dev/null 2>&1 || flux uptime >/dev/null 2>&1 "
-        "    || flux getattr size >/dev/null 2>&1; } && echo flux-live; fi; "
-        "if command -v sbatch >/dev/null 2>&1; then echo slurm-bin; "
-        "  scontrol ping 2>/dev/null | grep -qi 'is UP' && echo slurm-ctld; "
-        "  sinfo -h -o %R 2>/dev/null | grep -q . && echo slurm-live; fi; "
-        "true"
+        'if command -v flux >/dev/null 2>&1; then echo flux-bin; '
+        'for U in "local:///run/flux/local" ""; do '
+        'if [ -n "$U" ]; then FX="flux --uri $U"; else FX="flux"; fi; '
+        'L=$($FX getattr instance-level 2>/dev/null); '
+        'if [ -n "$L" ]; then { [ "$L" = 0 ] && echo flux-live || echo flux-nested; }; break; fi; '
+        'if $FX resource list >/dev/null 2>&1 || $FX uptime >/dev/null 2>&1; then echo flux-live; break; fi; '
+        'done; fi; '
+        'if command -v sbatch >/dev/null 2>&1; then echo slurm-bin; '
+        "scontrol ping 2>/dev/null | grep -qi 'is up' && echo slurm-ctld; "
+        'sinfo -h -o %R 2>/dev/null | grep -q . && echo slurm-live; fi; '
+        'true'
     )
 
 
@@ -274,17 +281,18 @@ def pick_scheduler(available: str, explicit: str | None = None) -> tuple[str | N
     remote_scheduler_probe).
 
     Ranking (explicit flag > config > evidence):
-      * flux-live present                 -> FLUX. A reachable Flux broker means
-                                             Flux runs the machine; if slurm commands
-                                             also answered they are compat shims that
-                                             proxy to Flux (submitting via them yields
-                                             Flux job ids slurm tools can't track —
-                                             the eldorado failure). Override with
-                                             --scheduler slurm / BOXY_SCHEDULER=slurm.
-      * a real slurmctld / sinfo (no flux)-> SLURM.
-      * no liveness, one binary           -> that one.
-      * no liveness, both binaries        -> slurm default, loud override note.
-      * nothing                           -> None (a direct/local serve).
+      * a live SYSTEM Flux broker (flux-live) -> FLUX. System Flux runs the machine;
+                                             any slurm commands that also answered are
+                                             compat shims that proxy to Flux (submitting
+                                             via them yields Flux job ids slurm can't
+                                             track — the eldorado failure). Override
+                                             with --scheduler slurm / BOXY_SCHEDULER=slurm.
+      * a real slurmctld / sinfo (slurm-live) -> SLURM. Outranks a merely NESTED flux
+                                             instance (a personal flux under Slurm).
+      * only a nested flux instance           -> FLUX (it's the reachable scheduler).
+      * no liveness, one binary               -> that one.
+      * no liveness, both binaries            -> slurm default, loud override note.
+      * nothing                               -> None (a direct/local serve).
     A bare `flux`/`slurm` token (no `-bin`/`-live` suffix) counts as binary-only,
     so older callers/tests that pass plain names still work."""
     if explicit in ("slurm", "flux"):
@@ -296,12 +304,13 @@ def pick_scheduler(available: str, explicit: str | None = None) -> tuple[str | N
         return None, "config site.scheduler=none"
 
     toks = set((available or "").split())
-    flux_live = "flux-live" in toks
+    flux_live = "flux-live" in toks            # SYSTEM flux == authoritative
+    flux_nested = "flux-nested" in toks        # personal/nested flux only
     slurm_live = "slurm-ctld" in toks or "slurm-live" in toks
     bins = [s for s in ("flux", "slurm") if s in toks or f"{s}-bin" in toks]
 
     if flux_live:
-        # a live Flux broker is authoritative — even if slurm commands answered.
+        # a live SYSTEM Flux broker is authoritative — even if slurm commands answered.
         if slurm_live:
             return "flux", ("detected (Flux broker is live — Flux runs this machine; slurm "
                             "commands also answered but on a Flux system those are compat shims "
@@ -310,7 +319,10 @@ def pick_scheduler(available: str, explicit: str | None = None) -> tuple[str | N
         return "flux", "detected (Flux broker is live)"
     if slurm_live:
         how = "slurmctld responded to scontrol ping" if "slurm-ctld" in toks else "sinfo listed partitions"
-        return "slurm", f"detected (Slurm is live — {how})"
+        extra = " (a personal nested Flux instance was also seen, but Slurm runs this machine)" if flux_nested else ""
+        return "slurm", f"detected (Slurm is live — {how}{extra})"
+    if flux_nested:
+        return "flux", "detected (a Flux instance is reachable)"
     if len(bins) == 1:
         return bins[0], "detected"
     if len(bins) == 2:

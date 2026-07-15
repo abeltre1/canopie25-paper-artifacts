@@ -425,8 +425,10 @@ def test_ssh_flux_system_with_slurm_shims_detects_flux(ssh, capfd, monkeypatch):
     # feeds the partition probe; `flux jobs` reports nothing live (auto-unique).
     _shim(ssh["bin"], "flux",
           "#!/bin/bash\n"
+          'if [ "$1" = "--uri" ]; then shift 2; fi\n'   # a system flux answers on the system socket
           'case "$1" in\n'
-          "  resource|uptime|getattr) exit 0 ;;\n"
+          "  getattr) echo 0 ;;\n"                       # instance-level 0 == SYSTEM instance
+          "  resource|uptime) : ;;\n"
           '  queue) echo "pbatch|true" ;;\n'
           "  jobs) : ;;\n"
           "  *) : ;;\n"
@@ -508,6 +510,33 @@ def test_ssh_explicit_time_wins(ssh, capfd, monkeypatch):
     assert "auto: time:" not in cap.out                    # not injected over an explicit flag
     ssh_log = ssh["ssh_log"].read_text()
     assert "--time 2:00:00" in ssh_log and "--time 30:00" not in ssh_log
+
+
+# ---- readiness timeout is raised so an OLD cluster boxy doesn't give up early ------
+
+
+def test_ssh_injects_ready_timeout(ssh, capfd, monkeypatch):
+    # NO --ready-timeout: boxy raises the delegated boxy's readiness wait (an old
+    # cluster boxy defaults to 180s and gives up on a still-loading model). The
+    # generous ceiling rides the delegated command; READY is still reported the
+    # instant the endpoint answers, so it never over-waits.
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: ready-timeout: 20 min" in cap.out
+    assert "--ready-timeout 1200" in ssh["ssh_log"].read_text()
+
+
+def test_ssh_explicit_ready_timeout_wins(ssh, capfd, monkeypatch):
+    # a power user pinning --ready-timeout (incl. 0 = submit-and-detach) is respected.
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ready-timeout", "0",
+               "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: ready-timeout:" not in cap.out
+    assert "--ready-timeout 1200" not in ssh["ssh_log"].read_text()
 
 
 # ---- login node itself: scheduler auto-detected on PATH ---------------------------
