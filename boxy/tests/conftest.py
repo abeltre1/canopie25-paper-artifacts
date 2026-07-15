@@ -37,6 +37,11 @@ def _isolate_config(monkeypatch, tmp_path):
     # tests exercise the DELEGATION path; keep that the test default and let the
     # agentless tests opt in with BOXY_AGENTLESS_SSH=true (mirrors the opt-outs above).
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "false")
+    # the interactive WCID picker is a TTY feature; keep it OFF for the suite so no
+    # test can block on input() and multi-account discovery keeps its silent
+    # first-pick. Picker tests opt in with BOXY_PICK_ACCOUNT=always + a fake input().
+    monkeypatch.setenv("BOXY_PICK_ACCOUNT", "never")
+    monkeypatch.delenv("WCID", raising=False)
     # the Slurm GRES auto-detect override is process-global; clear it so a value
     # set by one --ssh agentless test can't leak into the next (default 'auto').
     from boxy.schedulers import slurm as _slurm

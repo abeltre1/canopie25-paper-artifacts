@@ -60,7 +60,12 @@ choice (nothing is hidden, only the *work*):
   `--system slurm-cuda | flux-rocm | laptop-podman | cloud-aws-gpu | openshift-gpu`
   (3 per type; the cloud ones drive SkyPilot via `boxy generate sky`).
 - **site discovery** fills `--account` from `mywcid` / `$SBATCH_ACCOUNT` /
-  `sacctmgr`, plus partition/time. **Partition selection is automatic** — with
+  `sacctmgr`, plus partition/time. When `mywcid` lists **several charge accounts
+  (WCIDs)** and you didn't name one, boxy shows an **interactive picker** on a
+  terminal so you choose which the job charges to (remembered per cluster,
+  validated against the live list); bypass it with `--account`, `WCID=fy…`, or
+  `BOXY_ACCOUNT`, and it never blocks a non-terminal run (`BOXY_PICK_ACCOUNT`).
+  **Partition selection is automatic** — with
   no flag, boxy reads `sinfo`/`flux queue list` and submits to every
   **GPU-bearing** partition (idle-first), so Slurm starts the job wherever a GPU
   frees first instead of parking in one queue. Override with `--partition

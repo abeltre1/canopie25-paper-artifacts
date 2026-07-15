@@ -1,0 +1,156 @@
+"""Interactive WCID / charge-account picker.
+
+boxy discovers the accounts a user may charge to (`mywcid`, sacctmgr) in
+`site.py`; historically it silently took the FIRST. This module adds the inline
+menu: when several accounts are available and none was named, list them (with the
+project text `mywcid` prints), let the user pick, remember the choice per cluster,
+and validate it against the live list so a stale default can't charge an account
+the user has lost. Pure stdlib — a numbered prompt, no third-party TUI — and it
+NEVER blocks without a TTY, so batch scripts and CI stay safe.
+
+Selection precedence (the caller wires this up): an explicit `--account`, then
+`$WCID`, then config `site.account` — any of these BYPASS the menu entirely. Only
+when none is set and more than one account was discovered does the menu appear
+(and only on a TTY, unless `site.pick_account=always`)."""
+
+from __future__ import annotations
+
+import re
+import sys
+
+from boxy import config
+
+Row = tuple[str, str]  # (wcid, label)
+
+
+def is_interactive(mode: str | None = None) -> bool:
+    """Whether to render the menu. config site.pick_account (or the passed mode):
+    'always' forces it, 'never' disables it, 'auto' (default) shows it only when
+    both stdin and stdout are a TTY."""
+    m = (mode or config.get_str("site.pick_account") or "auto").strip().lower()
+    if m == "always":
+        return True
+    if m == "never":
+        return False
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (ValueError, AttributeError):
+        return False
+
+
+def _normalize(accounts) -> list[Row]:
+    """Accept a list of (wcid, label) rows OR bare wcid strings; return rows."""
+    rows: list[Row] = []
+    for a in accounts or []:
+        if isinstance(a, (tuple, list)):
+            rows.append((str(a[0]), str(a[1]) if len(a) > 1 and a[1] else ""))
+        else:
+            rows.append((str(a), ""))
+    return rows
+
+
+# ---- remembered per-cluster default -------------------------------------------------
+
+
+def _state_file(where: str = ""):
+    from boxy import jobs
+
+    tag = re.sub(r"[^A-Za-z0-9._-]", "_", where) if where else ""
+    return jobs._dir() / (f"last_account.{tag}" if tag else "last_account")
+
+
+def recall(where: str = "") -> str:
+    """The last account picked for this cluster/target, or '' if none/unreadable."""
+    try:
+        return _state_file(where).read_text().strip()
+    except OSError:
+        return ""
+
+
+def remember(wcid: str, where: str = "") -> None:
+    """Persist the pick as the per-cluster default (best-effort; never raises)."""
+    if not wcid:
+        return
+    try:
+        _state_file(where).write_text(wcid + "\n")
+    except OSError:
+        pass
+
+
+# ---- the menu -----------------------------------------------------------------------
+
+
+def render_menu(rows: list[Row], default: str | None = None, *, stream=None) -> None:
+    stream = stream or sys.stderr
+    print("Select a charge account (WCID):", file=stream)
+    for i, (wcid, label) in enumerate(rows, 1):
+        mark = "  [default]" if default and wcid == default else ""
+        lbl = f"  {label}" if label else ""
+        print(f"  {i}) {wcid}{lbl}{mark}", file=stream)
+
+
+def _read_choice(n: int, default_index: int | None, *, stream=None) -> int | None:
+    """A 0-based index chosen at the prompt, or None to keep the default. Bad
+    input re-prompts; EOF/Ctrl-C falls back to the default (never a traceback)."""
+    stream = stream or sys.stderr
+    hint = f" (Enter = {default_index + 1})" if default_index is not None else ""
+    prompt = f"account [1-{n}]{hint}: "
+    for _ in range(5):
+        print(prompt, end="", file=stream, flush=True)
+        try:
+            raw = input().strip()
+        except (EOFError, KeyboardInterrupt):
+            print("", file=stream)
+            return default_index
+        if not raw:
+            return default_index
+        if raw.isdigit() and 1 <= int(raw) <= n:
+            return int(raw) - 1
+        print(f"  '{raw}' is not in 1-{n}; try again.", file=stream)
+    return default_index
+
+
+# ---- the decision -------------------------------------------------------------------
+
+
+def choose_account(accounts, *, explicit: str | None = None, remembered: str | None = None,
+                   mode: str | None = None, where: str = "", source: str = "mywcid",
+                   ) -> tuple[str | None, str]:
+    """Pick a WCID. Returns (account_or_None, note). A None account means "the
+    caller keeps its existing behavior" — either because an explicit account was
+    given (bypass) or nothing was discovered (degrade to the scheduler default).
+    A non-empty note is a human decision line the caller prints as
+    `auto: account: <acct> (<note>)`. Never blocks without a TTY."""
+    rows = _normalize(accounts)
+    wcids = [w for w, _ in rows]
+
+    # an explicit --account / $WCID / config pin bypasses the menu; validate it
+    # against the live list and WARN (not fail) if it isn't there, then let the
+    # caller's normal resolution use it.
+    if explicit:
+        if wcids and explicit not in wcids:
+            print(f"warning: account {explicit!r} is not among your {source} accounts "
+                  f"({', '.join(wcids)}); submitting anyway.", file=sys.stderr)
+        return None, ""
+
+    if not rows:
+        return None, ""                                   # caller degrades/errors
+    if len(rows) == 1:
+        return wcids[0], f"only account from {source}"
+
+    default = remembered if remembered in wcids else None
+
+    if not is_interactive(mode):
+        if default:
+            return default, f"remembered default of {len(rows)} from {source}"
+        return wcids[0], (f"first of {len(rows)} from {source}; "
+                          f"use --account or export WCID to choose")
+
+    default_index = wcids.index(default) if default else None
+    render_menu(rows, default=default)
+    idx = _read_choice(len(rows), default_index)
+    if idx is None:
+        idx = default_index if default_index is not None else 0
+    pick = wcids[idx]
+    remember(pick, where)
+    return pick, f"you picked {idx + 1} of {len(rows)} from {source}"

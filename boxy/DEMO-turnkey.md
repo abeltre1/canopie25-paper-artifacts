@@ -141,6 +141,29 @@ $ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --ssh ambelt@hops
 > the detection, pin it: `export BOXY_GPU_DIRECTIVE=gres|gpus|gpus-per-node|none`
 > (and optionally `BOXY_GPU_TYPE=a100`).
 
+> **Choosing your WCID (charge account).** When `mywcid` lists several accounts
+> and you didn't pass `--account`, boxy shows an inline menu (on a terminal) so you
+> pick which one the job charges to — instead of silently taking the first:
+>
+> ```console
+> $ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --ssh ambelt@hops
+>   ...
+> Select a charge account (WCID):
+>   1) fy140001  system software and tools
+>   2) fy140252  common computing environment  [default]
+>   3) fy260064  the genesis project
+> account [1-3] (Enter = 2): 3
+>   auto: account: fy260064 (you picked 3 of 3 from mywcid on hops)
+> ```
+>
+> Your pick is remembered per cluster (hit **Enter** next time to reuse it, shown
+> as `[default]`), and validated against the live `mywcid` list so a stale default
+> can't charge an account you've lost. Bypass the menu entirely with `--account
+> fy…`, `export WCID=fy…` (handy in scripts/CI), or a pinned `BOXY_ACCOUNT`. The
+> menu never blocks a non-terminal run (batch/CI): with no TTY it auto-picks the
+> first/remembered account and prints how to choose. Force or disable it with
+> `--pick-account` / `--no-pick-account`, or `export BOXY_PICK_ACCOUNT=always|never`.
+
 While the model loads, boxy prints a **live progress line** every ~10 s — an
 elapsed clock, the current phase (QUEUED → STARTING → PULLING IMAGE → LOADING
 WEIGHTS → CAPTURING CUDA GRAPHS → SERVER STARTING → READY), and a bar parsed from

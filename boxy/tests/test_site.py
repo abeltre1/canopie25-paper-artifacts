@@ -52,6 +52,31 @@ def test_parse_accounts_real_mywcid_table():
     assert got == ["fy140001", "fy140252", "fy260064"]
 
 
+def test_parse_account_rows_keeps_labels_for_the_menu():
+    rows = site.parse_account_rows(REAL_MYWCID)
+    # same three ids in order, each paired with the project text mywcid prints
+    # (the leading numeric description-id is dropped from the label).
+    ids = [wcid for wcid, _ in rows]
+    assert ids == ["fy140001", "fy140252", "fy260064"]
+    labels = {wcid: label for wcid, label in rows}
+    assert labels["fy140001"].startswith("system software")
+    assert "135101" not in labels["fy140252"]                 # numeric desc-id stripped
+    assert "common computing environment" in labels["fy140252"]
+
+
+def test_parse_account_rows_labelled_layout():
+    # the `WCID: fy... (Project)` layout: id + parenthesized label
+    rows = site.parse_account_rows("WCID: fy260064 (Genesis Project)\n")
+    assert rows == [("fy260064", "(Genesis Project)")]
+
+
+def test_discover_account_rows_uses_the_configured_command(clean_env, tmp_path, monkeypatch):
+    _shim(tmp_path, "mywcid", "cat <<'EOF'\n" + REAL_MYWCID + "EOF\n")
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    rows = site.discover_account_rows()
+    assert [wcid for wcid, _ in rows] == ["fy140001", "fy140252", "fy260064"]
+
+
 def test_real_mywcid_first_pick_and_alternatives(clean_env, tmp_path, monkeypatch):
     shim = tmp_path / "mywcid"
     shim.write_text("#!/bin/bash\ncat <<'EOF'\n" + REAL_MYWCID + "EOF\n")
@@ -75,12 +100,22 @@ def _shim(tmp_path, name, body):
 @pytest.fixture
 def clean_env(monkeypatch):
     for v in ("SBATCH_ACCOUNT", "SLURM_ACCOUNT", "BOXY_ACCOUNT", "BOXY_PARTITION",
-              "BOXY_DEFAULT_TIME", "BOXY_SCHEDULER"):
+              "BOXY_DEFAULT_TIME", "BOXY_SCHEDULER", "WCID"):
         monkeypatch.delenv(v, raising=False)
 
 
 def test_account_flag_wins(clean_env):
     assert site.resolve_account("fy111111") == ("fy111111", "--account")
+
+
+def test_wcid_env_bypasses_discovery(clean_env, tmp_path, monkeypatch):
+    # $WCID is a session bypass: it beats mywcid/config so a scripted run charges a
+    # chosen account without the menu.
+    _shim(tmp_path, "mywcid", "echo fy260064\n")
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    monkeypatch.setenv("WCID", "fy_session")
+    acct, why = site.resolve_account(None)
+    assert acct == "fy_session" and why == "$WCID"
 
 
 def test_account_from_mywcid_shim(clean_env, tmp_path, monkeypatch):

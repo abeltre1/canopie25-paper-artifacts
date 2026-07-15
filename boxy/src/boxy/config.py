@@ -144,6 +144,12 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
     Setting("site.account_command", "BOXY_ACCOUNT_COMMAND", "mywcid",
             help="site command that prints the user's charge account(s) (Sandia: mywcid). "
                  "boxy takes the first account-looking token. Set empty to skip it."),
+    Setting("site.pick_account", "BOXY_PICK_ACCOUNT", "auto",
+            help="when several charge accounts (WCIDs) are discovered and none was named, "
+                 "show an interactive numbered menu to pick one: 'auto' (default) shows it "
+                 "only on a TTY (else auto-picks the first / remembered), 'always' forces the "
+                 "prompt, 'never' disables it (silent first-pick). --account / $WCID / "
+                 "site.account bypass the menu; --pick-account / --no-pick-account override."),
     Setting("site.partition", "BOXY_PARTITION", "",
             help="default Slurm partition / Flux queue. Empty => AUTO: boxy picks the "
                  "soonest-start GPU partitions from sinfo. Also accepts 'all' (every "

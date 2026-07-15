@@ -686,3 +686,62 @@ def test_ssh_agentless_pinned_gpu_directive_wins_over_auto(ssh, capfd, monkeypat
     assert "#SBATCH --gpus-per-node=1" in cap.out
     assert "--gres=gpu" not in cap.out
     assert "auto: gpu request:" not in cap.out              # detection skipped when pinned
+
+
+# ---- interactive WCID picker: the chosen account lands in the batch script ----------
+
+
+def test_login_node_picker_selects_account(cluster, capfd, monkeypatch):
+    # Several WCIDs from mywcid + a TTY -> the numbered menu. A pick of '2' puts
+    # the SECOND account into the batch script the scheduler actually ran.
+    monkeypatch.setenv("BOXY_PICK_ACCOUNT", "always")       # suite default is 'never'
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "2")
+    rc = main(["serve", MODEL, "--scheduler", "slurm"])     # no --account, no --dryrun
+    out = capfd.readouterr().out
+    assert rc == 0
+    script = _the_script(cluster["jobs"])
+    assert "#SBATCH --account=fy140252" in script           # the 2nd WCID, not the 1st
+    assert "#SBATCH --account=fy140001" not in script
+    assert "auto: account: fy140252 (you picked 2 of 3 from mywcid)" in out
+    assert "### READY" in out
+
+
+def test_login_node_no_prompt_when_disabled(cluster, capfd, monkeypatch):
+    # Suite default (never): multi-account discovery keeps the silent first-pick
+    # and NEVER calls input() — proves batch/CI can't block on the menu.
+    def _boom(*a, **k):
+        raise AssertionError("input() must not be called when the picker is off")
+
+    monkeypatch.setattr("builtins.input", _boom)
+    rc = main(["serve", MODEL, "--scheduler", "slurm"])     # BOXY_PICK_ACCOUNT=never (conftest)
+    assert rc == 0
+    assert "#SBATCH --account=fy140001" in _the_script(cluster["jobs"])   # first, silently
+
+
+def test_ssh_agentless_picker_selects_account(ssh, capfd, monkeypatch):
+    # Over --ssh with NO boxy on the cluster: mywcid is probed ON the cluster and
+    # the menu runs LAPTOP-side. Emptying the LOCAL account command emulates a
+    # laptop with no mywcid, so resolution falls through to the remote probe.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_PICK_ACCOUNT", "always")
+    monkeypatch.setenv("BOXY_ACCOUNT_COMMAND", "")          # laptop has no mywcid
+    monkeypatch.delenv("BOXY_ACCOUNT", raising=False)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "2")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "Agentless (no boxy on the cluster)" in cap.out
+    assert "#SBATCH --account=fy140252" in cap.out
+    assert "you picked 2 of 3 from mywcid on hops" in cap.out
+
+
+def test_wcid_env_bypasses_the_menu(cluster, capfd, monkeypatch):
+    # $WCID is a scripted bypass: it wins with no prompt even under 'always'.
+    monkeypatch.setenv("BOXY_PICK_ACCOUNT", "always")
+    monkeypatch.setenv("WCID", "fy260064")
+    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("menu shown despite $WCID")))
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--dryrun"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "#SBATCH --account=fy260064" in out               # $WCID, no menu

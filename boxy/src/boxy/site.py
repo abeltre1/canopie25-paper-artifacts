@@ -7,11 +7,15 @@ explicit flag always wins.
 
 Account probe chain (first hit wins):
   1. --account flag                          (handled by the caller; passed in)
-  2. config site.account                     (BOXY_ACCOUNT / [site].account)
-  3. site.account_command                    (default `mywcid`, Sandia's WC-ID lister)
-  4. $SBATCH_ACCOUNT / $SLURM_ACCOUNT
-  5. `sacctmgr show assoc user=$USER ...`     (single assoc auto-picks; many -> first + note)
-  6. none -> omit (the scheduler uses its own site default)
+  2. $WCID                                    (a session bypass for the picker)
+  3. config site.account                     (BOXY_ACCOUNT / [site].account)
+  4. site.account_command                    (default `mywcid`, Sandia's WC-ID lister)
+  5. $SBATCH_ACCOUNT / $SLURM_ACCOUNT
+  6. `sacctmgr show assoc user=$USER ...`     (single assoc auto-picks; many -> first + note)
+  7. none -> omit (the scheduler uses its own site default)
+
+When several accounts are discovered and none was named, the caller may show an
+interactive menu (see picker.py) instead of silently taking the first.
 
 All external commands run on the LOGIN node (where `_serve_submission` runs,
 including under --ssh), are best-effort (missing binary / timeout -> skip), and
@@ -84,6 +88,52 @@ def parse_accounts(text: str) -> list[str]:
     return prefixed if prefixed else bare
 
 
+def _row_label(line: str, m: re.Match) -> str:
+    """A short human label for one account row — the descriptive text `mywcid`
+    prints (project/title), shown beside the id in the picker menu. Takes the
+    text after the matched id, dropping a leading numeric description-id
+    (`fy140001  103732 system software` -> `system software`); falls back to
+    text before the id (labelled `WCID: fy... (Project)` layouts)."""
+    tail = re.sub(r"\s+", " ", line[m.end():]).strip()
+    tail = re.sub(r"^\d{4,}\s+", "", tail).strip()
+    if not tail:
+        tail = re.sub(r"\s+", " ", line[:m.start()]).strip(" :\t")
+    return tail[:60]
+
+
+def parse_account_rows(text: str) -> list[tuple[str, str]]:
+    """Like parse_accounts but keeps each account's row LABEL for the interactive
+    picker: [(wcid, label), ...], in order, de-duplicated. Same header-skip and
+    prefer-letter-prefixed-ids rules; bare numeric ids are the fallback ONLY when
+    no letter-prefixed token exists anywhere."""
+    prefixed: list[tuple[str, str]] = []
+    bare: list[tuple[str, str]] = []
+    seen_ci: set[str] = set()
+    for line in text.splitlines():
+        if _HEADER_RE.search(line):
+            continue
+        m = _ACCOUNT_RE.search(line)
+        if m:
+            if m.group(1).lower() not in seen_ci:
+                seen_ci.add(m.group(1).lower())
+                prefixed.append((m.group(1), _row_label(line, m)))
+            continue
+        b = _BARE_ID_RE.search(line)
+        if b and all(b.group(1) != w for w, _ in bare):
+            bare.append((b.group(1), _row_label(line, b)))
+    return prefixed if prefixed else bare
+
+
+def discover_account_rows() -> list[tuple[str, str]]:
+    """(wcid, label) rows from the configured site account command (default
+    `mywcid`), for the interactive picker. [] if the command is unset, missing,
+    or produced nothing account-looking."""
+    cmd = config.get_str("site.account_command").strip()
+    if not cmd:
+        return []
+    return parse_account_rows(_run(cmd.split()))
+
+
 def _first_output_line(text: str) -> str:
     """The first non-empty line of a probe's output, truncated — shown when
     parsing finds nothing, so the field fix is a glance, not a debug session."""
@@ -123,6 +173,9 @@ def resolve_account(explicit: str | None) -> tuple[str | None, str]:
     """(account, provenance). None means 'let the scheduler default decide'."""
     if explicit:
         return explicit, "--account"
+    wcid = os.environ.get("WCID", "").strip()
+    if wcid:
+        return wcid, "$WCID"
     cfg = config.get_str("site.account").strip()
     if cfg:
         return cfg, "config site.account"

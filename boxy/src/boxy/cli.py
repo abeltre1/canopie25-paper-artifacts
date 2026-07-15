@@ -1110,6 +1110,63 @@ def _submission_hint(stderr: str) -> str:
 AGENTLESS_REMOTE_SUBDIR = ".local/share/boxy/agentless"
 
 
+def _pick_mode(args) -> str:
+    """The interactive-picker mode for this serve: --pick-account/--no-pick-account
+    (a tri-state store_true/false, default None) override config site.pick_account
+    ('auto' | 'always' | 'never')."""
+    from boxy import config
+
+    v = getattr(args, "pick_account", None)
+    if v is True:
+        return "always"
+    if v is False:
+        return "never"
+    return (config.get_str("site.pick_account") or "auto").strip().lower()
+
+
+def _pick_account(args, where: str = "", rows=None) -> None:
+    """Resolve the charge account interactively when several are discovered and
+    none was named, setting args.account to the pick (so the rest of the pipeline
+    is unchanged) and printing the decision line. A no-op when the picker is off
+    ('never'), an account is already set, or a pin ($WCID / site.account) applies
+    — those keep boxy's existing silent resolution. `rows` may be pre-probed
+    (over --ssh); otherwise they're discovered locally from the account command."""
+    from boxy import config, picker, site
+
+    if getattr(args, "account", None) or _pick_mode(args) == "never":
+        return
+    explicit = os.environ.get("WCID", "").strip() or config.get_str("site.account").strip()
+    if rows is None:
+        rows = site.discover_account_rows()
+    pick, note = picker.choose_account(rows, explicit=explicit or None,
+                                       remembered=picker.recall(where), mode=_pick_mode(args),
+                                       where=where, source="mywcid")
+    if pick:
+        args.account = pick
+        print(f"  auto: account: {pick} ({note})")
+
+
+def _pick_remote_account(args, rows, host: str, target: str) -> tuple[str | None, str]:
+    """Choose the account from a cluster-probed (wcid, label) list for an --ssh
+    serve. Returns (account_or_None, note). Shows the interactive menu only when
+    the picker is enabled AND several accounts exist; otherwise the silent
+    first-pick with the legacy `mywcid on <host>; also: …` note, so batch/CI and
+    the delegation tests are unchanged."""
+    from boxy import picker
+
+    accounts = [w for w, _ in rows]
+    if not accounts:
+        return None, ""
+    if len(accounts) > 1 and picker.is_interactive(_pick_mode(args)):
+        pick, note = picker.choose_account(rows, remembered=picker.recall(target),
+                                           mode=_pick_mode(args), where=target,
+                                           source=f"mywcid on {host}")
+        if pick:
+            return pick, note
+    extra = f"; also: {', '.join(accounts[1:3])}" if len(accounts) > 1 else ""
+    return accounts[0], f"mywcid on {host}{extra}"
+
+
 def _serve_agentless_ssh(args, target: str) -> int:
     """Fully AGENTLESS serve over --ssh: NOTHING is installed on the HPC system —
     no boxy, no Python, no RamaLama. The laptop does everything over the one ssh
@@ -1191,10 +1248,12 @@ def _serve_agentless_ssh(args, target: str) -> int:
     site_args = list(location.scheduler_args)
     acct, awhy = site.resolve_account(getattr(args, "account", None))
     if not acct:
+        # probe mywcid on the cluster and pick laptop-side — works against an
+        # OLD/absent cluster boxy. A TTY-driven menu when several accounts and the
+        # picker is enabled; otherwise the silent first-pick (legacy behavior).
         rc, out = remote.ssh_capture(target, site.remote_account_probe(), timeout=20)
-        accts = site.parse_accounts(out) if rc == 0 else []
-        if accts:
-            acct, awhy = accts[0], f"mywcid on {host}"
+        rows = site.parse_account_rows(out) if rc == 0 else []
+        acct, awhy = _pick_remote_account(args, rows, host, target)
     if acct:
         site_args.append(scheduler.site_directive("account", acct))
         print(f"  auto: account: {acct} (via {awhy})")
@@ -1494,6 +1553,11 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
     # partitions that actually have accelerators — else it parks in a CPU
     # partition and never starts (field failure).
     need_gpu = location.resources.gpus_per_node > 0
+    # interactive WCID picker (once, on the primary submission): several accounts +
+    # no --account/pin + a TTY -> menu; sets args.account so resolve_site sees it as
+    # explicit and stays silent. A no-op under 'never' (the suite/CI default).
+    if name_override is None:
+        _pick_account(args, where="")
     site_map, site_decisions = site.resolve_site(args, scheduler_name, need_gpu=need_gpu)
     if name_override is None:
         for line in site_decisions:
@@ -2161,12 +2225,11 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
         acct, why = site.resolve_account(None)   # laptop-side config/env first
         if not acct and master_ok:
             rc, out = remote.ssh_capture(target, site.remote_account_probe(), timeout=20)
-            accounts = site.parse_accounts(out) if rc == 0 else []
-            if accounts:
-                acct = accounts[0]
-                extra = f"; also: {', '.join(accounts[1:3])}" if len(accounts) > 1 else ""
-                why = f"mywcid on {host}{extra}"
-            else:
+            rows = site.parse_account_rows(out) if rc == 0 else []
+            # pick laptop-side (a TTY menu when several + the picker is on, else the
+            # first) over the cluster-probed list; it rides the delegated command.
+            acct, why = _pick_remote_account(args, rows, host, target)
+            if not acct:
                 first = next((ln.strip()[:100] for ln in (out or "").splitlines() if ln.strip()), "")
                 detail = f" (probe answered: {first!r})" if first else ""
                 print(f"  auto: account: none discovered on {target}{detail} — the scheduler's "
@@ -3531,7 +3594,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "(every partition), or `off` (the scheduler's own default). Resolved on the "
                         "cluster over --ssh; opt a fixed default via BOXY_PARTITION.")
     p.add_argument("--account", default=None,
-                   help="account/bank for --scheduler jobs (Slurm --account, Flux --bank)")
+                   help="account/bank for --scheduler jobs (Slurm --account, Flux --bank). "
+                        "Omit to auto-discover (mywcid/sacctmgr); with several accounts and a "
+                        "TTY, boxy shows an interactive picker. $WCID also bypasses the menu.")
+    pick = p.add_mutually_exclusive_group()
+    pick.add_argument("--pick-account", dest="pick_account", action="store_true", default=None,
+                      help="force the interactive WCID picker even when auto-discovery would "
+                           "otherwise take the first account (overrides site.pick_account).")
+    pick.add_argument("--no-pick-account", dest="pick_account", action="store_false",
+                      help="never prompt; silently use the first / remembered discovered account.")
     p.add_argument("--time", default=None,
                    help="time limit for --scheduler jobs (e.g. 4:00:00)")
     p.add_argument("--scheduler-arg", action="append", default=[], dest="scheduler_args", metavar="FLAG",
