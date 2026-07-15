@@ -56,6 +56,10 @@ choice (nothing is hidden, only the *work*):
 
 - **model cards** (`boxy cards`) map a model → GPUs / engine / engine args; an
   unknown model is sized from its name (`-70B` → 4 GPUs). RamaLama picks the image.
+  Don't have a card for a model? Generate one from its HuggingFace id —
+  `boxy generate card <hf-model-id>` fetches the config, derives the engine +
+  GPU/VRAM sizing + a capped context, and writes a card into
+  `~/.config/boxy/cards/models/` so `boxy serve <id>` just works (see below).
 - **system cards** are deployment profiles per system type —
   `--system slurm-cuda | flux-rocm | laptop-podman | cloud-aws-gpu | openshift-gpu`
   (3 per type; the cloud ones drive SkyPilot via `boxy generate sky`).
@@ -376,6 +380,36 @@ boxy generate sky --box examples/boxes/vllm.toml \
 sky launch task.yaml        # batch, or:
 sky serve up task.yaml      # managed serving (SkyServe replicas + readiness probe)
 ```
+
+### Add a model in one command — `boxy generate card`
+
+Serving a model boxy doesn't ship a card for? Generate one from its HuggingFace
+id. boxy fetches the model's `config.json` + safetensors index, picks the engine
+(vLLM, or llama.cpp for GGUF repos), derives `gpus`/`min_vram_gb` from the weight
+size vs an 80GB-class GPU, caps the context at 8192, and writes a card into
+`~/.config/boxy/cards/models/` (where `boxy serve` reads it):
+
+```bash
+# preview first (writes nothing):
+boxy generate card meta-llama/Llama-3.1-8B-Instruct --dry-run
+# -> # meta-llama/Llama-3.1-8B-Instruct — 8B params, bf16 (~16GB weights): 1 80GB-class GPU.
+#    [model]
+#    match = "meta-llama/Llama-3.1-8B-Instruct*"
+#    engine = "vllm"
+#    gpus = 1
+#    min_vram_gb = 24
+#    [model.args]
+#    max_model_len = 8192
+
+boxy generate card meta-llama/Llama-3.1-8B-Instruct   # writes the card
+boxy serve hf://meta-llama/Llama-3.1-8B-Instruct       # now sized automatically
+```
+
+Gated repos (`meta-llama/*`) need `export HF_TOKEN=…` (accept the license on the
+model page first). Flags: `--engine vllm|llama.cpp` forces the backend,
+`--max-model-len N` sets the context, `--force` overwrites an existing card
+(keeps a `.bak`), `-o FILE` writes elsewhere. Existing cards are never clobbered
+silently — a terminal prompts with a diff, a script must pass `--force`.
 
 ## Going to production
 

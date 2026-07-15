@@ -2774,9 +2774,105 @@ def cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_generate_card(args: argparse.Namespace) -> int:
+    """`boxy generate card <hf-model-id>`: fetch the model from HuggingFace, derive
+    a serving card and write it where boxy reads cards from (with an overwrite
+    guard). --dry-run prints without writing; --force replaces (keeping a .bak)."""
+    import difflib
+
+    from boxy import cardgen, cards
+
+    repo = getattr(args, "model_id", None)
+    if not repo:
+        print("usage: boxy generate card <hf-model-id>   (e.g. meta-llama/Llama-3.1-8B-Instruct)",
+              file=sys.stderr)
+        return 2
+    try:
+        text, engine, warnings = cardgen.generate(
+            repo, engine=(args.engine or ""), max_model_len=getattr(args, "max_model_len", None),
+            token=getattr(args, "hf_token", None))
+    except cardgen.CardGenError as e:
+        print(f"boxy generate card: {e}", file=sys.stderr)
+        return 1
+    repo = cards.model_key(repo.strip().lstrip("/"))
+    for w in warnings:
+        print(f"warning: {w}", file=sys.stderr)
+
+    dest = cards._user_dir() / f"{cardgen.slug(repo)}.toml"
+    # a USER card that already serves this model blocks an accidental overwrite —
+    # the target file, or a user card under a different filename whose glob covers
+    # the id. A PACKAGED match is only shadowed (never overwritten), so it's an
+    # informational note, not a prompt.
+    match = cards.find_card(repo)
+    user_match = match if (match and match.source == "user") else None
+    existing_path = dest if dest.exists() else None
+    if user_match and existing_path is None:
+        cand = cards._user_dir() / f"{user_match.card_name}.toml"
+        existing_path = cand if cand.exists() else None
+    prior = existing_path.read_text() if existing_path else ""
+    overwriting = bool(existing_path or user_match)
+
+    def _show_diff() -> None:
+        diff = difflib.unified_diff(prior.splitlines(), text.splitlines(),
+                                    fromfile=str(existing_path or "existing"), tofile=str(dest),
+                                    lineterm="")
+        print("\n".join(diff), file=sys.stderr)
+
+    if args.dryrun:
+        print(text, end="")
+        if overwriting:
+            where = str(existing_path) if existing_path else f"a user card matching {user_match.match!r}"
+            print(f"\n# NOTE: would overwrite {where} (rerun without --dry-run to write; "
+                  f"--force to skip the prompt).", file=sys.stderr)
+            if prior:
+                _show_diff()
+        elif match:  # a packaged card exists; the new user card takes precedence
+            print(f"\n# NOTE: shadows the packaged card matching {match.match!r} "
+                  f"(user cards win); would write {dest}.", file=sys.stderr)
+        else:
+            print(f"\n# would write {dest}", file=sys.stderr)
+        return 0
+
+    if overwriting:
+        target_desc = str(existing_path) if existing_path else f"user card matching {user_match.match!r}"
+        if args.force:
+            if existing_path:
+                bak = existing_path.with_suffix(".toml.bak")
+                existing_path.replace(bak)
+                print(f"boxy: replaced {existing_path} (backup: {bak})")
+        elif sys.stdin.isatty() and sys.stdout.isatty():
+            print(f"A card already serves {repo}: {target_desc}", file=sys.stderr)
+            if prior:
+                _show_diff()
+            try:
+                ans = input(f"Overwrite {dest.name}? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = ""
+            if ans not in ("y", "yes"):
+                print("boxy: kept the existing card (no change).", file=sys.stderr)
+                return 0
+        else:
+            print(f"boxy generate card: a card already serves {repo} ({target_desc}); "
+                  f"pass --force to replace it.", file=sys.stderr)
+            return 1
+
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(text)
+        print(f"wrote {args.output}")
+        return 0
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(text)
+    print(f"### wrote {dest}  (engine: {engine})")
+    print(f"###   serve it:  boxy serve {repo}")
+    return 0
+
+
 def cmd_generate(args: argparse.Namespace) -> int:
     from boxy import sky_export
 
+    if args.format == "card":
+        return cmd_generate_card(args)
     if args.format == "flux-mcp":
         return _generate_flux_mcp(args)
     if args.format == "relay":
@@ -3798,13 +3894,27 @@ def build_parser() -> argparse.ArgumentParser:
                                         "sky (SkyPilot YAML), slurm|flux (boxy-free job script), "
                                         "flux-mcp (persistent OpenShift MCP service), or "
                                         "relay (the everyone-URL share ingress on OpenShift)")
-    p.add_argument("format", choices=["sky", "slurm", "flux", "sbatch", "flux-mcp", "relay"],
+    p.add_argument("format", choices=["sky", "slurm", "flux", "sbatch", "flux-mcp", "relay", "card"],
                    help="sky = SkyPilot task YAML; slurm|flux = agentless batch script (no boxy on the "
                         "cluster); flux-mcp = the Flux MCP server as a persistent OpenShift service; "
-                        "relay = the chisel relay behind `boxy open --share` (deploy once)")
+                        "relay = the chisel relay behind `boxy open --share` (deploy once); "
+                        "card = a model card from a HuggingFace id (see `card <hf-model-id>`)")
+    p.add_argument("model_id", nargs="?", default=None,
+                   help="card: the HuggingFace model id (e.g. meta-llama/Llama-3.1-8B-Instruct)")
     p.add_argument("--box", default=None)
     p.add_argument("--location", default=None)
     p.add_argument("--port", type=int, default=None)
+    # card: generate a boxy model card from a HuggingFace model id
+    p.add_argument("--engine", default=None, help="card: force the engine (vllm|llama.cpp) instead "
+                                                  "of auto-detecting from the model's architecture")
+    p.add_argument("--max-model-len", type=int, default=None, dest="max_model_len",
+                   help="card: context length to cap at (default: min(model's native, 8192))")
+    p.add_argument("--hf-token", default=None, dest="hf_token",
+                   help="card: HuggingFace token for gated repos (else $HF_TOKEN / the HF cache token)")
+    p.add_argument("--force", action="store_true",
+                   help="card: overwrite an existing card without prompting (keeps a .bak)")
+    p.add_argument("--dry-run", "--dryrun", action="store_true", dest="dryrun",
+                   help="card: print the generated card without writing it")
     # flux-mcp / relay: persistent OpenShift services (no box/location needed)
     p.add_argument("--namespace", default=None, help="flux-mcp/relay: OpenShift namespace")
     p.add_argument("--host", default=None,

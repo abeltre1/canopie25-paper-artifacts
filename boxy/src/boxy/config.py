@@ -184,6 +184,10 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
                  "machine; slurm-compat sbatch/sinfo shims proxy to it), else a real slurmctld / "
                  "sinfo => slurm. Not a guess from which binary exists. Pin 'slurm'/'flux'/'none' "
                  "if a cluster's primary differs; --scheduler always wins."),
+    Setting("cardgen.gpu_class_gb", "BOXY_GPU_CLASS_GB", "80",
+            help="GPU memory (GB) `boxy generate card` sizes against when deriving gpus / "
+                 "min_vram_gb from a model's weights (default 80 = A100/H100-class; set 40 "
+                 "for a 40GB-class site so cards spread across more GPUs)."),
     Setting("site.default_accelerator", "BOXY_DEFAULT_ACCELERATOR", "cuda",
             help="accelerator assumed for a GPU job submitted from a GPU-less login node "
                  "(where detection sees no device). --accelerator / a --location profile win."),
