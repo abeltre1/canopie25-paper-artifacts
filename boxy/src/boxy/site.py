@@ -444,6 +444,30 @@ def remote_jobname_live_probe(scheduler_name: str, name: str) -> str:
 _GPU_GRES_RE = re.compile(r"\bgpu:(?:([A-Za-z0-9_.+-]+):)?\d+", re.IGNORECASE)
 
 
+def gpu_types_from_gres(sinfo_text: str, partitions: set[str] | None = None) -> list[str]:
+    """ALL candidate GPU TYPES from Slurm's reported GRES, ordered: types on the
+    target partitions first, then the rest of the cluster (dedup, first-seen).
+    The GRES self-heal tries a typed --gres=gpu:<type>:N for EACH of these — a
+    site that REQUIRES a type (field: kahuna) is unrecoverable with the untyped
+    forms alone, and restricting to one 'spanning' type found nothing when the
+    cluster mixes types across partitions."""
+    def scan(pset: set[str] | None) -> list[str]:
+        found: list[str] = []
+        for line in (sinfo_text or "").splitlines():
+            cols = line.split("|")
+            if pset is not None and cols and cols[0].strip() not in pset:
+                continue
+            gres = cols[3] if len(cols) > 3 else line
+            for m in _GPU_GRES_RE.finditer(gres):
+                t = m.group(1)
+                if t and t.lower() != "null" and t not in found:
+                    found.append(t)
+        return found
+
+    selected = scan(partitions) if partitions else []
+    return selected + [t for t in scan(None) if t not in selected]
+
+
 def gpu_request_from_gres(sinfo_text: str, partitions: set[str] | None = None) -> tuple[str, str]:
     """Auto-detect the site's GPU request convention from Slurm's reported GRES
     (`sinfo -h -o "%R|%a|%F|%G"`). A cluster that lists a `gpu` GRES wants

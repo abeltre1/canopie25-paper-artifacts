@@ -1130,10 +1130,10 @@ def _looks_like_pull_block(text: str) -> bool:
             or ("registry" in low and ("403" in low or "denied" in low)))
 
 
-def _local_gpu_type() -> str:
-    """Best-effort GPU TYPE token from LOCAL sinfo (login node), so a local
-    auto-recovery tries typed --gres=gpu:<type>:N before the untyped form. ''
-    when sinfo is missing/errors or reports no single type."""
+def _local_gpu_types() -> list[str]:
+    """Best-effort GPU TYPE tokens from LOCAL sinfo (login node), so a local
+    auto-recovery tries typed --gres=gpu:<type>:N forms before the untyped one.
+    [] when sinfo is missing/errors or reports no types."""
     from boxy import site
     from boxy.schedulers import get_scheduler
 
@@ -1142,9 +1142,8 @@ def _local_gpu_type() -> str:
                            capture_output=True, text=True, timeout=15)
         out = p.stdout if p.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError, ValueError, KeyError):
-        return ""
-    _, gtype = site.gpu_request_from_gres(out)
-    return gtype
+        return []
+    return site.gpu_types_from_gres(out)
 
 
 def _gpu_form_label(gform: str, gtype: str) -> str:
@@ -1156,19 +1155,23 @@ def _gpu_form_label(gform: str, gtype: str) -> str:
             "gpus-per-node": f"--gpus-per-node={t}N"}.get(gform, f"--{gform}={t}N")
 
 
-def _gres_fallback_forms(gtype: str) -> list[tuple[str, str]]:
+def _gres_fallback_forms(gtypes: list[str]) -> list[tuple[str, str]]:
     """The GPU-request forms to try, in order, when a site REJECTS the GPU line
     ('Invalid generic resource (gres) specification', or 'Requested node
     configuration is not available' from a wrong pinned type — field: kahuna/hops).
-    Drop a (possibly wrong) TYPE first by retrying the proven untyped
-    --gpus-per-node=N; then a typed --gres=gpu:<type>:N if sinfo named a type (some
-    sites REQUIRE it), then untyped --gres=gpu:N, then --gpus=N. Recovers without
-    the user setting BOXY_GPU_DIRECTIVE / unsetting BOXY_GPU_TYPE by hand."""
-    forms: list[tuple[str, str]] = [("gpus-per-node", "")]
-    if gtype:
-        forms.append(("gres", gtype))
-    forms.append(("gres", ""))
-    forms.append(("gpus", ""))
+
+    Order: an untyped --gpus-per-node=N FIRST but only when a pinned
+    BOXY_GPU_TYPE poisoned the initial request (dropping the wrong type is the
+    fix there); then a typed --gres=gpu:<type>:N for EVERY type sinfo reported —
+    kahuna REQUIRES the type and rejects all untyped spellings, and a cluster
+    mixing types across partitions never yielded the single 'spanning' type the
+    old probe wanted; then untyped --gres=gpu:N; then --gpus=N. Recovers without
+    the user setting BOXY_GPU_DIRECTIVE / BOXY_GPU_TYPE by hand."""
+    forms: list[tuple[str, str]] = []
+    if config.get_str("site.gpu_type").strip():
+        forms.append(("gpus-per-node", ""))    # shed the poisoned pinned type first
+    forms += [("gres", t) for t in gtypes]
+    forms += [("gres", ""), ("gpus", "")]
     seen: set = set()
     ordered: list[tuple[str, str]] = []
     for f in forms:
@@ -1656,8 +1659,8 @@ def _serve_agentless_ssh(args, target: str) -> int:
         grc, gout = remote.ssh_capture(target, site.remote_partition_probe("slurm"), timeout=20)
         sel = ({p.strip() for p in part.split(",")}
                if part and site.partition_mode(part) == "set" else None)
-        _, probed_type = site.gpu_request_from_gres(gout, sel) if grc == 0 else ("", "")
-        for gform, gtype in _gres_fallback_forms(probed_type):
+        gtypes = site.gpu_types_from_gres(gout, sel) if grc == 0 else []
+        for gform, gtype in _gres_fallback_forms(gtypes):
             _slurm.set_auto_gres(gform, gtype)
             try:
                 script_text = deploy.render_agentless_script(
@@ -2016,7 +2019,7 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
         from boxy import deploy
         from boxy.schedulers import slurm as _slurm
 
-        for gform, gtype in _gres_fallback_forms(_local_gpu_type()):
+        for gform, gtype in _gres_fallback_forms(_local_gpu_types()):
             _slurm.set_auto_gres(gform, gtype)
             try:
                 if getattr(args, "agentless", False):

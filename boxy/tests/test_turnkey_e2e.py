@@ -1123,26 +1123,66 @@ echo "12345"
 """
 
 
-def test_gres_fallback_forms_order():
+def test_gres_fallback_forms_order(monkeypatch):
     from boxy.cli import _gres_fallback_forms
-    # drop a (possibly wrong) TYPE first via untyped --gpus-per-node; then a typed
-    # --gres if sinfo named one, then untyped --gres, then --gpus.
-    assert _gres_fallback_forms("a100") == [
-        ("gpus-per-node", ""), ("gres", "a100"), ("gres", ""), ("gpus", "")]
-    assert _gres_fallback_forms("") == [("gpus-per-node", ""), ("gres", ""), ("gpus", "")]
+    # every sinfo-reported TYPE is tried as --gres=gpu:<type>:N (some sites
+    # REQUIRE the type — field: kahuna), then untyped --gres, then --gpus. The
+    # just-rejected default --gpus-per-node is NOT retried — unless a pinned
+    # BOXY_GPU_TYPE poisoned it, where dropping the type is the fix.
+    assert _gres_fallback_forms(["h200", "a100"]) == [
+        ("gres", "h200"), ("gres", "a100"), ("gres", ""), ("gpus", "")]
+    assert _gres_fallback_forms([]) == [("gres", ""), ("gpus", "")]
+    monkeypatch.setenv("BOXY_GPU_TYPE", "h200")               # the poisoned-pin case
+    assert _gres_fallback_forms([]) == [
+        ("gpus-per-node", ""), ("gres", ""), ("gpus", "")]
 
 
 def test_login_node_auto_recovers_from_gres_rejection(cluster, capfd, monkeypatch):
     # Same recovery when boxy submits ON the login node: the picky sbatch rejects
-    # --gpus-per-node, boxy re-renders with --gres=gpu:N and resubmits itself.
+    # --gpus-per-node; sinfo names a100 first, so the typed form is tried and
+    # accepted (some sites require the type; a site that doesn't still takes it).
     _shim(cluster["bin"], "sbatch", GRES_PICKY_SBATCH)
     rc = main(["serve", MODEL, "--scheduler", "slurm"])
     cap = capfd.readouterr()
     assert rc == 0
-    assert "retrying with --gres=gpu:N" in cap.err
-    assert "GPU request accepted as --gres=gpu:N (auto-recovered)" in cap.out
+    assert "retrying with --gres=gpu:a100:N" in cap.err
+    assert "GPU request accepted as --gres=gpu:a100:N (auto-recovered)" in cap.out
     script = _the_script(cluster["jobs"])
-    assert "--gres=gpu:1" in script and "--gpus-per-node" not in script
+    assert "--gres=gpu:a100:1" in script and "--gpus-per-node" not in script
+
+
+def test_ssh_agentless_recovers_on_type_required_site(ssh, capfd, monkeypatch):
+    # THE kahuna failure: the site rejects EVERY untyped GPU spelling
+    # (--gpus-per-node, --gres=gpu:N, --gpus=N) and accepts only a TYPED
+    # --gres=gpu:<type>:N. The recovery must try each sinfo-reported type.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("HOME", str(ssh["tmp"] / "home"))
+    (ssh["tmp"] / "home").mkdir(exist_ok=True)
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\ncat <<'EOF'\n"
+          "hopper|up|2/6/0/8|gpu:h200:4\n"
+          "short|up|3/5/0/8|(null)\n"
+          "EOF\n")
+    _shim(ssh["bin"], "sbatch", r"""#!/bin/bash
+echo "$@" >> "$SBATCH_LOG"
+script="${!#}"
+if ! grep -Eq -- '--gres=gpu:[a-z0-9]+:[0-9]+' "$script"; then
+  echo "sbatch: error: Invalid generic resource (gres) specification" >&2
+  exit 1
+fi
+ep="${script%.sh}.endpoint.json"
+host="$(hostname)"
+printf '{"name":"x","host":"%s","port":8000,"url":"http://%s:8000","job":"12345"}\n' \
+       "$host" "$host" > "$ep"
+echo "12345"
+""")
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", lambda *a, **k: True)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "hopper",
+               "--ssh", "user@kahuna"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "retrying with --gres=gpu:h200:N" in cap.err
+    assert "GPU request accepted as --gres=gpu:h200:N (auto-recovered)" in cap.out
 
 
 def test_ssh_agentless_auto_recovers_from_gres_rejection(ssh, capfd, monkeypatch):
