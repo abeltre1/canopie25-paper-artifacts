@@ -792,9 +792,11 @@ echo "12345"
 
 def test_gres_fallback_forms_order():
     from boxy.cli import _gres_fallback_forms
-    # a known type is tried first (some sites require it), then untyped, then --gpus
-    assert _gres_fallback_forms("a100") == [("gres", "a100"), ("gres", ""), ("gpus", "")]
-    assert _gres_fallback_forms("") == [("gres", ""), ("gpus", "")]
+    # drop a (possibly wrong) TYPE first via untyped --gpus-per-node; then a typed
+    # --gres if sinfo named one, then untyped --gres, then --gpus.
+    assert _gres_fallback_forms("a100") == [
+        ("gpus-per-node", ""), ("gres", "a100"), ("gres", ""), ("gpus", "")]
+    assert _gres_fallback_forms("") == [("gpus-per-node", ""), ("gres", ""), ("gpus", "")]
 
 
 def test_login_node_auto_recovers_from_gres_rejection(cluster, capfd, monkeypatch):

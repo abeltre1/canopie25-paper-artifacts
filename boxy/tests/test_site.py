@@ -109,12 +109,17 @@ def test_account_flag_wins(clean_env):
 
 
 def test_resolve_license_flag_and_config(clean_env, monkeypatch):
-    assert site.resolve_license("tscratch:1") == ("tscratch:1", "--license")
-    assert site.resolve_license(None) == ("", "")                 # none by default
-    monkeypatch.setenv("BOXY_LICENSE", "tscratch:1,pscratch:1")
     from boxy import config
+    assert site.resolve_license("tscratch:1") == ("tscratch:1", "--license")
+    # default (BOXY_LICENSE unset by clean_env) -> the tscratch:1 default
     config.reset()
-    assert site.resolve_license(None) == ("tscratch:1,pscratch:1", "config site.license")
+    assert site.resolve_license(None) == ("tscratch:1", "config site.license")
+    monkeypatch.setenv("BOXY_LICENSE", "pscratch:1")
+    config.reset()
+    assert site.resolve_license(None) == ("pscratch:1", "config site.license")
+    monkeypatch.setenv("BOXY_LICENSE", "")                        # explicit empty -> none
+    config.reset()
+    assert site.resolve_license(None) == ("", "")
 
 
 def test_wcid_env_bypasses_discovery(clean_env, tmp_path, monkeypatch):

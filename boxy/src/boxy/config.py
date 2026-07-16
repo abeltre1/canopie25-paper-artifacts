@@ -160,11 +160,11 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
                  "only on a TTY (else keeps the soonest-start comma-list), 'always' forces "
                  "the prompt, 'never' disables it. --partition / --pick-partition / "
                  "--no-pick-partition override."),
-    Setting("site.license", "BOXY_LICENSE", "",
+    Setting("site.license", "BOXY_LICENSE", "tscratch:1",
             help="Slurm license(s) to request as `#SBATCH --license=<val>` (e.g. "
                  "'tscratch:1' or 'tscratch:1,pscratch:1'), for sites that gate filesystems "
-                 "behind licenses. Empty => none added (many sites, e.g. hops, auto-add "
-                 "filesystem licenses themselves). --license wins."),
+                 "behind licenses. Default 'tscratch:1'; set empty (BOXY_LICENSE=) on a site "
+                 "with no such license, or override with --license. --license wins."),
     Setting("serve.agentless_ssh", "BOXY_AGENTLESS_SSH", "true",
             help="over --ssh, serve a model with NOTHING installed on the HPC (no boxy/Python/"
                  "RamaLama): the laptop renders a self-contained podman batch script, submits + "

@@ -42,6 +42,9 @@ def _isolate_config(monkeypatch, tmp_path):
     # first-pick. Picker tests opt in with BOXY_PICK_ACCOUNT=always + a fake input().
     monkeypatch.setenv("BOXY_PICK_ACCOUNT", "never")
     monkeypatch.setenv("BOXY_PICK_PARTITION", "never")
+    # site.license defaults to tscratch:1 (Sandia); neutralize it for the broad
+    # suite so goldens/e2e stay site-agnostic. The license tests opt back in.
+    monkeypatch.setenv("BOXY_LICENSE", "")
     monkeypatch.delenv("WCID", raising=False)
     # the Slurm GRES auto-detect override is process-global; clear it so a value
     # set by one --ssh agentless test can't leak into the next (default 'auto').

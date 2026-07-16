@@ -1111,11 +1111,14 @@ AGENTLESS_REMOTE_SUBDIR = ".local/share/boxy/agentless"
 
 
 def _is_gres_error(text: str) -> bool:
-    """True when a scheduler's rejection is about the GPU/GRES request line
-    ('Invalid generic resource (gres) specification' and kin) — the signal to
-    auto-retry with a different GPU request form."""
+    """True when a scheduler's rejection is about the GPU request — the signal to
+    auto-retry with a different GPU form/type. Covers both the wrong-FORM error
+    ('Invalid generic resource (gres) specification') and the wrong-TYPE/count
+    error ('Requested node configuration is not available' — e.g. a pinned
+    BOXY_GPU_TYPE that the site doesn't have)."""
     low = (text or "").lower()
-    return "gres" in low or "generic resource" in low
+    return ("gres" in low or "generic resource" in low
+            or "requested node configuration is not available" in low)
 
 
 def _looks_like_pull_block(text: str) -> bool:
@@ -1144,13 +1147,24 @@ def _local_gpu_type() -> str:
     return gtype
 
 
+def _gpu_form_label(gform: str, gtype: str) -> str:
+    """The human GPU-request label for a recovery attempt (matches what's submitted
+    so the 'retrying with …' message never lies): e.g. --gpus-per-node=N,
+    --gres=gpu:a100:N, --gpus=N."""
+    t = f"{gtype}:" if gtype else ""
+    return {"gres": f"--gres=gpu:{t}N", "gpus": f"--gpus={t}N",
+            "gpus-per-node": f"--gpus-per-node={t}N"}.get(gform, f"--{gform}={t}N")
+
+
 def _gres_fallback_forms(gtype: str) -> list[tuple[str, str]]:
     """The GPU-request forms to try, in order, when a site REJECTS the GPU line
-    ('Invalid generic resource (gres) specification' — field: kahuna). Most
-    portable first: a typed `--gres=gpu:<type>:N` when sinfo named a type (some
-    sites REQUIRE the type), then untyped `--gres=gpu:N`, then `--gpus=N`. Used to
-    auto-recover without the user setting BOXY_GPU_DIRECTIVE by hand."""
-    forms: list[tuple[str, str]] = []
+    ('Invalid generic resource (gres) specification', or 'Requested node
+    configuration is not available' from a wrong pinned type — field: kahuna/hops).
+    Drop a (possibly wrong) TYPE first by retrying the proven untyped
+    --gpus-per-node=N; then a typed --gres=gpu:<type>:N if sinfo named a type (some
+    sites REQUIRE it), then untyped --gres=gpu:N, then --gpus=N. Recovers without
+    the user setting BOXY_GPU_DIRECTIVE / unsetting BOXY_GPU_TYPE by hand."""
+    forms: list[tuple[str, str]] = [("gpus-per-node", "")]
     if gtype:
         forms.append(("gres", gtype))
     forms.append(("gres", ""))
@@ -1452,8 +1466,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
                     proxy_prefix="", port=args.port, engine_pulls_model=engine_pull)
             except deploy.AgentlessError:
                 break
-            shown = (f"--gres=gpu:{gtype + ':' if gtype else ''}N" if gform == "gres"
-                     else "--gpus=N")
+            shown = _gpu_form_label(gform, gtype)
             print(f"boxy: the site rejected the GPU request; retrying with {shown} ...",
                   file=sys.stderr)
             if remote.push_file(target, script_remote, script_text) != 0:
@@ -1803,7 +1816,7 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
             except deploy.AgentlessError:
                 break
             jobs.script_path(name).write_text(script_text)
-            shown = f"--gres=gpu:{gtype + ':' if gtype else ''}N" if gform == "gres" else "--gpus=N"
+            shown = _gpu_form_label(gform, gtype)
             print(f"boxy: the site rejected the GPU request; retrying with {shown} ...", file=sys.stderr)
             result = subprocess.run(submit, capture_output=True, text=True)
             if result.returncode == 0:
