@@ -747,11 +747,13 @@ def test_ssh_agentless_license_flag_lands_in_the_script(ssh, capfd, monkeypatch)
     assert "auto: license: tscratch:1,pscratch:1 (via --license)" in cap.out
 
 
-def test_ssh_agentless_ca_mounts_cluster_path_not_laptop(ssh, capfd, monkeypatch, tmp_path):
-    # THE hops CERTIFICATE_VERIFY_FAILED fix: the container must mount a CA path that
-    # exists ON THE COMPUTE NODE. boxy stages the laptop's MERGED bundle onto the
-    # cluster's shared FS and mounts THAT — never the laptop's SSL_CERT_FILE path,
-    # which is meaningless on the node (the old bug bind-mounted an empty file).
+def test_ssh_agentless_ca_picked_on_the_node_at_runtime(ssh, capfd, monkeypatch, tmp_path):
+    # THE hops CERTIFICATE_VERIFY_FAILED fix: the batch script picks a CA bundle ON
+    # THE COMPUTE NODE at job runtime — the boxy-staged laptop bundle first (when one
+    # exists), else the node's OWN system trust store, which provably trusts the
+    # site's TLS interceptor (host-side pulls work) — and splices the mount + TLS env
+    # into the podman argv via $_CAARGS. Never the laptop's SSL_CERT_FILE path
+    # (meaningless on the node; the old bug bind-mounted an empty file).
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
     monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
     laptop_ca = tmp_path / "ca-merged.crt"
@@ -762,23 +764,55 @@ def test_ssh_agentless_ca_mounts_cluster_path_not_laptop(ssh, capfd, monkeypatch
     cap = capfd.readouterr()
     assert rc == 0
     assert "would stage your merged site CA" in cap.out
-    # the podman run mounts the CLUSTER path at the standard container CA path ...
-    assert "agentless/hops/boxy-ca-merged.pem:/etc/ssl/certs/boxy-ca-merged.pem:ro" in cap.out
-    # ... and NEVER the laptop path (that was the CERTIFICATE_VERIFY_FAILED bug)
-    assert f"{laptop_ca}:/etc/ssl/certs" not in cap.out
+    # staged shared-FS bundle is the FIRST candidate, node system stores follow
+    assert "agentless/hops/boxy-ca-merged.pem" in cap.out
+    assert "/etc/pki/tls/certs/ca-bundle.crt" in cap.out
+    # the pick is spliced into the container argv before the image ...
+    assert "${_CAARGS}" in cap.out
+    assert "-e SSL_CERT_FILE=/etc/ssl/certs/boxy-ca-merged.pem" in cap.out
+    # ... and the laptop path is NEVER mounted (the CERTIFICATE_VERIFY_FAILED bug)
+    assert f"{laptop_ca}:" not in cap.out
 
 
-def test_ssh_agentless_no_ca_when_none_merged(ssh, capfd, monkeypatch):
-    # No merged bundle on the laptop (or BOXY_NO_CA_PROPAGATE): no CA line, no mount
-    # — the cluster uses its own trust store.
+def test_ssh_agentless_node_system_ca_without_laptop_bundle(ssh, capfd, monkeypatch):
+    # No merged bundle on the laptop: nothing is staged, but the script STILL
+    # carries the runtime CA pick over the node's own system stores — the fix must
+    # not depend on the laptop's TLS setup at all.
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
     monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)
     rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
     cap = capfd.readouterr()
     assert rc == 0
-    assert "site CA" not in cap.out
-    assert "boxy-ca-merged.pem" not in cap.out
+    assert "stage your merged site CA" not in cap.out              # nothing staged
+    assert "agentless/hops/boxy-ca-merged.pem" not in cap.out      # no staged candidate
+    assert "/etc/pki/tls/certs/ca-bundle.crt" in cap.out           # RHEL store
+    assert "/etc/ssl/certs/ca-certificates.crt" in cap.out         # Debian store
+    assert "${_CAARGS}" in cap.out
+
+
+def test_ssh_agentless_persistent_hf_cache_on_shared_fs(ssh, capfd, monkeypatch):
+    # engine-pull mounts a shared-FS HF cache into the container (download once,
+    # reused by every rerun) and the script creates the dir at job runtime.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: model cache:" in cap.out and "hfcache" in cap.out
+    assert "hfcache:/root/.cache/huggingface" in cap.out           # the bind mount
+    assert "HF_HOME=/root/.cache/huggingface" in cap.out           # engine writes there
+    assert 'mkdir -p "$(dirname "${_EP}")/hfcache"' in cap.out     # created at runtime
+
+
+def test_config_default_proxy_is_sandia(monkeypatch):
+    # zero-flag turnkey on-site: network.proxy ships the Sandia proxy so no --proxy
+    # is ever needed; BOXY_PROXY= (empty) opts out off-site.
+    from boxy import config
+
+    monkeypatch.delenv("BOXY_PROXY", raising=False)
+    config.reset()
+    assert config.get_str("network.proxy") == "http://proxy.sandia.gov:80"
 
 
 def test_ssh_agentless_prestage_dryrun_announces_plan(ssh, capfd, monkeypatch):

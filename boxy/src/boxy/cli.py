@@ -1477,6 +1477,12 @@ def _serve_agentless_ssh(args, target: str) -> int:
     hf_tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if hf_tok and engine_pull:
         extra_env["HF_TOKEN"] = hf_tok
+        print("  auto: HF token: forwarded from your laptop env into the container "
+              "(gated-repo downloads authenticate)")
+    elif engine_pull:
+        print("boxy: note: no HF_TOKEN in your laptop env — if the model is a GATED repo "
+              "(meta-llama/* is), the download will 401; export HF_TOKEN and rerun.",
+              file=sys.stderr)
     if extra_env:
         box = dc_replace(box, env={**box.env, **extra_env})
 
@@ -1536,6 +1542,21 @@ def _serve_agentless_ssh(args, target: str) -> int:
     ep_remote = f"{rdir}/{name}.endpoint.json"
     tok = scheduler.output_token or ""
     log_remote = f"{rdir}/{name}{('-' + tok) if tok else ''}.log"
+
+    # engine-pull: persist the engine's HF cache on the CLUSTER's shared FS so the
+    # model downloads ONCE and every rerun (and every compute node) reuses it —
+    # no per-run 16GB re-download, no prestage wait. The batch script mkdir -p's
+    # the dir at job runtime (shared FS, so it exists wherever the job lands).
+    if engine_pull:
+        from boxy.box import Volume
+
+        hf_cache = f"{rdir}/hfcache"
+        box = dc_replace(
+            box,
+            volumes=[*box.volumes, Volume(source=hf_cache, target="/root/.cache/huggingface")],
+            env={**box.env, "HF_HOME": "/root/.cache/huggingface"})
+        print(f"  auto: model cache: {host}:{hf_cache} (shared FS — downloaded once, "
+              f"reused by every rerun)")
 
     # 6b) CA: stage the laptop's MERGED bundle onto the shared FS and mount THAT
     #     compute-node-valid path into the container, so an in-container HuggingFace

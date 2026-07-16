@@ -27,6 +27,9 @@ def _isolate_config(monkeypatch, tmp_path):
     # ditto proxy forwarding: the CI/sandbox runner may export proxy vars, which
     # would otherwise be injected into every delegated command; e2e tests opt in.
     monkeypatch.setenv("BOXY_NO_PROXY_PROPAGATE", "1")
+    # network.proxy ships a site default (proxy.sandia.gov); blank it so goldens
+    # stay site-agnostic. Proxy tests pass --proxy explicitly.
+    monkeypatch.setenv("BOXY_PROXY", "")
     # ditto remote account injection (a dev box may carry sacctmgr/mywcid,
     # making --ssh serve tests nondeterministic); e2e tests opt back in.
     monkeypatch.setenv("BOXY_NO_REMOTE_ACCOUNT", "1")

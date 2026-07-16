@@ -217,8 +217,46 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
         raise AgentlessError(
             "agentless can't detect hardware on the compute node — pin --accelerator "
             "(cuda|rocm|…) so the podman command is fully resolved here.")
-    deployment = plan_serve(box, local, port=port, dryrun=True)  # dryrun: no pull, no verify
-    podman = shlex.join(deployment.command)
+    global _AGENTLESS_RENDER
+    _AGENTLESS_RENDER = True
+    try:
+        deployment = plan_serve(box, local, port=port, dryrun=True)  # dryrun: no pull, no verify
+    finally:
+        _AGENTLESS_RENDER = False
+
+    # CA into the container, picked ON THE COMPUTE NODE at job runtime: the
+    # engine's in-container HuggingFace fetch must trust the site's TLS
+    # interceptor or it dies with CERTIFICATE_VERIFY_FAILED (field: hops). The
+    # laptop's CA path is meaningless here; the node's own system bundle provably
+    # trusts the interceptor (host-side pulls work). Candidates: the boxy-staged
+    # laptop bundle (if any) first, then the node's system stores. $_CAARGS is
+    # spliced into the container argv BEFORE the image; empty when nothing found.
+    cmd = list(deployment.command)
+    image = deployment.box.image or ""
+    ca_block = ""
+    runtime = local.resolve_runtime()
+    if runtime in ("podman", "docker") and image and image in cmd:
+        idx = cmd.index(image)
+        podman = f"{shlex.join(cmd[:idx])} ${{_CAARGS}} {shlex.join(cmd[idx:])}"
+        candidates = ([_AGENTLESS_CA_SOURCE] if _AGENTLESS_CA_SOURCE else []) + list(_HOST_CA_BUNDLES)
+        ca_env = " ".join(f"-e {var}={CA_CONTAINER_PATH}"
+                          for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"))
+        ca_block = (
+            '_CAARGS=""\n'
+            f'for _c in {" ".join(shlex.quote(c) for c in candidates)}; do\n'
+            '  if [ -f "$_c" ]; then\n'
+            f'    _CAARGS="-v $_c:{CA_CONTAINER_PATH}:ro {ca_env}"\n'
+            '    break\n'
+            '  fi\n'
+            'done\n'
+        )
+    else:
+        podman = shlex.join(cmd)
+    # engine-pull: the model lands in the container's HF cache, which the caller
+    # bind-mounts from the shared FS (download once, reuse every run) — create it
+    # here so podman never fails on a missing bind source.
+    mk_cache = 'mkdir -p "$(dirname "${_EP}")/hfcache"\n' if engine_pulls_model else ''
+
     resolved_port = deployment.port or port or 0
     scheduler = get_scheduler(scheduler_name)
     # atomic endpoint publish + foreground container; $(hostname) is the compute node.
@@ -226,6 +264,8 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
         'set -e\n'
         '_H="$(hostname)"\n'
         f'_EP={shlex.quote(endpoint_file)}\n'
+        f'{mk_cache}'
+        f'{ca_block}'
         'cat > "${_EP}.tmp" <<EOF_BOXY_EP\n'
         f'{{"name": "{name}", "host": "${{_H}}", "port": {resolved_port}, '
         f'"url": "http://${{_H}}:{resolved_port}", "job": "${{SLURM_JOB_ID:-${{FLUX_JOB_ID:-}}}}"}}\n'
@@ -245,20 +285,33 @@ def plan_run(box: Box, location: Location, user_args: list[str], dryrun: bool = 
 
 CA_CONTAINER_PATH = "/etc/ssl/certs/boxy-ca-merged.pem"
 
-# Agentless override: over --ssh the compute node can't see the LAPTOP's
-# SSL_CERT_FILE path, so mounting it bind-mounts an empty file and the container
-# still doesn't trust the site CA (field: hops, CERTIFICATE_VERIFY_FAILED fetching
-# config.json from huggingface.co). _serve_agentless_ssh stages the merged bundle
-# onto the cluster's shared FS and sets this to that ABSOLUTE cluster path so the
-# rendered `podman run -v <cluster path>:CA_CONTAINER_PATH` is valid on the node.
+# Agentless CA handling: over --ssh the compute node can't see the LAPTOP's
+# SSL_CERT_FILE path, so a static mount of it bind-mounts nothing and the
+# container still doesn't trust the site's TLS interceptor (field: hops,
+# CERTIFICATE_VERIFY_FAILED fetching config.json from huggingface.co). The
+# agentless batch script instead picks a CA bundle AT JOB RUNTIME on the compute
+# node — the boxy-staged laptop bundle if the caller staged one (set via
+# set_agentless_ca), else the NODE's OWN system trust store, which provably
+# trusts the interceptor (host-side podman pulls succeed). While an agentless
+# render is in flight, _propagate_ca_bundle must stay out of the way (a laptop
+# path in the mounts would be invalid on the node).
 _AGENTLESS_CA_SOURCE: str | None = None
+_AGENTLESS_RENDER = False
+
+# RHEL/Fedora first (Sandia clusters), then Debian/Ubuntu — checked in order on
+# the COMPUTE node by the batch script.
+_HOST_CA_BUNDLES = (
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+)
 
 
 def set_agentless_ca(cluster_path: str | None) -> None:
-    """Point _propagate_ca_bundle at a CLUSTER-side merged-CA path (mounted into
-    the agentless container) instead of the laptop's SSL_CERT_FILE. Pass None to
-    clear it. Process-global; the caller sets it around render_agentless_script and
-    clears it after (mirrors schedulers.slurm.set_auto_gres)."""
+    """Register a CLUSTER-side staged merged-CA path as the batch script's first
+    CA candidate (ahead of the node's system bundle). Pass None to clear.
+    Process-global; the caller sets it around render_agentless_script and clears
+    it after (mirrors schedulers.slurm.set_auto_gres)."""
     global _AGENTLESS_CA_SOURCE
     _AGENTLESS_CA_SOURCE = cluster_path or None
 
@@ -275,16 +328,16 @@ def _propagate_ca_bundle(env: dict, mounts: list) -> None:
     trust and break huggingface.co. No-op when the merge is disabled/absent or the
     user set the cert env in [box.env].
 
-    In agentless mode set_agentless_ca() supplies an absolute CLUSTER path (the
-    bundle staged onto the shared FS); we mount THAT — the laptop path is invalid on
-    the compute node — and skip the local os.path.isfile() check for it."""
+    No-op during an agentless render: the laptop's SSL_CERT_FILE path is invalid
+    on the compute node, so the batch script mounts a node-side bundle at job
+    runtime instead (see render_agentless_script's CA-pick block)."""
+    if _AGENTLESS_RENDER:
+        return
+    ca = os.environ.get("SSL_CERT_FILE")
+    if not ca or not ca.endswith("ca-merged.crt") or not os.path.isfile(ca):
+        return
     if any(target == CA_CONTAINER_PATH for _, target, _ in mounts):
         return
-    ca = _AGENTLESS_CA_SOURCE
-    if not ca:
-        ca = os.environ.get("SSL_CERT_FILE")
-        if not ca or not ca.endswith("ca-merged.crt") or not os.path.isfile(ca):
-            return
     mounts.append((ca, CA_CONTAINER_PATH, "ro"))
     for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
         env.setdefault(var, CA_CONTAINER_PATH)  # box.env still wins (already merged)
