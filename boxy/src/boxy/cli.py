@@ -1150,6 +1150,8 @@ def _gpu_form_label(gform: str, gtype: str) -> str:
     """The human GPU-request label for a recovery attempt (matches what's submitted
     so the 'retrying with …' message never lies): e.g. --gpus-per-node=N,
     --gres=gpu:a100:N, --gpus=N."""
+    if gform == "none":
+        return "NO GPU directive (this site has no GRES config — the partition implies the GPUs)"
     t = f"{gtype}:" if gtype else ""
     return {"gres": f"--gres=gpu:{t}N", "gpus": f"--gpus={t}N",
             "gpus-per-node": f"--gpus-per-node={t}N"}.get(gform, f"--{gform}={t}N")
@@ -1172,6 +1174,10 @@ def _gres_fallback_forms(gtypes: list[str]) -> list[tuple[str, str]]:
         forms.append(("gpus-per-node", ""))    # shed the poisoned pinned type first
     forms += [("gres", t) for t in gtypes]
     forms += [("gres", ""), ("gpus", "")]
+    # LAST rung: no GPU directive at all — a site with NO GRES configured (every
+    # partition reports (null); field: kahuna) rejects every gres/gpus spelling,
+    # and GPUs there are implied by the PARTITION (hopper/grace/blackwell).
+    forms.append(("none", ""))
     seen: set = set()
     ordered: list[tuple[str, str]] = []
     for f in forms:

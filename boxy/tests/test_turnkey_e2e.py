@@ -1130,11 +1130,11 @@ def test_gres_fallback_forms_order(monkeypatch):
     # just-rejected default --gpus-per-node is NOT retried — unless a pinned
     # BOXY_GPU_TYPE poisoned it, where dropping the type is the fix.
     assert _gres_fallback_forms(["h200", "a100"]) == [
-        ("gres", "h200"), ("gres", "a100"), ("gres", ""), ("gpus", "")]
-    assert _gres_fallback_forms([]) == [("gres", ""), ("gpus", "")]
+        ("gres", "h200"), ("gres", "a100"), ("gres", ""), ("gpus", ""), ("none", "")]
+    assert _gres_fallback_forms([]) == [("gres", ""), ("gpus", ""), ("none", "")]
     monkeypatch.setenv("BOXY_GPU_TYPE", "h200")               # the poisoned-pin case
     assert _gres_fallback_forms([]) == [
-        ("gpus-per-node", ""), ("gres", ""), ("gpus", "")]
+        ("gpus-per-node", ""), ("gres", ""), ("gpus", ""), ("none", "")]
 
 
 def test_login_node_auto_recovers_from_gres_rejection(cluster, capfd, monkeypatch):
@@ -1215,6 +1215,39 @@ echo "12345"
     cap = capfd.readouterr()
     assert rc == 0
     assert "GPU request accepted as --gres=gpu:h200:N (auto-recovered)" in cap.out
+
+
+def test_ssh_agentless_recovers_on_no_gres_site(ssh, capfd, monkeypatch):
+    # FIELD (kahuna): EVERY partition reports (null) GRES — the site has no GRES
+    # config at all, GPUs are implied by the PARTITION (hopper/grace/blackwell),
+    # and ANY --gres/--gpus/--gpus-per-node spelling errors. The last recovery
+    # rung drops the GPU directive entirely.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("HOME", str(ssh["tmp"] / "home"))
+    (ssh["tmp"] / "home").mkdir(exist_ok=True)
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\n"
+          'if [ "$1" = "-h" ] && [ "$2" = "-N" ]; then echo "(null)"; exit 0; fi\n'
+          "cat <<'EOF'\nhopper|up|1/1/2/4|(null)\nblackwell|up|2/0/0/2|(null)\nEOF\n")
+    _shim(ssh["bin"], "sbatch", r"""#!/bin/bash
+echo "$@" >> "$SBATCH_LOG"
+script="${!#}"
+if grep -Eq -- '--(gres|gpus|gpus-per-node)' "$script"; then
+  echo "sbatch: error: Invalid generic resource (gres) specification" >&2
+  exit 1
+fi
+ep="${script%.sh}.endpoint.json"
+host="$(hostname)"
+printf '{"name":"x","host":"%s","port":8000,"url":"http://%s:8000","job":"12345"}\n' \
+       "$host" "$host" > "$ep"
+echo "12345"
+""")
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", lambda *a, **k: True)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "hopper",
+               "--ssh", "user@kahuna"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "GPU request accepted as NO GPU directive" in cap.out
 
 
 def test_ssh_agentless_auto_recovers_from_gres_rejection(ssh, capfd, monkeypatch):
