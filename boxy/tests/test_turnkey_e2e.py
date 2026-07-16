@@ -719,6 +719,46 @@ def test_ssh_agentless_picker_selects_account(ssh, capfd, monkeypatch):
     assert "you picked 2 of 3 from mywcid on hops" in cap.out
 
 
+def test_ssh_agentless_license_flag_lands_in_the_script(ssh, capfd, monkeypatch):
+    # --license adds #SBATCH --license=... in the agentless batch script (Slurm).
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--license", "tscratch:1,pscratch:1",
+               "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "#SBATCH --license=tscratch:1,pscratch:1" in cap.out
+    assert "auto: license: tscratch:1,pscratch:1 (via --license)" in cap.out
+
+
+def test_ssh_agentless_partition_picker_selects_one(ssh, capfd, monkeypatch):
+    # 2+ partitions + a TTY -> the partition menu; picking one puts it in the script
+    # instead of the soonest-start comma-list.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("BOXY_PICK_PARTITION", "always")     # suite default is 'never'
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "2")   # pick the 2nd partition
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    # the fixture's GPU partitions are gpu(6 idle) + batch(2 idle) -> menu [gpu, batch, all]
+    assert "#SBATCH --partition=batch" in cap.out
+    assert "#SBATCH --partition=gpu,batch" not in cap.out
+    assert "you picked batch of 2" in cap.out
+
+
+def test_ssh_agentless_partition_default_keeps_comma_list(ssh, capfd, monkeypatch):
+    # suite default (never): the soonest-start comma-list is kept, no prompt.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("partition menu shown when disabled")))
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "#SBATCH --partition=gpu,batch" in cap.out
+
+
 def test_wcid_env_bypasses_the_menu(cluster, capfd, monkeypatch):
     # $WCID is a scripted bypass: it wins with no prompt even under 'always'.
     monkeypatch.setenv("BOXY_PICK_ACCOUNT", "always")

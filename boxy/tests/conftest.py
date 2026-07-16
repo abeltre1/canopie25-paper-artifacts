@@ -41,6 +41,7 @@ def _isolate_config(monkeypatch, tmp_path):
     # test can block on input() and multi-account discovery keeps its silent
     # first-pick. Picker tests opt in with BOXY_PICK_ACCOUNT=always + a fake input().
     monkeypatch.setenv("BOXY_PICK_ACCOUNT", "never")
+    monkeypatch.setenv("BOXY_PICK_PARTITION", "never")
     monkeypatch.delenv("WCID", raising=False)
     # the Slurm GRES auto-detect override is process-global; clear it so a value
     # set by one --ssh agentless test can't leak into the next (default 'auto').

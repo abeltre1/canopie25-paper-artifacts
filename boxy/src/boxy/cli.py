@@ -1200,6 +1200,56 @@ def _pick_account(args, where: str = "", rows=None) -> None:
         print(f"  auto: account: {pick} ({note})")
 
 
+def _pick_partition_mode(args) -> str:
+    from boxy import config
+
+    v = getattr(args, "pick_partition", None)
+    if v is True:
+        return "always"
+    if v is False:
+        return "never"
+    return (config.get_str("site.pick_partition") or "auto").strip().lower()
+
+
+def _pick_partition(args, scheduler_name: str, need_gpu: bool, where: str = "") -> None:
+    """Interactive partition pick when 2+ are available and none was named: sets
+    args.partition to the choice (so resolve_site sees it as explicit). A no-op
+    under 'never' (suite/CI default), when --partition/site.partition is set, or
+    when discovery finds <2 partitions. Local path — the list is discovered here."""
+    from boxy import config, picker, site
+
+    if getattr(args, "partition", None) or _pick_partition_mode(args) == "never":
+        return
+    if config.get_str("site.partition").strip():
+        return
+    part, _why = site.resolve_partition(None, scheduler_name, need_gpu)
+    names = [p for p in (part or "").split(",") if p]
+    if len(names) < 2:
+        return
+    pick, note = picker.choose_partition(
+        names, remembered=picker.recall(where, kind="partition"), mode=_pick_partition_mode(args),
+        where=where, source=scheduler_name, allow_all=(scheduler_name != "flux"))
+    if pick:
+        args.partition = pick
+        print(f"  auto: partition: {pick} ({note})")
+
+
+def _pick_remote_partition(args, names, host: str, target: str, scheduler_name: str) -> tuple[str, str]:
+    """Choose a partition from a cluster-probed list for an --ssh serve. Returns
+    (value, note). Interactive menu only when the picker is enabled AND 2+ exist;
+    otherwise the soonest-start comma-list (Slurm) / first (Flux) — legacy."""
+    from boxy import picker
+
+    if len(names) > 1 and picker.is_interactive(_pick_partition_mode(args)):
+        pick, note = picker.choose_partition(
+            names, remembered=picker.recall(target, kind="partition"),
+            mode=_pick_partition_mode(args), where=target, source=f"{scheduler_name} on {host}",
+            allow_all=(scheduler_name != "flux"))
+        if pick:
+            return pick, note
+    return ",".join(names), ""
+
+
 def _pick_remote_account(args, rows, host: str, target: str) -> tuple[str | None, str]:
     """Choose the account from a cluster-probed (wcid, label) list for an --ssh
     serve. Returns (account_or_None, note). Shows the interactive menu only when
@@ -1317,12 +1367,21 @@ def _serve_agentless_ssh(args, target: str) -> int:
         rc, out = remote.ssh_capture(target, site.remote_partition_probe(scheduler_name), timeout=20)
         value, pwhy = site.rank_remote_partitions(out, scheduler_name, need_gpu) if rc == 0 else ("", "")
         if value:
-            part = value
-            print(f"  auto: partition: {value} (via {scheduler_name} on {host}: {pwhy})")
+            names = [p for p in value.split(",") if p]
+            pick, pnote = _pick_remote_partition(args, names, host, target, scheduler_name)
+            part = pick
+            why = pnote or f"{scheduler_name} on {host}: {pwhy}"
+            print(f"  auto: partition: {part} (via {why})")
     if part and site.partition_mode(part) not in ("off",):
         if scheduler_name == "flux" and "," in part:
             part = part.split(",")[0].strip()
         site_args.append(scheduler.site_directive("partition", part))
+    # Slurm license(s): --license / config, e.g. #SBATCH --license=tscratch:1
+    if scheduler_name == "slurm":
+        lic, lwhy = site.resolve_license(getattr(args, "license", None))
+        if lic:
+            site_args.append(scheduler.site_directive("license", lic))
+            print(f"  auto: license: {lic} (via {lwhy})")
 
     # GPU request form: keep the proven default (--gpus-per-node, what works on
     # hops/eldorado/…). We DON'T proactively change a working cluster's directive;
@@ -1654,11 +1713,12 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
     # explicit and stays silent. A no-op under 'never' (the suite/CI default).
     if name_override is None:
         _pick_account(args, where="")
+        _pick_partition(args, scheduler_name, need_gpu, where="")
     site_map, site_decisions = site.resolve_site(args, scheduler_name, need_gpu=need_gpu)
     if name_override is None:
         for line in site_decisions:
             print(f"  auto: {line}")
-    for kind in ("partition", "account", "time"):
+    for kind in ("partition", "account", "time", "license"):
         if site_map.get(kind):
             site_args.append(scheduler.site_directive(kind, site_map[kind]))
     site_args += list(args.scheduler_args or [])
@@ -2337,9 +2397,11 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
             value, why = site.rank_remote_partitions(out, scheduler, prefer_gpu) if rc == 0 else ("", why)
         flagged = bool(part)
         if value:
+            names = [p for p in value.split(",") if p]
+            value, pnote = _pick_remote_partition(args, names, host, target, scheduler)
             head = (_argv_set_flag(head, "--partition", value) if flagged
                     else [*head, "--partition", value])
-            print(f"  auto: partition: {value} (via sinfo on {host}: {why})")
+            print(f"  auto: partition: {value} (via {pnote or f'sinfo on {host}: {why}'})")
         else:
             if flagged:
                 head = _argv_set_flag(head, "--partition", None)  # drop unresolved auto/all
@@ -3826,6 +3888,16 @@ def build_parser() -> argparse.ArgumentParser:
                            "otherwise take the first account (overrides site.pick_account).")
     pick.add_argument("--no-pick-account", dest="pick_account", action="store_false",
                       help="never prompt; silently use the first / remembered discovered account.")
+    pickp = p.add_mutually_exclusive_group()
+    pickp.add_argument("--pick-partition", dest="pick_partition", action="store_true", default=None,
+                       help="force the interactive partition picker when 2+ are available "
+                            "(overrides site.pick_partition).")
+    pickp.add_argument("--no-pick-partition", dest="pick_partition", action="store_false",
+                       help="never prompt; keep the soonest-start comma-list of partitions.")
+    p.add_argument("--license", default=None,
+                   help="Slurm license(s) as #SBATCH --license=VAL (e.g. tscratch:1 or "
+                        "tscratch:1,pscratch:1), for sites that gate filesystems behind "
+                        "licenses. Default from site.license / BOXY_LICENSE.")
     p.add_argument("--time", default=None,
                    help="time limit for --scheduler jobs (e.g. 4:00:00)")
     p.add_argument("--scheduler-arg", action="append", default=[], dest="scheduler_args", metavar="FLAG",

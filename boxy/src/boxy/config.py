@@ -154,6 +154,17 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
             help="default Slurm partition / Flux queue. Empty => AUTO: boxy picks the "
                  "soonest-start GPU partitions from sinfo. Also accepts 'all' (every "
                  "partition), 'off' (the scheduler's own default), or a name/comma-list."),
+    Setting("site.pick_partition", "BOXY_PICK_PARTITION", "auto",
+            help="when 2+ partitions are available and none was named, show an interactive "
+                 "menu to pick ONE (parallel to site.pick_account): 'auto' (default) prompts "
+                 "only on a TTY (else keeps the soonest-start comma-list), 'always' forces "
+                 "the prompt, 'never' disables it. --partition / --pick-partition / "
+                 "--no-pick-partition override."),
+    Setting("site.license", "BOXY_LICENSE", "",
+            help="Slurm license(s) to request as `#SBATCH --license=<val>` (e.g. "
+                 "'tscratch:1' or 'tscratch:1,pscratch:1'), for sites that gate filesystems "
+                 "behind licenses. Empty => none added (many sites, e.g. hops, auto-add "
+                 "filesystem licenses themselves). --license wins."),
     Setting("serve.agentless_ssh", "BOXY_AGENTLESS_SSH", "true",
             help="over --ssh, serve a model with NOTHING installed on the HPC (no boxy/Python/"
                  "RamaLama): the laptop renders a self-contained podman batch script, submits + "

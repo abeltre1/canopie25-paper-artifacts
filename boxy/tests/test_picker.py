@@ -134,3 +134,52 @@ def test_recall_survives_a_missing_jobs_dir(jobsdir):
     # and the state file lives under the (per-cluster) jobs dir
     picker.remember("fy1", where="hops")
     assert (jobs._dir() / "last_account.hops").exists()
+
+
+# ---- partition picker (parallel to the account picker) ------------------------------
+
+PARTS = ["gpu", "batch", "short"]
+
+
+def test_partition_zero_or_explicit_returns_none():
+    assert picker.choose_partition([], mode="always") == (None, "")
+    assert picker.choose_partition(PARTS, explicit="gpu", mode="always") == (None, "")
+
+
+def test_partition_single_auto_selects():
+    pick, note = picker.choose_partition(["gpu"], mode="always")
+    assert pick == "gpu" and "only partition" in note
+
+
+def test_partition_non_interactive_keeps_the_comma_list():
+    # the soonest-start default is preserved for batch/CI (Slurm accepts a list)
+    pick, note = picker.choose_partition(PARTS, mode="never")
+    assert pick == "gpu,batch,short" and "all 3" in note
+
+
+def test_partition_non_interactive_flux_takes_one():
+    pick, _ = picker.choose_partition(PARTS, mode="never", allow_all=False)
+    assert pick == "gpu"                       # Flux: one queue, the soonest-start
+
+
+def test_partition_interactive_pick_one(jobsdir, monkeypatch, capsys):
+    _answer(monkeypatch, "2")
+    pick, note = picker.choose_partition(PARTS, mode="always", where="hops")
+    assert pick == "batch" and "you picked batch of 3" in note
+    err = capsys.readouterr().err
+    assert "Select a partition" in err and "partition [1-4]" in err   # 3 parts + 'all'
+    assert picker.recall("hops", kind="partition") == "batch"
+
+
+def test_partition_interactive_all_keeps_the_list(jobsdir, monkeypatch):
+    # 'all' is the last menu entry (index 4 here); it keeps the comma-list
+    _answer(monkeypatch, "4")
+    pick, note = picker.choose_partition(PARTS, mode="always", where="hops")
+    assert pick == "gpu,batch,short" and "all 3" in note
+
+
+def test_partition_remembered_default_is_partition_scoped(jobsdir):
+    picker.remember("batch", where="hops", kind="partition")
+    picker.remember("fy1", where="hops", kind="account")
+    assert picker.recall("hops", kind="partition") == "batch"
+    assert picker.recall("hops", kind="account") == "fy1"    # separate files

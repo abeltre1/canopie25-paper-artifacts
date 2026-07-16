@@ -104,7 +104,8 @@ class SlurmScheduler(Scheduler):
     def site_directive(self, kind: str, value: str) -> str:
         return {"partition": f"--partition={value}",
                 "account": f"--account={value}",
-                "time": f"--time={value}"}[kind]
+                "time": f"--time={value}",
+                "license": f"--license={value}"}[kind]
 
     def submit_command(self, script: str) -> list[str]:
         return ["sbatch", "--parsable", script]

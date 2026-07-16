@@ -52,27 +52,27 @@ def _normalize(accounts) -> list[Row]:
 # ---- remembered per-cluster default -------------------------------------------------
 
 
-def _state_file(where: str = ""):
+def _state_file(where: str = "", kind: str = "account"):
     from boxy import jobs
 
     tag = re.sub(r"[^A-Za-z0-9._-]", "_", where) if where else ""
-    return jobs._dir() / (f"last_account.{tag}" if tag else "last_account")
+    return jobs._dir() / (f"last_{kind}.{tag}" if tag else f"last_{kind}")
 
 
-def recall(where: str = "") -> str:
-    """The last account picked for this cluster/target, or '' if none/unreadable."""
+def recall(where: str = "", kind: str = "account") -> str:
+    """The last value picked for this cluster/target + kind, or '' if none."""
     try:
-        return _state_file(where).read_text().strip()
+        return _state_file(where, kind).read_text().strip()
     except OSError:
         return ""
 
 
-def remember(wcid: str, where: str = "") -> None:
+def remember(value: str, where: str = "", kind: str = "account") -> None:
     """Persist the pick as the per-cluster default (best-effort; never raises)."""
-    if not wcid:
+    if not value:
         return
     try:
-        _state_file(where).write_text(wcid + "\n")
+        _state_file(where, kind).write_text(value + "\n")
     except OSError:
         pass
 
@@ -80,21 +80,23 @@ def remember(wcid: str, where: str = "") -> None:
 # ---- the menu -----------------------------------------------------------------------
 
 
-def render_menu(rows: list[Row], default: str | None = None, *, stream=None) -> None:
+def render_menu(rows: list[Row], default: str | None = None, *, stream=None,
+                title: str = "Select a charge account (WCID):") -> None:
     stream = stream or sys.stderr
-    print("Select a charge account (WCID):", file=stream)
-    for i, (wcid, label) in enumerate(rows, 1):
-        mark = "  [default]" if default and wcid == default else ""
+    print(title, file=stream)
+    for i, (value, label) in enumerate(rows, 1):
+        mark = "  [default]" if default and value == default else ""
         lbl = f"  {label}" if label else ""
-        print(f"  {i}) {wcid}{lbl}{mark}", file=stream)
+        print(f"  {i}) {value}{lbl}{mark}", file=stream)
 
 
-def _read_choice(n: int, default_index: int | None, *, stream=None) -> int | None:
+def _read_choice(n: int, default_index: int | None, *, stream=None,
+                 noun: str = "account") -> int | None:
     """A 0-based index chosen at the prompt, or None to keep the default. Bad
     input re-prompts; EOF/Ctrl-C falls back to the default (never a traceback)."""
     stream = stream or sys.stderr
     hint = f" (Enter = {default_index + 1})" if default_index is not None else ""
-    prompt = f"account [1-{n}]{hint}: "
+    prompt = f"{noun} [1-{n}]{hint}: "
     for _ in range(5):
         print(prompt, end="", file=stream, flush=True)
         try:
@@ -154,3 +156,41 @@ def choose_account(accounts, *, explicit: str | None = None, remembered: str | N
     pick = wcids[idx]
     remember(pick, where)
     return pick, f"you picked {idx + 1} of {len(rows)} from {source}"
+
+
+def choose_partition(partitions, *, explicit: str | None = None, remembered: str | None = None,
+                     mode: str | None = None, where: str = "", source: str = "sinfo",
+                     allow_all: bool = True) -> tuple[str | None, str]:
+    """Pick ONE partition when several are available (parallel to choose_account).
+    `partitions` is a list of names (soonest-start order) or (name, label) rows.
+    Returns (value, note): a single partition; OR the full comma-list when the user
+    keeps 'all' / non-interactively (preserving boxy's soonest-start default); OR
+    (None, '') when --partition was given or there's nothing to choose. allow_all
+    offers an 'all' entry (Slurm takes a comma-list; Flux takes ONE queue -> False)."""
+    rows = _normalize(partitions)
+    names = [n for n, _ in rows]
+    full = ",".join(names)
+    if explicit or not names:
+        return None, ""
+    if len(names) == 1:
+        return names[0], f"only partition ({source})"
+    if not is_interactive(mode):
+        return ((full, f"all {len(names)} partitions from {source} (soonest-start)")
+                if allow_all else (names[0], f"first of {len(names)} from {source}"))
+
+    menu = list(rows)
+    if allow_all:
+        menu.append(("all", f"any of {full} — Slurm starts wherever a slot frees first"))
+    labels = [m for m, _ in menu]
+    default = remembered if remembered in labels else ("all" if allow_all else names[0])
+    render_menu(menu, default=default,
+                title=f"Select a partition ({len(names)} available, soonest-start):")
+    idx = _read_choice(len(menu), labels.index(default), noun="partition")
+    if idx is None:
+        idx = labels.index(default)
+    pick = menu[idx][0]
+    if pick != "all":
+        remember(pick, where=where, kind="partition")
+    if pick == "all":
+        return full, f"all {len(names)} from {source}"
+    return pick, f"you picked {pick} of {len(names)} from {source}"

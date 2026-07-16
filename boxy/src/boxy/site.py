@@ -527,4 +527,21 @@ def resolve_site(args, scheduler_name: str, need_gpu: bool = False) -> tuple[dic
         if twhy != "--time":
             decisions.append(f"time: {t} (via {twhy})")
 
+    if scheduler_name == "slurm":
+        lic, lwhy = resolve_license(getattr(args, "license", None))
+        if lic:
+            out["license"] = lic
+            if lwhy != "--license":
+                decisions.append(f"license: {lic} (via {lwhy})")
+
     return out, decisions
+
+
+def resolve_license(explicit: str | None) -> tuple[str, str]:
+    """(value, provenance) for a Slurm `--license=` request. --license wins, then
+    config site.license (BOXY_LICENSE). Empty => none (many sites auto-add
+    filesystem licenses; hops prints 'Adding filesystem licenses to job: …')."""
+    if explicit:
+        return explicit, "--license"
+    cfg = config.get_str("site.license").strip()
+    return (cfg, "config site.license") if cfg else ("", "")

@@ -100,12 +100,21 @@ def _shim(tmp_path, name, body):
 @pytest.fixture
 def clean_env(monkeypatch):
     for v in ("SBATCH_ACCOUNT", "SLURM_ACCOUNT", "BOXY_ACCOUNT", "BOXY_PARTITION",
-              "BOXY_DEFAULT_TIME", "BOXY_SCHEDULER", "WCID"):
+              "BOXY_DEFAULT_TIME", "BOXY_SCHEDULER", "WCID", "BOXY_LICENSE"):
         monkeypatch.delenv(v, raising=False)
 
 
 def test_account_flag_wins(clean_env):
     assert site.resolve_account("fy111111") == ("fy111111", "--account")
+
+
+def test_resolve_license_flag_and_config(clean_env, monkeypatch):
+    assert site.resolve_license("tscratch:1") == ("tscratch:1", "--license")
+    assert site.resolve_license(None) == ("", "")                 # none by default
+    monkeypatch.setenv("BOXY_LICENSE", "tscratch:1,pscratch:1")
+    from boxy import config
+    config.reset()
+    assert site.resolve_license(None) == ("tscratch:1,pscratch:1", "config site.license")
 
 
 def test_wcid_env_bypasses_discovery(clean_env, tmp_path, monkeypatch):

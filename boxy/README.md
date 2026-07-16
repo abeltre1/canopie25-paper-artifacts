@@ -69,6 +69,11 @@ choice (nothing is hidden, only the *work*):
   terminal so you choose which the job charges to (remembered per cluster,
   validated against the live list); bypass it with `--account`, `WCID=fy…`, or
   `BOXY_ACCOUNT`, and it never blocks a non-terminal run (`BOXY_PICK_ACCOUNT`).
+  Likewise, when **2+ partitions** are available and none was named, boxy offers
+  an **interactive partition picker** (pick one, or `all` to keep the
+  soonest-start comma-list); bypass with `--partition`/`BOXY_PICK_PARTITION`.
+  Slurm **licenses** can be requested with `--license tscratch:1` (or
+  `BOXY_LICENSE`) for sites that gate filesystems behind them.
   **Partition selection is automatic** — with
   no flag, boxy reads `sinfo`/`flux queue list` and submits to every
   **GPU-bearing** partition (idle-first), so Slurm starts the job wherever a GPU
