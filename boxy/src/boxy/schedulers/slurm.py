@@ -16,15 +16,18 @@ _JOBID_RE = re.compile(r"^\s*(\d+)(?:;\S+)?\s*$")
 # Site GRES convention auto-detected from `sinfo` over --ssh (set by the CLI just
 # before rendering; consulted only when site.gpu_directive is 'auto'). Process-
 # global for one invocation; reset between tests (conftest).
-_AUTO_GRES = {"form": "", "type": ""}
+_AUTO_GRES = {"form": "", "type": "", "active": False}
 
 
 def set_auto_gres(form: str, gtype: str) -> None:
-    _AUTO_GRES["form"], _AUTO_GRES["type"] = (form or ""), (gtype or "")
+    # the CLI's auto-recovery is now driving the GPU request; its form+type become
+    # AUTHORITATIVE (they win over a pinned config site.gpu_type) so an "untyped"
+    # retry truly submits --gres=gpu:N and the announced form matches what's sent.
+    _AUTO_GRES["form"], _AUTO_GRES["type"], _AUTO_GRES["active"] = (form or ""), (gtype or ""), True
 
 
 def reset_auto_gres() -> None:
-    _AUTO_GRES["form"], _AUTO_GRES["type"] = "", ""
+    _AUTO_GRES["form"], _AUTO_GRES["type"], _AUTO_GRES["active"] = "", "", False
 
 
 def _gpu_flag(n: int) -> str | None:
@@ -43,7 +46,9 @@ def _gpu_flag(n: int) -> str | None:
 
     form = (config.get_str("site.gpu_directive") or "auto").strip().lower()
     gtype = config.get_str("site.gpu_type").strip()
-    if form == "auto":
+    if _AUTO_GRES["active"]:
+        form, gtype = (_AUTO_GRES["form"] or "gpus-per-node"), _AUTO_GRES["type"]
+    elif form == "auto":
         form = _AUTO_GRES["form"] or "gpus-per-node"
         gtype = gtype or _AUTO_GRES["type"]
     typed = f"{gtype}:{n}" if gtype else str(n)     # a100:2  /  2
