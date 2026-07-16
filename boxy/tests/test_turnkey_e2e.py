@@ -805,6 +805,45 @@ def test_ssh_agentless_persistent_hf_cache_on_shared_fs(ssh, capfd, monkeypatch)
     assert 'mkdir -p "$(dirname "${_EP}")/hfcache"' in cap.out     # created at runtime
 
 
+def test_agentless_list_logs_stop_answer_from_laptop_records(ssh, capfd, monkeypatch, tmp_path):
+    # FIELD: `boxy list --ssh hops` delegated to the cluster's boxy, whose
+    # login-node `podman ps` showed NOTHING while the container ran on the compute
+    # node. Agentless records live on THIS machine; list/logs/stop must answer
+    # from them over the master — never delegate.
+    from boxy import jobs
+
+    rdir = tmp_path / "agentless"
+    rdir.mkdir()
+    (rdir / "boxy-m-777.log").write_text("vllm says hello\nApplication startup complete\n")
+    ep = rdir / "boxy-m.endpoint.json"
+    ep.write_text('{"name": "boxy-m", "host": "hops7", "port": 8000, "url": "http://hops7:8000"}')
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "777",
+                                 "model": "hf://x", "submitted_from": "agentless-ssh",
+                                 "target": "user@hops", "endpoint_remote": str(ep),
+                                 "log": str(rdir / "boxy-m-%j.log")})
+    _shim(ssh["bin"], "squeue", "#!/bin/bash\necho RUNNING\n")
+    _shim(ssh["bin"], "scancel", "#!/bin/bash\necho ok\n")
+
+    rc = main(["list", "--ssh", "user@hops"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "agentless jobs" in cap.out
+    assert "boxy-m  slurm job 777 on user@hops  RUNNING  http://hops7:8000/v1" in cap.out
+    assert "### Remote" not in cap.out                     # no delegation to a cluster boxy
+    assert "podman ps" not in cap.out                      # no login-node container listing
+
+    rc = main(["logs", "boxy-m"])                          # fetched over the master
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "vllm says hello" in cap.out
+
+    rc = main(["stop", "boxy-m", "--ssh", "user@hops"])    # canceled over the master
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "stopped slurm job 777 on user@hops" in cap.out
+    assert jobs.read_record("boxy-m") is None              # record reaped
+
+
 def test_config_default_proxy_is_sandia(monkeypatch):
     # zero-flag turnkey on-site: network.proxy ships the Sandia proxy so no --proxy
     # is ever needed; BOXY_PROXY= (empty) opts out off-site.

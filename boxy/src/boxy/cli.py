@@ -3314,7 +3314,130 @@ def cmd_unshare(args: argparse.Namespace) -> int:
     return 0
 
 
+def _agentless_records() -> list[dict]:
+    """This machine's records of AGENTLESS --ssh serves: the job runs on the
+    cluster, but the ONLY state lives here (the cluster has no boxy state — that's
+    the point). list/logs/stop must answer from these records over the SSH master,
+    never by delegating to a cluster boxy that knows nothing (field: `boxy list
+    --ssh hops` ran podman ps on the LOGIN node and showed nothing while the
+    container ran on the compute node)."""
+    from boxy import jobs
+
+    return [r for r in jobs.list_records()
+            if r.get("submitted_from") == "agentless-ssh" and r.get("target")]
+
+
+def _agentless_state(record: dict) -> str:
+    from boxy import remote
+    from boxy.schedulers import get_scheduler
+
+    scheduler = get_scheduler(record["scheduler"])
+    target = record["target"]
+    if remote.ensure_master(target) != 0:
+        return "UNREACHABLE"
+    rc, out = remote.ssh_capture(target, shlex.join(scheduler.state_command(record["job"])), timeout=20)
+    return scheduler.interpret_state(out) if rc == 0 else "UNKNOWN"
+
+
+def _agentless_url(record: dict) -> str:
+    import json as _json
+
+    from boxy import remote
+
+    ep = record.get("endpoint_remote", "")
+    if not ep:
+        return "-"
+    rc, out = remote.ssh_capture(record["target"], f"cat {shlex.quote(ep)} 2>/dev/null || true",
+                                 timeout=15)
+    if rc == 0 and out.strip():
+        try:
+            d = _json.loads(out)
+            if d.get("url"):
+                return f"{d['url']}/v1"
+        except ValueError:
+            pass
+    return "-"
+
+
+def _list_agentless(records: list[dict]) -> None:
+    print("agentless jobs (state probed over SSH; nothing installed on the cluster):")
+    for r in records:
+        state = _agentless_state(r)
+        url = _agentless_url(r) if state == "RUNNING" else "-"
+        print(f"  {r['name']}  {r['scheduler']} job {r['job']} on {r['target']}  {state}  {url}")
+        print(f"      logs: boxy logs {r['name']}      stop: boxy stop {r['name']}")
+
+
+def _agentless_log_glob(record: dict) -> str:
+    """The remote log path with the scheduler's output token (%j / {{id}}) turned
+    into a glob, so `ls -t` finds the actual per-job file(s)."""
+    pat = record.get("log", "")
+    for tok in ("%j", "{{id}}"):
+        pat = pat.replace(tok, "*")
+    return pat
+
+
+def _agentless_logs(args, record: dict) -> int:
+    """Tail an agentless job's log from the CLUSTER's shared FS over the master.
+    The newest per-job file matching the record's log pattern wins (reruns write
+    <name>-<jobid>.log siblings)."""
+    from boxy import diagnostics, remote
+
+    target = record["target"]
+    if remote.ensure_master(target) != 0:
+        print(f"boxy: could not open an SSH session to {target}", file=sys.stderr)
+        return 1
+    pat = _agentless_log_glob(record)
+    cmd = f'tail -n {int(args.tail)} "$(ls -t {pat} 2>/dev/null | head -1)" 2>/dev/null || true'
+    rc, out = remote.ssh_capture(target, cmd, timeout=30)
+    if rc != 0 or not out.strip():
+        raise UsageError(f"no log yet for {record['name']!r} on {target} (pattern {pat}) — "
+                         f"the job may still be pending; check: boxy list")
+    lines = out.splitlines()
+    print(f"### {target}:{pat}  (last {len(lines)} lines)")
+    for line in lines:
+        print(f"    {line}")
+    hint = diagnostics.diagnose(out)
+    if hint:
+        print()
+        print(hint)
+    return 0
+
+
+def _agentless_stop(args, record: dict, name: str) -> int:
+    from boxy import jobs, remote
+    from boxy.schedulers import get_scheduler
+
+    scheduler = get_scheduler(record["scheduler"])
+    target = record["target"]
+    cancel = shlex.join(scheduler.cancel_command(record["job"]))
+    print(f"### Remote {target}  $ {cancel}")
+    if args.dryrun:
+        return 0
+    if remote.ensure_master(target) != 0:
+        print(f"boxy: could not reach {target} to cancel job {record['job']}", file=sys.stderr)
+        return 1
+    rc, out = remote.ssh_capture(target, cancel, timeout=30)
+    if rc == 0:
+        jobs.remove(name)
+        print(f"### stopped {record['scheduler']} job {record['job']} on {target}")
+    else:
+        print(f"boxy: cancel failed on {target}:\n{out.strip()}", file=sys.stderr)
+    return rc
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
+    from boxy import jobs as _jobs
+
+    # an AGENTLESS record is handled from HERE over the master — even with --ssh
+    # (boxy's own output says `boxy stop NAME --ssh <target>`): the cluster's boxy
+    # (if any) has no record of this job and would no-op/fail.
+    nm = args.name or (Box.from_toml(args.box).name if args.box else None)
+    if nm:
+        rec = _jobs.read_record(nm)
+        if rec and rec.get("submitted_from") == "agentless-ssh" and rec.get("target"):
+            return _agentless_stop(args, rec, nm)
+
     rc = _delegate_remote(args)
     if rc is not None:
         return rc
@@ -3356,13 +3479,30 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
+    from boxy import remote as _remote
+
+    # AGENTLESS records live on THIS machine; with --ssh to their cluster, answer
+    # from here over the master instead of delegating to a cluster boxy that has
+    # no records (its login-node `podman ps` shows nothing — the container runs
+    # on the COMPUTE node).
+    agentless = _agentless_records()
+    tgt = _remote.resolve_target(args) or ""
+    if tgt:
+        thost = tgt.split("@")[-1]
+        mine = [r for r in agentless if r["target"].split("@")[-1] == thost]
+        if mine:
+            _list_agentless(mine)
+            return 0
+
     rc = _delegate_remote(args)
     if rc is not None:
         return rc
     from boxy import jobs
     from boxy.schedulers import get_scheduler
 
-    records = jobs.list_records()
+    if agentless:
+        _list_agentless(agentless)
+    records = [r for r in jobs.list_records() if r not in agentless]
     foreign_seen = False
     if records:
         print("scheduler jobs:")
@@ -3411,10 +3551,10 @@ def cmd_list(args: argparse.Namespace) -> int:
     try:
         runtime = args.runtime or _container_runtime(location)
     except RuntimeError:
-        if records:
+        if records or agentless:
             return 0  # jobs listed; no container runtime on this host is fine
         raise
-    rc = _list_local_containers(runtime, args.dryrun, have_records=bool(records))
+    rc = _list_local_containers(runtime, args.dryrun, have_records=bool(records or agentless))
     if not args.dryrun:
         _report_exited_containers(runtime)
     return rc
@@ -3557,7 +3697,23 @@ def _record_is_foreign(record: dict) -> tuple[bool, str]:
 
 def cmd_logs(args: argparse.Namespace) -> int:
     """Show a job's log (newest first) + boxy's crash diagnosis. Works after the
-    record is reaped (log files outlive DONE jobs) and over --ssh."""
+    record is reaped (log files outlive DONE jobs) and over --ssh. An AGENTLESS
+    job's log lives on the CLUSTER's shared FS — fetched from here over the
+    master (the cluster's own boxy, if any, has no record of it)."""
+    from boxy import jobs as _jobs
+
+    ag_rec = None
+    if args.name:
+        r = _jobs.read_record(args.name)
+        if r and r.get("submitted_from") == "agentless-ssh" and r.get("target"):
+            ag_rec = r
+    else:
+        ags = _agentless_records()
+        if ags:
+            ag_rec = ags[-1]  # newest record wins when unnamed
+    if ag_rec and ag_rec.get("log"):
+        return _agentless_logs(args, ag_rec)
+
     rc = _delegate_remote(args)
     if rc is not None:
         return rc
