@@ -1250,6 +1250,46 @@ echo "12345"
     assert "GPU request accepted as NO GPU directive" in cap.out
 
 
+def test_ssh_agentless_recovers_gres_then_license(ssh, capfd, monkeypatch):
+    # THE full kahuna sequence: no GRES config (every GPU spelling invalid) AND
+    # no tscratch license. The GPU ladder must land on 'no directive', then the
+    # license self-heal drops --license and the submit succeeds.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("BOXY_LICENSE", "tscratch:1")          # ship-default, opt back in
+    monkeypatch.setenv("HOME", str(ssh["tmp"] / "home"))
+    (ssh["tmp"] / "home").mkdir(exist_ok=True)
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\n"
+          'if [ "$1" = "-h" ] && [ "$2" = "-N" ]; then echo "(null)"; exit 0; fi\n'
+          "cat <<'EOF'\nhopper|up|1/1/2/4|(null)\nEOF\n")
+    _shim(ssh["bin"], "sbatch", r"""#!/bin/bash
+echo "$@" >> "$SBATCH_LOG"
+script="${!#}"
+if grep -Eq -- '--(gres|gpus|gpus-per-node)' "$script"; then
+  echo "sbatch: error: Invalid generic resource (gres) specification" >&2
+  exit 1
+fi
+if grep -q -- '--license' "$script"; then
+  echo "sbatch: error: Batch job submission failed: Invalid license specification" >&2
+  exit 1
+fi
+ep="${script%.sh}.endpoint.json"
+host="$(hostname)"
+printf '{"name":"x","host":"%s","port":8000,"url":"http://%s:8000","job":"12345"}\n' \
+       "$host" "$host" > "$ep"
+echo "12345"
+""")
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", lambda *a, **k: True)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "hopper",
+               "--ssh", "user@kahuna"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "retrying with NO GPU directive" in cap.err          # the GPU ladder's last rung
+    assert "the site rejected the license request" in cap.err   # then the license self-heal
+    assert "### license request dropped (auto-recovered)." in cap.out
+    assert "### Submitted slurm job 12345" in cap.out
+
+
 def test_ssh_agentless_auto_recovers_from_gres_rejection(ssh, capfd, monkeypatch):
     # THE kahuna fix: sinfo shows no gpu GRES so the first script uses
     # --gpus-per-node, which this site rejects. boxy must re-render with the

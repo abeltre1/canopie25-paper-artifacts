@@ -1121,6 +1121,14 @@ def _is_gres_error(text: str) -> bool:
             or "requested node configuration is not available" in low)
 
 
+def _is_license_error(text: str) -> bool:
+    """True when a submit failed on the LICENSE line ('Invalid license
+    specification') — the shipped site.license default (tscratch:1, a hops-ism)
+    doesn't exist on every cluster (field: kahuna). The self-heal drops the
+    directive and resubmits."""
+    return "invalid license" in (text or "").lower()
+
+
 def _looks_like_pull_block(text: str) -> bool:
     """True when a job log shows a blocked/failed container-image pull (compute
     node can't reach the registry — Docker Hub/ghcr 403, Zscaler block, air-gap)."""
@@ -1691,6 +1699,31 @@ def _serve_agentless_ssh(args, target: str) -> int:
             if rc == 0:
                 print(f"### GPU request accepted as {shown} (auto-recovered).")
                 break
+
+    # AUTO-RECOVER from a rejected LICENSE line: site.license ships a site default
+    # (tscratch:1 — hops gates filesystems behind it) that other clusters don't
+    # define ('Invalid license specification' — field: kahuna, surfaced after the
+    # GPU ladder cleared). Drop the directive and resubmit; the accepted GPU form
+    # from the ladder above is still active via set_auto_gres.
+    if rc != 0 and scheduler_name == "slurm" and _is_license_error(out):
+        lic_args = [a for a in site_args if "--license" in a]
+        if lic_args:
+            site_args = [a for a in site_args if "--license" not in a]
+            print(f"boxy: the site rejected the license request ({lic_args[0]!r} — a "
+                  f"site-specific default); retrying WITHOUT it ... (set BOXY_LICENSE= to "
+                  f"skip it on this cluster permanently)", file=sys.stderr)
+            try:
+                script_text = deploy.render_agentless_script(
+                    box, location, scheduler_name, name, ep_remote, log_remote, site_args,
+                    proxy_prefix=_proxy_prefix(args), port=args.port, engine_pulls_model=engine_pull)
+            except deploy.AgentlessError:
+                script_text = ""
+            if script_text and remote.push_file(target, script_remote, script_text) == 0:
+                remote.ssh_capture(target, f"chmod 600 {shlex.quote(script_remote)}", timeout=10)
+                rc, out = remote.ssh_capture(target, f"cd {shlex.quote(rhome)} && {submit_cmd}",
+                                             timeout=60)
+                if rc == 0:
+                    print("### license request dropped (auto-recovered).")
 
     deploy.set_agentless_ca(None)  # done rendering; don't leak the override
     if rc != 0:
