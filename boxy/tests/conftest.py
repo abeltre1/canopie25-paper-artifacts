@@ -30,6 +30,9 @@ def _isolate_config(monkeypatch, tmp_path):
     # network.proxy ships a site default (proxy.sandia.gov); blank it so goldens
     # stay site-agnostic. Proxy tests pass --proxy explicitly.
     monkeypatch.setenv("BOXY_PROXY", "")
+    # relay.apps_domain ships a site default (apps.goodall.sandia.gov); blank it
+    # so the oc-discovery paths are what the suite exercises.
+    monkeypatch.setenv("BOXY_APPS_DOMAIN", "")
     # ditto remote account injection (a dev box may carry sacctmgr/mywcid,
     # making --ssh serve tests nondeterministic); e2e tests opt back in.
     monkeypatch.setenv("BOXY_NO_REMOTE_ACCOUNT", "1")

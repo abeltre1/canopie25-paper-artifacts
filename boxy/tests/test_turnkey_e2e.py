@@ -899,6 +899,84 @@ def test_await_ready_extends_while_job_alive(monkeypatch, tmp_path):
     assert rc is False                                          # detached only when the job died
 
 
+def test_ssh_agentless_autodetects_rocm(ssh, capfd, monkeypatch):
+    # FIELD: an AMD cluster silently got the CUDA image because the accelerator
+    # defaulted to cuda. With no --accelerator, boxy now probes the login node's
+    # GPU stack over the master: rocm-smi present -> the ROCm image + no nvidia
+    # device flag.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    _shim(ssh["bin"], "rocm-smi", "#!/bin/bash\ntrue\n")           # the AMD userland marker
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@eldorado", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: accelerator: rocm (via the GPU stack on eldorado's login node)" in cap.out
+    assert "nvidia.com/gpu" not in cap.out                          # not the CUDA device flag
+    exec_line = [ln for ln in cap.out.splitlines() if "podman run" in ln][0]
+    assert "rocm" in exec_line                                      # the ROCm vLLM image
+
+
+def test_ssh_agentless_explicit_accelerator_skips_probe(ssh, capfd, monkeypatch):
+    # --accelerator pins it; the probe never runs (rocm-smi on PATH is ignored).
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    _shim(ssh["bin"], "rocm-smi", "#!/bin/bash\ntrue\n")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--accelerator", "cuda",
+               "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: accelerator:" not in cap.out
+    assert "nvidia.com/gpu" in cap.out
+
+
+def test_relay_apps_domain_discovery(monkeypatch):
+    # <service>.apps.<cluster>.<org>.<tld>: the apps domain comes from the
+    # cluster ingress config, else the api.->apps. transform of the oc server URL.
+    from boxy.exposers import relay
+
+    calls = {}
+
+    def fake_oc(args, **kw):
+        calls.setdefault("seq", []).append(args[0])
+        if args[0] == "get" and "ingresses.config.openshift.io" in args:
+            return 0, "apps.goodall.sandia.gov"
+        return 1, ""
+
+    monkeypatch.setattr(relay, "_oc", fake_oc)
+    dom, why = relay.discover_apps_domain()
+    assert dom == "apps.goodall.sandia.gov" and why == "cluster ingress config"
+
+    def fake_oc2(args, **kw):
+        if args[0] == "get":
+            return 1, "forbidden"                                  # no cluster-scope read
+        if args[0] == "whoami":
+            return 0, "https://api.goodall.sandia.gov:6443"
+        return 1, ""
+
+    monkeypatch.setattr(relay, "_oc", fake_oc2)
+    dom, why = relay.discover_apps_domain()
+    assert dom == "apps.goodall.sandia.gov" and "api. -> apps." in why
+
+    monkeypatch.setattr(relay, "_oc", lambda a, **k: (1, "not logged in"))
+    dom, why = relay.discover_apps_domain()
+    assert dom == "" and "oc login" in why
+
+
+def test_generate_relay_autodiscovers_host(capsys, monkeypatch):
+    # zero-flag relay: no --host -> the Route host derives from the logged-in
+    # cluster (boxy-relay.apps.<cluster>.<org>.<tld>); stdout stays pure YAML.
+    from boxy.exposers import relay
+
+    monkeypatch.setattr(relay, "discover_apps_domain",
+                        lambda: ("apps.goodall.sandia.gov", "cluster ingress config"))
+    rc = main(["generate", "relay", "--auth", "boxy:pw"])
+    cap = capsys.readouterr()
+    assert rc == 0
+    assert "auto: relay host: boxy-relay.apps.goodall.sandia.gov" in cap.err
+    assert "host: boxy-relay.apps.goodall.sandia.gov" in cap.out
+    assert "kind: Deployment" in cap.out
+
+
 def test_config_default_proxy_is_sandia(monkeypatch):
     # zero-flag turnkey on-site: network.proxy ships the Sandia proxy so no --proxy
     # is ever needed; BOXY_PROXY= (empty) opts out off-site.

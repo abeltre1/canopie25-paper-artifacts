@@ -73,6 +73,11 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
             help="default listen port for the llama.cpp engine."),
 
     # -- container images ------------------------------------------------------
+    Setting("relay.apps_domain", "BOXY_APPS_DOMAIN", "apps.goodall.sandia.gov",
+            help="the OpenShift apps domain share/relay URLs are minted under "
+                 "(<name>.<apps domain>). Defaults to the Sandia goodall cluster; empty "
+                 "(BOXY_APPS_DOMAIN=) auto-discovers from the logged-in cluster instead "
+                 "(oc ingress config, else api.->apps. off `oc whoami --show-server`)."),
     Setting("images.relay", "BOXY_RELAY_IMAGE", "quay.sandia.gov/ambelt/chisel:1.10.1",
             help="chisel image for the share relay CLIENT + OpenShift relay server "
                  "(one override mirrors both). Defaults to the Sandia mirror so "

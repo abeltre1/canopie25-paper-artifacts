@@ -1442,6 +1442,18 @@ def _serve_agentless_ssh(args, target: str) -> int:
     args.scheduler = scheduler_name  # pin it so _resolve_or_load doesn't trip the login-node guard
     scheduler = get_scheduler(scheduler_name)
 
+    # 1b) accelerator: with no explicit flag, probe the TARGET's login-node GPU
+    #     stack over the master (nvidia-smi vs rocm-smi//opt/rocm) BEFORE
+    #     resolution — the local resolver can only see THIS laptop, so it would
+    #     fall back to the cuda config default and hand an AMD cluster the CUDA
+    #     image (field: AMD system). Probed value rides in as the explicit flag.
+    if not getattr(args, "accelerator", None):
+        arc, aout = remote.ssh_capture(target, site.remote_accel_probe(), timeout=20)
+        probed = site.parse_remote_accel(aout) if arc == 0 else ""
+        if probed:
+            args.accelerator = probed
+            print(f"  auto: accelerator: {probed} (via the GPU stack on {host}'s login node)")
+
     # 2) model card -> gpus/engine/args (all laptop-side; nothing needed on the cluster)
     for line in cards.apply_to_args(args):
         print(f"  auto: {line}")
@@ -3194,9 +3206,17 @@ def _generate_relay(args: argparse.Namespace) -> int:
     from boxy.exposers import relay
 
     if not args.host:
-        print("boxy generate relay: --host is required (the relay's Route host, "
-              "e.g. relay-boxy.apps.<cluster>)", file=sys.stderr)
-        return 2
+        # zero-flag: derive the Route host from the LOGGED-IN cluster —
+        # <relay>.<apps domain> where the apps domain comes from the cluster's
+        # ingress config (or api.->apps. off `oc whoami --show-server`).
+        dom, why = relay.discover_apps_domain()
+        if not dom:
+            print(f"boxy generate relay: could not discover the cluster's apps domain ({why}) — "
+                  "pass --host <name>.apps.<cluster>.<org>.<tld>", file=sys.stderr)
+            return 2
+        args.host = f"{relay.RELAY_APP}.{dom}"
+        # stderr so stdout stays pure YAML for `| oc apply -f -`
+        print(f"  auto: relay host: {args.host} (via {why})", file=sys.stderr)
     text = relay.emit_relay_manifest(args.host, args.namespace or relay.DEFAULT_NAMESPACE,
                                      image=args.image or config.get("images.relay"),
                                      auth=args.auth, key_seed=args.key_seed)

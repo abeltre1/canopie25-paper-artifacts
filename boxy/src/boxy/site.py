@@ -290,6 +290,27 @@ def remote_partition_probe(scheduler_name: str) -> str:
     return shlex.join(cmd) + " 2>/dev/null || true"
 
 
+def remote_accel_probe() -> str:
+    """Shell one-liner run on a cluster LOGIN node (over the ssh master) to
+    auto-detect the accelerator family for an agentless serve. Login nodes
+    usually carry the site's GPU userland even when they have no GPU themselves:
+    NVIDIA ships nvidia-smi (or /proc/driver/nvidia), ROCm ships rocm-smi /
+    /opt/rocm (field: an AMD system silently got the CUDA image because the
+    default accelerator is cuda). Prints exactly one token: cuda | rocm | none."""
+    return ("if command -v nvidia-smi >/dev/null 2>&1 || [ -e /proc/driver/nvidia/version ]; "
+            "then echo cuda; "
+            "elif command -v rocm-smi >/dev/null 2>&1 || [ -d /opt/rocm ]; then echo rocm; "
+            "else echo none; fi")
+
+
+def parse_remote_accel(out: str) -> str:
+    """The probe's token, or '' when nothing usable came back (banner noise from
+    a login shell is tolerated — only the LAST line is read)."""
+    lines = [ln.strip() for ln in (out or "").strip().splitlines() if ln.strip()]
+    tok = lines[-1] if lines else ""
+    return tok if tok in ("cuda", "rocm") else ""
+
+
 def remote_scheduler_probe() -> str:
     """Shell one-liner run on a cluster login node (over the ssh master) to
     auto-detect `--scheduler`. It reports which scheduler is ACTUALLY OPERATIONAL,

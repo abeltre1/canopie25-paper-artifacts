@@ -133,10 +133,28 @@ def test_cli_generate_relay(capsys):
     assert "ZERO install" in out                           # zero-install (containerized chisel) hint
 
 
-def test_cli_generate_relay_requires_host(capsys):
+def test_cli_generate_relay_without_host_or_cluster_errors(capsys, monkeypatch):
+    # no --host, no configured apps domain, no oc login -> a clear error naming
+    # every way out (the suite blanks BOXY_APPS_DOMAIN; prod ships a site default).
+    from boxy.exposers import relay as relay_mod
+
+    monkeypatch.setattr(relay_mod, "_oc", lambda a, **k: (1, "not logged in"))
     rc = main(["generate", "relay"])
+    err = capsys.readouterr().err
     assert rc == 2
-    assert "--host is required" in capsys.readouterr().err
+    assert "could not discover the cluster's apps domain" in err
+    assert "--host" in err
+
+
+def test_cli_generate_relay_uses_configured_apps_domain(capsys, monkeypatch):
+    # the shipped site default (relay.apps_domain) mints the host with no oc at
+    # all: boxy-relay.apps.goodall.sandia.gov — the demo path.
+    monkeypatch.setenv("BOXY_APPS_DOMAIN", "apps.goodall.sandia.gov")
+    rc = main(["generate", "relay", "--auth", "boxy:pw"])
+    cap = capsys.readouterr()
+    assert rc == 0
+    assert "auto: relay host: boxy-relay.apps.goodall.sandia.gov (via config relay.apps_domain)" in cap.err
+    assert "host: boxy-relay.apps.goodall.sandia.gov" in cap.out
 
 
 def test_cli_generate_relay_image_override_for_mirror(capsys):

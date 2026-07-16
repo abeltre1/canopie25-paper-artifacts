@@ -330,6 +330,31 @@ def _oc(args: list[str], *, stdin: str | None = None, timeout: float = 20) -> tu
         return 127, str(e)
 
 
+def discover_apps_domain() -> tuple[str, str]:
+    """The OpenShift cluster's apps domain ('apps.<cluster>.<org>.<tld>') plus how
+    it was found — so relay/share URLs derive with NO --host: <name>.<apps domain>.
+    Order: config relay.apps_domain (the shipped site default; a leading '*.'
+    wildcard spelling is tolerated) > the logged-in cluster's ingress config >
+    the api.->apps. transform of `oc whoami --show-server` (for users without
+    cluster-scope read). ('', why) when nothing is configured and oc is absent
+    or logged out."""
+    from boxy import config
+
+    pinned = config.get_str("relay.apps_domain").strip().lstrip("*").lstrip(".")
+    if pinned:
+        return pinned, "config relay.apps_domain"
+    rc, out = _oc(["get", "ingresses.config.openshift.io", "cluster",
+                   "-o", "jsonpath={.spec.domain}"])
+    if rc == 0 and out and "." in out and " " not in out:
+        return out.strip(), "cluster ingress config"
+    rc, out = _oc(["whoami", "--show-server"])
+    if rc == 0 and out:
+        host = out.strip().split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+        if host.startswith("api.") and "." in host[4:]:
+            return "apps." + host[len("api."):], "oc whoami --show-server (api. -> apps.)"
+    return "", "oc not logged in — `oc login <cluster>` first, or pass --host / BOXY_RELAY_URL"
+
+
 def relay_admission(namespace: str = "") -> tuple[str, str]:
     """Doctor helper (read-only): is the shared relay Route admitted on this
     cluster? Returns (status, detail) with status in {'ok', 'missing', 'rejected',
@@ -409,9 +434,11 @@ class RelayExposer(Exposer):
         rc, out = _oc(["get", "route", RELAY_APP, "-n", self._namespace(),
                        "-o", "jsonpath={.spec.host}"])
         if rc != 0 or not out:
+            dom, _why = discover_apps_domain()
+            hint = f"{RELAY_APP}.{dom}" if dom else f"{RELAY_APP}.apps.<cluster>.<org>.<tld>"
             raise ExposeError(
-                f"relay not found (set {ENV_RELAY_URL} or deploy it: "
-                f"`boxy generate relay --host relay-boxy.apps.<cluster> | oc apply -f -`)")
+                f"relay not deployed on this cluster (set {ENV_RELAY_URL} or deploy it once: "
+                f"`boxy generate relay --auth boxy:<pw> | oc apply -f -` -> https://{hint})")
         return f"https://{out}"
 
     def _credential(self) -> str:
