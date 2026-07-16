@@ -495,10 +495,10 @@ def test_ssh_injects_default_walltime(ssh, capfd, monkeypatch):
     rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
     cap = capfd.readouterr()
     assert rc == 0
-    assert "auto: time: 30:00" in cap.out
+    assert "auto: time: 1:00:00" in cap.out
     assert "stops the job at this walltime" in cap.out
-    assert "--time 30:00" in ssh["ssh_log"].read_text()
-    assert "#SBATCH --time=30:00" in cap.out
+    assert "--time 1:00:00" in ssh["ssh_log"].read_text()
+    assert "#SBATCH --time=1:00:00" in cap.out
 
 
 def test_ssh_explicit_time_wins(ssh, capfd, monkeypatch):
@@ -509,7 +509,7 @@ def test_ssh_explicit_time_wins(ssh, capfd, monkeypatch):
     assert rc == 0
     assert "auto: time:" not in cap.out                    # not injected over an explicit flag
     ssh_log = ssh["ssh_log"].read_text()
-    assert "--time 2:00:00" in ssh_log and "--time 30:00" not in ssh_log
+    assert "--time 2:00:00" in ssh_log and "--time 1:00:00" not in ssh_log
 
 
 # ---- readiness timeout is raised so an OLD cluster boxy doesn't give up early ------
@@ -554,7 +554,7 @@ def test_login_node_scheduler_from_config(cluster, capfd, monkeypatch):
     assert "auto: scheduler: slurm (via config site.scheduler)" in cap.out
     script = _the_script(cluster["jobs"])
     assert "#SBATCH --account=fy140001" in script
-    assert "#SBATCH --time=30:00" in script
+    assert "#SBATCH --time=1:00:00" in script
 
 
 # ---- --share is abstracted: a team URL is published automatically over --ssh ------
@@ -603,7 +603,7 @@ def test_ssh_agentless_default_renders_self_contained_script(ssh, capfd, monkeyp
     # site directives resolved laptop-side over SSH and baked into the script
     assert "#SBATCH --account=fy260064" in cap.out
     assert "#SBATCH --partition=gpu,batch" in cap.out
-    assert "#SBATCH --time=30:00" in cap.out
+    assert "#SBATCH --time=1:00:00" in cap.out
     assert "sbatch --parsable" in cap.out
     # NOT the delegated path — the cluster's boxy is never invoked
     assert "$ boxy serve" not in cap.out

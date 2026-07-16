@@ -180,9 +180,9 @@ def test_account_none_when_nothing_discovers(clean_env, monkeypatch):
 
 
 def test_time_defaults(clean_env, monkeypatch):
-    # the default walltime is 30 min (turnkey: the job always carries one, so it
+    # the default walltime is 1 h (turnkey: the job always carries one, so it
     # never blocks on a missing --time); an explicit config value overrides it.
-    assert site.resolve_time(None) == ("30:00", "config site.default_time")
+    assert site.resolve_time(None) == ("1:00:00", "config site.default_time")
     monkeypatch.setenv("BOXY_DEFAULT_TIME", "4:00:00")
     assert site.resolve_time(None)[0] == "4:00:00"
     monkeypatch.setenv("BOXY_DEFAULT_TIME", "")   # explicit empty => scheduler's own default

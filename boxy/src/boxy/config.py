@@ -174,9 +174,9 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
             help="when a live instance of the same model already exists, start an "
                  "independent instance instead of blocking (turnkey). Set false to "
                  "restore the strict singleton (re-run reports 'already submitted')."),
-    Setting("site.default_time", "BOXY_DEFAULT_TIME", "30:00",
+    Setting("site.default_time", "BOXY_DEFAULT_TIME", "1:00:00",
             help="default walltime when --time is absent (Slurm colon notation, e.g. "
-                 "'30:00' = 30 min, '4:00:00' = 4 h; boxy converts it to Flux FSD). "
+                 "'1:00:00' = 1 h, '30:00' = 30 min; boxy converts it to Flux FSD). "
                  "NOTE: the scheduler KILLS the served job at the walltime, so raise this "
                  "for long serving sessions. Empty => the scheduler's own default."),
     Setting("site.gpu_directive", "BOXY_GPU_DIRECTIVE", "auto",
