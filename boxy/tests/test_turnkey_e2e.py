@@ -1185,6 +1185,38 @@ echo "12345"
     assert "GPU request accepted as --gres=gpu:h200:N (auto-recovered)" in cap.out
 
 
+def test_ssh_agentless_recovers_via_per_node_gres(ssh, capfd, monkeypatch):
+    # Some sites report (null) GRES at PARTITION level and only surface the GPU
+    # type per-NODE (`sinfo -N -o %G`). The recovery falls back to that probe
+    # before abandoning the typed form.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("HOME", str(ssh["tmp"] / "home"))
+    (ssh["tmp"] / "home").mkdir(exist_ok=True)
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\n"
+          'if [ "$1" = "-h" ] && [ "$2" = "-N" ]; then echo "gpu:h200:4(S:0-1)"; exit 0; fi\n'
+          "cat <<'EOF'\nhopper|up|2/6/0/8|(null)\nEOF\n")
+    _shim(ssh["bin"], "sbatch", r"""#!/bin/bash
+echo "$@" >> "$SBATCH_LOG"
+script="${!#}"
+if ! grep -Eq -- '--gres=gpu:[a-z0-9]+:[0-9]+' "$script"; then
+  echo "sbatch: error: Invalid generic resource (gres) specification" >&2
+  exit 1
+fi
+ep="${script%.sh}.endpoint.json"
+host="$(hostname)"
+printf '{"name":"x","host":"%s","port":8000,"url":"http://%s:8000","job":"12345"}\n' \
+       "$host" "$host" > "$ep"
+echo "12345"
+""")
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", lambda *a, **k: True)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "hopper",
+               "--ssh", "user@kahuna"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "GPU request accepted as --gres=gpu:h200:N (auto-recovered)" in cap.out
+
+
 def test_ssh_agentless_auto_recovers_from_gres_rejection(ssh, capfd, monkeypatch):
     # THE kahuna fix: sinfo shows no gpu GRES so the first script uses
     # --gpus-per-node, which this site rejects. boxy must re-render with the

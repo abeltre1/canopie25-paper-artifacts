@@ -1660,6 +1660,13 @@ def _serve_agentless_ssh(args, target: str) -> int:
         sel = ({p.strip() for p in part.split(",")}
                if part and site.partition_mode(part) == "set" else None)
         gtypes = site.gpu_types_from_gres(gout, sel) if grc == 0 else []
+        if not gtypes:
+            # some sites only surface GRES types per-NODE (%G at partition level
+            # shows (null)); ask node-wise before giving up on a typed form.
+            nrc, nout = remote.ssh_capture(target, "sinfo -h -N -o %G 2>/dev/null || true",
+                                           timeout=20)
+            if nrc == 0:
+                gtypes = site.gpu_types_from_gres(nout)
         for gform, gtype in _gres_fallback_forms(gtypes):
             _slurm.set_auto_gres(gform, gtype)
             try:
