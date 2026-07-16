@@ -719,6 +719,22 @@ def test_ssh_agentless_picker_selects_account(ssh, capfd, monkeypatch):
     assert "you picked 2 of 3 from mywcid on hops" in cap.out
 
 
+def test_ssh_agentless_forwards_proxy_to_the_compute_node_pull(ssh, capfd, monkeypatch):
+    # THE regression: the --ssh agentless script must forward the corporate proxy to
+    # the compute-node `podman pull`, or an isolated node 403s on Docker Hub (Zscaler).
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.delenv("BOXY_NO_PROXY_PROPAGATE", raising=False)     # opt in (suite opts out)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--proxy", "http://proxy.site:80",
+               "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    # the podman pull is prefixed with the proxy env, and boxy says so
+    assert "exec env " in cap.out and "proxy.site:80" in cap.out
+    assert "env " in cap.out.split("podman run")[0].rsplit("exec ", 1)[-1] or "proxy.site:80" in cap.out
+    assert "forwarding" in cap.out and "compute-node image pull" in cap.out
+
+
 def test_ssh_agentless_license_flag_lands_in_the_script(ssh, capfd, monkeypatch):
     # --license adds #SBATCH --license=... in the agentless batch script (Slurm).
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")

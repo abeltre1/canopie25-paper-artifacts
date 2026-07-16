@@ -1418,11 +1418,18 @@ def _serve_agentless_ssh(args, target: str) -> int:
     tok = scheduler.output_token or ""
     log_remote = f"{rdir}/{name}{('-' + tok) if tok else ''}.log"
 
-    # 7) render the self-contained script LAPTOP-side
+    # 7) render the self-contained script LAPTOP-side. Forward the corporate proxy
+    #    to the COMPUTE-NODE `podman pull` (Docker Hub/ghcr 403 behind Zscaler): the
+    #    submitter's ambient proxy env (or --proxy) is carried over — same as every
+    #    other agentless render. Without this the isolated node can't reach the registry.
+    pfx = _proxy_prefix(args)
+    if pfx:
+        print(f"  auto: proxy: forwarding {pfx.strip()}to the compute-node image pull "
+              f"(reach the registry behind the site proxy)")
     try:
         script_text = deploy.render_agentless_script(
             box, location, scheduler_name, name, ep_remote, log_remote, site_args,
-            proxy_prefix="", port=args.port, engine_pulls_model=engine_pull)
+            proxy_prefix=pfx, port=args.port, engine_pulls_model=engine_pull)
     except deploy.AgentlessError as e:
         print(f"boxy: agentless: {e}", file=sys.stderr)
         return 2
@@ -1463,7 +1470,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
             try:
                 script_text = deploy.render_agentless_script(
                     box, location, scheduler_name, name, ep_remote, log_remote, site_args,
-                    proxy_prefix="", port=args.port, engine_pulls_model=engine_pull)
+                    proxy_prefix=_proxy_prefix(args), port=args.port, engine_pulls_model=engine_pull)
             except deploy.AgentlessError:
                 break
             shown = _gpu_form_label(gform, gtype)
