@@ -10,6 +10,19 @@ def test_slurm_srun_prefix(hops):
     assert cmd == ["srun", "--nodes=2", "--gpus-per-node=4", "podman", "run"]
 
 
+def test_slurm_parse_job_id_ignores_sbatch_info_noise():
+    s = get_scheduler("slurm")
+    # field: hops merges sbatch's stderr INFO line into the captured output, and it
+    # can land AFTER the job id — the id must still be extracted, not the INFO line.
+    noisy = ("1819345\nsbatch: INFO: Adding filesystem licenses to job: "
+             "gpfs:1,tscratch:1,pscratch:1,rlfs01:1,rnfs01:1")
+    assert s.parse_job_id(noisy) == "1819345"
+    assert s.parse_job_id("sbatch: INFO: Adding filesystem licenses\n1819345") == "1819345"
+    assert s.parse_job_id("1818768") == "1818768"
+    assert s.parse_job_id("1818768;clusterA") == "1818768"
+    assert s.parse_job_id("") == ""
+
+
 def test_slurm_clears_xdg(hops):
     # Prototype check_podman: unset XDG_SESSION_ID / XDG_RUNTIME_DIR in jobs.
     assert get_scheduler("slurm").host_env_fixups() == ["XDG_SESSION_ID", "XDG_RUNTIME_DIR"]

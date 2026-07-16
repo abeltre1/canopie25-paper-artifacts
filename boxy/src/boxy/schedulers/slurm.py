@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+import re
+
 from boxy.location import Location
 from boxy.schedulers.base import PartitionInfo, Scheduler
+
+# a Slurm --parsable job id: bare digits, optionally ";cluster". Used to pluck the
+# real id out of sbatch output that also carries INFO chatter (field: hops emits
+# "sbatch: INFO: Adding filesystem licenses to job: gpfs:1,tscratch:1,...").
+_JOBID_RE = re.compile(r"^\s*(\d+)(?:;\S+)?\s*$")
 
 
 # Site GRES convention auto-detected from `sinfo` over --ssh (set by the CLI just
@@ -103,9 +110,16 @@ class SlurmScheduler(Scheduler):
         return ["sbatch", "--parsable", script]
 
     def parse_job_id(self, submit_stdout: str) -> str:
-        # --parsable prints "jobid" or "jobid;cluster"
-        last = super().parse_job_id(submit_stdout)
-        return last.split(";")[0]
+        # --parsable prints "jobid" or "jobid;cluster", BUT some sites also emit
+        # noise on the same stream — e.g. hops prints
+        # "sbatch: INFO: Adding filesystem licenses to job: gpfs:1,..." — and the
+        # ssh capture merges stdout+stderr. Pick the LAST bare-numeric (optionally
+        # ;cluster) line, not just the last line, so the INFO chatter is ignored.
+        for line in reversed(submit_stdout.strip().splitlines()):
+            m = _JOBID_RE.match(line)
+            if m:
+                return m.group(1)
+        return super().parse_job_id(submit_stdout).split(";")[0]  # fallback: last token
 
     def cancel_command(self, job_id: str) -> list[str]:
         return ["scancel", job_id]
