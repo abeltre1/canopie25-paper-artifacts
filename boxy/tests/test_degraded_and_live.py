@@ -30,6 +30,21 @@ def _run_isolated(code: str) -> subprocess.CompletedProcess:
                           env=env, cwd=ROOT, timeout=120)
 
 
+def _ramalama_isolatable() -> bool:
+    """True when the isolated harness can actually hide ramalama. Setting
+    PYTHONPATH=SRC does NOT exclude site-packages, so when ramalama is pip-installed
+    (as in CI's `.[ramalama]` env, or this sandbox) the subprocess still imports it
+    and the degraded-mode precondition can't be met. CI excludes this whole file
+    for exactly that reason; here we SKIP (not fail) so a full local `pytest` on a
+    ramalama-present machine stays green."""
+    p = _run_isolated("import importlib.util as u; print(u.find_spec('ramalama') is None)")
+    return p.returncode == 0 and p.stdout.strip() == "True"
+
+
+@pytest.mark.skipif(not _ramalama_isolatable(),
+                    reason="ramalama is importable in the harness (pip-installed); the "
+                           "no-ramalama degradation tests need it truly absent (CI excludes "
+                           "this file). Run in a venv/image without ramalama to exercise them.")
 class TestDegradedWithoutRamalama:
     def test_ramalama_really_absent_in_harness(self):
         p = _run_isolated("import importlib.util as u; print(u.find_spec('ramalama'))")
