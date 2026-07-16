@@ -899,21 +899,38 @@ def test_await_ready_extends_while_job_alive(monkeypatch, tmp_path):
     assert rc is False                                          # detached only when the job died
 
 
-def test_ssh_agentless_autodetects_rocm(ssh, capfd, monkeypatch):
-    # FIELD: an AMD cluster silently got the CUDA image because the accelerator
-    # defaulted to cuda. With no --accelerator, boxy now probes the login node's
-    # GPU stack over the master: rocm-smi present -> the ROCm image + no nvidia
-    # device flag.
+def test_ssh_agentless_autodetects_rocm_from_gres(ssh, capfd, monkeypatch):
+    # FIELD: an AMD cluster got the CUDA image and died with 'unresolvable CDI
+    # devices nvidia.com/gpu=all'. The SCHEDULER's GPU inventory is authoritative
+    # (it describes the COMPUTE nodes): mi300a GRES -> rocm, even when the login
+    # node exposes no GPU userland at all.
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
     monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
-    _shim(ssh["bin"], "rocm-smi", "#!/bin/bash\ntrue\n")           # the AMD userland marker
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\ncat <<'EOF'\n"
+          "batch|up|2/6/0/8|gpu:mi300a:4\n"
+          "EOF\n")
     rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@eldorado", "--dryrun"])
     cap = capfd.readouterr()
     assert rc == 0
     assert "auto: accelerator: rocm (via the GPU stack on eldorado's login node)" in cap.out
     assert "nvidia.com/gpu" not in cap.out                          # not the CUDA device flag
+    assert "--device /dev/kfd" in cap.out                           # the AMD device nodes
     exec_line = [ln for ln in cap.out.splitlines() if "podman run" in ln][0]
     assert "rocm" in exec_line                                      # the ROCm vLLM image
+
+
+def test_ssh_agentless_autodetects_rocm_from_userland(ssh, capfd, monkeypatch):
+    # No GRES signal (CPU-only sinfo answer, e.g. a Flux system without the
+    # slurm shim): the login node's ROCm userland (rocm-smi) still wins.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\necho 'batch|up|2/6/0/8|(null)'\n")
+    _shim(ssh["bin"], "rocm-smi", "#!/bin/bash\ntrue\n")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@eldorado", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: accelerator: rocm (via the GPU stack on eldorado's login node)" in cap.out
+    assert "--device /dev/kfd" in cap.out
 
 
 def test_ssh_agentless_explicit_accelerator_skips_probe(ssh, capfd, monkeypatch):

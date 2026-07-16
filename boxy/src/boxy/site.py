@@ -291,16 +291,30 @@ def remote_partition_probe(scheduler_name: str) -> str:
 
 
 def remote_accel_probe() -> str:
-    """Shell one-liner run on a cluster LOGIN node (over the ssh master) to
-    auto-detect the accelerator family for an agentless serve. Login nodes
-    usually carry the site's GPU userland even when they have no GPU themselves:
-    NVIDIA ships nvidia-smi (or /proc/driver/nvidia), ROCm ships rocm-smi /
-    /opt/rocm (field: an AMD system silently got the CUDA image because the
-    default accelerator is cuda). Prints exactly one token: cuda | rocm | none."""
-    return ("if command -v nvidia-smi >/dev/null 2>&1 || [ -e /proc/driver/nvidia/version ]; "
-            "then echo cuda; "
-            "elif command -v rocm-smi >/dev/null 2>&1 || [ -d /opt/rocm ]; then echo rocm; "
-            "else echo none; fi")
+    """Shell snippet run on a cluster LOGIN node (over the ssh master) to
+    auto-detect the accelerator family for an agentless serve. Prints exactly
+    one token: cuda | rocm | none.
+
+    Signal order (field: an AMD system got the CUDA image + 'unresolvable CDI
+    devices nvidia.com/gpu=all'):
+    1. the SCHEDULER's GPU inventory (`sinfo -o %G` GRES types) — authoritative,
+       it describes the COMPUTE nodes: mi250/mi300/amd => rocm; h100/a100/... =>
+       cuda. Works even when the login node carries no GPU userland at all.
+    2. login-node userland markers — rocm-smi//opt/rocm//dev/kfd before the
+       NVIDIA markers, since ROCm userland on an NVIDIA cluster is far rarer
+       than a stray CUDA module on an AMD one."""
+    return (
+        'g=$( (sinfo -h -o %G 2>/dev/null || true) | tr "[:upper:]" "[:lower:]" | tr "\\n" " " ); '
+        'case "$g" in '
+        '*mi[0-9]*|*amd*|*gfx[0-9]*) echo rocm ;; '
+        '*h100*|*h200*|*a100*|*v100*|*gh200*|*b200*|*l4*|*t4*|*p100*|*k80*|*rtx*|*tesla*|*nvidia*) '
+        'echo cuda ;; '
+        '*) if command -v rocm-smi >/dev/null 2>&1 || [ -d /opt/rocm ] || [ -e /dev/kfd ]; '
+        'then echo rocm; '
+        'elif command -v nvidia-smi >/dev/null 2>&1 || [ -e /proc/driver/nvidia/version ]; '
+        'then echo cuda; '
+        'else echo none; fi ;; '
+        'esac')
 
 
 def parse_remote_accel(out: str) -> str:
