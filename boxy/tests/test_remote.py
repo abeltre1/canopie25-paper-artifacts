@@ -98,7 +98,9 @@ def test_remote_proxy_env_prefers_config_then_ambient(monkeypatch):
         monkeypatch.delenv(v, raising=False)
     monkeypatch.setenv("BOXY_PROXY", "http://cfg:8080")           # config wins
     assert remote.remote_proxy_env()["https_proxy"] == "http://cfg:8080"
-    monkeypatch.delenv("BOXY_PROXY", raising=False)
+    # BOXY_PROXY="" is the explicit opt-out of the shipped site default
+    # (proxy.sandia.gov) — only then does the ambient env fall through.
+    monkeypatch.setenv("BOXY_PROXY", "")
     monkeypatch.setenv("https_proxy", "http://ambient:3128")      # else ambient env
     assert remote.remote_proxy_env()["https_proxy"] == "http://ambient:3128"
 
