@@ -72,9 +72,12 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
             help="default listen port for the llama.cpp engine."),
 
     # -- container images ------------------------------------------------------
-    Setting("images.relay", "BOXY_RELAY_IMAGE", "docker.io/jpillora/chisel:1.10",
-            help="chisel image for the OpenShift share relay (point at a mirror "
-                 "if Docker Hub is blocked)."),
+    Setting("images.relay", "BOXY_RELAY_IMAGE", "quay.sandia.gov/ambelt/chisel:1.10.1",
+            help="chisel image for the share relay CLIENT + OpenShift relay server "
+                 "(one override mirrors both). Defaults to the Sandia mirror so "
+                 "isolated/air-gapped compute nodes don't 403 on Docker Hub; set "
+                 "BOXY_RELAY_IMAGE / [images].relay to docker.io/jpillora/chisel:1.10 "
+                 "(or another mirror) off-site."),
     Setting("images.flux_mcp", "BOXY_FLUX_MCP_IMAGE", "ghcr.io/converged-computing/flux-mcp:latest",
             help="flux-mcp image for the persistent OpenShift MCP service."),
     Setting("images.awscli", "BOXY_AWSCLI_IMAGE", "public.ecr.aws/aws-cli/aws-cli:latest",
@@ -170,16 +173,16 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
                  "RamaLama): the laptop renders a self-contained podman batch script, submits + "
                  "polls it over SSH. Set false (or --delegate / BOXY_SSH_DELEGATE=1) to run the "
                  "cluster's own boxy instead (needed for --replicas/--distributed/--box)."),
-    Setting("serve.agentless_prestage", "BOXY_AGENTLESS_PRESTAGE", "auto",
-            help="agentless --ssh only: on an ISOLATED compute node (no external network at "
-                 "runtime) the engine can't pull an hf:// model or the container image, so boxy "
-                 "PRE-STAGES both from the LOGIN node (which has your SSH session's network + the "
-                 "forwarded proxy) onto the shared filesystem, then serves the model by path — "
-                 "nothing is installed on the cluster. 'auto' (default) stages when the model is "
-                 "a transport URI (hf://…); 'always' also pre-pulls for a path model's image; "
-                 "'never' (or --no-prestage) skips it and lets the compute node pull (only works "
-                 "on a networked node). The image pull is reused by every compute node sharing "
-                 "$HOME's podman store, with no re-download."),
+    Setting("serve.agentless_prestage", "BOXY_AGENTLESS_PRESTAGE", "never",
+            help="agentless --ssh only: on a truly ISOLATED compute node (no external network at "
+                 "runtime) the engine can't pull an hf:// model or the container image. Pass "
+                 "--prestage (or set this to 'auto'/'always') to PRE-STAGE both from the LOGIN "
+                 "node (which has your SSH session's network + the forwarded proxy) onto the "
+                 "shared filesystem, then serve the model by path — nothing installed on the "
+                 "cluster. Default 'never': the compute node pulls the image/model itself, which "
+                 "is FASTER (no up-front login-node download) and works whenever the node has "
+                 "network — the common case. 'auto' stages a transport URI (hf://…); 'always' "
+                 "also pre-pulls a path model's image."),
     Setting("serve.auto_unique", "BOXY_AUTO_UNIQUE", "true",
             help="when a live instance of the same model already exists, start an "
                  "independent instance instead of blocking (turnkey). Set false to "

@@ -228,9 +228,12 @@ def podman_share_env(share_env, monkeypatch):
     return share_env
 
 
-def test_container_mode_full_lifecycle(podman_share_env):
+def test_container_mode_full_lifecycle(podman_share_env, monkeypatch):
     from boxy import jobs
 
+    # pin the relay image explicitly so this test is decoupled from the shipped
+    # default (a site mirror), asserting behavior rather than the packaged value.
+    monkeypatch.setenv("BOXY_RELAY_IMAGE", "docker.io/jpillora/chisel:1.10")
     url, note = RelayExposer().expose("nemo", 8090)
     assert url == "https://nemo-boxy.apps.x.y/v1"
     log = (podman_share_env / "podman.log").read_text()

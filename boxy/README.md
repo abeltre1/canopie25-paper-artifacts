@@ -438,18 +438,19 @@ mitigations is `SPEC.md §8b`.
 boxy/Python/RamaLama on the cluster** (needs only a scheduler + container runtime
 + shared FS). `boxy generate slurm|flux -o job.sh` emits the same script to a file.
 
-*Isolated compute nodes* (no external network at run time — a common HPC setup)
-are handled automatically: boxy **pre-stages** the container image *and* the
-model from the **login node** (which has your SSH session's network + the
-forwarded corporate proxy) onto the shared filesystem, then serves the model
-**by path** — so the compute node never needs to reach Docker Hub or
-HuggingFace. It's on by default for an `hf://` model (`serve.agentless_prestage
-= auto`); `--no-prestage` lets a networked node pull for itself, `--prestage`
-forces it. boxy also stages your merged site **CA bundle** onto the cluster and
-mounts it into the container, so an in-container HuggingFace fetch through a
-TLS-interceptor proxy (Zscaler) doesn't die with `CERTIFICATE_VERIFY_FAILED`.
-The hardware is pinned (`--accelerator`) so the `podman run` is fully resolved
-laptop-side; see `SPEC.md §8c`.
+By default the compute node pulls the image + model itself (fast — no up-front
+download), which works whenever the node has network. boxy stages your merged
+site **CA bundle** onto the cluster and mounts it into the container, so an
+in-container HuggingFace fetch through a TLS-interceptor proxy (Zscaler) doesn't
+die with `CERTIFICATE_VERIFY_FAILED`. The hardware is pinned (`--accelerator`)
+so the `podman run` is fully resolved laptop-side.
+
+*Truly isolated compute nodes* (no external network at run time) can opt into
+`--prestage`: boxy pulls the image *and* downloads the model on the **login
+node** (which has your SSH session's network + the forwarded proxy) onto the
+shared filesystem, then serves the model **by path** — so the compute node never
+needs to reach Docker Hub or HuggingFace. `--prestage` / `BOXY_AGENTLESS_PRESTAGE
+= auto|always`; off by default. See `SPEC.md §8c`.
 
 ## Tests
 

@@ -39,13 +39,29 @@ def _silence_prompts() -> None:
     The env-var route (above) depends on RamaLama's config layering; field
     testing showed the macOS applehv prompt can still fire. Patching
     confirm_no_gpu at the seam is unconditional. (Field finding #8, 2026-07.)
-    """
-    try:
-        import ramalama.common as _rc
 
-        _rc.confirm_no_gpu = lambda name, provider: True
-    except Exception:
-        pass
+    Also patch the two call sites that BIND the name at import
+    (`ramalama.model`/`ramalama.engine` do `from .common import confirm_no_gpu`),
+    so a plugin's `get_container_image()` — reached via boxy's default_image()
+    over --ssh, where no local GPU exists — can't reopen the prompt either
+    (field: agentless serve from a Mac laptop, applehv machine, 2026-07).
+    """
+    _noprompt = lambda name, provider: True  # noqa: E731
+    for _mod in ("ramalama.common", "ramalama.model", "ramalama.engine"):
+        try:
+            import importlib
+
+            m = importlib.import_module(_mod)
+            if hasattr(m, "confirm_no_gpu"):
+                m.confirm_no_gpu = _noprompt
+        except Exception:
+            pass
+
+
+# Patch at IMPORT so the very first RamaLama call in any boxy command (image
+# defaults, accel probe) can't reopen the macOS applehv prompt — belt to the
+# env-var suspenders above. No-op when RamaLama isn't installed.
+_silence_prompts()
 
 
 def ramalama_available() -> bool:
