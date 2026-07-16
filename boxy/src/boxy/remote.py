@@ -349,14 +349,21 @@ def push_file(host: str, remote_path: str, content: str) -> int:
 
 def await_ready_and_tunnel(host: str, node: str, port: int, log_path: str,
                            local_port: int | None, local_route: str, share: str,
-                           exposer_name: str, share_auto: bool, timeout_s: float = 1800.0) -> bool:
+                           exposer_name: str, share_auto: bool, timeout_s: float = 1800.0,
+                           still_alive=None) -> bool:
     """Block until the served endpoint is ready, then print READY -> LOCAL -> SHARE.
     Used by the fully-agentless --ssh serve (no boxy on the cluster): the laptop
     opens the tunnel to the compute node's `node:port` and confirms readiness via
     `http://127.0.0.1:<lport>/health` THROUGH it (unauthenticated; checked as
     localhost from the laptop where the forward reaches the serving node), falling
     back to the engine's "server is up" line in the job log grepped over the master.
-    Returns True on ready, False on timeout."""
+
+    `still_alive` (optional callback): consulted when `timeout_s` expires — if the
+    scheduler says the job is still alive, the wait EXTENDS instead of detaching.
+    A big model legitimately loads for 10-20+ min; detaching while the job runs
+    loses the tunnel + READY for no reason (field: hops, vLLM cold start outlived
+    the window). Returns True on ready; False only when the deadline passes AND
+    the job is gone (or no callback was given)."""
     import time
 
     from boxy import readiness
@@ -365,7 +372,12 @@ def await_ready_and_tunnel(host: str, node: str, port: int, log_path: str,
     if add_forward(host, lport, node, port) != 0:
         lport = 0  # couldn't forward — fall back to log-only, user tunnels manually
     deadline = time.time() + timeout_s
-    while time.time() < deadline:
+    while True:
+        if time.time() >= deadline:
+            if still_alive is None or not still_alive():
+                return False
+            print("###   the job is still alive (model loading) — continuing to wait ...", flush=True)
+            deadline = time.time() + 120.0
         ready = bool(lport) and readiness.probe_once(f"http://127.0.0.1:{lport}", timeout=3) is not None
         if not ready and log_path:
             rc, out = ssh_capture(
@@ -382,7 +394,6 @@ def await_ready_and_tunnel(host: str, node: str, port: int, log_path: str,
                       f"couldn't forward a tunnel — tunnel manually: ssh -L {port}:{node}:{port} {host})")
             return True
         time.sleep(5)
-    return False
 
 
 def _pick_local_port(local_port: int | None, remote_port: int) -> int:

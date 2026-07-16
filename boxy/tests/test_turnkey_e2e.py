@@ -844,6 +844,61 @@ def test_agentless_list_logs_stop_answer_from_laptop_records(ssh, capfd, monkeyp
     assert jobs.read_record("boxy-m") is None              # record reaped
 
 
+def test_boxy_attach_rejoins_agentless_serve(ssh, capfd, monkeypatch, tmp_path):
+    # FIELD: the serve detached while vLLM was still loading and there was NO way
+    # back to the tunnel/READY. `boxy attach` re-joins: reads the endpoint from
+    # the shared FS over the master, opens the tunnel, waits (extending while the
+    # job is alive), prints READY.
+    from boxy import jobs, remote
+
+    rdir = tmp_path / "agentless"
+    rdir.mkdir()
+    (rdir / "boxy-m-777.log").write_text("Application startup complete.\n")
+    ep = rdir / "boxy-m.endpoint.json"
+    ep.write_text('{"name": "boxy-m", "host": "hops11", "port": 8000, "url": "http://hops11:8000"}')
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "777",
+                                 "model": "hf://x", "submitted_from": "agentless-ssh",
+                                 "target": "user@hops", "endpoint_remote": str(ep),
+                                 "log": str(rdir / "boxy-m-%j.log")})
+    _shim(ssh["bin"], "squeue", "#!/bin/bash\necho RUNNING\n")
+    calls = {}
+
+    def fake_await(host, node, port, log_path, *a, **kw):
+        calls.update(host=host, node=node, port=port, log=log_path,
+                     alive=kw.get("still_alive"))
+        return True
+
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", fake_await)
+    rc = main(["attach", "boxy-m"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "attaching to boxy-m on hops11" in cap.out
+    assert calls["host"] == "user@hops" and calls["node"] == "hops11" and calls["port"] == 8000
+    assert calls["log"].endswith("boxy-m-777.log")     # newest real per-job file, not the %j token
+    assert calls["alive"] is not None and calls["alive"]() is True   # squeue says RUNNING
+
+
+def test_await_ready_extends_while_job_alive(monkeypatch, tmp_path):
+    # THE detach fix: when the window expires but the scheduler says the job is
+    # alive, the wait EXTENDS; when the job is gone, it returns False.
+    import boxy.readiness as readiness
+    from boxy import remote
+
+    monkeypatch.setattr(remote, "_pick_local_port", lambda lp, rp: 0)
+    monkeypatch.setattr(remote, "add_forward", lambda *a: 1)   # no tunnel: log-grep only
+    monkeypatch.setattr(readiness, "probe_once", lambda *a, **k: None)
+    monkeypatch.setattr(remote, "ssh_capture", lambda *a, **k: (0, ""))  # log never ready
+    # fake clock: sleep(5) advances a minute so the 120s extensions elapse instantly
+    clock = {"t": 0.0}
+    monkeypatch.setattr("time.time", lambda: clock["t"])
+    monkeypatch.setattr("time.sleep", lambda s: clock.__setitem__("t", clock["t"] + 60.0))
+
+    lives = iter([True, True, False])                          # alive twice, then gone
+    rc = remote.await_ready_and_tunnel("u@h", "n1", 8000, "/log", None, "", "", "relay",
+                                       False, timeout_s=0.0, still_alive=lambda: next(lives))
+    assert rc is False                                          # detached only when the job died
+
+
 def test_config_default_proxy_is_sandia(monkeypatch):
     # zero-flag turnkey on-site: network.proxy ships the Sandia proxy so no --proxy
     # is ever needed; BOXY_PROXY= (empty) opts out off-site.

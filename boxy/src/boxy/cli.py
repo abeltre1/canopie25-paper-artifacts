@@ -1693,8 +1693,11 @@ def _serve_agentless_ssh(args, target: str) -> int:
     #    compute node, hand off to the tunnel + localhost/health readiness.
     print("### Waiting for the job to start and the server to become ready ... "
           "(Ctrl-C detaches; the job keeps running)")
-    ready_window = (args.ready_timeout if args.ready_timeout and args.ready_timeout > 0
-                    else max(getattr(args, "ready_timeout", 0) or 0, _SCHED_READY_FLOOR))
+    # readiness window: never below the scheduler floor — the flag's config DEFAULT
+    # (timeouts.readiness, 180s) must not masquerade as an explicit short window;
+    # a cold vLLM start takes 5-15 min and detaching at 3 min lost the tunnel/READY
+    # (field: hops). An explicit LONGER --ready-timeout still wins.
+    ready_window = max(getattr(args, "ready_timeout", 0) or 0, _SCHED_READY_FLOOR)
     deadline = time.time() + 24 * 3600
     last_state = None
     try:
@@ -1707,8 +1710,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
             if state == "DONE":
                 print(f"boxy: job {job_id} ended before the server became ready; last log lines:",
                       file=sys.stderr)
-                _, tail = remote.ssh_capture(target, f"tail -n 60 {shlex.quote(log_remote)} 2>/dev/null || true",
-                                             timeout=20)
+                tail = _remote_log_tail(target, log_remote)
                 print(tail, file=sys.stderr)
                 # turn a raw compute-node failure (blocked image pull, OOM, bad
                 # image tag, …) into a plain-language fix instead of a bare trace.
@@ -1736,24 +1738,35 @@ def _serve_agentless_ssh(args, target: str) -> int:
                     ep = None
             if ep and ep.get("host") and ep.get("port"):
                 print(f"###   server starting on {ep['host']} — confirming readiness from your laptop "
-                      f"(localhost/health through the tunnel)")
+                      f"(localhost/health through the tunnel; boxy stays attached while the job is alive)")
+
+                def _job_alive() -> bool:
+                    arc, ast = remote.ssh_capture(target, shlex.join(scheduler.state_command(job_id)),
+                                                  timeout=20)
+                    return arc == 0 and scheduler.interpret_state(ast) in ("RUNNING", "PENDING")
+
                 ok = remote.await_ready_and_tunnel(
                     target, ep["host"], int(ep["port"]), log_remote,
                     getattr(args, "local_port", None), getattr(args, "route", "") or "",
                     getattr(args, "share", "") or "", getattr(args, "exposer", None) or "relay",
-                    getattr(args, "share_auto", False), timeout_s=ready_window)
+                    getattr(args, "share_auto", False), timeout_s=ready_window,
+                    still_alive=_job_alive)
                 if ok:
                     print(f"###   stop: boxy stop {name} --ssh {target}")
                     return 0
-                print(f"### DETACHED — {scheduler_name} job {job_id} is RUNNING but not ready within "
-                      f"{ready_window / 60:.0f} min; the SERVER IS NOT DEAD.\n"
-                      f"###   watch: ssh {target} tail -f {log_remote}\n"
-                      f"###   stop:  boxy stop {name} --ssh {target}", file=sys.stderr)
+                # the wait extends while the job is alive, so reaching here means
+                # the job ENDED before the server answered — diagnose, don't shrug.
+                print(f"boxy: {scheduler_name} job {job_id} ended before the server became ready; "
+                      f"last log lines:", file=sys.stderr)
+                tail = _remote_log_tail(target, log_remote)
+                print(tail, file=sys.stderr)
+                _print_diagnosis(tail)
+                print(f"###   full log: boxy logs {name}", file=sys.stderr)
                 return 1
             time.sleep(5)
     except KeyboardInterrupt:
         print(f"\n### Detached — {scheduler_name} job {job_id} keeps running on {host}.")
-        print(f"###   stop: boxy stop {name} --ssh {target}")
+        print(f"###   reattach: boxy attach {name}    stop: boxy stop {name}")
         return 0
     return 1
 
@@ -3368,13 +3381,29 @@ def _list_agentless(records: list[dict]) -> None:
         print(f"      logs: boxy logs {r['name']}      stop: boxy stop {r['name']}")
 
 
-def _agentless_log_glob(record: dict) -> str:
-    """The remote log path with the scheduler's output token (%j / {{id}}) turned
+def _log_token_glob(path: str) -> str:
+    """A remote log path with the scheduler's output token (%j / {{id}}) turned
     into a glob, so `ls -t` finds the actual per-job file(s)."""
-    pat = record.get("log", "")
     for tok in ("%j", "{{id}}"):
-        pat = pat.replace(tok, "*")
-    return pat
+        path = path.replace(tok, "*")
+    return path
+
+
+def _agentless_log_glob(record: dict) -> str:
+    return _log_token_glob(record.get("log", ""))
+
+
+def _remote_log_tail(target: str, log_path: str, n: int = 60) -> str:
+    """Tail the NEWEST file matching a (token-bearing) remote log path over the
+    master. `tail`ing the literal %j path reads nothing (field: the death path
+    printed an empty log because Slurm had substituted the job id)."""
+    from boxy import remote
+
+    pat = _log_token_glob(log_path)
+    _, out = remote.ssh_capture(
+        target, f'tail -n {int(n)} "$(ls -t {pat} 2>/dev/null | head -1)" 2>/dev/null || true',
+        timeout=20)
+    return out
 
 
 def _agentless_logs(args, record: dict) -> int:
@@ -3402,6 +3431,69 @@ def _agentless_logs(args, record: dict) -> int:
         print()
         print(hint)
     return 0
+
+
+def cmd_attach(args: argparse.Namespace) -> int:
+    """Re-attach to a serve that DETACHED (e.g. the model was still loading when
+    the readiness window closed): read the endpoint from the cluster's shared FS,
+    open the tunnel, confirm readiness, and print the READY url — exactly what the
+    attached serve would have printed. Agentless --ssh serves (records on this
+    machine) are supported; the job itself is untouched."""
+    import json as _json
+
+    from boxy import jobs, remote
+
+    name = args.name
+    rec = jobs.read_record(name) if name else None
+    if rec is None:
+        ags = _agentless_records()
+        if name:
+            ags = [r for r in ags if r["name"] == name]
+        if len(ags) == 1:
+            rec = ags[0]
+            name = rec["name"]
+        elif len(ags) > 1:
+            raise UsageError("several agentless jobs — pick one: boxy attach "
+                             + " | ".join(r["name"] for r in ags))
+    if not (rec and rec.get("submitted_from") == "agentless-ssh" and rec.get("target")):
+        raise UsageError("nothing to attach to — `boxy attach` re-joins an agentless --ssh serve "
+                         "recorded on this machine (see boxy list)")
+    target = rec["target"]
+    if remote.ensure_master(target) != 0:
+        print(f"boxy: could not open an SSH session to {target}", file=sys.stderr)
+        return 1
+    rc, epj = remote.ssh_capture(
+        target, f"cat {shlex.quote(rec.get('endpoint_remote', ''))} 2>/dev/null || true", timeout=15)
+    ep = None
+    if rc == 0 and epj.strip():
+        try:
+            ep = _json.loads(epj)
+        except ValueError:
+            ep = None
+    if not (ep and ep.get("host") and ep.get("port")):
+        raise UsageError(f"{name}: no endpoint on {target} yet — the job may still be "
+                         f"pending (state: {_agentless_state(rec)}); see boxy list")
+    # resolve the newest per-job log for the readiness grep fallback
+    _, lp = remote.ssh_capture(
+        target, f"ls -t {_agentless_log_glob(rec)} 2>/dev/null | head -1", timeout=15)
+    print(f"###   attaching to {name} on {ep['host']} (job {rec['job']}) — confirming readiness "
+          f"through the tunnel (stays attached while the job is alive)")
+
+    def _job_alive() -> bool:
+        return _agentless_state(rec) in ("RUNNING", "PENDING")
+
+    ok = remote.await_ready_and_tunnel(
+        target, ep["host"], int(ep["port"]), lp.strip(),
+        getattr(args, "local_port", None), "", getattr(args, "share", "") or "",
+        getattr(args, "exposer", None) or "relay", False,
+        timeout_s=(args.ready_timeout if getattr(args, "ready_timeout", 0) > 0 else _SCHED_READY_FLOOR),
+        still_alive=_job_alive)
+    if ok:
+        print(f"###   stop: boxy stop {name}")
+        return 0
+    print(f"boxy: job {rec['job']} ended before the server became ready; see: boxy logs {name}",
+          file=sys.stderr)
+    return 1
 
 
 def _agentless_stop(args, record: dict, name: str) -> int:
@@ -4392,6 +4484,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ssh", default=None, metavar="USER@HOST",
                    help="read the logs on that cluster over SSH (reuses the boxy SSH session)")
     p.set_defaults(func=cmd_logs, location=None)
+
+    p = sub.add_parser("attach", help="re-join a detached serve: open the tunnel, wait for READY, "
+                                      "print the url (agentless --ssh jobs)")
+    p.add_argument("name", nargs="?", default=None,
+                   help="job name from `boxy list` (optional when only one is running)")
+    p.add_argument("--local-port", type=int, default=None,
+                   help="laptop port for the tunnel (default: the serving port when free)")
+    p.add_argument("--ready-timeout", type=float, default=0.0,
+                   help="max seconds to wait (default: keeps waiting while the job is alive)")
+    p.add_argument("--share", default="",
+                   help="publish as https://NAME-boxy.apps.<cluster>/ via the OpenShift relay once ready")
+    p.add_argument("--ssh", default=None, metavar="USER@HOST",
+                   help="accepted for symmetry; the record already knows its cluster")
+    p.set_defaults(func=cmd_attach, location=None)
 
     p = sub.add_parser("curl", help="query a served model: boxy curl [NAME] --prompt '...' "
                                     "(finds the endpoint from boxy's records; --ssh runs it cluster-side)")
