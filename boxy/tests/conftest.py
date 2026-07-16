@@ -51,9 +51,19 @@ def _isolate_config(monkeypatch, tmp_path):
     from boxy.schedulers import slurm as _slurm
 
     _slurm.reset_auto_gres()
+    # the agentless CA-mount override is process-global too; clear it so a value set
+    # by one --ssh agentless test can't leak the laptop/cluster CA path into the next.
+    from boxy import deploy as _deploy
+
+    _deploy.set_agentless_ca(None)
+    # agentless pre-staging is on-by-default in prod, but the existing agentless e2e
+    # tests assert the engine-pull render; keep it off for the suite and let the
+    # prestage tests opt in with BOXY_AGENTLESS_PRESTAGE=auto/always.
+    monkeypatch.setenv("BOXY_AGENTLESS_PRESTAGE", "never")
     config.reset()
     yield
     config.reset()
+    _deploy.set_agentless_ca(None)
 
 
 @pytest.fixture

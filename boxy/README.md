@@ -432,11 +432,24 @@ OK/WARN/FAIL + a fix for each — run it before serving, or `boxy doctor --ssh
 user@login` to audit a cluster. The full catalog of issues, severities, and
 mitigations is `SPEC.md §8b`.
 
-**Agentless (zero-install).** `boxy generate slurm|flux -o job.sh` and `boxy
-serve --agentless --accelerator cuda --image …` emit a **self-contained** batch
-script — a plain `podman run` + a shared-FS endpoint write, **no boxy on the
-compute node** (needs only a scheduler + container runtime + shared FS). The
-model must be pre-staged and the hardware pinned; see `SPEC.md §8c`.
+**Agentless (zero-install).** `boxy serve hf://<model> --ssh user@login` is
+**fully agentless by default**: from your laptop, boxy renders a self-contained
+`podman run` batch script — a plain container + a shared-FS endpoint write, **no
+boxy/Python/RamaLama on the cluster** (needs only a scheduler + container runtime
++ shared FS). `boxy generate slurm|flux -o job.sh` emits the same script to a file.
+
+*Isolated compute nodes* (no external network at run time — a common HPC setup)
+are handled automatically: boxy **pre-stages** the container image *and* the
+model from the **login node** (which has your SSH session's network + the
+forwarded corporate proxy) onto the shared filesystem, then serves the model
+**by path** — so the compute node never needs to reach Docker Hub or
+HuggingFace. It's on by default for an `hf://` model (`serve.agentless_prestage
+= auto`); `--no-prestage` lets a networked node pull for itself, `--prestage`
+forces it. boxy also stages your merged site **CA bundle** onto the cluster and
+mounts it into the container, so an in-container HuggingFace fetch through a
+TLS-interceptor proxy (Zscaler) doesn't die with `CERTIFICATE_VERIFY_FAILED`.
+The hardware is pinned (`--accelerator`) so the `podman run` is fully resolved
+laptop-side; see `SPEC.md §8c`.
 
 ## Tests
 

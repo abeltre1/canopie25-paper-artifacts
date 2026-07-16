@@ -747,6 +747,100 @@ def test_ssh_agentless_license_flag_lands_in_the_script(ssh, capfd, monkeypatch)
     assert "auto: license: tscratch:1,pscratch:1 (via --license)" in cap.out
 
 
+def test_ssh_agentless_ca_mounts_cluster_path_not_laptop(ssh, capfd, monkeypatch, tmp_path):
+    # THE hops CERTIFICATE_VERIFY_FAILED fix: the container must mount a CA path that
+    # exists ON THE COMPUTE NODE. boxy stages the laptop's MERGED bundle onto the
+    # cluster's shared FS and mounts THAT — never the laptop's SSL_CERT_FILE path,
+    # which is meaningless on the node (the old bug bind-mounted an empty file).
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    laptop_ca = tmp_path / "ca-merged.crt"
+    laptop_ca.write_text("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n")
+    monkeypatch.setenv("SSL_CERT_FILE", str(laptop_ca))
+    monkeypatch.delenv("BOXY_NO_CA_PROPAGATE", raising=False)     # opt in (suite opts out)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "would stage your merged site CA" in cap.out
+    # the podman run mounts the CLUSTER path at the standard container CA path ...
+    assert "agentless/hops/boxy-ca-merged.pem:/etc/ssl/certs/boxy-ca-merged.pem:ro" in cap.out
+    # ... and NEVER the laptop path (that was the CERTIFICATE_VERIFY_FAILED bug)
+    assert f"{laptop_ca}:/etc/ssl/certs" not in cap.out
+
+
+def test_ssh_agentless_no_ca_when_none_merged(ssh, capfd, monkeypatch):
+    # No merged bundle on the laptop (or BOXY_NO_CA_PROPAGATE): no CA line, no mount
+    # — the cluster uses its own trust store.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "site CA" not in cap.out
+    assert "boxy-ca-merged.pem" not in cap.out
+
+
+def test_ssh_agentless_prestage_dryrun_announces_plan(ssh, capfd, monkeypatch):
+    # agentless on an ISOLATED node: with prestaging on (auto), --dryrun ANNOUNCES it
+    # would pull the image + download the hf:// model on the login node and serve BY
+    # PATH — but performs nothing (dryrun must never touch the cluster).
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_AGENTLESS_PRESTAGE", "auto")        # suite default is 'never'
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "prestage: would stage model meta-llama/Llama-3.1-8B-Instruct" in cap.out
+    assert "then serve BY PATH" in cap.out
+    assert "not run under --dryrun" in cap.out
+
+
+def test_ssh_agentless_no_prestage_keeps_engine_pull(ssh, capfd, monkeypatch):
+    # --no-prestage (also the suite default 'never') keeps the engine-pull render and
+    # prints no prestage plan.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_AGENTLESS_PRESTAGE", "auto")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--no-prestage",
+               "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "prestage:" not in cap.out
+    assert "the engine downloads it at container start" in cap.out
+
+
+def test_prestage_agentless_model_stages_and_rewrites_to_path(monkeypatch, tmp_path):
+    # Unit: _prestage_agentless_model pulls the image, runs the in-container
+    # snapshot_download, and returns the shared-FS path (which the caller mounts).
+    import argparse
+
+    from boxy import cli
+    from boxy.box import Box
+
+    calls = []
+
+    def fake_capture(target, cmd, timeout=20):
+        calls.append(cmd)
+        return 0, ""
+
+    monkeypatch.setattr("boxy.remote.ssh_capture", fake_capture)
+    monkeypatch.setattr("boxy.remote.remote_proxy_env", lambda: {})
+    monkeypatch.setenv("HF_TOKEN", "hf_secret")
+    box = Box(name="m", image="", entrypoint="vllm", engine="vllm",
+              model="meta-llama/Llama-3.1-8B-Instruct")
+    args = argparse.Namespace()
+    staged = cli._prestage_agentless_model(
+        args, "user@hops", "hops", box, "vllm/vllm-openai:latest", "", "/home/u/.local/share/boxy/agentless/hops", None)
+    assert staged == "/home/u/.local/share/boxy/agentless/hops/models/meta-llama-llama-3.1-8b-instruct"
+    # the image was pulled on the login node ...
+    assert any("podman pull vllm/vllm-openai:latest" in c for c in calls)
+    # ... and the model downloaded IN-CONTAINER via huggingface_hub, with the token
+    dl = [c for c in calls if "snapshot_download" in c]
+    assert dl and "hf_secret" in dl[0] and "python3" in dl[0]
+    assert "meta-llama/Llama-3.1-8B-Instruct" in dl[0]
+
+
 def test_ssh_agentless_partition_picker_selects_one(ssh, capfd, monkeypatch):
     # 2+ partitions + a TTY -> the partition menu; picking one puts it in the script
     # instead of the soonest-start comma-list.

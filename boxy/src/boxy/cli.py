@@ -1285,6 +1285,125 @@ def _pick_remote_account(args, rows, host: str, target: str) -> tuple[str | None
     return accounts[0], f"mywcid on {host}{extra}"
 
 
+def _stage_agentless_ca(target: str, host: str, rdir: str, dryrun: bool = False) -> str | None:
+    """Stage the laptop's MERGED CA bundle (public CAs + your site interceptor CA)
+    onto the cluster's shared FS and return its ABSOLUTE cluster path, so the
+    agentless container mounts a path that actually exists on the compute node.
+
+    Why: over --ssh the compute node can't see the laptop's SSL_CERT_FILE path, so
+    the old mount bind-mounted an empty file and the in-container HuggingFace fetch
+    died with CERTIFICATE_VERIFY_FAILED behind the site's TLS interceptor (field:
+    hops). We push the bundle here and hand the path to deploy.set_agentless_ca().
+    No-op when there's no merged bundle or BOXY_NO_CA_PROPAGATE is set (tests).
+
+    In `dryrun` the path is still returned (so the printed script shows the real
+    mount) but nothing is copied — --dryrun must not touch the cluster."""
+    from boxy import remote
+
+    if os.environ.get("BOXY_NO_CA_PROPAGATE"):
+        return None
+    ca = os.environ.get("SSL_CERT_FILE", "")
+    if not (ca.endswith("ca-merged.crt") and os.path.isfile(ca)):
+        return None  # no boxy-merged bundle to carry (the cluster uses its own store)
+    remote_path = f"{rdir}/boxy-ca-merged.pem"
+    if dryrun:
+        print(f"  auto: CA: would stage your merged site CA -> {host}:{remote_path} "
+              "(mounted into the container so its HuggingFace/TLS trusts the site CA)")
+        return remote_path
+    try:
+        data = open(ca, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+    if remote.push_file(target, remote_path, data) != 0:
+        print(f"boxy: warning: could not stage the site CA to {host}; an in-container "
+              "HuggingFace pull may fail TLS (CERTIFICATE_VERIFY_FAILED)", file=sys.stderr)
+        return None
+    print(f"  auto: CA: staged your merged site CA -> {host}:{remote_path} "
+          "(mounted into the container so its HuggingFace/TLS trusts the site CA)")
+    return remote_path
+
+
+def _prestage_mode(args) -> str:
+    """Resolve the agentless pre-stage policy: --prestage/--no-prestage win, else
+    config serve.agentless_prestage (auto|always|never)."""
+    flag = getattr(args, "prestage", None)
+    if flag in ("always", "never"):
+        return flag
+    mode = (config.get_str("serve.agentless_prestage") or "auto").strip().lower()
+    return mode if mode in ("auto", "always", "never") else "auto"
+
+
+def _prestage_agentless_model(args, target: str, host: str, box, image: str,
+                              pfx: str, rdir: str, ca_remote: str | None):
+    """PRE-STAGE the container image + hf:// model on the LOGIN node (which has the
+    SSH session's network + the forwarded proxy), onto the cluster's shared FS, so a
+    fully ISOLATED compute node needs no runtime network. Returns the staged
+    shared-FS model path on success, or None to leave engine-pull in place.
+
+    The model download runs INSIDE the just-pulled image (it already ships
+    huggingface_hub), so nothing extra is installed on the cluster. Only vLLM
+    (safetensors) is auto-staged this way; a GGUF/llama.cpp repo is left to the
+    engine (its image may lack python). The image pull alone still runs so a
+    networked compute node reuses $HOME's podman store with no re-download."""
+    from boxy import deploy, remote
+
+    repo = box.model  # already the bare repo id (scheme stripped by the caller)
+    # 1) pull the image on the login node over the forwarded proxy (reused by every
+    #    compute node sharing $HOME's podman store — no re-download on the node).
+    print(f"  auto: prestage: pulling image {image} on {host} (login-node network) ...")
+    rc, out = remote.ssh_capture(target, f"{pfx}podman pull {shlex.quote(image)}", timeout=3600)
+    if rc != 0:
+        print(f"boxy: warning: login-node image pull failed on {host}:\n{out.strip()[-800:]}\n"
+              "boxy: continuing — the compute node will try to pull it itself.", file=sys.stderr)
+    if box.engine != "vllm":
+        # llama.cpp/GGUF: skip the in-container model download (image may have no
+        # python). Image is pre-pulled; the engine fetches the GGUF at start.
+        print(f"  auto: prestage: {box.engine} model left to the engine (only the image is "
+              "pre-pulled); pass a shared-FS GGUF path for a fully offline node.")
+        return None
+    stage_dir = f"{rdir}/models/{_model_slug(repo)}"
+    hf_tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+    # proxy vars for INSIDE the download container (the pull reaches HF via the proxy)
+    penv = remote.remote_proxy_env()
+    run = ["podman", "run", "--rm", "--network", "host", "-v", f"{stage_dir}:/stage"]
+    cenv = {"HF_HUB_ENABLE_HF_TRANSFER": "0"}
+    if hf_tok:
+        cenv["HF_TOKEN"] = hf_tok
+        cenv["HUGGING_FACE_HUB_TOKEN"] = hf_tok
+    if ca_remote:
+        run += ["-v", f"{ca_remote}:{deploy.CA_CONTAINER_PATH}:ro"]
+        for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+            cenv[var] = deploy.CA_CONTAINER_PATH
+    cenv.update(penv)
+    for k, v in cenv.items():
+        run += ["-e", f"{k}={v}"]
+    # skip the redundant PyTorch 'original/' checkpoint (Llama ships both) and any
+    # GGUF — vLLM serves the safetensors; this halves the download.
+    py = ("from huggingface_hub import snapshot_download; "
+          "snapshot_download(repo_id=%r, local_dir='/stage', "
+          "ignore_patterns=['original/*','*.pth','consolidated*','*.gguf'])"
+          % repo)
+    run += ["--entrypoint", "python3", image, "-c", py]
+    dl = pfx + shlex.join(run)
+    print(f"  auto: prestage: downloading {repo} on {host} -> {stage_dir} "
+          "(in-container huggingface_hub; may take several minutes) ...")
+    rc, out = remote.ssh_capture(target, f"mkdir -p {shlex.quote(stage_dir)} && {dl}", timeout=7200)
+    if rc != 0:
+        print(f"boxy: warning: login-node model download failed on {host}:\n{out.strip()[-1200:]}\n"
+              "boxy: continuing agentless with engine-pull (works only if the COMPUTE node has "
+              "network); pass --no-prestage to silence, or stage the model yourself and serve by "
+              "path.", file=sys.stderr)
+        return None
+    print(f"  auto: prestage: model staged at {host}:{stage_dir} — serving BY PATH "
+          "(the compute node needs no network).")
+    return stage_dir
+
+
+def _model_slug(repo: str) -> str:
+    """Filesystem-safe slug for a HF repo id (org/name -> org-name)."""
+    return repo.strip().strip("/").replace("/", "-").replace(":", "-").lower()
+
+
 def _serve_agentless_ssh(args, target: str) -> int:
     """Fully AGENTLESS serve over --ssh: NOTHING is installed on the HPC system —
     no boxy, no Python, no RamaLama. The laptop does everything over the one ssh
@@ -1300,7 +1419,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
     import time
     from dataclasses import replace as dc_replace
 
-    from boxy import cards, deploy, jobs, remote, resolve, site
+    from boxy import cards, deploy, jobs, ramalama_shim, remote, resolve, site
     from boxy.schedulers import get_scheduler
 
     host = target.split("@")[-1]
@@ -1418,6 +1537,12 @@ def _serve_agentless_ssh(args, target: str) -> int:
     tok = scheduler.output_token or ""
     log_remote = f"{rdir}/{name}{('-' + tok) if tok else ''}.log"
 
+    # 6b) CA: stage the laptop's MERGED bundle onto the shared FS and mount THAT
+    #     compute-node-valid path into the container, so an in-container HuggingFace
+    #     pull trusts the site's TLS interceptor (field: hops CERTIFICATE_VERIFY_
+    #     FAILED). The laptop's SSL_CERT_FILE path is invalid on the node.
+    ca_remote = _stage_agentless_ca(target, host, rdir, dryrun=args.dryrun)
+
     # 7) render the self-contained script LAPTOP-side. Forward the corporate proxy
     #    to the COMPUTE-NODE `podman pull` (Docker Hub/ghcr 403 behind Zscaler): the
     #    submitter's ambient proxy env (or --proxy) is carried over — same as every
@@ -1426,11 +1551,44 @@ def _serve_agentless_ssh(args, target: str) -> int:
     if pfx:
         print(f"  auto: proxy: forwarding {pfx.strip()}to the compute-node image pull "
               f"(reach the registry behind the site proxy)")
+
+    # 6c) PRE-STAGE (agentless on an isolated compute node): pull the image + download
+    #     the hf:// model on the LOGIN node (network via your SSH session), land both
+    #     on the shared FS, then serve the model BY PATH — the compute node needs no
+    #     runtime network. 'auto' stages a transport-URI model; 'always' also for a
+    #     path model's image; 'never'/--no-prestage skips it. Best-effort: a failure
+    #     falls back to engine-pull (only works on a networked node). Skipped under
+    #     --dryrun (a real network/disk op); the plan line prints instead.
+    pmode = _prestage_mode(args)
+    if pmode != "never" and (engine_pull or pmode == "always"):
+        image = args.image or box.image or ramalama_shim.default_image(box.engine, accel)
+        if args.dryrun:
+            what = f"model {box.model} + image {image}" if engine_pull else f"image {image}"
+            tail = ("then serve BY PATH — the compute node needs no network"
+                    if engine_pull else "so an isolated compute node reuses $HOME's podman store")
+            print(f"  auto: prestage: would stage {what} on {host} (login node), {tail} "
+                  "(--no-prestage to skip; not run under --dryrun)")
+        elif engine_pull:
+            staged = _prestage_agentless_model(args, target, host, box, image, pfx, rdir, ca_remote)
+            if staged:
+                box = dc_replace(box, model=staged)
+                engine_pull = False
+        else:
+            # path model: just warm the image on the login node so an isolated node
+            # reuses $HOME's podman store (no model download needed — it's already staged).
+            print(f"  auto: prestage: pulling image {image} on {host} (login-node network) ...")
+            prc, pout = remote.ssh_capture(target, f"{pfx}podman pull {shlex.quote(image)}", timeout=3600)
+            if prc != 0:
+                print(f"boxy: warning: login-node image pull failed on {host}:\n{pout.strip()[-800:]}",
+                      file=sys.stderr)
+
+    deploy.set_agentless_ca(ca_remote)
     try:
         script_text = deploy.render_agentless_script(
             box, location, scheduler_name, name, ep_remote, log_remote, site_args,
             proxy_prefix=pfx, port=args.port, engine_pulls_model=engine_pull)
     except deploy.AgentlessError as e:
+        deploy.set_agentless_ca(None)
         print(f"boxy: agentless: {e}", file=sys.stderr)
         return 2
 
@@ -1442,6 +1600,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
     submit_cmd = shlex.join(scheduler.submit_command(script_remote))
     print(f"### Submit Command (on {host}):\n    {submit_cmd}")
     if args.dryrun:
+        deploy.set_agentless_ca(None)
         return 0
 
     # 8) write the script (mode 600 — it may carry HF_TOKEN) + submit, over the master
@@ -1484,6 +1643,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
                 print(f"### GPU request accepted as {shown} (auto-recovered).")
                 break
 
+    deploy.set_agentless_ca(None)  # done rendering; don't leak the override
     if rc != 0:
         print(f"boxy: submit failed on {host}:\n{out.strip()}", file=sys.stderr)
         low = out.lower()
@@ -3953,6 +4113,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="with --ssh: run the CLUSTER's own boxy instead of the default fully-"
                         "agentless flow (needs boxy installed there; also BOXY_SSH_DELEGATE=1). "
                         "Use for --replicas/--distributed/--box, which agentless doesn't cover yet.")
+    p.add_argument("--prestage", dest="prestage", action="store_const", const="always", default=None,
+                   help="agentless --ssh: force PRE-STAGING the image + model on the login node (over "
+                        "your SSH session's network) so an ISOLATED compute node needs no network. "
+                        "Default 'auto' stages an hf:// model automatically; --prestage also pre-pulls "
+                        "for a by-path model. Opposite: --no-prestage / BOXY_AGENTLESS_PRESTAGE=never.")
+    p.add_argument("--no-prestage", dest="prestage", action="store_const", const="never",
+                   help="agentless --ssh: do NOT pre-stage; let the compute node pull the image/model "
+                        "itself (only works on a NETWORKED compute node).")
     p.add_argument("--dryrun", action="store_true", help="print the command instead of executing it")
     p.add_argument("args", nargs="*", help="extra engine args (put them after --)")
     p.set_defaults(func=cmd_serve)

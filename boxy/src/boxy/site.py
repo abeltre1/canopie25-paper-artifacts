@@ -527,12 +527,15 @@ def resolve_site(args, scheduler_name: str, need_gpu: bool = False) -> tuple[dic
         if twhy != "--time":
             decisions.append(f"time: {t} (via {twhy})")
 
-    if scheduler_name == "slurm":
-        lic, lwhy = resolve_license(getattr(args, "license", None))
-        if lic:
-            out["license"] = lic
-            if lwhy != "--license":
-                decisions.append(f"license: {lic} (via {lwhy})")
+    # Slurm always honors the license (explicit --license or the config default,
+    # e.g. tscratch:1). Other schedulers (Flux) have no license concept, so only an
+    # EXPLICIT --license is passed through verbatim — never the Slurm-oriented config
+    # default, which would otherwise attach a bogus directive to every Flux job.
+    lic, lwhy = resolve_license(getattr(args, "license", None))
+    if lic and (scheduler_name == "slurm" or lwhy == "--license"):
+        out["license"] = lic
+        if lwhy != "--license":
+            decisions.append(f"license: {lic} (via {lwhy})")
 
     return out, decisions
 

@@ -170,6 +170,16 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
                  "RamaLama): the laptop renders a self-contained podman batch script, submits + "
                  "polls it over SSH. Set false (or --delegate / BOXY_SSH_DELEGATE=1) to run the "
                  "cluster's own boxy instead (needed for --replicas/--distributed/--box)."),
+    Setting("serve.agentless_prestage", "BOXY_AGENTLESS_PRESTAGE", "auto",
+            help="agentless --ssh only: on an ISOLATED compute node (no external network at "
+                 "runtime) the engine can't pull an hf:// model or the container image, so boxy "
+                 "PRE-STAGES both from the LOGIN node (which has your SSH session's network + the "
+                 "forwarded proxy) onto the shared filesystem, then serves the model by path — "
+                 "nothing is installed on the cluster. 'auto' (default) stages when the model is "
+                 "a transport URI (hf://…); 'always' also pre-pulls for a path model's image; "
+                 "'never' (or --no-prestage) skips it and lets the compute node pull (only works "
+                 "on a networked node). The image pull is reused by every compute node sharing "
+                 "$HOME's podman store, with no re-download."),
     Setting("serve.auto_unique", "BOXY_AUTO_UNIQUE", "true",
             help="when a live instance of the same model already exists, start an "
                  "independent instance instead of blocking (turnkey). Set false to "

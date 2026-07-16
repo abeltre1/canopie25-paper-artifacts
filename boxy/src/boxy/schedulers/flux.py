@@ -87,10 +87,12 @@ class FluxScheduler(Scheduler):
     def site_directive(self, kind: str, value: str) -> str:
         # Flux spells the site knobs differently: queue not partition, bank
         # (flux-accounting) not account, -t (an FSD duration — converted from
-        # Slurm colon notation, see _to_fsd) not --time.
+        # Slurm colon notation, see _to_fsd) not --time. Any other boxy-owned or
+        # bare flag (e.g. --license, --qos) is passed through verbatim so it isn't
+        # silently dropped — Flux ignores an unknown batch option it doesn't use.
         return {"partition": f"--queue={value}",
                 "account": f"--bank={value}",
-                "time": f"-t {_to_fsd(value)}"}[kind]
+                "time": f"-t {_to_fsd(value)}"}.get(kind, f"--{kind}={value}")
 
     def submit_command(self, script: str) -> list[str]:
         return ["flux", "batch", script]

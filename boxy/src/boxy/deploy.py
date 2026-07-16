@@ -245,6 +245,23 @@ def plan_run(box: Box, location: Location, user_args: list[str], dryrun: bool = 
 
 CA_CONTAINER_PATH = "/etc/ssl/certs/boxy-ca-merged.pem"
 
+# Agentless override: over --ssh the compute node can't see the LAPTOP's
+# SSL_CERT_FILE path, so mounting it bind-mounts an empty file and the container
+# still doesn't trust the site CA (field: hops, CERTIFICATE_VERIFY_FAILED fetching
+# config.json from huggingface.co). _serve_agentless_ssh stages the merged bundle
+# onto the cluster's shared FS and sets this to that ABSOLUTE cluster path so the
+# rendered `podman run -v <cluster path>:CA_CONTAINER_PATH` is valid on the node.
+_AGENTLESS_CA_SOURCE: str | None = None
+
+
+def set_agentless_ca(cluster_path: str | None) -> None:
+    """Point _propagate_ca_bundle at a CLUSTER-side merged-CA path (mounted into
+    the agentless container) instead of the laptop's SSL_CERT_FILE. Pass None to
+    clear it. Process-global; the caller sets it around render_agentless_script and
+    clears it after (mirrors schedulers.slurm.set_auto_gres)."""
+    global _AGENTLESS_CA_SOURCE
+    _AGENTLESS_CA_SOURCE = cluster_path or None
+
 
 def _propagate_ca_bundle(env: dict, mounts: list) -> None:
     """Mount boxy's merged CA (certifi public CAs + your site CA) into the container
@@ -256,12 +273,18 @@ def _propagate_ca_bundle(env: dict, mounts: list) -> None:
     Only the MERGED bundle is propagated (it contains the public CAs too, so public
     HTTPS keeps working) — never a bare site CA, which would REPLACE the container's
     trust and break huggingface.co. No-op when the merge is disabled/absent or the
-    user set the cert env in [box.env]."""
-    ca = os.environ.get("SSL_CERT_FILE")
-    if not ca or not ca.endswith("ca-merged.crt") or not os.path.isfile(ca):
-        return
+    user set the cert env in [box.env].
+
+    In agentless mode set_agentless_ca() supplies an absolute CLUSTER path (the
+    bundle staged onto the shared FS); we mount THAT — the laptop path is invalid on
+    the compute node — and skip the local os.path.isfile() check for it."""
     if any(target == CA_CONTAINER_PATH for _, target, _ in mounts):
         return
+    ca = _AGENTLESS_CA_SOURCE
+    if not ca:
+        ca = os.environ.get("SSL_CERT_FILE")
+        if not ca or not ca.endswith("ca-merged.crt") or not os.path.isfile(ca):
+            return
     mounts.append((ca, CA_CONTAINER_PATH, "ro"))
     for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
         env.setdefault(var, CA_CONTAINER_PATH)  # box.env still wins (already merged)
