@@ -994,6 +994,62 @@ def test_generate_relay_autodiscovers_host(capsys, monkeypatch):
     assert "kind: Deployment" in cap.out
 
 
+def test_hf_arch_preflight_refuses_asr_model(ssh, capfd, monkeypatch):
+    # FIELD: nvidia's nemotron ASR (RNN-T decoder) burned a 400s eldorado GPU job
+    # before vLLM refused it. The laptop-side preflight reads the repo's declared
+    # architecture and refuses in seconds — before any submit.
+    from boxy import cardgen
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.delenv("BOXY_NO_PREFLIGHT", raising=False)      # opt in (suite opts out)
+    monkeypatch.setattr(cardgen, "hf_get_json",
+                        lambda *a, **k: {"architectures": ["Nemotron3_5AsrRNNTDecoder"]})
+    rc = main(["serve", "hf://nvidia/nemotron-3.5-asr-streaming-0.6b",
+               "--scheduler", "slurm", "--ssh", "user@eldorado", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 2
+    assert "not a text-generation model" in cap.err
+    assert "NeMo/Riva" in cap.err
+    assert "sbatch" not in cap.out                               # never reached a submit
+
+
+def test_hf_arch_preflight_passes_causal_lm_and_survives_fetch_failure(ssh, capfd, monkeypatch):
+    # A CausalLM arch proceeds; an uncheckable repo (gated/offline fetch error)
+    # NEVER blocks — the engine gets to try.
+    from boxy import cardgen
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.delenv("BOXY_NO_PREFLIGHT", raising=False)
+    monkeypatch.setattr(cardgen, "hf_get_json",
+                        lambda *a, **k: {"architectures": ["LlamaForCausalLM"]})
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    assert rc == 0
+    capfd.readouterr()
+
+    def boom(*a, **k):
+        raise cardgen.CardGenError("gated")
+
+    monkeypatch.setattr(cardgen, "hf_get_json", boom)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0                                               # uncheckable => proceed
+    assert "not a text-generation model" not in cap.err
+
+
+def test_diagnose_not_a_text_generation_model():
+    from boxy import diagnostics
+
+    hint = diagnostics.diagnose(
+        "ValueError: Argument inputs_embeds not found in the forward method of "
+        "<class 'transformers...Nemotron3_5AsrRNNTDecoder'>")
+    assert hint and "NOT a text-generation LLM" in hint
+    # the benign fallback warning ALONE must not trigger it
+    assert diagnostics.diagnose(
+        "WARNING ... TransformersForCausalLM has no vLLM implementation, falling back") is None
+
+
 def test_config_default_proxy_is_sandia(monkeypatch):
     # zero-flag turnkey on-site: network.proxy ships the Sandia proxy so no --proxy
     # is ever needed; BOXY_PROXY= (empty) opts out off-site.

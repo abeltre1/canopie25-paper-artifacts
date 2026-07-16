@@ -1121,6 +1121,36 @@ def _is_gres_error(text: str) -> bool:
             or "requested node configuration is not available" in low)
 
 
+def _hf_arch_preflight(repo: str) -> str | None:
+    """Best-effort LAPTOP-side sanity check before burning a GPU allocation:
+    fetch the repo's config.json and return a refusal message when the declared
+    architecture is plainly NOT a text-generation model (field: an ASR RNN-T
+    nemotron burned a 400s eldorado job before vLLM refused it with 'Argument
+    inputs_embeds not found'). Returns None to proceed — unknown or uncheckable
+    (gated/offline) architectures are left to the engine. Skip entirely with
+    --no-preflight / BOXY_NO_PREFLIGHT=1."""
+    if os.environ.get("BOXY_NO_PREFLIGHT"):
+        return None
+    from boxy import cardgen
+
+    try:
+        cfg = cardgen.hf_get_json(repo, "config.json", cardgen.resolve_token(None), timeout=8)
+    except Exception:
+        return None                      # can't check (gated/offline) — let the engine try
+    arch = ((cfg or {}).get("architectures") or [""])[0]
+    low = arch.lower()
+    if not arch:
+        return None
+    if any(tok in low for tok in ("asr", "rnnt", "speech", "audio", "wav2vec",
+                                  "embedding", "reranker", "sequenceclassification")):
+        return (f"{repo} declares architecture {arch!r} — not a text-generation model. "
+                f"No engine boxy drives (vLLM, llama.cpp) can serve it, on any cluster: "
+                f"ASR/speech models need their own runtime (e.g. NVIDIA NeMo/Riva), "
+                f"embedding/reranker models need an embedding server. "
+                f"Pass --no-preflight to try anyway.")
+    return None
+
+
 def _is_license_error(text: str) -> bool:
     """True when a submit failed on the LICENSE line ('Invalid license
     specification') — the shipped site.license default (tscratch:1, a hops-ism)
@@ -1494,6 +1524,12 @@ def _serve_agentless_ssh(args, target: str) -> int:
     if engine_pull:
         bare = box.model.split("://", 1)[1]
         box = dc_replace(box, model=bare)
+        # laptop-side arch sanity check — refuse a plainly unservable model in
+        # seconds instead of burning a GPU allocation on it (field: ASR nemotron)
+        refusal = None if getattr(args, "no_preflight", False) else _hf_arch_preflight(bare)
+        if refusal:
+            print(f"boxy: {refusal}", file=sys.stderr)
+            return 2
         print(f"  auto: model: {args.model} — the engine downloads it at container start "
               f"(no RamaLama on the cluster)")
     box = dc_replace(box, name=name, image=(args.image or box.image))
@@ -4459,6 +4495,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-prestage", dest="prestage", action="store_const", const="never",
                    help="agentless --ssh: do NOT pre-stage; let the compute node pull the image/model "
                         "itself (only works on a NETWORKED compute node).")
+    p.add_argument("--no-preflight", action="store_true",
+                   help="skip the laptop-side HF architecture sanity check that refuses plainly "
+                        "unservable models (ASR/audio/embedding) before a GPU allocation is burned")
     p.add_argument("--dryrun", action="store_true", help="print the command instead of executing it")
     p.add_argument("args", nargs="*", help="extra engine args (put them after --)")
     p.set_defaults(func=cmd_serve)

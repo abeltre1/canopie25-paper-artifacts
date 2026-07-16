@@ -33,6 +33,9 @@ def _isolate_config(monkeypatch, tmp_path):
     # relay.apps_domain ships a site default (apps.goodall.sandia.gov); blank it
     # so the oc-discovery paths are what the suite exercises.
     monkeypatch.setenv("BOXY_APPS_DOMAIN", "")
+    # the HF architecture preflight does a live Hub fetch; keep it off for the
+    # suite (no network calls per test) — the preflight tests opt back in.
+    monkeypatch.setenv("BOXY_NO_PREFLIGHT", "1")
     # ditto remote account injection (a dev box may carry sacctmgr/mywcid,
     # making --ssh serve tests nondeterministic); e2e tests opt back in.
     monkeypatch.setenv("BOXY_NO_REMOTE_ACCOUNT", "1")

@@ -231,7 +231,26 @@ def _gguf_load_fail(m: "re.Match[str]", log: str) -> str:
 
 
 # Ordered most-specific first. diagnose() returns the first match.
+def _not_a_text_generation_model(m: "re.Match[str]", log: str) -> str:
+    return _fmt(
+        "this model is NOT a text-generation LLM — vLLM cannot serve it",
+        "vLLM has no implementation for this architecture and its generic Transformers\n"
+        "fallback needs a causal-LM forward() (the 'inputs_embeds not found' error).\n"
+        "ASR/speech, audio, embedding and reranker models need their own runtime\n"
+        "(e.g. NVIDIA NeMo/Riva for ASR) — no engine boxy drives (vLLM, llama.cpp)\n"
+        "can serve them, on any cluster or GPU. Pick a text-generation model\n"
+        "(architectures like *ForCausalLM on the model's HF page).",
+    )
+
+
 RULES: list[Rule] = [
+    # only the DEFINITIVE signature: the 'has no vLLM implementation' warning alone
+    # is benign (the Transformers fallback often works); this error is fatal.
+    Rule(
+        "not-a-text-generation-model",
+        re.compile(r"Argument inputs_embeds not found in the forward method", re.IGNORECASE),
+        _not_a_text_generation_model,
+    ),
     Rule(
         "vllm-weights-not-initialized",
         re.compile(r"weights?\s+were\s+not\s+initialized\s+from\s+checkpoint", re.IGNORECASE),
