@@ -310,3 +310,12 @@ def test_pip_wrapper_wraps_serve_command():
     assert cmd[0:2] == ["sh", "-c"]
     assert cmd[2].startswith("pip install --no-cache-dir --quiet open_clip_torch && exec vllm serve")
     assert "--trust-remote-code" in cmd[2]
+
+
+def test_packaged_llama4_scout_card():
+    # shipped from the captured HF config: filtered-egress laptops can't run
+    # `generate card`, so the MoE's geometry + context cap come packaged.
+    card = cards.find_card("hf://meta-llama/Llama-4-Scout-17B-16E-Instruct")
+    assert card and card.source == "packaged" and card.engine == "vllm"
+    assert card.gpus == 4 and card.min_vram_gb == 228
+    assert card.args["max_model_len"] == 8192
