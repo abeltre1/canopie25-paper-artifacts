@@ -214,3 +214,15 @@ def test_card_engine_args_reach_the_box(monkeypatch):
                               require_exists=False, here=True)
     assert res.box.args.get("max_model_len") == 8192
     assert any("engine args" in d and "card" in d for d in res.decisions)
+
+
+def test_packaged_nemotron_parse_card_carries_trust_and_mm_limit():
+    # FIELD (hops, repeatedly): serving nvidia/NVIDIA-Nemotron-Parse died at
+    # vLLM config validation for want of --trust-remote-code. The packaged card
+    # bakes the complete serve spec in, so the FIRST submit is right — no Hub
+    # probe, no death-path resubmit needed.
+    card = cards.find_card("nvidia/NVIDIA-Nemotron-Parse-v1.2")
+    assert card and card.source == "packaged" and card.engine == "vllm"
+    assert card.args.get("trust_remote_code") is True
+    assert card.args.get("limit-mm-per-prompt") == '{"image": 1}'
+    assert card.gpus == 1
