@@ -319,3 +319,26 @@ def test_packaged_llama4_scout_card():
     assert card and card.source == "packaged" and card.engine == "vllm"
     assert card.gpus == 4 and card.min_vram_gb == 228
     assert card.args["max_model_len"] == 8192
+
+
+def test_single_node_multi_gpu_gets_tensor_parallel():
+    # FIELD (Llama-4-Scout): a 4-GPU single-node allocation still ran vLLM with
+    # its default tensor_parallel_size=1 — 218GB of MoE weights loaded onto GPU
+    # 0 alone and OOM'd (uniproc executor in the traceback). Single-node
+    # multi-GPU now shards across the allocation; user overrides still win.
+    from boxy import engines
+    from boxy.box import Box
+    from boxy.location import Location, Resources
+
+    box = Box(name="x", image="", engine="vllm", model="m", ports=[8000])
+    loc4 = Location(name="l", resources=Resources(nodes=1, gpus_per_node=4))
+    cmd = " ".join(engines.build_serve_cmd(box, loc4, "m"))
+    assert "--tensor-parallel-size=4" in cmd
+
+    override = Box(name="x", image="", engine="vllm", model="m", ports=[8000],
+                   args={"tensor_parallel_size": 2})
+    cmd2 = " ".join(engines.build_serve_cmd(override, loc4, "m"))
+    assert "--tensor-parallel-size=2" in cmd2 and "--tensor-parallel-size=4" not in cmd2
+
+    loc1 = Location(name="l", resources=Resources(nodes=1, gpus_per_node=1))
+    assert "--tensor-parallel-size" not in " ".join(engines.build_serve_cmd(box, loc1, "m"))

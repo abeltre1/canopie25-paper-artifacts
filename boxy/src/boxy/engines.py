@@ -165,6 +165,13 @@ def build_vllm_serve_cmd(
         tp, pp = parallelism
         cmd = _tack_on_last(cmd, {"tensor_parallel_size": tp, "pipeline_parallel_size": pp,
                                   "distributed_executor_backend": "ray"})
+    elif location.resources.nodes <= 1 and location.resources.gpus_per_node > 1:
+        # SINGLE-node multi-GPU: vLLM defaults to tensor_parallel_size=1 and
+        # loads the whole model onto GPU 0 — a 4-GPU allocation OOM'd exactly
+        # this way (field: Llama-4-Scout, 218GB onto one 140GB device, uniproc
+        # executor in the traceback). Shard across the allocation's GPUs; a
+        # user/box/tuning value still wins (tack-on-last).
+        cmd = _tack_on_last(cmd, {"tensor_parallel_size": location.resources.gpus_per_node})
     # HPC default: model stores live on NFS/Lustre, where vLLM >= 0.24 auto-enables
     # the 'prefetch' safetensors strategy — which has misloaded checkpoints (field
     # report: 'weights were not initialized from checkpoint' on a standard
