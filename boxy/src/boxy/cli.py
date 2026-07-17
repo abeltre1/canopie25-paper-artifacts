@@ -1114,6 +1114,107 @@ def _app_site_args(args, card, scheduler, scheduler_name: str, target: str = "",
     return site_args
 
 
+_SRC_ARCHIVE_RE = re.compile(r"\.(tar\.(gz|bz2|xz)|tgz|zip)$")
+
+
+def _spack_fetch_blocked(text: str) -> bool:
+    """The cluster-egress-filter signature for a failed spack source fetch:
+    every fetcher died on a 403/block page (field: Zscaler CATEGORY_DENIED for
+    mirror.spack.io AND the package's upstream on the cluster)."""
+    low = text.lower()
+    return "all fetchers failed" in low and ("block-page" in low or "block-message" in low
+                                             or "403" in low or "forbidden" in low)
+
+
+def _extract_spack_sources(text: str) -> tuple[list[str], str]:
+    """From a failed job log: (source-archive URLs to try laptop-side, the
+    relative mirror path to store the archive at). Egress-filter block-page URLs
+    are unwrapped from their percent-encoded url= parameter. The store path
+    prefers spack's sha-addressed _source-cache layout (the digest doubles as an
+    integrity check); else the per-package <name>/<name>-<version>.<ext> layout
+    parsed from the failing stage name."""
+    import urllib.parse as _up
+
+    urls: list[str] = []
+    for m in re.finditer(r"https?://\S+", text):
+        u = m.group(0).rstrip(":,)\"'")
+        if "block" in _up.urlparse(u).netloc:
+            wrapped = _up.parse_qs(_up.urlparse(u).query).get("url", [""])[0]
+            if not wrapped:
+                continue
+            u = _up.unquote(wrapped)
+        if _SRC_ARCHIVE_RE.search(u) and u not in urls:
+            urls.append(u)
+    # the spack mirror URL first: its path embeds the sha256 we verify against
+    urls.sort(key=lambda u: 0 if "_source-cache/archive/" in u else 1)
+    rel = ""
+    for u in urls:
+        m = re.search(r"_source-cache/archive/[0-9a-f]{2}/[0-9a-f]{64}\.[a-z0-9.]+$", u)
+        if m:
+            rel = m.group(0)
+            break
+    if not rel and urls:
+        m = re.search(r"failed for (?:spack-stage-)?([a-z0-9-]+?)-([0-9][0-9a-z.]*)-[a-z0-9]{20,}",
+                      text)
+        if m:
+            ext = next((c for c in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip")
+                        if urls[0].endswith(c)), ".tar.gz")
+            rel = f"{m.group(1)}/{m.group(1)}-{m.group(2)}{ext}"
+    return urls, rel
+
+
+def _download_bytes(url: str, timeout: int = 600) -> bytes:
+    """Fetch a URL on THIS machine through the ambient proxy + CA bundle (the
+    same opener `generate card` uses against the Hub)."""
+    from boxy import cardgen
+
+    with cardgen._opener().open(url, timeout=timeout) as r:
+        return r.read()
+
+
+def _maybe_spack_source_heal(target: str, host: str, tail: str, mirror_remote: str,
+                             downloader=None) -> bool:
+    """Egress-filter heal for spack app jobs: the CLUSTER can't download the
+    source archive (category-blocked 403), but the LAPTOP usually can — so pull
+    it here, sha256-verify when the mirror path names the digest, push it into
+    the job's file:// spack mirror on the shared FS, and tell the caller to
+    resubmit. False = not stageable (the caller reports the log as-is)."""
+    import hashlib
+
+    from boxy import remote
+
+    urls, rel = _extract_spack_sources(tail)
+    if not urls or not rel:
+        return False
+    print("boxy: the cluster's egress filter blocked spack's source download — fetching "
+          "the archive on YOUR machine and staging it into a spack mirror on the "
+          "cluster's shared FS ...", file=sys.stderr)
+    data, src = None, ""
+    for u in urls:
+        try:
+            data = (downloader or _download_bytes)(u)
+            src = u
+            break
+        except Exception as e:  # noqa: BLE001 — every fetcher gets its chance
+            print(f"boxy:   {u}: {e}", file=sys.stderr)
+    if data is None:
+        print(f"boxy: the source is unreachable from this machine too — download the "
+              f"archive yourself and place it at {host}:{mirror_remote}/{rel}, then rerun.",
+              file=sys.stderr)
+        return False
+    digest = re.search(r"([0-9a-f]{64})", rel)
+    if digest and hashlib.sha256(data).hexdigest() != digest.group(1):
+        print("boxy: the downloaded archive does not match spack's sha256 — refusing to "
+              "stage it (a filter may have served an HTML block page instead).", file=sys.stderr)
+        return False
+    dest = f"{mirror_remote}/{rel}"
+    if remote.push_file(target, dest, data) != 0:
+        return False
+    print(f"boxy: staged {src} -> {host}:{dest} ({len(data) // 1024} KiB) — resubmitting.",
+          file=sys.stderr)
+    return True
+
+
 def _app_agentless_ssh(args, card, target: str) -> int:
     """Agentless app run over --ssh: render the card's batch script laptop-side,
     push + submit over the one master, then (unless --detach) poll the job to
@@ -1153,11 +1254,15 @@ def _app_agentless_ssh(args, card, target: str) -> int:
     log_remote = f"{rdir}/{name}{('-' + tok) if tok else ''}.log"
 
     pfx = _proxy_prefix(args) if card.kind == "container" else ""
+    # a boxy-owned file:// source mirror rides in every spack script: normally
+    # empty and inert, but the landing spot when the egress filter blocks the
+    # cluster's fetch and the archive has to be staged from the laptop.
+    mirror_remote = f"{rdir}/spack-mirror"
     script_text = appcards.render_app_script(
         card, scheduler_name, name, log_remote, site_args,
         nodes=getattr(args, "nodes", 0) or 0,
         tasks_per_node=getattr(args, "tasks_per_node", 0) or 0,
-        proxy_prefix=pfx)
+        proxy_prefix=pfx, spack_mirror_dir=(mirror_remote if card.kind == "spack" else ""))
 
     print(f"### Agentless app run from {card.label} (no boxy on the cluster).")
     print(f"### Batch script ({script_remote}):")
@@ -1185,7 +1290,7 @@ def _app_agentless_ssh(args, card, target: str) -> int:
                 card, scheduler_name, name, log_remote, site_args,
                 nodes=getattr(args, "nodes", 0) or 0,
                 tasks_per_node=getattr(args, "tasks_per_node", 0) or 0,
-                proxy_prefix=pfx)
+                proxy_prefix=pfx, spack_mirror_dir=(mirror_remote if card.kind == "spack" else ""))
             if remote.push_file(target, script_remote, script_text) == 0:
                 rc, out = remote.ssh_capture(target, f"cd {shlex.quote(rhome)} && {submit_cmd}",
                                              timeout=60)
@@ -1205,6 +1310,7 @@ def _app_agentless_ssh(args, card, target: str) -> int:
     # follow to completion: an app job is FINITE — the results ARE the log.
     print("### Waiting for the job to finish (Ctrl-C detaches; the job keeps running) ...")
     last_state = ""
+    healed_sources = False
     try:
         while True:
             src, sout = remote.ssh_capture(target, shlex.join(scheduler.state_command(job_id)),
@@ -1214,6 +1320,27 @@ def _app_agentless_ssh(args, card, target: str) -> int:
                 print(f"### Job {job_id}: {state}")
                 last_state = state
             if state == "DONE":
+                # a spack job that died because the CLUSTER's egress filter blocked
+                # the source download is healed from the laptop: stage the archive
+                # into the job's file:// mirror and resubmit ONCE.
+                tail = _remote_log_tail(target, log_remote, n=200)
+                if (card.kind == "spack" and not healed_sources and _spack_fetch_blocked(tail)
+                        and _maybe_spack_source_heal(target, host, tail, mirror_remote)):
+                    healed_sources = True
+                    rc, out = remote.ssh_capture(target, f"cd {shlex.quote(rhome)} && {submit_cmd}",
+                                                 timeout=60)
+                    if rc == 0:
+                        job_id = scheduler.parse_job_id(out)
+                        print(f"### Resubmitted as {scheduler_name} job {job_id} "
+                              f"(sources staged from your machine).")
+                        jobs.write_record(name, {"name": name, "scheduler": scheduler_name,
+                                                 "job": job_id, "app": card.name,
+                                                 "submitted_from": "app-agentless-ssh",
+                                                 "target": target, "log": log_remote})
+                        last_state = ""
+                        _time.sleep(5)
+                        continue
+                    print(f"boxy: resubmit failed on {host}:\n{out.strip()}", file=sys.stderr)
                 break
             _time.sleep(10)
     except KeyboardInterrupt:

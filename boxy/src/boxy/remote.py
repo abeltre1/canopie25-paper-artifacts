@@ -332,15 +332,16 @@ def add_forward(host: str, local_port: int, remote_host: str, remote_port: int) 
                           capture_output=True, text=True).returncode
 
 
-def push_file(host: str, remote_path: str, content: str) -> int:
-    """Write `content` to `remote_path` on host over the LIVE master (cat >, no
-    re-auth), creating the parent dir. `remote_path` is used UNQUOTED so a leading
-    $HOME expands remote-side — pass a boxy-controlled path (a job-name slug), never
-    user free-text. Returns the ssh rc (0 = written)."""
+def push_file(host: str, remote_path: str, content: str | bytes) -> int:
+    """Write `content` (text or raw bytes — e.g. a staged source tarball) to
+    `remote_path` on host over the LIVE master (cat >, no re-auth), creating the
+    parent dir. `remote_path` is used UNQUOTED so a leading $HOME expands
+    remote-side — pass a boxy-controlled path (a job-name slug), never user
+    free-text. Returns the ssh rc (0 = written)."""
     proc = subprocess.run(
         [ssh_bin(), "-o", f"ControlPath={control_path()}", host,
          f'mkdir -p "$(dirname {remote_path})" && cat > {remote_path}'],
-        input=content.encode(), capture_output=True)
+        input=content if isinstance(content, bytes) else content.encode(), capture_output=True)
     if proc.returncode != 0:
         print(f"warning: could not write {remote_path} on {host}: "
               f"{(proc.stderr or b'').decode(errors='replace')[:200]}", file=sys.stderr)

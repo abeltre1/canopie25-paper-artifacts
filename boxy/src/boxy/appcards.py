@@ -151,12 +151,18 @@ def _launcher(scheduler_name: str, nodes: int, ntasks: int) -> str:
     return ""  # scheduler 'none': run bare (the app decides its own parallelism)
 
 
-def _spack_bootstrap(spec: str) -> list[str]:
+def _spack_bootstrap(spec: str, mirror_dir: str = "") -> list[str]:
     """Shell lines that find spack on the COMPUTE node, build the spec once
     (--reuse makes reruns a no-op against the shared-FS install tree), and load
-    it into the environment. Fails with a clear message when no spack exists."""
+    it into the environment. Fails with a clear message when no spack exists.
+
+    `mirror_dir` registers a boxy-owned file:// source mirror BEFORE the install:
+    when the cluster's egress filter blocks spack's fetch (field: Zscaler
+    CATEGORY_DENIED on mirror.spack.io AND the upstream), boxy downloads the
+    archive laptop-side and drops it here, so the resubmitted job finds the
+    source locally. An empty/missing mirror is harmless — spack falls through."""
     probes = " ".join(f'"{c}"' for c in _SPACK_SETUP_CANDIDATES)
-    return [
+    lines = [
         "_SP=''",
         f"for _c in {probes}; do",
         '  if [ -f "$_c" ]; then _SP="$_c"; break; fi',
@@ -167,14 +173,23 @@ def _spack_bootstrap(spec: str) -> list[str]:
         "  exit 3",
         "fi",
         '. "$_SP"',
+    ]
+    if mirror_dir:
+        lines += [
+            f'mkdir -p "{mirror_dir}"',
+            f'spack mirror add boxy-local "file://{mirror_dir}" 2>/dev/null || '
+            f'spack mirror set-url boxy-local "file://{mirror_dir}" 2>/dev/null || true',
+        ]
+    lines += [
         f"spack install --reuse -y {spec}",
         f"spack load {spec}",
     ]
+    return lines
 
 
 def render_app_script(card: AppCard, scheduler_name: str, name: str, log_file: str,
                       site_args: list[str], *, nodes: int = 0, tasks_per_node: int = 0,
-                      proxy_prefix: str = "") -> str:
+                      proxy_prefix: str = "", spack_mirror_dir: str = "") -> str:
     """A fully self-contained batch script for an app card — the agentless
     contract: NOTHING boxy-side on the cluster; the compute node needs only
     spack (spack kind) or a container runtime (container kind)."""
@@ -188,7 +203,7 @@ def render_app_script(card: AppCard, scheduler_name: str, name: str, log_file: s
     for m in card.modules:
         body_lines.append(f"module load {m}")
     if card.kind == "spack":
-        body_lines += _spack_bootstrap(card.spec)
+        body_lines += _spack_bootstrap(card.spec, mirror_dir=spack_mirror_dir)
     body_lines += [str(s) for s in card.setup]
     launch = _launcher(scheduler_name, n, ntasks)
     for cmd in card.run:

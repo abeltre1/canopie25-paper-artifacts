@@ -4,6 +4,8 @@ batch script (spack bootstrap, launcher geometry, container+proxy), and the CLI
 list/dryrun/error paths — all against packaged cards or tmp user cards, never a
 real spack or scheduler."""
 
+import hashlib
+
 import pytest
 
 from boxy import appcards
@@ -131,3 +133,80 @@ def test_cli_cards_listing_includes_apps(capfd):
     out = capfd.readouterr().out
     assert rc == 0
     assert "app cards" in out and "osu-benchmarks" in out
+
+
+# ---- egress-filter (Zscaler) source-fetch heal --------------------------------------
+
+TARBALL = b"fake-osu-tarball-bytes"
+DIGEST = hashlib.sha256(TARBALL).hexdigest()
+
+# condensed from the real kahuna/hops failure: every fetcher (spack mirror AND
+# upstream) 403'd into the site filter's block page — CATEGORY_DENIED.
+ZSCALER_LOG = f"""\
+spack.error.FetchError: All fetchers failed for spack-stage-osu-micro-benchmarks-7.5.2-frmvtwk7ojga4y4kl5nfrc5bamxwrrz5
+        https://mirror.spack.io/_source-cache/archive/{DIGEST[:2]}/{DIGEST}.tar.gz: DetailedHTTPError: GET http://block-message.ca.sandia.gov/block-page.html?url=https%3a%2f%2fmirror%2espack%2eio%2f_source-cache%2farchive%2f{DIGEST[:2]}%2f{DIGEST}%2etar%2egz&reason=Not+allowed returned 403: Forbidden
+    https://mvapich.cse.ohio-state.edu/download/mvapich/osu-micro-benchmarks-7.5.2.tar.gz: DetailedHTTPError: GET http://block-message.ca.sandia.gov/block-page.html?url=https%3a%2f%2fmvapich%2ecse%2eohio%2dstate%2eedu%2fdownload%2fmvapich%2fosu-micro-benchmarks-7.5.2%2etar%2egz&reason=Not+allowed returned 403: Forbidden
+==> Error: The following packages failed to install:
+osu-micro-benchmarks@7.5.2/frmvtwk: /tmp/spack-stage.log
+"""
+
+
+def test_spack_fetch_block_detected_and_sources_extracted():
+    from boxy import cli
+
+    assert cli._spack_fetch_blocked(ZSCALER_LOG)
+    assert not cli._spack_fetch_blocked("CUDA out of memory")
+    urls, rel = cli._extract_spack_sources(ZSCALER_LOG)
+    assert urls[0].startswith("https://mirror.spack.io/")            # sha-addressed first
+    assert any("mvapich.cse.ohio-state.edu" in u for u in urls)      # upstream unwrapped
+    assert not any("block-message" in u for u in urls)               # block pages excluded
+    assert rel == f"_source-cache/archive/{DIGEST[:2]}/{DIGEST}.tar.gz"
+
+
+def test_spack_sources_fall_back_to_package_layout():
+    from boxy import cli
+
+    log = ("spack.error.FetchError: All fetchers failed for "
+           "spack-stage-stream-5.10-abcdefghijklmnopqrstuvwxyz012345\n"
+           "    https://www.cs.virginia.edu/stream/FTP/Code/stream-5.10.tar.gz: "
+           "returned 403: Forbidden\n")
+    urls, rel = cli._extract_spack_sources(log)
+    assert urls == ["https://www.cs.virginia.edu/stream/FTP/Code/stream-5.10.tar.gz"]
+    assert rel == "stream/stream-5.10.tar.gz"
+
+
+def test_spack_source_heal_stages_verified_archive(monkeypatch, capfd):
+    from boxy import cli, remote
+
+    pushed = {}
+    monkeypatch.setattr(remote, "push_file", lambda t, path, data: pushed.update({path: data}) or 0)
+    ok = cli._maybe_spack_source_heal("user@hops", "hops", ZSCALER_LOG, "/home/u/mir",
+                                      downloader=lambda u: TARBALL)
+    err = capfd.readouterr().err
+    assert ok
+    dest = f"/home/u/mir/_source-cache/archive/{DIGEST[:2]}/{DIGEST}.tar.gz"
+    assert pushed == {dest: TARBALL}
+    assert "staging it into a spack mirror" in err and "resubmitting" in err
+
+
+def test_spack_source_heal_rejects_sha_mismatch(monkeypatch, capfd):
+    # the filter may serve an HTML block page WITH a 200 — never stage bytes that
+    # don't match spack's digest.
+    from boxy import cli, remote
+
+    monkeypatch.setattr(remote, "push_file",
+                        lambda *a: (_ for _ in ()).throw(AssertionError("must not push")))
+    ok = cli._maybe_spack_source_heal("user@hops", "hops", ZSCALER_LOG, "/m",
+                                      downloader=lambda u: b"<html>blocked</html>")
+    assert not ok
+    assert "does not match spack's sha256" in capfd.readouterr().err
+
+
+def test_render_includes_local_mirror_when_given():
+    card = appcards.find_card("osu-benchmarks")
+    text = appcards.render_app_script(card, "slurm", "app-osu", "/tmp/x.log", [],
+                                      spack_mirror_dir="/home/u/.local/share/boxy/agentless/h/spack-mirror")
+    assert 'spack mirror add boxy-local "file:///home/u/.local/share/boxy/agentless/h/spack-mirror"' in text
+    assert text.index("spack mirror add") < text.index("spack install")
+    plain = appcards.render_app_script(card, "slurm", "app-osu", "/tmp/x.log", [])
+    assert "spack mirror" not in plain
