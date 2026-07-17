@@ -1583,3 +1583,24 @@ def test_ssh_agentless_app_prestages_card_sources_first_try(ssh, capfd, monkeypa
     assert "export https_proxy=http://proxy.sandia.gov:80" in script   # spack rides the proxy
     assert "spack mirror add boxy-local" in script
     assert "### Submitted slurm job 12345" in cap.out
+
+
+def test_ssh_agentless_adhoc_image_submits(ssh, capfd, monkeypatch):
+    # `boxy app --image REF --ssh cluster` — no card at all: the image is an
+    # ad-hoc container app pushed through the same agentless pipeline, with the
+    # proxy exported into the job for the compute-node podman pull.
+    home = ssh["tmp"] / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("BOXY_PROXY", "http://proxy.sandia.gov:80")
+    rc = main(["app", "--image", "quay.io/podman/hello:latest", "--ssh", "user@hops",
+               "--detach"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "### Submitted slurm job 12345" in cap.out
+    script = (home / ".local/share/boxy/agentless/hops/app-hello.sh").read_text()
+    assert "srun -N 1 -n 1" in script and "podman run --rm quay.io/podman/hello:latest" in script
+    assert "export https_proxy=http://proxy.sandia.gov:80" in script
+    assert "spack" not in script
+    rec = json.loads((ssh["jobs"] / "app-hello.json").read_text())
+    assert rec["app"] == "hello" and rec["job"] == "12345"

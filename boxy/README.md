@@ -76,6 +76,10 @@ choice (nothing is hidden, only the *work*):
   CATEGORY_DENIED on `mirror.spack.io` *and* the upstream), boxy fetches the
   archive on **your machine**, sha256-verifies it, stages it into a `file://`
   spack mirror on the cluster's shared FS, and resubmits — automatically.
+  Any container image runs as an ad-hoc app with no card at all:
+  `boxy app --image quay.io/x/y:tag --ssh <cluster> [--cmd '...']` — pulled on
+  the compute node through the forwarded proxy and launched via `srun`/`flux run`
+  with `--nodes/--tasks-per-node` geometry (`--container` is an alias).
 - **service cards** name the persistent cloud services boxy emits as Helm
   charts/manifests — `boxy generate flux-mcp | relay` (see `boxy cards`).
 - **site discovery** fills `--account` from `mywcid` / `$SBATCH_ACCOUNT` /

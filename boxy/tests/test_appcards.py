@@ -262,3 +262,34 @@ def test_render_exports_proxy_env_before_spack():
     assert text.index("export https_proxy") < text.index("spack install")
     plain = appcards.render_app_script(card, "slurm", "app-osu", "/tmp/x.log", [])
     assert "export https_proxy" not in plain
+
+
+# ---- ad-hoc container apps (--image / --container) ----------------------------------
+
+
+def test_cli_adhoc_image_runs_entrypoint(capfd, monkeypatch, tmp_path):
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    rc = main(["app", "--image", "quay.io/podman/hello:latest", "--dryrun"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "#SBATCH --job-name=app-hello" in out            # name derived from the image
+    assert "srun -N 1 -n 1 podman run --rm quay.io/podman/hello:latest\n" in out
+    assert "spack" not in out
+
+
+def test_cli_adhoc_container_alias_cmd_and_geometry(capfd, monkeypatch, tmp_path):
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    rc = main(["app", "--container", "quay.io/podman/hello:latest", "--cmd", "echo hi",
+               "--nodes", "2", "--tasks-per-node", "4", "--dryrun"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "#SBATCH --nodes=2" in out
+    assert "srun -N 2 -n 8 podman run --rm quay.io/podman/hello:latest echo hi" in out
+
+
+def test_cli_adhoc_image_with_explicit_name(capfd, monkeypatch, tmp_path):
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    rc = main(["app", "smoke", "--image", "quay.io/podman/hello:latest", "--dryrun"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "#SBATCH --job-name=app-smoke" in out            # the positional names the job

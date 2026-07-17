@@ -1041,12 +1041,33 @@ def cmd_app(args: argparse.Namespace) -> int:
     Agentless over --ssh: the cluster needs only spack (or podman), never boxy."""
     from boxy import appcards
 
+    image = getattr(args, "image", None)
+    if image:
+        # AD-HOC container app — no card needed: boxy app --image quay.io/x/y:tag
+        # --ssh cluster [--cmd '...']. Same agentless pipeline as a card: proxy
+        # exported for the pull, zero-flag site resolution, submit, wait, log.
+        slug = re.sub(r"[^a-z0-9]+", "-",
+                      image.rsplit("/", 1)[-1].split(":")[0].split("@")[0].lower()).strip("-")
+        card = appcards.AppCard(
+            name=(getattr(args, "name", None) or slug or "container"),
+            card_name=(getattr(args, "name", None) or slug or "container"),
+            source="cli", kind="container", image=image,
+            summary=f"ad-hoc container app ({image})",
+            nodes=getattr(args, "nodes", 0) or 1,
+            tasks_per_node=getattr(args, "tasks_per_node", 0) or 1,
+            run=[getattr(args, "cmd", None) or ""])   # "" = the image's own entrypoint
+        target = getattr(args, "ssh", None) or os.environ.get("BOXY_SSH_HOST", "")
+        if target:
+            return _app_agentless_ssh(args, card, target)
+        return _app_local(args, card)
+
     if not getattr(args, "name", None):
         rows = appcards.load_cards()
         if not rows:
             print("boxy: no app cards found — add one under ~/.config/boxy/cards/apps/", file=sys.stderr)
             return 1
-        print("app cards (run one: `boxy app <name> --ssh <cluster>`):")
+        print("app cards (run one: `boxy app <name> --ssh <cluster>`; any image: "
+              "`boxy app --image REF --ssh <cluster>`):")
         seen: set[str] = set()
         for a in rows:
             if a.name in seen:
@@ -1059,7 +1080,8 @@ def cmd_app(args: argparse.Namespace) -> int:
     if card is None:
         names = ", ".join(sorted({c.name for c in appcards.load_cards()})) or "(none)"
         print(f"boxy: no app card named {args.name!r} — available: {names}. "
-              f"Add your own under ~/.config/boxy/cards/apps/ (see `boxy cards`).", file=sys.stderr)
+              f"Add your own under ~/.config/boxy/cards/apps/, or run any image directly: "
+              f"boxy app --image REF --ssh <cluster> (see `boxy cards`).", file=sys.stderr)
         return 2
 
     target = getattr(args, "ssh", None) or os.environ.get("BOXY_SSH_HOST", "")
@@ -4978,10 +5000,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_cards, location=None)
 
     p = sub.add_parser("app", help="run an HPC application/benchmark from an APP CARD "
-                                   "(spack build or container) — agentless over --ssh: "
-                                   "`boxy app osu-benchmarks --ssh cluster`")
+                                   "(spack build or container) or any container image — "
+                                   "agentless over --ssh: `boxy app osu-benchmarks --ssh cluster`, "
+                                   "`boxy app --image quay.io/x/y:tag --ssh cluster`")
     p.add_argument("name", nargs="?", default=None,
-                   help="app card name (omit to list the available cards)")
+                   help="app card name (omit to list the available cards; with --image, "
+                        "an optional job name)")
+    p.add_argument("--image", "--container", dest="image", default=None, metavar="REF",
+                   help="run this container image as an AD-HOC app (no card needed): pulled "
+                        "on the compute node through the forwarded proxy and launched via "
+                        "srun/flux run with the requested geometry")
+    p.add_argument("--cmd", default=None, metavar="COMMAND",
+                   help="command to run inside the --image container (default: the image's "
+                        "own entrypoint)")
     p.add_argument("--ssh", default=None, metavar="USER@HOST",
                    help="run on that cluster over one multiplexed SSH session (agentless: "
                         "the cluster needs only spack or podman, never boxy)")

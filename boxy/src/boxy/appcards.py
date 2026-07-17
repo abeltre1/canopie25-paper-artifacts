@@ -222,7 +222,9 @@ def render_app_script(card: AppCard, scheduler_name: str, name: str, log_file: s
     launch = _launcher(scheduler_name, n, ntasks)
     for cmd in card.run:
         if card.kind == "container":
-            inner = (f"podman run --rm {shlex.quote(card.image)} {cmd}")
+            # an empty run line means "the image's own entrypoint" (the ad-hoc
+            # `boxy app --image REF` case)
+            inner = f"podman run --rm {shlex.quote(card.image)}" + (f" {cmd}" if cmd else "")
             body_lines.append(f"{proxy_prefix}{launch}{inner}")
         else:
             body_lines.append(f"{launch}{cmd}")
