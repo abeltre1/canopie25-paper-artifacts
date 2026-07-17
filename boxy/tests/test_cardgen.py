@@ -41,6 +41,16 @@ FIXTURES = {
         "index": {"metadata": {"total_size": 141_000_000_000}},  # ~141 GB bf16
         "generation": None,
     },
+    # a custom-code VISION model (image-text-to-text OCR): auto_map => needs
+    # --trust-remote-code, vision_config => needs --limit-mm-per-prompt.
+    "nvidia/NVIDIA-Nemotron-Parse-v1.2": {
+        "config": {"architectures": ["NemotronParseForConditionalGeneration"],
+                   "auto_map": {"AutoModel": "modeling_nemotron_parse.NemotronParse"},
+                   "vision_config": {"hidden_size": 1280},
+                   "torch_dtype": "bfloat16", "max_position_embeddings": 8192},
+        "index": {"metadata": {"total_size": 1_800_000_000}},    # ~0.9B params bf16
+        "generation": None,
+    },
 }
 
 
@@ -115,6 +125,20 @@ def test_gguf_repo_picks_llama_cpp():
 def test_unknown_arch_warns_but_defaults_vllm():
     engine, _why, warn = cardgen.pick_engine("acme/Weird-3B", {"architectures": ["WeirdNetForCausalLM"]}, "")
     assert engine == "vllm" and "isn't in boxy's known-vLLM list" in warn
+
+
+def test_custom_code_vision_card_carries_trust_and_mm_limit():
+    # FIELD (Nemotron-Parse): the generated card must be a COMPLETE serve spec —
+    # trust_remote_code + limit-mm-per-prompt in [model.args] — so the card alone
+    # serves the model (it died at vLLM config validation without --trust-remote-code).
+    text, engine, warnings = _gen("nvidia/NVIDIA-Nemotron-Parse-v1.2")
+    card = cards._parse_card(text, "x", "user", "x")     # must round-trip through the loader
+    assert engine == "vllm"
+    assert card.args.get("trust_remote_code") is True
+    assert card.args.get("limit-mm-per-prompt") == '{"image": 1}'
+    assert "trust_remote_code = true" in text
+    assert any("custom-code" in w for w in warnings)
+    assert any("vision" in w or "multimodal" in w for w in warnings)
 
 
 def test_explicit_engine_override_wins():

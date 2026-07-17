@@ -281,9 +281,26 @@ def _human_b(billions: float) -> str:
     return f"{billions:g}B params"
 
 
-def render_card(repo: str, engine: str, sizing: dict) -> str:
+def needs_trust_remote_code(config: dict) -> bool:
+    """True when the repo ships custom modeling code (config.json has `auto_map`);
+    vLLM/transformers refuse to load it without --trust-remote-code / it dies at
+    config validation (field: Nemotron-Parse)."""
+    return "auto_map" in (config or {})
+
+
+def is_vision_model(config: dict) -> bool:
+    """True for a vision/multimodal (image-text-to-text) model — it needs vLLM's
+    --limit-mm-per-prompt to accept image input."""
+    c = config or {}
+    return bool(c.get("vision_config")) or "image_token_id" in c or "image_token_index" in c
+
+
+def render_card(repo: str, engine: str, sizing: dict, *,
+                trust_remote_code: bool = False, vlm: bool = False) -> str:
     """The card TOML, hand-formatted to match the packaged style (header comment +
-    [model] + [model.args] with inline notes)."""
+    [model] + [model.args] with inline notes). `trust_remote_code`/`vlm` (detected
+    from config.json) add the vLLM knobs a custom-code / vision model needs so the
+    card is a COMPLETE, reproducible serve spec (field: Nemotron-Parse)."""
     b = sizing
     bits: list[str] = [_human_b(b["billions"])]
     if b["is_moe"]:
@@ -301,6 +318,14 @@ def render_card(repo: str, engine: str, sizing: dict) -> str:
     if b["min_vram_gb"]:
         lines.append(f"min_vram_gb = {b['min_vram_gb']}")
     lines.append("[model.args]")
+    if trust_remote_code:
+        lines.append("# the repo ships custom modeling code (config auto_map); vLLM refuses to")
+        lines.append("# load it without this — it dies at config validation otherwise.")
+        lines.append("trust_remote_code = true")
+    if vlm:
+        lines.append("# vision/multimodal model: accept one image per prompt (send an image +")
+        lines.append("# prompt to /v1/chat/completions; raise the cap with `-- --limit-mm-per-prompt`).")
+        lines.append('limit-mm-per-prompt = \'{"image": 1}\'')
     if b["capped"]:
         lines.append(f"# {repo.rsplit('/', 1)[-1]} has a {b['native_ctx']}-token native context; vLLM")
         lines.append("# profiles KV cache for the FULL window at startup and can OOM on a small GPU.")
@@ -340,6 +365,14 @@ def generate(repo: str, *, engine: str = "", max_model_len: int | None = None,
     if sizing["param_src"] == "unknown":
         warnings.append("could not determine size from the safetensors index or the name; "
                         "the geometry is a guess — check gpus/min_vram_gb and override if needed.")
-    text = render_card(repo, eng, sizing)
+    trust = needs_trust_remote_code(data["config"])
+    vlm = is_vision_model(data["config"])
+    if trust:
+        warnings.append("custom-code repo (auto_map) — card sets trust_remote_code=true; "
+                        "vLLM will run the model's own code.")
+    if vlm:
+        warnings.append("vision/multimodal model — card sets limit-mm-per-prompt; query it with "
+                        "an image on /v1/chat/completions, not plain text.")
+    text = render_card(repo, eng, sizing, trust_remote_code=trust, vlm=vlm)
     validate(text, repo)
     return text, eng, warnings

@@ -1038,6 +1038,49 @@ def test_hf_arch_preflight_passes_causal_lm_and_survives_fetch_failure(ssh, capf
     assert "not a text-generation model" not in cap.err
 
 
+def test_ssh_agentless_autoconfigures_custom_code_vlm(ssh, capfd, monkeypatch):
+    # FIELD (Nemotron-Parse): a custom-code VISION model died at vLLM config
+    # validation for want of --trust-remote-code. boxy now reads config.json
+    # (auto_map => custom code; vision_config => VLM) and folds --trust-remote-code
+    # + --limit-mm-per-prompt into the rendered vLLM command — turnkey, no flags.
+    from boxy import cardgen
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.delenv("BOXY_NO_PREFLIGHT", raising=False)       # opt in (suite opts out)
+    monkeypatch.setattr(cardgen, "hf_get_json", lambda *a, **k: {
+        "architectures": ["NemotronParseForConditionalGeneration"],
+        "auto_map": {"AutoModel": "modeling_nemotron_parse.NemotronParse"},
+        "vision_config": {"hidden_size": 1280}})
+    rc = main(["serve", "hf://nvidia/NVIDIA-Nemotron-Parse-v1.2",
+               "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "trust-remote-code: enabled" in cap.out and "auto_map" in cap.out
+    assert "multimodal:" in cap.out
+    exec_line = [ln for ln in cap.out.splitlines() if "podman run" in ln][0]
+    assert "--trust-remote-code" in exec_line                    # the fix for the crash
+    assert "--limit-mm-per-prompt" in exec_line and '"image": 1' in exec_line
+
+
+def test_ssh_agentless_explicit_trust_remote_code(ssh, capfd, monkeypatch):
+    # --trust-remote-code forces it even when the probe can't see the config
+    # (gated/offline) — the flag still reaches the rendered vLLM command.
+    from boxy import cardgen
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.delenv("BOXY_NO_PREFLIGHT", raising=False)
+    monkeypatch.setattr(cardgen, "hf_get_json",
+                        lambda *a, **k: (_ for _ in ()).throw(cardgen.CardGenError("gated")))
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--trust-remote-code",
+               "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    exec_line = [ln for ln in cap.out.splitlines() if "podman run" in ln][0]
+    assert "--trust-remote-code" in exec_line
+
+
 def test_diagnose_not_a_text_generation_model():
     from boxy import diagnostics
 

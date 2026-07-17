@@ -1121,34 +1121,71 @@ def _is_gres_error(text: str) -> bool:
             or "requested node configuration is not available" in low)
 
 
-def _hf_arch_preflight(repo: str) -> str | None:
-    """Best-effort LAPTOP-side sanity check before burning a GPU allocation:
-    fetch the repo's config.json and return a refusal message when the declared
-    architecture is plainly NOT a text-generation model (field: an ASR RNN-T
-    nemotron burned a 400s eldorado job before vLLM refused it with 'Argument
-    inputs_embeds not found'). Returns None to proceed — unknown or uncheckable
-    (gated/offline) architectures are left to the engine. Skip entirely with
-    --no-preflight / BOXY_NO_PREFLIGHT=1."""
+def _hf_model_facts(repo: str) -> dict:
+    """Best-effort LAPTOP-side probe of a HF repo's config.json — used before
+    burning a GPU allocation. Returns a dict:
+      refusal          str|None — set when the arch is plainly NOT servable by any
+                                  engine boxy drives (ASR/speech/embedding — field:
+                                  an ASR nemotron burned a 400s job); None => proceed.
+      trust_remote_code bool    — the repo ships custom modeling code (config has
+                                  `auto_map`); vLLM needs --trust-remote-code or it
+                                  dies at config validation (field: Nemotron-Parse).
+      vlm              bool     — a vision/multimodal model (config has vision_config
+                                  or an image token) — needs --limit-mm-per-prompt.
+      arch             str      — the first declared architecture (for messages).
+    Empty facts (all falsey) when uncheckable (gated/offline) or BOXY_NO_PREFLIGHT."""
+    empty = {"refusal": None, "trust_remote_code": False, "vlm": False, "arch": ""}
     if os.environ.get("BOXY_NO_PREFLIGHT"):
-        return None
+        return empty
     from boxy import cardgen
 
     try:
-        cfg = cardgen.hf_get_json(repo, "config.json", cardgen.resolve_token(None), timeout=8)
+        cfg = cardgen.hf_get_json(repo, "config.json", cardgen.resolve_token(None), timeout=8) or {}
     except Exception:
-        return None                      # can't check (gated/offline) — let the engine try
-    arch = ((cfg or {}).get("architectures") or [""])[0]
+        return empty                     # can't check (gated/offline) — let the engine try
+    arch = (cfg.get("architectures") or [""])[0] or ""
     low = arch.lower()
-    if not arch:
-        return None
-    if any(tok in low for tok in ("asr", "rnnt", "speech", "audio", "wav2vec",
-                                  "embedding", "reranker", "sequenceclassification")):
-        return (f"{repo} declares architecture {arch!r} — not a text-generation model. "
-                f"No engine boxy drives (vLLM, llama.cpp) can serve it, on any cluster: "
-                f"ASR/speech models need their own runtime (e.g. NVIDIA NeMo/Riva), "
-                f"embedding/reranker models need an embedding server. "
-                f"Pass --no-preflight to try anyway.")
-    return None
+    trust = cardgen.needs_trust_remote_code(cfg)   # custom code => --trust-remote-code
+    vlm = cardgen.is_vision_model(cfg)             # vision => --limit-mm-per-prompt
+    refusal = None
+    # a VLM/image-text-to-text model IS servable by vLLM — never refuse it; only the
+    # plainly-non-generative families are hopeless on vLLM/llama.cpp.
+    if arch and not vlm and any(tok in low for tok in (
+            "asr", "rnnt", "speech", "audio", "wav2vec",
+            "embedding", "reranker", "sequenceclassification")):
+        refusal = (f"{repo} declares architecture {arch!r} — not a text-generation model. "
+                   f"No engine boxy drives (vLLM, llama.cpp) can serve it, on any cluster: "
+                   f"ASR/speech models need their own runtime (e.g. NVIDIA NeMo/Riva), "
+                   f"embedding/reranker models need an embedding server. "
+                   f"Pass --no-preflight to try anyway.")
+    return {"refusal": refusal, "trust_remote_code": trust, "vlm": vlm, "arch": arch}
+
+
+def _apply_model_facts(box, facts: dict, args):
+    """Fold the auto-detected serve knobs into box.args (rendered as vLLM flags on
+    the compute node). --trust-remote-code for a custom-code repo (config auto_map)
+    or an explicit --trust-remote-code; --limit-mm-per-prompt for a vision model so
+    it accepts one image (matches the model cards' recommended serve line). vLLM
+    only — llama.cpp's server rejects these. box.args wins if already set."""
+    from dataclasses import replace as _replace
+
+    if box.engine != "vllm":
+        if facts.get("trust_remote_code") or getattr(args, "trust_remote_code", False):
+            print(f"  auto: trust-remote-code: skipped (engine is {box.engine}, not vllm)",
+                  file=sys.stderr)
+        return box
+    new_args = dict(box.args)
+    want_trust = facts.get("trust_remote_code") or getattr(args, "trust_remote_code", False)
+    if want_trust and "trust_remote_code" not in new_args and "trust-remote-code" not in new_args:
+        new_args["trust_remote_code"] = True
+        why = ("the repo ships custom code (config auto_map)"
+               if facts.get("trust_remote_code") else "requested via --trust-remote-code")
+        print(f"  auto: trust-remote-code: enabled — {why}; vLLM will run the model's custom code")
+    if facts.get("vlm") and not any(k.replace("_", "-") == "limit-mm-per-prompt" for k in new_args):
+        new_args["limit-mm-per-prompt"] = '{"image": 1}'
+        print(f"  auto: multimodal: {facts.get('arch') or 'vision model'} — "
+              "--limit-mm-per-prompt '{\"image\": 1}' (send an image + prompt to /v1/chat/completions)")
+    return _replace(box, args=new_args)
 
 
 def _is_license_error(text: str) -> bool:
@@ -1524,12 +1561,15 @@ def _serve_agentless_ssh(args, target: str) -> int:
     if engine_pull:
         bare = box.model.split("://", 1)[1]
         box = dc_replace(box, model=bare)
-        # laptop-side arch sanity check — refuse a plainly unservable model in
-        # seconds instead of burning a GPU allocation on it (field: ASR nemotron)
-        refusal = None if getattr(args, "no_preflight", False) else _hf_arch_preflight(bare)
-        if refusal:
-            print(f"boxy: {refusal}", file=sys.stderr)
+        # laptop-side HF probe: refuse a plainly unservable model in seconds instead
+        # of burning a GPU allocation (field: ASR nemotron), AND auto-detect the
+        # serve knobs a custom-code / vision model needs so `serve hf://…` stays
+        # turnkey (field: Nemotron-Parse died for want of --trust-remote-code).
+        facts = {} if getattr(args, "no_preflight", False) else _hf_model_facts(bare)
+        if facts.get("refusal"):
+            print(f"boxy: {facts['refusal']}", file=sys.stderr)
             return 2
+        box = _apply_model_facts(box, facts, args)
         print(f"  auto: model: {args.model} — the engine downloads it at container start "
               f"(no RamaLama on the cluster)")
     box = dc_replace(box, name=name, image=(args.image or box.image))
