@@ -2130,20 +2130,20 @@ def _ensure_card_args(box, model_ref: str):
 
     from boxy import cards
 
-    card = None
+    card_args, label = {}, ""
     for ref in (model_ref, getattr(box, "model", "")):
         if ref:
-            card = cards.find_card(ref)
-            if card:
+            card_args, label = cards.layered_args(ref)
+            if card_args:
                 break
-    if not card or not card.args:
+    if not card_args:
         return box, ""
-    missing = {k: v for k, v in card.args.items() if k not in box.args}
+    missing = {k: v for k, v in card_args.items() if k not in box.args}
     if not missing:
         return box, ""
     kv = ", ".join(f"{k}={v}" for k, v in missing.items())
     return (dc_replace(box, args={**box.args, **missing}),
-            f"engine args: {kv} ({card.label} — merged into the final command)")
+            f"engine args: {kv} ({label} — merged into the final command)")
 
 
 def _serve_agentless_ssh(args, target: str) -> int:

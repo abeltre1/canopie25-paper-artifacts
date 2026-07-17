@@ -151,6 +151,39 @@ def find_card(model: str) -> ModelCard | None:
     return best
 
 
+def layered_args(model: str) -> tuple[dict, str]:
+    """[model.args] with CONFIG-STYLE LAYERING: the best-matching PACKAGED card
+    is the base, the best-matching USER card overlays it key-by-key. A user card
+    still wins every key it SETS — but keys it doesn't mention fall through to
+    the packaged card instead of being erased.
+
+    Field failure this exists for: a stale `generate card` user card (written
+    before cardgen knew about trust_remote_code) shadowed the packaged
+    Nemotron-Parse card entirely, silently dropping --trust-remote-code and
+    killing every serve at vLLM config validation. Returns (args, provenance)."""
+    key = model_key(model)
+    best: dict[str, ModelCard] = {}
+    for card in load_cards():
+        if not (fnmatch.fnmatchcase(key, card.match) or key == card.match):
+            continue
+        cur = best.get(card.source)
+        if cur is None or len(card.match) > len(cur.match):
+            best[card.source] = card
+    user, packaged = best.get("user"), best.get("packaged")
+    if user is None and packaged is None:
+        return {}, ""
+    if user is None:
+        return dict(packaged.args), packaged.label
+    if packaged is None or not packaged.args:
+        return dict(user.args), user.label
+    merged = {**packaged.args, **user.args}
+    inherited = [k for k in packaged.args if k not in user.args]
+    label = user.label
+    if inherited:
+        label += f" + {', '.join(inherited)} inherited from the {packaged.label}"
+    return merged, label
+
+
 def size_heuristic(model: str) -> ModelCard | None:
     """Geometry guess for a model with no card, from the size token in its name:
     '-8B' -> 8, '8x7B' (MoE) -> 56 effective. Tiered for 80GB-class GPUs. None

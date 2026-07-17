@@ -395,12 +395,10 @@ def resolve(
     # args need no extra flag plumbing through the scheduler.
     from boxy import cards as _cards
 
-    card = _cards.find_card(resolved_model)
-    card_args: dict = {}
-    if card and card.args:
-        card_args = dict(card.args)
+    card_args, card_label = _cards.layered_args(resolved_model)
+    if card_args:
         kv = ", ".join(f"{k}={v}" for k, v in card_args.items())
-        decisions.append(f"engine args: {kv} ({card.label})")
+        decisions.append(f"engine args: {kv} ({card_label})")
 
     box_name = name or _slug(model)
     box = Box(

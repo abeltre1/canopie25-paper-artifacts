@@ -256,3 +256,28 @@ def test_ensure_card_args_matches_by_box_model_when_cli_ref_is_a_path():
               model="nvidia/NVIDIA-Nemotron-Parse-v1.2", ports=[8000], args={})
     healed, _ = _ensure_card_args(box, "/scratch/staged/model-dir")
     assert healed.args.get("trust_remote_code") is True
+
+
+def test_stale_user_card_inherits_packaged_safety_args(tmp_path, monkeypatch):
+    # THE field failure: a stale `generate card` user card (pre-trust_remote_code
+    # cardgen) shadowed the packaged Nemotron-Parse card and silently dropped
+    # --trust-remote-code. Args now LAYER: user keys win, missing keys fall
+    # through to the packaged card.
+    d = tmp_path / "cfg" / "boxy" / "cards" / "models"
+    d.mkdir(parents=True)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    (d / "nvidia-nvidia-nemotron-parse-v1.2.toml").write_text(
+        '[model]\nmatch = "nvidia/NVIDIA-Nemotron-Parse-v1.2*"\nengine = "vllm"\n'
+        'gpus = 1\n[model.args]\nmax_model_len = 4096\n')          # stale: no trust flag
+    args, label = cards.layered_args("hf://nvidia/NVIDIA-Nemotron-Parse-v1.2")
+    assert args["max_model_len"] == 4096                           # user value wins
+    assert args["trust_remote_code"] is True                       # inherited from packaged
+    assert args["limit-mm-per-prompt"] == '{"image": 1}'
+    assert "inherited from the packaged" in label
+
+
+def test_layered_args_user_only_and_packaged_only():
+    args, label = cards.layered_args("nvidia/NVIDIA-Nemotron-Parse-v1.2")
+    assert args.get("trust_remote_code") is True and "packaged" in label   # packaged only
+    none_args, none_label = cards.layered_args("acme/NoCardAnywhere-3B")
+    assert none_args == {} and none_label == ""
