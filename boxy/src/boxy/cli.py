@@ -1326,6 +1326,38 @@ def _prestage_card_sources(card, target: str, host: str, mirror_remote: str,
           "both failed) — the job will try spack's own proxied fetch.", file=sys.stderr)
 
 
+_OMPI_TCP_EXPORTS = [
+    "export OMPI_MCA_pml=ob1",
+    "export OMPI_MCA_btl=self,vader,tcp",
+]
+
+
+def _looks_like_ompi_ucx_failure(text: str) -> bool:
+    """OpenMPI died in MPI_Init because a pinned pml component (ucx) is missing:
+    the site env tunes OMPI_MCA_pml=ucx for its fabric, but the spack-built
+    OpenMPI has no ucx (field: cronus)."""
+    low = text.lower()
+    return ("mca_base_framework_open on ompi_pml failed" in low
+            or ("framework: pml" in low and "component: ucx" in low))
+
+
+def _card_with_tcp_mpi(card):
+    """The card with the OpenMPI MCA pin overridden to the portable ob1/tcp
+    path, exported before the run lines so every srun-launched rank sees it."""
+    from dataclasses import replace as dc_replace
+
+    return dc_replace(card, setup=[*card.setup, *_OMPI_TCP_EXPORTS])
+
+
+def _print_tcp_mpi_caveat() -> None:
+    print("boxy: MPI_Init failed: the site environment pins OpenMPI's pml to ucx, but the "
+          "spack-built OpenMPI has no ucx component. Resubmitting with the portable "
+          "ob1/tcp transport so the job RUNS — NOTE: bandwidth/latency numbers will "
+          "reflect TCP, not the high-speed fabric. For fabric-true numbers, point the "
+          "card's `modules` at the site MPI, or build ucx into the stack: "
+          "spack install osu-micro-benchmarks ^openmpi fabrics=ucx", file=sys.stderr)
+
+
 def _app_agentless_ssh(args, card, target: str) -> int:
     """Agentless app run over --ssh: render the card's batch script laptop-side,
     push + submit over the one master, then (unless --detach) poll the job to
@@ -1403,20 +1435,29 @@ def _app_agentless_ssh(args, card, target: str) -> int:
         staged = _stage_source_file(args, target, host, mirror_remote)
         if staged is False:
             return 1
+        prev = _remote_log_tail(target, log_remote, n=200)
         if not staged and card.sha256 and card.sources:
             # TURNKEY prestage: the card names its source + digest, so the
             # archive is guaranteed into the mirror before the FIRST submit —
             # login-node fetch through the proxy, laptop fallback.
             _prestage_card_sources(card, target, host, mirror_remote, penv)
-        elif not staged:
+        elif not staged and prev.strip() and _spack_fetch_blocked(prev):
             # rerun-after-failure (cards without source provenance): if the
             # PREVIOUS run died on a blocked fetch while nobody was following
             # (detached / Ctrl-C), stage the archive from its log NOW.
-            prev = _remote_log_tail(target, log_remote, n=200)
-            if prev.strip() and _spack_fetch_blocked(prev):
-                print("boxy: the previous run died on a blocked source fetch — staging the "
-                      "archive before this submission ...", file=sys.stderr)
-                _maybe_spack_source_heal(target, host, prev, mirror_remote)
+            print("boxy: the previous run died on a blocked source fetch — staging the "
+                  "archive before this submission ...", file=sys.stderr)
+            _maybe_spack_source_heal(target, host, prev, mirror_remote)
+        if prev.strip() and _looks_like_ompi_ucx_failure(prev):
+            # rerun-after-failure: the previous run built fine but MPI_Init died
+            # on the site's ucx pml pin — fold the portable transport in NOW.
+            _print_tcp_mpi_caveat()
+            card = _card_with_tcp_mpi(card)
+            script_text = appcards.render_app_script(
+                card, scheduler_name, name, log_remote, site_args,
+                nodes=getattr(args, "nodes", 0) or 0,
+                tasks_per_node=getattr(args, "tasks_per_node", 0) or 0,
+                proxy_prefix=pfx, spack_mirror_dir=mirror_remote, proxy_env=penv)
 
     if remote.push_file(target, script_remote, script_text) != 0:
         return 1
@@ -1456,6 +1497,23 @@ def _app_agentless_ssh(args, card, target: str) -> int:
     print("### Waiting for the job to finish (Ctrl-C detaches; the job keeps running) ...")
     last_state = ""
     healed_sources = False
+    healed_mpi = False
+
+    def _resubmit(why: str) -> bool:
+        nonlocal job_id, last_state
+        rc2, out2 = remote.ssh_capture(target, f"cd {shlex.quote(rhome)} && {submit_cmd}",
+                                       timeout=60)
+        if rc2 != 0:
+            print(f"boxy: resubmit failed on {host}:\n{out2.strip()}", file=sys.stderr)
+            return False
+        job_id = scheduler.parse_job_id(out2)
+        print(f"### Resubmitted as {scheduler_name} job {job_id} ({why}).")
+        jobs.write_record(name, {"name": name, "scheduler": scheduler_name, "job": job_id,
+                                 "app": card.name, "submitted_from": "app-agentless-ssh",
+                                 "target": target, "log": log_remote})
+        last_state = ""
+        return True
+
     try:
         while True:
             src, sout = remote.ssh_capture(target, shlex.join(scheduler.state_command(job_id)),
@@ -1465,27 +1523,32 @@ def _app_agentless_ssh(args, card, target: str) -> int:
                 print(f"### Job {job_id}: {state}")
                 last_state = state
             if state == "DONE":
-                # a spack job that died because the CLUSTER's egress filter blocked
-                # the source download is healed from the laptop: stage the archive
-                # into the job's file:// mirror and resubmit ONCE.
+                # death-path self-heals, each fired at most once per run:
+                #  * egress filter blocked the source download -> stage the
+                #    archive from the laptop into the file:// mirror, resubmit
+                #  * MPI_Init died on the site's ucx pml pin -> resubmit with
+                #    the portable ob1/tcp transport exported (loud perf caveat)
                 tail = _remote_log_tail(target, log_remote, n=200)
                 if (card.kind == "spack" and not healed_sources and _spack_fetch_blocked(tail)
                         and _maybe_spack_source_heal(target, host, tail, mirror_remote)):
                     healed_sources = True
-                    rc, out = remote.ssh_capture(target, f"cd {shlex.quote(rhome)} && {submit_cmd}",
-                                                 timeout=60)
-                    if rc == 0:
-                        job_id = scheduler.parse_job_id(out)
-                        print(f"### Resubmitted as {scheduler_name} job {job_id} "
-                              f"(sources staged from your machine).")
-                        jobs.write_record(name, {"name": name, "scheduler": scheduler_name,
-                                                 "job": job_id, "app": card.name,
-                                                 "submitted_from": "app-agentless-ssh",
-                                                 "target": target, "log": log_remote})
-                        last_state = ""
+                    if _resubmit("sources staged from your machine"):
                         _time.sleep(5)
                         continue
-                    print(f"boxy: resubmit failed on {host}:\n{out.strip()}", file=sys.stderr)
+                if (card.kind == "spack" and not healed_mpi
+                        and _looks_like_ompi_ucx_failure(tail)):
+                    _print_tcp_mpi_caveat()
+                    card = _card_with_tcp_mpi(card)
+                    script_text = appcards.render_app_script(
+                        card, scheduler_name, name, log_remote, site_args,
+                        nodes=getattr(args, "nodes", 0) or 0,
+                        tasks_per_node=getattr(args, "tasks_per_node", 0) or 0,
+                        proxy_prefix=pfx, spack_mirror_dir=mirror_remote, proxy_env=penv)
+                    if remote.push_file(target, script_remote, script_text) == 0:
+                        healed_mpi = True
+                        if _resubmit("portable ob1/tcp MPI transport"):
+                            _time.sleep(5)
+                            continue
                 break
             _time.sleep(10)
     except KeyboardInterrupt:

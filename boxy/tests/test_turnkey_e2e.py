@@ -1604,3 +1604,26 @@ def test_ssh_agentless_adhoc_image_submits(ssh, capfd, monkeypatch):
     assert "spack" not in script
     rec = json.loads((ssh["jobs"] / "app-hello.json").read_text())
     assert rec["app"] == "hello" and rec["job"] == "12345"
+
+
+def test_ssh_agentless_app_rerun_heals_ucx_mpi_pin(ssh, capfd, monkeypatch):
+    # FIELD (cronus): the build succeeded but MPI_Init died — the site pins
+    # OMPI_MCA_pml=ucx and the spack OpenMPI has no ucx. A plain rerun must fold
+    # the portable ob1/tcp transport into the script (with a loud perf caveat).
+    home = ssh["tmp"] / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    prev_log = home / ".local/share/boxy/agentless/hops/app-stream-222.log"
+    prev_log.parent.mkdir(parents=True, exist_ok=True)
+    prev_log.write_text(
+        "Framework: pml\nComponent: ucx\n"
+        "  mca_base_framework_open on ompi_pml failed\n"
+        "*** An error occurred in MPI_Init\n")
+    rc = main(["app", "stream", "--ssh", "user@hops", "--detach"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "ob1/tcp" in cap.err and "not the high-speed fabric" in cap.err
+    script = (home / ".local/share/boxy/agentless/hops/app-stream.sh").read_text()
+    assert "export OMPI_MCA_pml=ob1" in script
+    assert "export OMPI_MCA_btl=self,vader,tcp" in script
+    assert "### Submitted slurm job 12345" in cap.out

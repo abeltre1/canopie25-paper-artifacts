@@ -308,3 +308,30 @@ def test_spack_bootstrap_uses_externals_and_gcc_retry():
     assert "if ! spack install --reuse -y osu-micro-benchmarks@7.5.2; then" in text
     assert "spack install --reuse -y osu-micro-benchmarks@7.5.2 %gcc" in text
     assert "spack compilers" in text                      # gated on gcc being registered
+
+
+OMPI_UCX_LOG = """\
+A requested component was not found, or was unable to be opened.
+Host:      cronus1
+Framework: pml
+Component: ucx
+--------------------------------------------------------------------------
+  mca_base_framework_open on ompi_pml failed
+  --> Returned "Not found" (-13) instead of "Success" (0)
+*** An error occurred in MPI_Init
+srun: error: cronus1: task 0: Exited with exit code 14
+"""
+
+
+def test_ompi_ucx_failure_detected_and_card_gets_tcp_transport():
+    from boxy import cli
+
+    assert cli._looks_like_ompi_ucx_failure(OMPI_UCX_LOG)
+    assert not cli._looks_like_ompi_ucx_failure("Segmentation fault (core dumped)")
+    card = appcards.find_card("osu-benchmarks")
+    healed = cli._card_with_tcp_mpi(card)
+    assert "export OMPI_MCA_pml=ob1" in healed.setup
+    assert "export OMPI_MCA_btl=self,vader,tcp" in healed.setup
+    text = appcards.render_app_script(healed, "slurm", "app-osu", "/tmp/x.log", [])
+    body = text[text.index("set -e"):]
+    assert body.index("export OMPI_MCA_pml=ob1") < body.index("osu_bw")   # before the ranks launch
