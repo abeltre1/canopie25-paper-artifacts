@@ -210,3 +210,34 @@ def test_render_includes_local_mirror_when_given():
     assert text.index("spack mirror add") < text.index("spack install")
     plain = appcards.render_app_script(card, "slurm", "app-osu", "/tmp/x.log", [])
     assert "spack mirror" not in plain
+
+
+def test_stage_source_pushes_at_its_own_digest(tmp_path, monkeypatch, capfd):
+    # --stage-source: a browser-downloaded archive lands in the mirror at its OWN
+    # sha256 — correct file => spack finds it by digest; wrong file => ignored.
+    import argparse
+
+    from boxy import cli, remote
+
+    tarball = tmp_path / "osu-micro-benchmarks-7.5.2.tar.gz"
+    tarball.write_bytes(TARBALL)
+    pushed = {}
+    monkeypatch.setattr(remote, "push_file", lambda t, path, data: pushed.update({path: data}) or 0)
+    ns = argparse.Namespace(stage_source=str(tarball))
+    assert cli._stage_source_file(ns, "user@hops", "hops", "/m") is True
+    assert pushed == {f"/m/_source-cache/archive/{DIGEST[:2]}/{DIGEST}.tar.gz": TARBALL}
+    assert "digest-addressed" in capfd.readouterr().out
+
+
+def test_stage_source_rejects_non_archive(tmp_path, capfd):
+    import argparse
+
+    from boxy import cli
+
+    junk = tmp_path / "notes.txt"
+    junk.write_text("hi")
+    ns = argparse.Namespace(stage_source=str(junk))
+    assert cli._stage_source_file(ns, "u@h", "h", "/m") is False
+    assert "not a source archive" in capfd.readouterr().err
+    ns2 = argparse.Namespace(stage_source=None)
+    assert cli._stage_source_file(ns2, "u@h", "h", "/m") is None

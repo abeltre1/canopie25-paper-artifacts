@@ -1215,6 +1215,45 @@ def _maybe_spack_source_heal(target: str, host: str, tail: str, mirror_remote: s
     return True
 
 
+_ARCHIVE_EXTS = (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip")
+
+
+def _stage_source_file(args, target: str, host: str, mirror_remote: str) -> bool | None:
+    """--stage-source: push a hand-downloaded source archive into the job's
+    file:// spack mirror, addressed by ITS OWN sha256 — spack fetches by digest,
+    so the right file is found and a wrong one is simply never consulted. The
+    escape hatch when the egress filter blocks the cluster AND the laptop's
+    batch fetchers: a BROWSER download passes the filter's user auth (the block
+    page's 'noauth-useragent' is exactly the batch-client case).
+    None = flag not given; True = staged; False = hard error."""
+    import hashlib
+
+    from boxy import remote
+
+    path = getattr(args, "stage_source", None)
+    if not path:
+        return None
+    p = os.path.expanduser(path)
+    if not os.path.isfile(p):
+        print(f"boxy: --stage-source {path}: no such file", file=sys.stderr)
+        return False
+    base = os.path.basename(p)
+    ext = next((c for c in _ARCHIVE_EXTS if base.endswith(c)), "")
+    if not ext:
+        print(f"boxy: --stage-source {path}: not a source archive "
+              f"(expected one of {', '.join(_ARCHIVE_EXTS)})", file=sys.stderr)
+        return False
+    with open(p, "rb") as f:
+        data = f.read()
+    sha = hashlib.sha256(data).hexdigest()
+    dest = f"{mirror_remote}/_source-cache/archive/{sha[:2]}/{sha}{ext}"
+    if remote.push_file(target, dest, data) != 0:
+        return False
+    print(f"  auto: source: staged {base} -> {host}:{dest} ({len(data) // 1024} KiB, "
+          f"digest-addressed — spack uses it iff it matches the spec's sha256)")
+    return True
+
+
 def _app_agentless_ssh(args, card, target: str) -> int:
     """Agentless app run over --ssh: render the card's batch script laptop-side,
     push + submit over the one master, then (unless --detach) poll the job to
@@ -1274,6 +1313,26 @@ def _app_agentless_ssh(args, card, target: str) -> int:
         return 0
 
     remote.ssh_capture(target, f"mkdir -p {shlex.quote(rdir)}", timeout=15)
+
+    if card.kind == "spack":
+        # a hand-downloaded archive (--stage-source): push it into the mirror at
+        # its OWN sha256 — if it's the right file spack finds it by digest, if
+        # not spack ignores it. The escape hatch when even the laptop's egress is
+        # filtered: download in a BROWSER (which passes the filter's auth), then
+        #   boxy app <name> --ssh <host> --stage-source ~/Downloads/<archive>
+        staged = _stage_source_file(args, target, host, mirror_remote)
+        if staged is False:
+            return 1
+        # rerun-after-failure: if the PREVIOUS run of this job died on a blocked
+        # source fetch (the follow loop wasn't there to see it — detached or
+        # Ctrl-C'd), stage the archive NOW, before this submission.
+        if not staged:
+            prev = _remote_log_tail(target, log_remote, n=200)
+            if prev.strip() and _spack_fetch_blocked(prev):
+                print("boxy: the previous run died on a blocked source fetch — staging the "
+                      "archive before this submission ...", file=sys.stderr)
+                _maybe_spack_source_heal(target, host, prev, mirror_remote)
+
     if remote.push_file(target, script_remote, script_text) != 0:
         return 1
     rc, out = remote.ssh_capture(target, f"cd {shlex.quote(rhome)} && {submit_cmd}", timeout=60)
@@ -4875,6 +4934,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--license", default=None, help="Slurm license string (default: config site.license)")
     p.add_argument("--proxy", default=None, metavar="URL",
                    help="corporate proxy forwarded to a container app's image pull")
+    p.add_argument("--stage-source", default=None, metavar="ARCHIVE", dest="stage_source",
+                   help="push a hand-downloaded source archive (e.g. from your browser, which "
+                        "passes the egress filter's auth) into the job's spack mirror on the "
+                        "cluster before submitting — for sites that block spack's own fetch")
     p.add_argument("--detach", action="store_true",
                    help="submit and return immediately (default: wait for the job and print its log)")
     p.add_argument("--dryrun", action="store_true", help="print the batch script; submit nothing")

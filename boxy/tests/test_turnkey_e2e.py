@@ -1510,3 +1510,39 @@ def test_ssh_agentless_app_submits_spack_benchmark(ssh, capfd, monkeypatch):
     assert "--parsable" in ssh["sbatch_log"].read_text()       # really submitted
     rec = json.loads((ssh["jobs"] / "app-osu-benchmarks.json").read_text())
     assert rec["app"] == "osu-benchmarks" and rec["job"] == "12345"
+
+
+def test_ssh_agentless_app_rerun_stages_blocked_source(ssh, capfd, monkeypatch):
+    # FIELD (hops): the app job died on a Zscaler-blocked spack fetch while boxy
+    # wasn't following (detached) — so a plain RERUN of the same command must
+    # heal: read the previous run's log, download the archive laptop-side, land
+    # it in the file:// mirror BEFORE submitting.
+    import hashlib
+
+    from boxy import cli
+
+    home = ssh["tmp"] / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    tarball = b"fake-osu-tarball-bytes"
+    digest = hashlib.sha256(tarball).hexdigest()
+    prev_log = home / ".local/share/boxy/agentless/hops/app-osu-benchmarks-111.log"
+    prev_log.parent.mkdir(parents=True, exist_ok=True)
+    prev_log.write_text(
+        "spack.error.FetchError: All fetchers failed for "
+        "spack-stage-osu-micro-benchmarks-7.5.2-frmvtwk7ojga4y4kl5nfrc5bamxwrrz5\n"
+        f"    https://mirror.spack.io/_source-cache/archive/{digest[:2]}/{digest}.tar.gz: "
+        "DetailedHTTPError: GET http://block-message.ca.sandia.gov/block-page.html?url=x "
+        "returned 403: Forbidden\n")
+    monkeypatch.setattr(cli, "_download_bytes", lambda u, timeout=600: tarball)
+    rc = main(["app", "osu-benchmarks", "--ssh", "user@hops", "--detach"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "previous run died on a blocked source fetch" in cap.err
+    staged = (home / ".local/share/boxy/agentless/hops/spack-mirror/_source-cache/archive"
+              / digest[:2] / f"{digest}.tar.gz")
+    assert staged.read_bytes() == tarball                     # in the mirror BEFORE submit
+    assert "### Submitted slurm job 12345" in cap.out
+    # and the submitted script registers that mirror
+    script = (home / ".local/share/boxy/agentless/hops/app-osu-benchmarks.sh").read_text()
+    assert "spack mirror add boxy-local" in script
