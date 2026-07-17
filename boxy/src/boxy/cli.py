@@ -2118,6 +2118,39 @@ def _model_slug(repo: str) -> str:
     return repo.strip().strip("/").replace("/", "-").replace(":", "-").lower()
 
 
+# import name -> PyPI distribution name, for packages where they differ. The
+# transformers error message names the IMPORT ('pip install open_clip' is its
+# wrong suggestion — the distribution is open_clip_torch).
+_IMPORT_TO_PIP = {
+    "open_clip": "open_clip_torch",
+    "cv2": "opencv-python-headless",
+    "PIL": "pillow",
+    "sklearn": "scikit-learn",
+    "yaml": "pyyaml",
+    "skimage": "scikit-image",
+}
+
+_MISSING_PKG_RE = re.compile(
+    r"requires the following packages that were not found in your environment:\s*"
+    r"([A-Za-z0-9_\-\., ]+?)(?:\.\s*Run|\.?$)", re.MULTILINE)
+
+
+def _missing_py_packages(text: str) -> list[str]:
+    """PyPI package names for the imports a custom-code model failed on, parsed
+    from transformers' check_imports error ('This modeling file requires the
+    following packages that were not found in your environment: open_clip. Run
+    `pip install open_clip`'). Import names map through _IMPORT_TO_PIP."""
+    out: list[str] = []
+    for m in _MISSING_PKG_RE.finditer(text):
+        for name in m.group(1).split(","):
+            name = name.strip().strip(".")
+            if name and not name.startswith("`"):
+                pkg = _IMPORT_TO_PIP.get(name, name)
+                if pkg not in out:
+                    out.append(pkg)
+    return out
+
+
 def _ensure_card_args(box, model_ref: str):
     """Belt-and-suspenders: make sure the model card's [model.args] are on the
     box that is ABOUT TO BE RENDERED. resolve() merges them at build time, but
@@ -2130,20 +2163,24 @@ def _ensure_card_args(box, model_ref: str):
 
     from boxy import cards
 
-    card_args, label = {}, ""
+    card_args, label, card_pip = {}, "", []
     for ref in (model_ref, getattr(box, "model", "")):
         if ref:
             card_args, label = cards.layered_args(ref)
-            if card_args:
+            card_pip = cards.layered_pip(ref)
+            if card_args or card_pip:
                 break
-    if not card_args:
-        return box, ""
     missing = {k: v for k, v in card_args.items() if k not in box.args}
-    if not missing:
+    missing_pip = [p for p in card_pip if p not in box.pip]
+    if not missing and not missing_pip:
         return box, ""
-    kv = ", ".join(f"{k}={v}" for k, v in missing.items())
-    return (dc_replace(box, args={**box.args, **missing}),
-            f"engine args: {kv} ({label} — merged into the final command)")
+    notes = []
+    if missing:
+        notes.append(", ".join(f"{k}={v}" for k, v in missing.items()))
+    if missing_pip:
+        notes.append(f"pip: {' '.join(missing_pip)}")
+    return (dc_replace(box, args={**box.args, **missing}, pip=[*box.pip, *missing_pip]),
+            f"engine args: {'; '.join(notes)} ({label} — merged into the final command)")
 
 
 def _serve_agentless_ssh(args, target: str) -> int:
@@ -2505,6 +2542,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
     last_state = None
     proxy_healed = False
     trust_healed = False
+    pip_healed = False
 
     def _resubmit_current() -> bool:
         """Re-render with the CURRENT box/pfx, push, and resubmit — the shared
@@ -2552,6 +2590,30 @@ def _serve_agentless_ssh(args, target: str) -> int:
         print(f"### Resubmitted {scheduler_name} job {job_id} without the proxy (auto-recovered).")
         return True
 
+    def _maybe_pip_heal(tail: str) -> bool:
+        """The model's custom code imports a package the engine image doesn't
+        ship ('This modeling file requires the following packages that were not
+        found in your environment: X' — field: Nemotron-Parse's C-RADIO encoder
+        needs open_clip). Resubmit ONCE with a container-start pip install of
+        the missing packages (import names mapped to their PyPI names)."""
+        nonlocal box, pip_healed
+        if pip_healed:
+            return False
+        pkgs = _missing_py_packages(tail)
+        pkgs = [p for p in pkgs if p not in box.pip]
+        if not pkgs:
+            return False
+        pip_healed = True
+        print(f"boxy: the model's custom code needs package(s) the engine image doesn't "
+              f"ship ({', '.join(pkgs)}); resubmitting with a container-start "
+              f"`pip install` ...", file=sys.stderr)
+        box = dc_replace(box, pip=[*box.pip, *pkgs])
+        if not _resubmit_current():
+            return False
+        print(f"### Resubmitted {scheduler_name} job {job_id} with pip: {' '.join(pkgs)} "
+              f"(auto-recovered).")
+        return True
+
     def _maybe_trust_heal(tail: str) -> bool:
         """vLLM refused the model's CUSTOM code ('pass trust_remote_code=True' —
         field: Nemotron-Parse). Resubmit ONCE with the flag folded into the serve
@@ -2583,7 +2645,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
                 last_state = state
             if state == "DONE":
                 tail = _remote_log_tail(target, log_remote)
-                if _maybe_proxy_heal(tail) or _maybe_trust_heal(tail):
+                if _maybe_proxy_heal(tail) or _maybe_trust_heal(tail) or _maybe_pip_heal(tail):
                     time.sleep(5)
                     continue
                 print(f"boxy: job {job_id} ended before the server became ready; last log lines:",
@@ -2634,7 +2696,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
                 # the wait extends while the job is alive, so reaching here means
                 # the job ENDED before the server answered — diagnose, don't shrug.
                 tail = _remote_log_tail(target, log_remote)
-                if _maybe_proxy_heal(tail) or _maybe_trust_heal(tail):
+                if _maybe_proxy_heal(tail) or _maybe_trust_heal(tail) or _maybe_pip_heal(tail):
                     time.sleep(5)
                     continue
                 print(f"boxy: {scheduler_name} job {job_id} ended before the server became ready; "

@@ -1079,6 +1079,10 @@ def test_ssh_agentless_nemotron_parse_card_serves_first_try(ssh, capfd, monkeypa
     exec_line = [ln for ln in cap.out.splitlines() if "podman run" in ln][0]
     assert "--trust-remote-code" in exec_line
     assert "--limit-mm-per-prompt" in exec_line and '"image": 1' in exec_line
+    # the card's pip deps install at container START, before the engine execs
+    # (field: the C-RADIO encoder imports open_clip; the vLLM image lacks it)
+    assert "pip install --no-cache-dir --quiet open_clip_torch" in exec_line
+    assert "&& exec vllm serve" in exec_line
 
 
 def test_looks_like_proxy_failure_matches_the_field_error():

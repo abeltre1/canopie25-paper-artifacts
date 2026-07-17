@@ -62,6 +62,9 @@ class ModelCard:
     nodes: int = 0                 # 0 -> no opinion
     min_vram_gb: int = 0           # advisory only
     args: dict = field(default_factory=dict)
+    # extra pip packages the model's custom code imports that the engine image
+    # doesn't ship (installed at container start; field: Nemotron-Parse/open_clip)
+    pip: list = field(default_factory=list)
 
     @property
     def label(self) -> str:
@@ -105,6 +108,7 @@ def _parse_card(text: str, card_name: str, source: str, path: str) -> ModelCard:
         nodes=int(section.get("nodes", 0)),
         min_vram_gb=int(section.get("min_vram_gb", 0)),
         args=dict(args),
+        pip=[str(x) for x in section.get("pip", [])],
     )
 
 
@@ -182,6 +186,26 @@ def layered_args(model: str) -> tuple[dict, str]:
     if inherited:
         label += f" + {', '.join(inherited)} inherited from the {packaged.label}"
     return merged, label
+
+
+def layered_pip(model: str) -> list:
+    """Extra pip packages for the model, UNION of the best-matching packaged and
+    user cards (same layering rationale as layered_args: a user card must never
+    silently drop a packaged card's required runtime deps)."""
+    key = model_key(model)
+    best: dict[str, ModelCard] = {}
+    for card in load_cards():
+        if not (fnmatch.fnmatchcase(key, card.match) or key == card.match):
+            continue
+        cur = best.get(card.source)
+        if cur is None or len(card.match) > len(cur.match):
+            best[card.source] = card
+    out: list = []
+    for c in (best.get("packaged"), best.get("user")):
+        for p in (c.pip if c else []):
+            if p not in out:
+                out.append(p)
+    return out
 
 
 def size_heuristic(model: str) -> ModelCard | None:

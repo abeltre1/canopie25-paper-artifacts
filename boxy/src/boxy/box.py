@@ -40,6 +40,11 @@ class Box:
     # Engine args appended last, without overriding user-supplied args
     # (the prototype's "tack on last" rule from common_boxy.sh).
     args: dict[str, object] = field(default_factory=dict)
+    # Extra pip packages the model's CUSTOM code imports that the engine image
+    # doesn't ship (field: Nemotron-Parse's C-RADIO encoder needs open_clip).
+    # Installed at container START through the forwarded proxy, before exec'ing
+    # the engine — no derived image, works on any cluster.
+    pip: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.engine not in ENGINES:

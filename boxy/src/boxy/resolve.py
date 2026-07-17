@@ -399,6 +399,10 @@ def resolve(
     if card_args:
         kv = ", ".join(f"{k}={v}" for k, v in card_args.items())
         decisions.append(f"engine args: {kv} ({card_label})")
+    card_pip = _cards.layered_pip(resolved_model)
+    if card_pip:
+        decisions.append(f"pip: {' '.join(card_pip)} (installed in the container at start — "
+                         f"the model's custom code imports them; the engine image doesn't ship them)")
 
     box_name = name or _slug(model)
     box = Box(
@@ -408,5 +412,6 @@ def resolve(
         model=resolved_model,
         ports=[resolved_port],
         args=card_args,
+        pip=card_pip,
     )
     return Resolution(box=box, location=location, decisions=decisions)

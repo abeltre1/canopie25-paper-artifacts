@@ -281,3 +281,32 @@ def test_layered_args_user_only_and_packaged_only():
     assert args.get("trust_remote_code") is True and "packaged" in label   # packaged only
     none_args, none_label = cards.layered_args("acme/NoCardAnywhere-3B")
     assert none_args == {} and none_label == ""
+
+
+def test_card_pip_layered_and_missing_pkg_parser():
+    # the packaged Nemotron-Parse card declares open_clip_torch; a user card
+    # can add more but never erases the packaged deps.
+    assert cards.layered_pip("hf://nvidia/NVIDIA-Nemotron-Parse-v1.2") == ["open_clip_torch"]
+
+    from boxy.cli import _missing_py_packages
+
+    err = ("ImportError: This modeling file requires the following packages that were "
+           "not found in your environment: open_clip. Run `pip install open_clip`")
+    assert _missing_py_packages(err) == ["open_clip_torch"]       # import -> PyPI name
+    assert _missing_py_packages("CUDA out of memory") == []
+    multi = ("This modeling file requires the following packages that were not found "
+             "in your environment: einops, cv2. Run `pip install einops cv2`")
+    assert _missing_py_packages(multi) == ["einops", "opencv-python-headless"]
+
+
+def test_pip_wrapper_wraps_serve_command():
+    from boxy import engines
+    from boxy.box import Box
+    from boxy.location import Location
+
+    box = Box(name="x", image="", engine="vllm", model="nvidia/NVIDIA-Nemotron-Parse-v1.2",
+              ports=[8000], args={"trust_remote_code": True}, pip=["open_clip_torch"])
+    cmd = engines.build_serve_cmd(box, Location(name="l"), box.model)
+    assert cmd[0:2] == ["sh", "-c"]
+    assert cmd[2].startswith("pip install --no-cache-dir --quiet open_clip_torch && exec vllm serve")
+    assert "--trust-remote-code" in cmd[2]

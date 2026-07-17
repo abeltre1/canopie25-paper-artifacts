@@ -9,6 +9,10 @@ match = "nvidia/NVIDIA-Nemotron-Parse*"
 engine = "vllm"
 gpus = 1
 min_vram_gb = 8
+# the C-RADIOv2 vision encoder's custom code imports open_clip, which the stock
+# vLLM image doesn't ship — installed in the container at start (PyPI package is
+# open_clip_torch; the model's own error message names the IMPORT, not the package).
+pip = ["open_clip_torch"]
 [model.args]
 trust_remote_code = true
 limit-mm-per-prompt = '{"image": 1}'

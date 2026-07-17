@@ -81,8 +81,20 @@ def build_serve_cmd(
     (tensor_parallel_size, pipeline_parallel_size) derived from the allocation
     geometry for multi-node distributed vLLM (ignored by llama.cpp)."""
     if box.engine == "llama.cpp":
-        return build_llamacpp_serve_cmd(box, location, model_path, host, port, extra_args)
-    return build_vllm_serve_cmd(box, location, model_path, host, port, extra_args, parallelism)
+        cmd = build_llamacpp_serve_cmd(box, location, model_path, host, port, extra_args)
+    else:
+        cmd = build_vllm_serve_cmd(box, location, model_path, host, port, extra_args, parallelism)
+    if box.pip:
+        # the model's custom code imports packages the image doesn't ship: install
+        # them at container START (through the container's proxy/CA env, already
+        # set on the box) and exec the engine — no derived image to build/push.
+        import shlex as _shlex
+
+        pkgs = " ".join(_shlex.quote(p) for p in box.pip)
+        inner = _shlex.join(c for c in cmd if c)
+        cmd = ["sh", "-c",
+               f"pip install --no-cache-dir --quiet {pkgs} && exec {inner}"]
+    return cmd
 
 
 def build_llamacpp_serve_cmd(
