@@ -1482,3 +1482,31 @@ def test_ssh_agentless_auto_recovers_from_gres_rejection(ssh, capfd, monkeypatch
     # and the accepted submission really used the portable form
     submits = ssh["sbatch_log"].read_text()
     assert submits.count("--parsable") >= 2                   # first (rejected) + retry
+
+
+# ---- app cards over --ssh: agentless spack benchmark submission --------------------
+
+
+def test_ssh_agentless_app_submits_spack_benchmark(ssh, capfd, monkeypatch):
+    # The deployment-OS promise for CLASSIC HPC apps: `boxy app osu-benchmarks
+    # --ssh cluster` resolves the site exactly like serve (account via mywcid on
+    # the cluster, walltime from the card), renders a self-contained spack batch
+    # script, pushes it to the shared FS, and submits — nothing boxy-side on the
+    # cluster. --detach returns right after the submit with a laptop record.
+    home = ssh["tmp"] / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))                 # pushed scripts stay in tmp
+    rc = main(["app", "osu-benchmarks", "--ssh", "user@hops", "--detach"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: account: fy140001 (via mywcid" in cap.out    # probed ON the cluster
+    assert "### Submitted slurm job 12345" in cap.out
+    script = (home / ".local/share/boxy/agentless/hops/app-osu-benchmarks.sh").read_text()
+    assert "#SBATCH --account=fy140001" in script
+    assert "#SBATCH --nodes=2" in script
+    assert "#SBATCH --time=30:00" in script                    # the card's walltime
+    assert "spack install --reuse -y osu-micro-benchmarks" in script
+    assert "srun -N 2 -n 2 " in script
+    assert "--parsable" in ssh["sbatch_log"].read_text()       # really submitted
+    rec = json.loads((ssh["jobs"] / "app-osu-benchmarks.json").read_text())
+    assert rec["app"] == "osu-benchmarks" and rec["job"] == "12345"

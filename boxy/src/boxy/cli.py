@@ -1011,7 +1011,267 @@ def cmd_cards(args: argparse.Namespace) -> int:
         by_type.setdefault(typ, []).append(cname)
     for typ in sorted(by_type):
         print(f"  {typ:<12} {', '.join(sorted(by_type[typ]))}")
-    print("\ndrop your own in ~/.config/boxy/cards/{models,systems}/ (they win over built-ins).")
+
+    from boxy import appcards
+
+    print("\napp cards (HPC applications/benchmarks — `boxy app <name> --ssh <cluster>`):")
+    seen_apps: set[str] = set()
+    for a in appcards.load_cards():
+        if a.name in seen_apps:
+            continue
+        seen_apps.add(a.name)
+        geo = f"{a.nodes}x{a.tasks_per_node}"
+        print(f"  {a.name:<24} {a.kind:<10} {geo:<6} {a.summary}  [{a.source}]")
+
+    print("\nservice cards (persistent cloud services boxy emits — `boxy generate <name>`):")
+    for sname, sdesc in (("flux-mcp", "Flux MCP server as a persistent OpenShift service (Helm chart)"),
+                         ("relay", "chisel reverse-tunnel relay — the everyone-URL share ingress")):
+        print(f"  {sname:<24} {sdesc}")
+
+    print("\ndrop your own in ~/.config/boxy/cards/{models,systems,apps}/ (they win over built-ins).")
+    return 0
+
+
+def cmd_app(args: argparse.Namespace) -> int:
+    """Run an HPC application/benchmark from an APP CARD — the deployment-OS
+    counterpart of `boxy serve MODEL`: the card carries what to build (a spack
+    spec) or pull (a container image), the geometry, and the run lines; boxy
+    resolves the site (scheduler/account/partition/time) with the same zero-flag
+    machinery the serve path uses and submits a self-contained batch script.
+    Agentless over --ssh: the cluster needs only spack (or podman), never boxy."""
+    from boxy import appcards
+
+    if not getattr(args, "name", None):
+        rows = appcards.load_cards()
+        if not rows:
+            print("boxy: no app cards found — add one under ~/.config/boxy/cards/apps/", file=sys.stderr)
+            return 1
+        print("app cards (run one: `boxy app <name> --ssh <cluster>`):")
+        seen: set[str] = set()
+        for a in rows:
+            if a.name in seen:
+                continue
+            seen.add(a.name)
+            print(f"  {a.name:<24} {a.kind:<10} {a.nodes}x{a.tasks_per_node:<4} {a.summary}  [{a.source}]")
+        return 0
+
+    card = appcards.find_card(args.name)
+    if card is None:
+        names = ", ".join(sorted({c.name for c in appcards.load_cards()})) or "(none)"
+        print(f"boxy: no app card named {args.name!r} — available: {names}. "
+              f"Add your own under ~/.config/boxy/cards/apps/ (see `boxy cards`).", file=sys.stderr)
+        return 2
+
+    target = getattr(args, "ssh", None) or os.environ.get("BOXY_SSH_HOST", "")
+    if target:
+        return _app_agentless_ssh(args, card, target)
+    return _app_local(args, card)
+
+
+def _app_site_args(args, card, scheduler, scheduler_name: str, target: str = "",
+                   host: str = "") -> list[str]:
+    """Site directives for an app job, resolved the same way the serve path does:
+    account (config/env, else mywcid probed on the cluster), partition (explicit
+    or auto-ranked from the cluster), time (flag > card > config default), and the
+    Slurm license default. Explicit flags always win."""
+    from boxy import remote, site
+
+    site_args: list[str] = []
+    acct, awhy = site.resolve_account(getattr(args, "account", None))
+    if not acct and target:
+        rc, out = remote.ssh_capture(target, site.remote_account_probe(), timeout=20)
+        rows = site.parse_account_rows(out) if rc == 0 else []
+        acct, awhy = _pick_remote_account(args, rows, host, target)
+    if acct:
+        site_args.append(scheduler.site_directive("account", acct))
+        print(f"  auto: account: {acct} (via {awhy})")
+    need_gpu = card.gpus_per_node > 0
+    part = getattr(args, "partition", None)
+    if target and site.partition_mode(part) in ("auto", "all"):
+        rc, out = remote.ssh_capture(target, site.remote_partition_probe(scheduler_name), timeout=20)
+        value, pwhy = site.rank_remote_partitions(out, scheduler_name, need_gpu) if rc == 0 else ("", "")
+        if value:
+            names = [p for p in value.split(",") if p]
+            pick, pnote = _pick_remote_partition(args, names, host, target, scheduler_name)
+            part = pick
+            print(f"  auto: partition: {part} (via {pnote or f'{scheduler_name} on {host}: {pwhy}'})")
+    if part and site.partition_mode(part) == "set":
+        if scheduler_name == "flux" and "," in part:
+            part = part.split(",")[0].strip()
+        site_args.append(scheduler.site_directive("partition", part))
+
+    explicit_t = getattr(args, "time", None) or card.time
+    t, twhy = (explicit_t, "--time / the app card") if explicit_t else site.resolve_time(None)
+    if t:
+        site_args.append(scheduler.site_directive("time", t))
+        print(f"  auto: time: {t} (via {twhy} — the scheduler stops the job at this walltime)")
+    if scheduler_name == "slurm":
+        lic, lwhy = site.resolve_license(getattr(args, "license", None))
+        if lic:
+            site_args.append(scheduler.site_directive("license", lic))
+            print(f"  auto: license: {lic} (via {lwhy})")
+    site_args += list(getattr(args, "scheduler_args", None) or [])
+    return site_args
+
+
+def _app_agentless_ssh(args, card, target: str) -> int:
+    """Agentless app run over --ssh: render the card's batch script laptop-side,
+    push + submit over the one master, then (unless --detach) poll the job to
+    completion and print the log — so `boxy app osu-benchmarks --ssh kahuna`
+    IS the benchmark run, results included."""
+    import time as _time
+
+    from boxy import appcards, jobs, remote, site
+    from boxy.schedulers import get_scheduler
+
+    host = target.split("@")[-1]
+    if not args.dryrun and remote.ensure_master(target) != 0:
+        print(f"boxy: could not open an SSH session to {target} — check the host, your VPN, "
+              f"and that you completed any OTP/YubiKey prompt", file=sys.stderr)
+        return 1
+
+    scheduler_name = getattr(args, "scheduler", None)
+    if scheduler_name not in ("slurm", "flux"):
+        rc, avail = remote.ssh_capture(target, site.remote_scheduler_probe(), timeout=20)
+        detected, why = site.pick_scheduler(avail if rc == 0 else "", None)
+        if detected not in ("slurm", "flux"):
+            print(f"boxy: no live scheduler detected on {host} ({why}) — pass --scheduler slurm|flux",
+                  file=sys.stderr)
+            return 1
+        scheduler_name = detected
+        print(f"  auto: scheduler: {detected} (via {why} on {host})")
+    scheduler = get_scheduler(scheduler_name)
+
+    site_args = _app_site_args(args, card, scheduler, scheduler_name, target=target, host=host)
+
+    rc, rhome = remote.ssh_capture(target, 'printf %s "$HOME"', timeout=15)
+    rhome = rhome.strip() if rc == 0 and rhome.strip() else f"/home/{target.split('@')[0]}"
+    rdir = f"{rhome}/{AGENTLESS_REMOTE_SUBDIR}/{host}"
+    name = f"app-{card.card_name}"
+    script_remote = f"{rdir}/{name}.sh"
+    tok = scheduler.output_token or ""
+    log_remote = f"{rdir}/{name}{('-' + tok) if tok else ''}.log"
+
+    pfx = _proxy_prefix(args) if card.kind == "container" else ""
+    script_text = appcards.render_app_script(
+        card, scheduler_name, name, log_remote, site_args,
+        nodes=getattr(args, "nodes", 0) or 0,
+        tasks_per_node=getattr(args, "tasks_per_node", 0) or 0,
+        proxy_prefix=pfx)
+
+    print(f"### Agentless app run from {card.label} (no boxy on the cluster).")
+    print(f"### Batch script ({script_remote}):")
+    for line in script_text.rstrip().splitlines():
+        print(f"    {line}")
+    submit_cmd = shlex.join(scheduler.submit_command(script_remote))
+    print(f"### Submit Command (on {host}):\n    {submit_cmd}")
+    if args.dryrun:
+        return 0
+
+    remote.ssh_capture(target, f"mkdir -p {shlex.quote(rdir)}", timeout=15)
+    if remote.push_file(target, script_remote, script_text) != 0:
+        return 1
+    rc, out = remote.ssh_capture(target, f"cd {shlex.quote(rhome)} && {submit_cmd}", timeout=60)
+
+    # a site-default license other clusters don't define is dropped and resubmitted,
+    # same auto-recovery as the serve path (field: kahuna).
+    if rc != 0 and scheduler_name == "slurm" and _is_license_error(out):
+        lic_args = [a for a in site_args if "--license" in a]
+        if lic_args:
+            site_args = [a for a in site_args if "--license" not in a]
+            print(f"boxy: the site rejected the license request ({lic_args[0]!r}); retrying "
+                  f"WITHOUT it ...", file=sys.stderr)
+            script_text = appcards.render_app_script(
+                card, scheduler_name, name, log_remote, site_args,
+                nodes=getattr(args, "nodes", 0) or 0,
+                tasks_per_node=getattr(args, "tasks_per_node", 0) or 0,
+                proxy_prefix=pfx)
+            if remote.push_file(target, script_remote, script_text) == 0:
+                rc, out = remote.ssh_capture(target, f"cd {shlex.quote(rhome)} && {submit_cmd}",
+                                             timeout=60)
+
+    if rc != 0:
+        print(f"boxy: submit failed on {host}:\n{out.strip()}", file=sys.stderr)
+        return 1
+    job_id = scheduler.parse_job_id(out)
+    print(f"### Submitted {scheduler_name} job {job_id}  ({name})")
+    jobs.write_record(name, {"name": name, "scheduler": scheduler_name, "job": job_id,
+                             "app": card.name, "submitted_from": "app-agentless-ssh",
+                             "target": target, "log": log_remote})
+    if getattr(args, "detach", False):
+        print(f"### Detached. Log (on {host}): {log_remote}")
+        return 0
+
+    # follow to completion: an app job is FINITE — the results ARE the log.
+    print("### Waiting for the job to finish (Ctrl-C detaches; the job keeps running) ...")
+    last_state = ""
+    try:
+        while True:
+            src, sout = remote.ssh_capture(target, shlex.join(scheduler.state_command(job_id)),
+                                           timeout=20)
+            state = scheduler.interpret_state(sout) if src == 0 else "UNKNOWN"
+            if state != last_state and state in ("PENDING", "RUNNING"):
+                print(f"### Job {job_id}: {state}")
+                last_state = state
+            if state == "DONE":
+                break
+            _time.sleep(10)
+    except KeyboardInterrupt:
+        print(f"\n### Detached. Log (on {host}): {log_remote}")
+        return 0
+    tail = _remote_log_tail(target, log_remote, n=200)
+    print(f"### Job {job_id} finished. Log ({host}:{log_remote}):")
+    print(tail if tail.strip() else "    (empty log)")
+    return 0
+
+
+def _app_local(args, card) -> int:
+    """Run an app card on THIS machine (a cluster login node with boxy installed):
+    render the batch script, write it under the jobs dir, and submit it with the
+    local scheduler. --dryrun prints the script without touching the scheduler."""
+    import subprocess
+
+    from boxy import appcards, jobs
+    from boxy.schedulers import get_scheduler
+
+    scheduler_name = getattr(args, "scheduler", None)
+    if scheduler_name not in ("slurm", "flux"):
+        detected = "slurm" if shutil.which("sbatch") else ("flux" if shutil.which("flux") else "")
+        if not detected and not args.dryrun:
+            print("boxy: no scheduler on this machine (sbatch/flux not on PATH) — run with "
+                  "--ssh <cluster> from your laptop, or --dryrun to inspect the script",
+                  file=sys.stderr)
+            return 1
+        scheduler_name = detected or "slurm"
+    scheduler = get_scheduler(scheduler_name)
+
+    site_args = _app_site_args(args, card, scheduler, scheduler_name)
+    name = f"app-{card.card_name}"
+    script_path = str(jobs.script_path(name))
+    tok = scheduler.output_token or ""
+    log_path = str(jobs.log_path(name, tok) if tok else jobs.log_path(name))
+
+    script_text = appcards.render_app_script(
+        card, scheduler_name, name, log_path, site_args,
+        nodes=getattr(args, "nodes", 0) or 0,
+        tasks_per_node=getattr(args, "tasks_per_node", 0) or 0)
+
+    print(f"### App run from {card.label}.")
+    print(f"### Batch script ({script_path}):")
+    for line in script_text.rstrip().splitlines():
+        print(f"    {line}")
+    if args.dryrun:
+        return 0
+    with open(script_path, "w") as f:
+        f.write(script_text)
+    result = subprocess.run(scheduler.submit_command(script_path), capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"boxy: submit failed:\n{(result.stderr or result.stdout).strip()}", file=sys.stderr)
+        return 1
+    job_id = scheduler.parse_job_id(result.stdout)
+    print(f"### Submitted {scheduler_name} job {job_id}  ({name}) — log: {log_path}")
+    jobs.write_record(name, {"name": name, "scheduler": scheduler_name, "job": job_id,
+                             "app": card.name, "submitted_from": "app-local", "log": log_path})
     return 0
 
 
@@ -4466,6 +4726,32 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("cards", help="list the built-in model & system deployment cards "
                                      "(turnkey: `boxy serve MODEL --scheduler slurm`)")
     p.set_defaults(func=cmd_cards, location=None)
+
+    p = sub.add_parser("app", help="run an HPC application/benchmark from an APP CARD "
+                                   "(spack build or container) — agentless over --ssh: "
+                                   "`boxy app osu-benchmarks --ssh cluster`")
+    p.add_argument("name", nargs="?", default=None,
+                   help="app card name (omit to list the available cards)")
+    p.add_argument("--ssh", default=None, metavar="USER@HOST",
+                   help="run on that cluster over one multiplexed SSH session (agentless: "
+                        "the cluster needs only spack or podman, never boxy)")
+    p.add_argument("--scheduler", choices=("slurm", "flux"), default=None,
+                   help="pin the scheduler (default: liveness-detect)")
+    p.add_argument("--nodes", type=int, default=0, help="override the card's node count")
+    p.add_argument("--tasks-per-node", dest="tasks_per_node", type=int, default=0,
+                   help="override the card's tasks per node")
+    p.add_argument("--account", default=None, help="charge account/WCID (default: config/env, "
+                                                   "else probed on the cluster)")
+    p.add_argument("--partition", default=None,
+                   help="partition/queue (default: auto — soonest-start pick; 'off' = scheduler default)")
+    p.add_argument("--time", default=None, help="walltime (default: the card's, else config)")
+    p.add_argument("--license", default=None, help="Slurm license string (default: config site.license)")
+    p.add_argument("--proxy", default=None, metavar="URL",
+                   help="corporate proxy forwarded to a container app's image pull")
+    p.add_argument("--detach", action="store_true",
+                   help="submit and return immediately (default: wait for the job and print its log)")
+    p.add_argument("--dryrun", action="store_true", help="print the batch script; submit nothing")
+    p.set_defaults(func=cmd_app, location=None, box=None, scheduler_args=[])
 
     p = sub.add_parser("doctor", help="audit the environment for known field issues "
                                       "(proxy/CA/runtime/scheduler/OOM/…); OK/WARN/FAIL + a fix each")

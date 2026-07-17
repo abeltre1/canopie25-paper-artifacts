@@ -1,0 +1,24 @@
+# MiniEM — Trilinos' electromagnetics mini-app (Panzer's MiniEM proxy for
+# EMPIRE-class workloads). Ships as part of Trilinos, so the spec builds
+# Trilinos with the Panzer stack — a LARGE build the first time; spack --reuse
+# makes every rerun a no-op against the shared-FS install tree.
+#
+# Some Trilinos builds don't install the example driver into bin/ — if the run
+# line fails, copy this card to ~/.config/boxy/cards/apps/miniem.toml and point
+# `run` at your site's MiniEM binary (user cards win over packaged ones).
+#   boxy app miniem --ssh <cluster>
+[app]
+name = "miniem"
+summary = "MiniEM electromagnetics mini-app (Trilinos/Panzer) — large first build"
+kind = "spack"
+spec = "trilinos +mpi +panzer +muelu"
+nodes = 1
+tasks_per_node = 4
+time = "1:00:00"
+setup = [
+    'MINIEM="$(find "$(spack location -i trilinos)" -name "PanzerMiniEM_BlockPrec.exe" | head -1)"',
+    'if [ -z "$MINIEM" ]; then echo "boxy: this Trilinos install did not ship PanzerMiniEM_BlockPrec.exe — override the card in ~/.config/boxy/cards/apps/miniem.toml with your site build" >&2; exit 3; fi',
+]
+run = [
+    '"$MINIEM" --numTimeSteps=3',
+]

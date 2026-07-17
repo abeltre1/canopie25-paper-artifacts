@@ -1,0 +1,19 @@
+# OSU MPI micro-benchmarks — the standard 2-node interconnect smoke test.
+# spack builds (once, --reuse) on the cluster; the binaries live under the
+# install prefix's libexec/, so setup resolves that path via `spack location`.
+#   boxy app osu-benchmarks --ssh <cluster>
+[app]
+name = "osu-benchmarks"
+summary = "OSU MPI micro-benchmarks: point-to-point bandwidth + latency across 2 nodes"
+kind = "spack"
+spec = "osu-micro-benchmarks"
+nodes = 2
+tasks_per_node = 1
+time = "30:00"
+setup = [
+    'OSU="$(spack location -i osu-micro-benchmarks)/libexec/osu-micro-benchmarks/mpi"',
+]
+run = [
+    '"$OSU"/pt2pt/osu_bw',
+    '"$OSU"/pt2pt/osu_latency',
+]

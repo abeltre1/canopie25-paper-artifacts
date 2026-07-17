@@ -1,0 +1,14 @@
+# STREAM — the McCalpin memory-bandwidth benchmark; the single-node sanity
+# check that a node's memory subsystem performs as specced.
+#   boxy app stream --ssh <cluster>
+[app]
+name = "stream"
+summary = "STREAM memory-bandwidth benchmark (single node)"
+kind = "spack"
+spec = "stream"
+nodes = 1
+tasks_per_node = 1
+time = "15:00"
+run = [
+    "stream_c.exe",
+]

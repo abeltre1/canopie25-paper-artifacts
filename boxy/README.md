@@ -63,6 +63,17 @@ choice (nothing is hidden, only the *work*):
 - **system cards** are deployment profiles per system type —
   `--system slurm-cuda | flux-rocm | laptop-podman | cloud-aws-gpu | openshift-gpu`
   (3 per type; the cloud ones drive SkyPilot via `boxy generate sky`).
+- **app cards** extend the same idea to *classic HPC applications and
+  benchmarks* — boxy as an operating system of deployments, where cards are the
+  package format and schedulers/runtimes are the drivers. An app card names a
+  spack spec (or a container image), the geometry, and the run lines;
+  `boxy app osu-benchmarks --ssh <cluster>` then builds it with spack ON the
+  cluster (`--reuse`, so reruns are no-ops), submits it with the same zero-flag
+  site resolution as `serve`, waits, and prints the results log — agentless, the
+  cluster needs only spack or podman. Packaged cards: `osu-benchmarks`, `stream`,
+  `miniem` (`boxy app` lists them; drop yours in `~/.config/boxy/cards/apps/`).
+- **service cards** name the persistent cloud services boxy emits as Helm
+  charts/manifests — `boxy generate flux-mcp | relay` (see `boxy cards`).
 - **site discovery** fills `--account` from `mywcid` / `$SBATCH_ACCOUNT` /
   `sacctmgr`, plus partition/time. When `mywcid` lists **several charge accounts
   (WCIDs)** and you didn't name one, boxy shows an **interactive picker** on a
