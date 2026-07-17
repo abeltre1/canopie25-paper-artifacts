@@ -328,6 +328,27 @@ flux run -N2 --gpus-per-node=4 bash -lc 'module load rocm/6.4.0 && exec \
   --tensor-parallel-size=4 --seed=12345 --gpu-memory-utilization=0.7'
 ```
 
+## Publish models to site storage — `boxy push`
+
+Download from HuggingFace ONCE and publish where every cluster can pull —
+an S3 bucket or a container registry (OCI model artifact):
+
+```bash
+boxy push meta-llama/Llama-3.1-8B-Instruct  s3://models/llama31-8b
+boxy push nvidia/NVIDIA-Nemotron-Parse-v1.2 oci://registry.site.gov/models/nemotron-parse:v1.2
+
+# then serve from the site copy anywhere:
+boxy serve s3://models/llama31-8b --ssh <cluster>
+boxy serve oci://registry.site.gov/models/nemotron-parse:v1.2 --ssh <cluster>
+```
+
+S3 uploads use boto3 or the aws CLI (`--endpoint` / `S3_ENDPOINT_URL` for
+internal object stores); registry pushes package the model as an OCI artifact
+via RamaLama (`podman login <registry>` first). On an intercepted network, fix
+TLS first with **`boxy trust huggingface.co`** — it captures the interceptor's
+CA chain (with your confirmation) into boxy's trust store, which is exactly
+what `boxy info --net` diagnoses.
+
 ## Air-gapped deployments
 
 Build a **bundle** on a connected machine, carry it across the gap, serve

@@ -1078,6 +1078,16 @@ def _cert_issuer(pem: str) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
+def cmd_push(args: argparse.Namespace) -> int:
+    """HF -> site storage (S3 bucket or OCI registry artifact): download once,
+    publish where every cluster can pull it — the feeder for air-gap mirrors."""
+    from boxy import cards, push
+
+    _print_provenance()
+    args.model = cards.model_key(args.model)   # hf:// prefix optional
+    return push.main_push(args)
+
+
 def cmd_trust(args: argparse.Namespace) -> int:
     """Capture the CA chain the corporate interceptor presents for HOST and add
     it to boxy's trusted-extra store (merged into ca-merged.crt on every run) —
@@ -5316,6 +5326,19 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("cards", help="list the built-in model & system deployment cards "
                                      "(turnkey: `boxy serve MODEL --scheduler slurm`)")
     p.set_defaults(func=cmd_cards, location=None)
+
+    p = sub.add_parser("push", help="publish a HuggingFace model into SITE storage: "
+                                    "`boxy push ORG/MODEL s3://bucket/prefix` or "
+                                    "`boxy push ORG/MODEL oci://registry/repo:tag` — then "
+                                    "serve from the site copy everywhere")
+    p.add_argument("model", help="HuggingFace model id (hf:// optional)")
+    p.add_argument("dest", help="s3://bucket/prefix or oci://registry/repo:tag")
+    p.add_argument("--endpoint", default=None,
+                   help="S3 endpoint URL (default: S3_ENDPOINT_URL env)")
+    p.add_argument("--hf-token", dest="hf_token", default=None,
+                   help="HuggingFace token for gated repos (default: HF_TOKEN env)")
+    p.add_argument("--dryrun", action="store_true", help="print the plan; transfer nothing")
+    p.set_defaults(func=cmd_push, location=None, box=None)
 
     p = sub.add_parser("trust", help="fix CERTIFICATE_VERIFY_FAILED turnkey: capture the CA "
                                      "chain the interceptor presents for HOST and add it to "
