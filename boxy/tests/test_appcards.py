@@ -293,3 +293,18 @@ def test_cli_adhoc_image_with_explicit_name(capfd, monkeypatch, tmp_path):
     out = capfd.readouterr().out
     assert rc == 0
     assert "#SBATCH --job-name=app-smoke" in out            # the positional names the job
+
+
+def test_spack_bootstrap_uses_externals_and_gcc_retry():
+    # FIELD (flux cluster, icc): spack rebuilt gmake bottom-up and the site's
+    # Intel classic compiler died on gnulib's __malloc__ attributes. The script
+    # must (a) register system build tools as externals so gmake isn't built at
+    # all, and (b) retry the install ONCE with %gcc when the default compiler
+    # fails and gcc is registered.
+    card = appcards.find_card("osu-benchmarks")
+    text = appcards.render_app_script(card, "flux", "app-osu", "/tmp/x.log", [])
+    assert "spack external find" in text
+    assert text.index("spack external find") < text.index("spack install")
+    assert "if ! spack install --reuse -y osu-micro-benchmarks@7.5.2; then" in text
+    assert "spack install --reuse -y osu-micro-benchmarks@7.5.2 %gcc" in text
+    assert "spack compilers" in text                      # gated on gcc being registered

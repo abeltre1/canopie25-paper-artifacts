@@ -187,7 +187,23 @@ def _spack_bootstrap(spec: str, mirror_dir: str = "") -> list[str]:
             f'spack mirror set-url boxy-local "file://{mirror_dir}" 2>/dev/null || true',
         ]
     lines += [
-        f"spack install --reuse -y {spec}",
+        # register the SYSTEM's build tools (gmake/cmake/autotools/…) as spack
+        # externals so spack doesn't rebuild the toolchain bottom-up — building
+        # gmake with a site's Intel classic compiler dies on gnulib's __malloc__
+        # attributes (field: flux cluster, icc). Idempotent; quick.
+        "spack external find >/dev/null 2>&1 || true",
+        # first try the site's default compiler; if the build fails and gcc is
+        # registered, retry ONCE with %gcc — the fix for classic-compiler (icc)
+        # gnulib breakage without permanently overriding the site's toolchain.
+        f"if ! spack install --reuse -y {spec}; then",
+        '  if spack compilers 2>/dev/null | grep -qi gcc; then',
+        '    echo "boxy: the build failed with the default compiler — retrying with %gcc'
+        ' (classic Intel compilers cannot build gnulib-based tools)" >&2',
+        f"    spack install --reuse -y {spec} %gcc",
+        "  else",
+        "    exit 1",
+        "  fi",
+        "fi",
         f"spack load {spec}",
     ]
     return lines
