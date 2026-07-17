@@ -1040,19 +1040,21 @@ def test_hf_arch_preflight_passes_causal_lm_and_survives_fetch_failure(ssh, capf
 
 def test_ssh_agentless_autoconfigures_custom_code_vlm(ssh, capfd, monkeypatch):
     # FIELD (Nemotron-Parse): a custom-code VISION model died at vLLM config
-    # validation for want of --trust-remote-code. boxy now reads config.json
-    # (auto_map => custom code; vision_config => VLM) and folds --trust-remote-code
-    # + --limit-mm-per-prompt into the rendered vLLM command — turnkey, no flags.
+    # validation for want of --trust-remote-code. For a model with NO packaged
+    # card, boxy reads config.json (auto_map => custom code; vision_config =>
+    # VLM) and folds --trust-remote-code + --limit-mm-per-prompt into the
+    # rendered vLLM command — turnkey, no flags. (Nemotron-Parse itself now
+    # ships a packaged card — covered below — so this uses a cardless id.)
     from boxy import cardgen
 
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
     monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
     monkeypatch.delenv("BOXY_NO_PREFLIGHT", raising=False)       # opt in (suite opts out)
     monkeypatch.setattr(cardgen, "hf_get_json", lambda *a, **k: {
-        "architectures": ["NemotronParseForConditionalGeneration"],
-        "auto_map": {"AutoModel": "modeling_nemotron_parse.NemotronParse"},
+        "architectures": ["AcmeParseForConditionalGeneration"],
+        "auto_map": {"AutoModel": "modeling_acme_parse.AcmeParse"},
         "vision_config": {"hidden_size": 1280}})
-    rc = main(["serve", "hf://nvidia/NVIDIA-Nemotron-Parse-v1.2",
+    rc = main(["serve", "hf://acme/Custom-Parse-VLM-1B",
                "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
     cap = capfd.readouterr()
     assert rc == 0
@@ -1060,6 +1062,22 @@ def test_ssh_agentless_autoconfigures_custom_code_vlm(ssh, capfd, monkeypatch):
     assert "multimodal:" in cap.out
     exec_line = [ln for ln in cap.out.splitlines() if "podman run" in ln][0]
     assert "--trust-remote-code" in exec_line                    # the fix for the crash
+    assert "--limit-mm-per-prompt" in exec_line and '"image": 1' in exec_line
+
+
+def test_ssh_agentless_nemotron_parse_card_serves_first_try(ssh, capfd, monkeypatch):
+    # Nemotron-Parse itself: the PACKAGED model card bakes the serve spec in, so
+    # the flags land on the FIRST submit with no Hub probe at all (the field
+    # laptops cannot reach the Hub) — deterministic, no self-heal needed.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", "hf://nvidia/NVIDIA-Nemotron-Parse-v1.2",
+               "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "packaged card 'nvidia-nemotron-parse'" in cap.out
+    exec_line = [ln for ln in cap.out.splitlines() if "podman run" in ln][0]
+    assert "--trust-remote-code" in exec_line
     assert "--limit-mm-per-prompt" in exec_line and '"image": 1' in exec_line
 
 
