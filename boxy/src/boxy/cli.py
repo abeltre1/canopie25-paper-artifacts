@@ -2118,6 +2118,34 @@ def _model_slug(repo: str) -> str:
     return repo.strip().strip("/").replace("/", "-").replace(":", "-").lower()
 
 
+def _ensure_card_args(box, model_ref: str):
+    """Belt-and-suspenders: make sure the model card's [model.args] are on the
+    box that is ABOUT TO BE RENDERED. resolve() merges them at build time, but
+    the agentless path mutates the box afterwards (bare-id rewrite, prestage
+    path swap) and the field produced scripts whose vLLM line lacked the card's
+    --trust-remote-code. The card is looked up by BOTH the original CLI model
+    reference and the box's current model value; user/explicit values win —
+    only MISSING keys merge. Returns (box, decision_note_or_'')."""
+    from dataclasses import replace as dc_replace
+
+    from boxy import cards
+
+    card = None
+    for ref in (model_ref, getattr(box, "model", "")):
+        if ref:
+            card = cards.find_card(ref)
+            if card:
+                break
+    if not card or not card.args:
+        return box, ""
+    missing = {k: v for k, v in card.args.items() if k not in box.args}
+    if not missing:
+        return box, ""
+    kv = ", ".join(f"{k}={v}" for k, v in missing.items())
+    return (dc_replace(box, args={**box.args, **missing}),
+            f"engine args: {kv} ({card.label} — merged into the final command)")
+
+
 def _serve_agentless_ssh(args, target: str) -> int:
     """Fully AGENTLESS serve over --ssh: NOTHING is installed on the HPC system —
     no boxy, no Python, no RamaLama. The laptop does everything over the one ssh
@@ -2337,6 +2365,14 @@ def _serve_agentless_ssh(args, target: str) -> int:
             if prc != 0:
                 print(f"boxy: warning: login-node image pull failed on {host}:\n{pout.strip()[-800:]}",
                       file=sys.stderr)
+
+    # GUARANTEE the model card's [model.args] ride the FINAL box, whatever the
+    # model reference mutated into above (bare-id rewrite, prestage path swap):
+    # the field kept producing scripts whose vLLM line lacked the card's
+    # --trust-remote-code. Idempotent when resolve already merged them.
+    box, late_note = _ensure_card_args(box, args.model)
+    if late_note:
+        print(f"  auto: {late_note}")
 
     deploy.set_agentless_ca(ca_remote)
     try:

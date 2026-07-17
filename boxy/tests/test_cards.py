@@ -226,3 +226,33 @@ def test_packaged_nemotron_parse_card_carries_trust_and_mm_limit():
     assert card.args.get("trust_remote_code") is True
     assert card.args.get("limit-mm-per-prompt") == '{"image": 1}'
     assert card.gpus == 1
+
+
+def test_ensure_card_args_merges_missing_only():
+    # the render-time guard: card args land on the FINAL box no matter how the
+    # model reference mutated (bare-id rewrite, prestage path swap) — but a
+    # value already on the box (user/explicit) is never overwritten.
+    from boxy.box import Box
+    from boxy.cli import _ensure_card_args
+
+    box = Box(name="x", image="", engine="vllm",
+              model="nvidia/NVIDIA-Nemotron-Parse-v1.2", ports=[8000],
+              args={"max_model_len": 4096})                       # user override present
+    healed, note = _ensure_card_args(box, "hf://nvidia/NVIDIA-Nemotron-Parse-v1.2")
+    assert healed.args.get("trust_remote_code") is True           # merged from the card
+    assert healed.args.get("limit-mm-per-prompt") == '{"image": 1}'
+    assert healed.args["max_model_len"] == 4096                   # override untouched
+    assert "trust_remote_code" in note and "merged into the final command" in note
+    again, note2 = _ensure_card_args(healed, "hf://nvidia/NVIDIA-Nemotron-Parse-v1.2")
+    assert again.args == healed.args and note2 == ""              # idempotent
+
+
+def test_ensure_card_args_matches_by_box_model_when_cli_ref_is_a_path():
+    # prestage rewrote args.model? the guard also tries the box's model value.
+    from boxy.box import Box
+    from boxy.cli import _ensure_card_args
+
+    box = Box(name="x", image="", engine="vllm",
+              model="nvidia/NVIDIA-Nemotron-Parse-v1.2", ports=[8000], args={})
+    healed, _ = _ensure_card_args(box, "/scratch/staged/model-dir")
+    assert healed.args.get("trust_remote_code") is True
