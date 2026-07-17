@@ -1516,7 +1516,8 @@ def test_ssh_agentless_app_rerun_stages_blocked_source(ssh, capfd, monkeypatch):
     # FIELD (hops): the app job died on a Zscaler-blocked spack fetch while boxy
     # wasn't following (detached) — so a plain RERUN of the same command must
     # heal: read the previous run's log, download the archive laptop-side, land
-    # it in the file:// mirror BEFORE submitting.
+    # it in the file:// mirror BEFORE submitting. Exercised on a card WITHOUT
+    # source provenance (stream) — provenance-carrying cards prestage instead.
     import hashlib
 
     from boxy import cli
@@ -1524,18 +1525,18 @@ def test_ssh_agentless_app_rerun_stages_blocked_source(ssh, capfd, monkeypatch):
     home = ssh["tmp"] / "home"
     home.mkdir(exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
-    tarball = b"fake-osu-tarball-bytes"
+    tarball = b"fake-stream-tarball-bytes"
     digest = hashlib.sha256(tarball).hexdigest()
-    prev_log = home / ".local/share/boxy/agentless/hops/app-osu-benchmarks-111.log"
+    prev_log = home / ".local/share/boxy/agentless/hops/app-stream-111.log"
     prev_log.parent.mkdir(parents=True, exist_ok=True)
     prev_log.write_text(
         "spack.error.FetchError: All fetchers failed for "
-        "spack-stage-osu-micro-benchmarks-7.5.2-frmvtwk7ojga4y4kl5nfrc5bamxwrrz5\n"
+        "spack-stage-stream-5.10-frmvtwk7ojga4y4kl5nfrc5bamxwrrz5\n"
         f"    https://mirror.spack.io/_source-cache/archive/{digest[:2]}/{digest}.tar.gz: "
         "DetailedHTTPError: GET http://block-message.ca.sandia.gov/block-page.html?url=x "
         "returned 403: Forbidden\n")
     monkeypatch.setattr(cli, "_download_bytes", lambda u, timeout=600: tarball)
-    rc = main(["app", "osu-benchmarks", "--ssh", "user@hops", "--detach"])
+    rc = main(["app", "stream", "--ssh", "user@hops", "--detach"])
     cap = capfd.readouterr()
     assert rc == 0
     assert "previous run died on a blocked source fetch" in cap.err
@@ -1544,5 +1545,41 @@ def test_ssh_agentless_app_rerun_stages_blocked_source(ssh, capfd, monkeypatch):
     assert staged.read_bytes() == tarball                     # in the mirror BEFORE submit
     assert "### Submitted slurm job 12345" in cap.out
     # and the submitted script registers that mirror
-    script = (home / ".local/share/boxy/agentless/hops/app-osu-benchmarks.sh").read_text()
+    script = (home / ".local/share/boxy/agentless/hops/app-stream.sh").read_text()
     assert "spack mirror add boxy-local" in script
+
+
+def test_ssh_agentless_app_prestages_card_sources_first_try(ssh, capfd, monkeypatch, tmp_path):
+    # TURNKEY on a filtered site: a card that names its sources + sha256 gets the
+    # archive staged into the mirror BEFORE the first submit — no failed job
+    # needed, no flags. The login-node fetch fails here (invalid host), so the
+    # laptop download rung stages it; and the proxy is exported into the script.
+    import hashlib
+
+    from boxy import cli
+
+    home = ssh["tmp"] / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("BOXY_PROXY", "http://proxy.sandia.gov:80")
+    tarball = b"demo-source-bytes"
+    digest = hashlib.sha256(tarball).hexdigest()
+    cards_dir = tmp_path / "cfg" / "boxy" / "cards" / "apps"
+    cards_dir.mkdir(parents=True)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    (cards_dir / "demo.toml").write_text(
+        '[app]\nname = "demo"\nkind = "spack"\nspec = "demo@1.0"\n'
+        'sources = ["https://demo.invalid/demo-1.0.tar.gz"]\n'
+        f'sha256 = "{digest}"\nrun = ["demo_bin"]\n')
+    monkeypatch.setattr(cli, "_download_bytes", lambda u, timeout=600: tarball)
+    rc = main(["app", "demo", "--ssh", "user@hops", "--detach"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "staged demo-1.0.tar.gz from this machine" in cap.out
+    staged = (home / ".local/share/boxy/agentless/hops/spack-mirror/_source-cache/archive"
+              / digest[:2] / f"{digest}.tar.gz")
+    assert staged.read_bytes() == tarball
+    script = (home / ".local/share/boxy/agentless/hops/app-demo.sh").read_text()
+    assert "export https_proxy=http://proxy.sandia.gov:80" in script   # spack rides the proxy
+    assert "spack mirror add boxy-local" in script
+    assert "### Submitted slurm job 12345" in cap.out

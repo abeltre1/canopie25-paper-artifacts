@@ -68,6 +68,11 @@ class AppCard:
     modules: list = field(default_factory=list)
     setup: list = field(default_factory=list)
     run: list = field(default_factory=list)
+    # source-archive provenance (spack kind): with these, boxy PRE-STAGES the
+    # archive into the job's file:// mirror before the first submit — the
+    # turnkey path on clusters whose egress filter blocks spack's own fetch.
+    sources: list = field(default_factory=list)   # candidate download URLs
+    sha256: str = ""                              # the archive's digest (spack's)
 
     @property
     def label(self) -> str:
@@ -104,6 +109,7 @@ def _parse_card(text: str, card_name: str, source: str, path: str) -> AppCard:
         gpus_per_node=int(a.get("gpus_per_node", 0)), time=str(a.get("time", "")),
         modules=list(a.get("modules", [])), setup=list(a.get("setup", [])),
         run=[str(r) for r in a.get("run", [])],
+        sources=[str(s) for s in a.get("sources", [])], sha256=str(a.get("sha256", "")),
     )
 
 
@@ -189,10 +195,16 @@ def _spack_bootstrap(spec: str, mirror_dir: str = "") -> list[str]:
 
 def render_app_script(card: AppCard, scheduler_name: str, name: str, log_file: str,
                       site_args: list[str], *, nodes: int = 0, tasks_per_node: int = 0,
-                      proxy_prefix: str = "", spack_mirror_dir: str = "") -> str:
+                      proxy_prefix: str = "", spack_mirror_dir: str = "",
+                      proxy_env: dict | None = None) -> str:
     """A fully self-contained batch script for an app card — the agentless
     contract: NOTHING boxy-side on the cluster; the compute node needs only
-    spack (spack kind) or a container runtime (container kind)."""
+    spack (spack kind) or a container runtime (container kind).
+
+    `proxy_env` is EXPORTED at the top of the job so spack's own source fetch
+    (and a container kind's podman pull) goes through the corporate proxy —
+    the direct-egress path is what the site filter 403s (field: Zscaler
+    noauth-useragent block on mirror.spack.io from the compute node)."""
     from boxy.location import Location, Resources
     from boxy.schedulers import get_scheduler
 
@@ -200,6 +212,8 @@ def render_app_script(card: AppCard, scheduler_name: str, name: str, log_file: s
     tpn = tasks_per_node or card.tasks_per_node
     ntasks = n * tpn
     body_lines: list[str] = ["set -e"]
+    for k, v in (proxy_env or {}).items():
+        body_lines.append(f"export {k}={shlex.quote(v)}")
     for m in card.modules:
         body_lines.append(f"module load {m}")
     if card.kind == "spack":

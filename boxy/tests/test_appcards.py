@@ -28,7 +28,7 @@ def test_packaged_cards_load_and_validate():
     names = {c.name for c in cards}
     assert {"osu-benchmarks", "stream", "miniem"} <= names
     osu = appcards.find_card("osu-benchmarks")
-    assert osu.kind == "spack" and osu.spec == "osu-micro-benchmarks"
+    assert osu.kind == "spack" and osu.spec.startswith("osu-micro-benchmarks")
     assert osu.nodes == 2 and osu.tasks_per_node == 1
     assert osu.source == "packaged"
 
@@ -241,3 +241,24 @@ def test_stage_source_rejects_non_archive(tmp_path, capfd):
     assert "not a source archive" in capfd.readouterr().err
     ns2 = argparse.Namespace(stage_source=None)
     assert cli._stage_source_file(ns2, "u@h", "h", "/m") is None
+
+
+def test_osu_card_carries_pinned_source_provenance():
+    # turnkey on filtered sites: the packaged card pins the version and names the
+    # archive + digest, so boxy can stage the source without ever needing a
+    # failed job to learn the URL from.
+    card = appcards.find_card("osu-benchmarks")
+    assert card.spec == "osu-micro-benchmarks@7.5.2"
+    assert card.sha256 == "618de3d0b1122f73a9229177d2da1e5cd62e431190580cb915f2605849cbbbdc"
+    assert any("mvapich.cse.ohio-state.edu" in u for u in card.sources)
+    assert any("mirror.spack.io" in u for u in card.sources)
+
+
+def test_render_exports_proxy_env_before_spack():
+    card = appcards.find_card("osu-benchmarks")
+    text = appcards.render_app_script(card, "slurm", "app-osu", "/tmp/x.log", [],
+                                      proxy_env={"https_proxy": "http://proxy.sandia.gov:80"})
+    assert "export https_proxy=http://proxy.sandia.gov:80" in text
+    assert text.index("export https_proxy") < text.index("spack install")
+    plain = appcards.render_app_script(card, "slurm", "app-osu", "/tmp/x.log", [])
+    assert "export https_proxy" not in plain

@@ -1254,6 +1254,56 @@ def _stage_source_file(args, target: str, host: str, mirror_remote: str) -> bool
     return True
 
 
+def _prestage_card_sources(card, target: str, host: str, mirror_remote: str,
+                           proxy_env: dict) -> None:
+    """TURNKEY source staging for a spack card that names its sources + sha256:
+    guarantee the archive is in the job's file:// mirror BEFORE the first
+    submit, so `boxy app <name> --ssh <host>` works first try on a cluster whose
+    egress filter blocks spack's fetch. Ladder: already staged -> login-node
+    curl THROUGH the corporate proxy -> laptop download. Best-effort — the job's
+    own (proxied) spack fetch still backs it."""
+    import hashlib
+
+    from boxy import remote
+
+    sha = card.sha256.strip().lower()
+    ext = next((c for c in _ARCHIVE_EXTS if card.sources[0].endswith(c)), ".tar.gz")
+    dest = f"{mirror_remote}/_source-cache/archive/{sha[:2]}/{sha}{ext}"
+    rc, _ = remote.ssh_capture(target, f"test -f {shlex.quote(dest)}", timeout=15)
+    if rc == 0:
+        print(f"  auto: source: {card.spec} is already staged in the cluster mirror")
+        return
+    envs = "".join(f"{k}={shlex.quote(v)} " for k, v in proxy_env.items())
+    part = f"{dest}.part"
+    for u in card.sources:
+        cmd = (f"mkdir -p {shlex.quote(os.path.dirname(dest))} && "
+               f"{('env ' + envs) if envs else ''}curl -fsSL --connect-timeout 20 "
+               f"-o {shlex.quote(part)} {shlex.quote(u)} && "
+               f"echo '{sha}  {part}' | sha256sum -c --quiet - && "
+               f"mv {shlex.quote(part)} {shlex.quote(dest)}")
+        rc, _out = remote.ssh_capture(target, cmd, timeout=600)
+        if rc == 0:
+            print(f"  auto: source: staged {u.rsplit('/', 1)[-1]} on {host} "
+                  f"(login-node fetch through the site proxy)")
+            return
+    for u in card.sources:
+        try:
+            data = _download_bytes(u)
+        except Exception as e:  # noqa: BLE001 — every source gets its chance
+            print(f"boxy:   {u}: {e}", file=sys.stderr)
+            continue
+        if hashlib.sha256(data).hexdigest() != sha:
+            print(f"boxy:   {u}: sha256 mismatch (a filter may have served a block page)",
+                  file=sys.stderr)
+            continue
+        if remote.push_file(target, dest, data) == 0:
+            print(f"  auto: source: staged {u.rsplit('/', 1)[-1]} from this machine "
+                  f"({len(data) // 1024} KiB)")
+            return
+    print("boxy: note: could not pre-stage the source archive (cluster and laptop fetches "
+          "both failed) — the job will try spack's own proxied fetch.", file=sys.stderr)
+
+
 def _app_agentless_ssh(args, card, target: str) -> int:
     """Agentless app run over --ssh: render the card's batch script laptop-side,
     push + submit over the one master, then (unless --detach) poll the job to
@@ -1293,6 +1343,13 @@ def _app_agentless_ssh(args, card, target: str) -> int:
     log_remote = f"{rdir}/{name}{('-' + tok) if tok else ''}.log"
 
     pfx = _proxy_prefix(args) if card.kind == "container" else ""
+    # the corporate proxy is EXPORTED into the job: spack's own source fetch (and
+    # podman pulls) then ride the sanctioned proxy instead of the direct egress
+    # the site filter 403s — the same fix that made image pulls work (field: hops).
+    penv = ramalama_shim.raw_proxy_env(_resolve_proxy(args))
+    if penv:
+        print("  auto: proxy: exported into the batch job (spack fetches and podman pulls "
+              "go through the site proxy instead of the filtered direct egress)")
     # a boxy-owned file:// source mirror rides in every spack script: normally
     # empty and inert, but the landing spot when the egress filter blocks the
     # cluster's fetch and the archive has to be staged from the laptop.
@@ -1301,7 +1358,8 @@ def _app_agentless_ssh(args, card, target: str) -> int:
         card, scheduler_name, name, log_remote, site_args,
         nodes=getattr(args, "nodes", 0) or 0,
         tasks_per_node=getattr(args, "tasks_per_node", 0) or 0,
-        proxy_prefix=pfx, spack_mirror_dir=(mirror_remote if card.kind == "spack" else ""))
+        proxy_prefix=pfx, spack_mirror_dir=(mirror_remote if card.kind == "spack" else ""),
+        proxy_env=penv)
 
     print(f"### Agentless app run from {card.label} (no boxy on the cluster).")
     print(f"### Batch script ({script_remote}):")
@@ -1323,10 +1381,15 @@ def _app_agentless_ssh(args, card, target: str) -> int:
         staged = _stage_source_file(args, target, host, mirror_remote)
         if staged is False:
             return 1
-        # rerun-after-failure: if the PREVIOUS run of this job died on a blocked
-        # source fetch (the follow loop wasn't there to see it — detached or
-        # Ctrl-C'd), stage the archive NOW, before this submission.
-        if not staged:
+        if not staged and card.sha256 and card.sources:
+            # TURNKEY prestage: the card names its source + digest, so the
+            # archive is guaranteed into the mirror before the FIRST submit —
+            # login-node fetch through the proxy, laptop fallback.
+            _prestage_card_sources(card, target, host, mirror_remote, penv)
+        elif not staged:
+            # rerun-after-failure (cards without source provenance): if the
+            # PREVIOUS run died on a blocked fetch while nobody was following
+            # (detached / Ctrl-C), stage the archive from its log NOW.
             prev = _remote_log_tail(target, log_remote, n=200)
             if prev.strip() and _spack_fetch_blocked(prev):
                 print("boxy: the previous run died on a blocked source fetch — staging the "
@@ -1349,7 +1412,8 @@ def _app_agentless_ssh(args, card, target: str) -> int:
                 card, scheduler_name, name, log_remote, site_args,
                 nodes=getattr(args, "nodes", 0) or 0,
                 tasks_per_node=getattr(args, "tasks_per_node", 0) or 0,
-                proxy_prefix=pfx, spack_mirror_dir=(mirror_remote if card.kind == "spack" else ""))
+                proxy_prefix=pfx, spack_mirror_dir=(mirror_remote if card.kind == "spack" else ""),
+                proxy_env=penv)
             if remote.push_file(target, script_remote, script_text) == 0:
                 rc, out = remote.ssh_capture(target, f"cd {shlex.quote(rhome)} && {submit_cmd}",
                                              timeout=60)
