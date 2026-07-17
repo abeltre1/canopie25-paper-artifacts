@@ -36,6 +36,46 @@ That's it — no secrets to paste.
 The `boxy-v*` prefix (not a bare `v*`) keeps boxy's tags from colliding with other
 artifacts in this monorepo.
 
+## Publishing to a local (private) PyPI
+
+For an internal index (devpi, Nexus, Artifactory, `pypiserver`, …) skip the tag
+flow entirely — the `Makefile` in `boxy/` does build → `twine check` → upload in
+one step:
+
+```bash
+cd boxy
+make wheel                                     # just build: dist/boxy_hpc-*.whl
+make publish LOCAL_PYPI=https://pypi.example.gov/   # build + check + upload
+```
+
+`LOCAL_PYPI` accepts either the index's **upload endpoint URL** (passed to twine
+as `--repository-url`) or a **section name from `~/.pypirc`** (passed as
+`--repository`), and can be exported once in your shell instead of repeated on
+the command line. A typical `~/.pypirc` for an internal index:
+
+```ini
+[distutils]
+index-servers = sandia
+
+[sandia]
+repository = https://pypi.example.gov/
+username = __token__          # or your LDAP user, per your index
+password = <token>
+```
+
+Credentials can also ride the environment (`TWINE_USERNAME` / `TWINE_PASSWORD`),
+which is friendlier for CI. If your index sits behind the site proxy, twine
+honors `https_proxy`; a custom CA goes in `TWINE_CERT=/path/to/ca-bundle.crt`.
+
+Installing from the local index on a cluster login node:
+
+```bash
+pip install --index-url https://pypi.example.gov/simple boxy-hpc
+```
+
+Note the upload endpoint and the `/simple` install index are usually *different
+paths* on the same server — check your index's docs for both.
+
 ## Extracting boxy into its own repository
 
 boxy is self-contained under `boxy/` (own `LICENSE`, `README.md`, `pyproject.toml`,

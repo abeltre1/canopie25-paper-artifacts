@@ -182,6 +182,10 @@ pip install "boxy-hpc[s3]"         # + boto3 for S3 model staging
 Developing on boxy? Use an **editable** install so `git pull` takes effect
 without reinstalling: `pip install -e './boxy[ramalama,test]'`.
 
+Building a wheel for an internal PyPI mirror? `make wheel` (or
+`make publish LOCAL_PYPI=<upload-url>`) from `boxy/` — see
+[RELEASING.md](RELEASING.md#publishing-to-a-local-private-pypi).
+
 **uv note:** uv-managed standalone Pythons don't inherit the system CA store,
 so HTTPS (model pulls) fails with `CERTIFICATE_VERIFY_FAILED` until you set
 `SSL_CERT_FILE`. `boxy pull` prints the remedy if you hit it.
