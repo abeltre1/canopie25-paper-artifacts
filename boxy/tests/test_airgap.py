@@ -72,3 +72,45 @@ def test_bundle_error_when_no_downloader(tmp_path, monkeypatch):
     with pytest.raises(airgap.BundleError) as e:
         airgap._hf_download("acme/x", str(tmp_path))
     assert "huggingface_hub" in str(e.value)
+
+
+FAKE_LEAF = "-----BEGIN CERTIFICATE-----\nLEAF\n-----END CERTIFICATE-----"
+FAKE_INTER = "-----BEGIN CERTIFICATE-----\nZIA-INTERMEDIATE\n-----END CERTIFICATE-----"
+FAKE_ROOT = "-----BEGIN CERTIFICATE-----\nZIA-ROOT\n-----END CERTIFICATE-----"
+
+
+def test_trust_captures_chain_and_merge_includes_it(tmp_path, monkeypatch, capfd):
+    # `boxy trust huggingface.co`: the interceptor's ISSUING chain (leaf dropped)
+    # lands in boxy's trusted-extra store, and every subsequent CA merge carries
+    # it — the turnkey CERTIFICATE_VERIFY_FAILED fix.
+    from boxy import cli, ramalama_shim
+
+    monkeypatch.setattr(ramalama_shim, "DEFAULT_STORE", str(tmp_path / "store"))
+    monkeypatch.setattr(cli, "_capture_tls_chain",
+                        lambda host, port, proxy: [FAKE_LEAF, FAKE_INTER, FAKE_ROOT])
+    monkeypatch.setattr(cli, "_cert_issuer", lambda pem: "issuer=CN=SNL ZIA TLS-Interception CA")
+    rc = main(["trust", "huggingface.co", "--yes"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    extra = (tmp_path / "store" / "site-trusted-ca.pem").read_text()
+    assert "ZIA-INTERMEDIATE" in extra and "ZIA-ROOT" in extra
+    assert "LEAF" not in extra                               # never pin a single host's leaf
+    assert "SNL ZIA" in out and "boxy info --net" in out
+    # the merge picks the extras up
+    primary = tmp_path / "site.crt"
+    primary.write_text("-----BEGIN CERTIFICATE-----\nSITE\n-----END CERTIFICATE-----\n")
+    merged = ramalama_shim._merge_with_certifi(str(primary), "test merge")
+    text = open(merged).read()
+    assert "ZIA-ROOT" in text and "SITE" in text             # certifi + site + trusted extras
+
+
+def test_trust_refuses_non_interactive_without_yes(tmp_path, monkeypatch, capfd):
+    from boxy import cli, ramalama_shim
+
+    monkeypatch.setattr(ramalama_shim, "DEFAULT_STORE", str(tmp_path / "store"))
+    monkeypatch.setattr(cli, "_capture_tls_chain", lambda *a: [FAKE_LEAF, FAKE_ROOT])
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    rc = main(["trust", "huggingface.co"])
+    assert rc == 1
+    assert "rerun with --yes" in capfd.readouterr().err
+    assert not (tmp_path / "store" / "site-trusted-ca.pem").exists()

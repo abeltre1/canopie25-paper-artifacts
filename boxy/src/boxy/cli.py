@@ -1047,6 +1047,82 @@ def _print_provenance() -> None:
     print(f"### boxy {version_string()} from {where}{hint}")
 
 
+def _capture_tls_chain(host: str, port: int, proxy: str) -> list[str]:
+    """The PEM chain the shell actually SEES for host:port (through the proxy
+    when one is configured) — i.e. the interceptor's chain on an intercepted
+    network. openssl s_client first (full chain), proxy then direct."""
+    ossl = shutil.which("openssl")
+    attempts: list[list[str]] = []
+    if ossl:
+        if proxy:
+            phost = proxy.split("://", 1)[-1].rstrip("/")
+            attempts.append([ossl, "s_client", "-showcerts", "-proxy", phost,
+                             "-connect", f"{host}:{port}"])
+        attempts.append([ossl, "s_client", "-showcerts", "-connect", f"{host}:{port}"])
+    for cmd in attempts:
+        proc = subprocess.run(cmd, input="", capture_output=True, text=True, timeout=30)
+        blocks = re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+                            proc.stdout, re.DOTALL)
+        if blocks:
+            return blocks
+    return []
+
+
+def _cert_issuer(pem: str) -> str:
+    """Best-effort issuer line for a PEM cert (openssl x509); '' when unknown."""
+    ossl = shutil.which("openssl")
+    if not ossl:
+        return ""
+    proc = subprocess.run([ossl, "x509", "-noout", "-issuer"], input=pem,
+                          capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def cmd_trust(args: argparse.Namespace) -> int:
+    """Capture the CA chain the corporate interceptor presents for HOST and add
+    it to boxy's trusted-extra store (merged into ca-merged.crt on every run) —
+    the turnkey fix for CERTIFICATE_VERIFY_FAILED against an intercepted host:
+
+        boxy trust huggingface.co
+        boxy info --net          # hf:// flips to PASS
+
+    The captured chain is shown and must be confirmed (this is trust-on-first-
+    use of whatever is intercepting your traffic — do it on the trusted network)."""
+    from boxy import ramalama_shim
+
+    _print_provenance()
+    host = args.host
+    proxy = _resolve_proxy(args) or ""
+    print(f"### capturing the TLS chain this machine sees for {host}:443"
+          + (f" (through {proxy})" if proxy else "") + " ...")
+    blocks = _capture_tls_chain(host, 443, proxy)
+    if not blocks:
+        print("boxy trust: could not capture a certificate chain — is openssl on PATH and "
+              "the host reachable from this shell?", file=sys.stderr)
+        return 1
+    # keep the ISSUING chain (drop the leaf — trusting a single host's leaf pins
+    # that host; trusting the interceptor's CA fixes every intercepted host)
+    keep = blocks[1:] if len(blocks) > 1 else blocks
+    for i, b in enumerate(keep):
+        print(f"###   cert {i + 1}: {_cert_issuer(b) or '(issuer unknown — no openssl x509)'}")
+    if not getattr(args, "yes", False):
+        if not sys.stdin.isatty():
+            print("boxy trust: refusing to add certificates without confirmation in a "
+                  "non-interactive shell — rerun with --yes", file=sys.stderr)
+            return 1
+        ans = input("Add these CA certificate(s) to boxy's trust store? [y/N] ").strip().lower()
+        if ans not in ("y", "yes"):
+            print("nothing added.")
+            return 0
+    extra = ramalama_shim.trusted_extra_path()
+    os.makedirs(os.path.dirname(extra), exist_ok=True)
+    with open(extra, "a") as f:
+        f.write("\n".join(keep) + "\n")
+    print(f"### added {len(keep)} certificate(s) -> {extra}")
+    print("### they merge into boxy's CA bundle on every run — verify: boxy info --net")
+    return 0
+
+
 def cmd_bundle(args: argparse.Namespace) -> int:
     """Build an AIR-GAP bundle for MODEL on a CONNECTED machine: the HF cache
     (model + the card's aux repos — custom code fetches them dynamically), the
@@ -5240,6 +5316,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("cards", help="list the built-in model & system deployment cards "
                                      "(turnkey: `boxy serve MODEL --scheduler slurm`)")
     p.set_defaults(func=cmd_cards, location=None)
+
+    p = sub.add_parser("trust", help="fix CERTIFICATE_VERIFY_FAILED turnkey: capture the CA "
+                                     "chain the interceptor presents for HOST and add it to "
+                                     "boxy's trust store — `boxy trust huggingface.co`")
+    p.add_argument("host", nargs="?", default="huggingface.co",
+                   help="intercepted host to capture the chain from (default huggingface.co)")
+    p.add_argument("--proxy", default=None, metavar="URL",
+                   help="capture through this proxy (default: config network.proxy / env)")
+    p.add_argument("--yes", action="store_true",
+                   help="add without the interactive confirmation (non-TTY shells)")
+    p.set_defaults(func=cmd_trust, location=None, box=None)
 
     p = sub.add_parser("bundle", help="build an AIR-GAP bundle for MODEL (HF cache incl. "
                                      "aux custom-code repos, engine image oci-archive, pip "

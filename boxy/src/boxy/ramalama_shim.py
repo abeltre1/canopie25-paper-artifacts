@@ -193,6 +193,13 @@ def discover_os_ca_bundle() -> str | None:
     return None
 
 
+def trusted_extra_path() -> str:
+    """boxy-owned PEM of roots the user explicitly accepted via `boxy trust
+    HOST` (the corporate interceptor's CA). Kept OUT of the user's own
+    SSL_CERT_FILE; merged into ca-merged.crt on every merge."""
+    return os.path.join(DEFAULT_STORE, "site-trusted-ca.pem")
+
+
 def _merge_with_certifi(primary: str, note: str) -> str | None:
     """Write certifi's public CAs + `primary` into boxy's ca-merged.crt and point
     this process at it. Superset of both stores — never drops a trust anchor.
@@ -213,6 +220,12 @@ def _merge_with_certifi(primary: str, note: str) -> str | None:
             bundle = f.read()
         with open(primary, "rb") as f:
             bundle += b"\n" + f.read()
+        # roots captured by `boxy trust HOST` (the site interceptor's CA, taken
+        # from the chain the shell actually sees) ride every merge too
+        extra = trusted_extra_path()
+        if os.path.isfile(extra) and os.path.getsize(extra) > 0:
+            with open(extra, "rb") as f:
+                bundle += b"\n" + f.read()
         with open(merged, "wb") as f:
             f.write(bundle)
     except OSError as e:
