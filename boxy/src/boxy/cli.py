@@ -1214,6 +1214,16 @@ def _looks_like_proxy_failure(text: str) -> bool:
     return "proxyconnect" in low or ("proxy" in low and ("i/o timeout" in low or "timeout" in low))
 
 
+def _looks_like_trust_remote_code_error(text: str) -> bool:
+    """True when vLLM refused to load the model's CUSTOM code — 'Please pass the
+    argument `trust_remote_code=True`' at config validation (field: nvidia
+    Nemotron-Parse). The self-heal resubmits with the flag folded in, so the fix
+    works even when the laptop can't reach the Hub to pre-detect it."""
+    low = (text or "").lower()
+    return "trust_remote_code=true" in low or (
+        "trust_remote_code" in low and "custom code" in low)
+
+
 def _local_gpu_types() -> list[str]:
     """Best-effort GPU TYPE tokens from LOCAL sinfo (login node), so a local
     auto-recovery tries typed --gres=gpu:<type>:N forms before the untyped one.
@@ -1847,25 +1857,18 @@ def _serve_agentless_ssh(args, target: str) -> int:
     deadline = time.time() + 24 * 3600
     last_state = None
     proxy_healed = False
+    trust_healed = False
 
-    def _maybe_proxy_heal(tail: str) -> bool:
-        """The job died reaching the FORWARDED proxy (field: eldorado can't reach
-        the proxy hops needs). Resubmit ONCE without the proxy — the node may hit
-        the registry directly / via its own proxy. Returns True after resubmitting
-        (job_id/last_state updated); the poll loop then continues on the new job."""
-        nonlocal job_id, pfx, last_state, proxy_healed
-        if proxy_healed or not pfx or not _looks_like_proxy_failure(tail):
-            return False
-        proxy_healed = True
-        print(f"boxy: the compute node couldn't reach the forwarded proxy "
-              f"({pfx.strip()}); resubmitting WITHOUT it — this cluster may reach the "
-              f"registry directly or via its own proxy (set BOXY_PROXY= to skip it here)...",
-              file=sys.stderr)
+    def _resubmit_current() -> bool:
+        """Re-render with the CURRENT box/pfx, push, and resubmit — the shared
+        tail of every death-path self-heal. Updates job_id/last_state and the job
+        record; the poll loop then continues on the new job."""
+        nonlocal job_id, last_state
         deploy.set_agentless_ca(ca_remote)
         try:
             heal_text = deploy.render_agentless_script(
                 box, location, scheduler_name, name, ep_remote, log_remote, site_args,
-                proxy_prefix="", port=args.port, engine_pulls_model=engine_pull)
+                proxy_prefix=pfx, port=args.port, engine_pulls_model=engine_pull)
         except deploy.AgentlessError:
             return False
         finally:
@@ -1877,13 +1880,51 @@ def _serve_agentless_ssh(args, target: str) -> int:
         hrc, hout = remote.ssh_capture(target, f"cd {shlex.quote(rhome)} && {submit_cmd}", timeout=60)
         if hrc != 0:
             return False
-        pfx = ""
         job_id = scheduler.parse_job_id(hout)
         last_state = None
         jobs.write_record(name, {"name": name, "scheduler": scheduler_name, "job": job_id,
                                  "model": args.model, "submitted_from": "agentless-ssh",
                                  "target": target, "endpoint_remote": ep_remote, "log": log_remote})
+        return True
+
+    def _maybe_proxy_heal(tail: str) -> bool:
+        """The job died reaching the FORWARDED proxy (field: eldorado can't reach
+        the proxy hops needs). Resubmit ONCE without the proxy — the node may hit
+        the registry directly / via its own proxy."""
+        nonlocal pfx, proxy_healed
+        if proxy_healed or not pfx or not _looks_like_proxy_failure(tail):
+            return False
+        proxy_healed = True
+        print(f"boxy: the compute node couldn't reach the forwarded proxy "
+              f"({pfx.strip()}); resubmitting WITHOUT it — this cluster may reach the "
+              f"registry directly or via its own proxy (set BOXY_PROXY= to skip it here)...",
+              file=sys.stderr)
+        pfx = ""
+        if not _resubmit_current():
+            return False
         print(f"### Resubmitted {scheduler_name} job {job_id} without the proxy (auto-recovered).")
+        return True
+
+    def _maybe_trust_heal(tail: str) -> bool:
+        """vLLM refused the model's CUSTOM code ('pass trust_remote_code=True' —
+        field: Nemotron-Parse). Resubmit ONCE with the flag folded into the serve
+        args — works even when the laptop-side HF probe couldn't pre-detect it
+        (gated repo, laptop offline, or an older install)."""
+        nonlocal box, trust_healed
+        if trust_healed or not _looks_like_trust_remote_code_error(tail):
+            return False
+        if box.engine != "vllm" or any(
+                k.replace("-", "_") == "trust_remote_code" for k in box.args):
+            return False                          # already on (or not vLLM) — a real failure
+        trust_healed = True
+        print("boxy: the model ships custom loader code vLLM refused to run; resubmitting "
+              "WITH --trust-remote-code (this executes code from the model repo — only for "
+              "models you trust)...", file=sys.stderr)
+        box = dc_replace(box, args={**box.args, "trust_remote_code": True})
+        if not _resubmit_current():
+            return False
+        print(f"### Resubmitted {scheduler_name} job {job_id} with --trust-remote-code "
+              f"(auto-recovered).")
         return True
 
     try:
@@ -1895,7 +1936,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
                 last_state = state
             if state == "DONE":
                 tail = _remote_log_tail(target, log_remote)
-                if _maybe_proxy_heal(tail):
+                if _maybe_proxy_heal(tail) or _maybe_trust_heal(tail):
                     time.sleep(5)
                     continue
                 print(f"boxy: job {job_id} ended before the server became ready; last log lines:",
@@ -1946,7 +1987,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
                 # the wait extends while the job is alive, so reaching here means
                 # the job ENDED before the server answered — diagnose, don't shrug.
                 tail = _remote_log_tail(target, log_remote)
-                if _maybe_proxy_heal(tail):
+                if _maybe_proxy_heal(tail) or _maybe_trust_heal(tail):
                     time.sleep(5)
                     continue
                 print(f"boxy: {scheduler_name} job {job_id} ended before the server became ready; "
