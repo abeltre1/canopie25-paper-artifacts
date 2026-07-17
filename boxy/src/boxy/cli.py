@@ -1205,6 +1205,15 @@ def _looks_like_pull_block(text: str) -> bool:
             or ("registry" in low and ("403" in low or "denied" in low)))
 
 
+def _looks_like_proxy_failure(text: str) -> bool:
+    """True when a pull failed trying to reach the FORWARDED proxy itself
+    (`proxyconnect ... i/o timeout` / `dial tcp <proxy>: timeout`) — the compute
+    node can't reach the proxy boxy forwarded. A cluster that doesn't use the
+    site proxy (field: eldorado vs the proxy hops needs) should retry WITHOUT it."""
+    low = (text or "").lower()
+    return "proxyconnect" in low or ("proxy" in low and ("i/o timeout" in low or "timeout" in low))
+
+
 def _local_gpu_types() -> list[str]:
     """Best-effort GPU TYPE tokens from LOCAL sinfo (login node), so a local
     auto-recovery tries typed --gres=gpu:<type>:N forms before the untyped one.
@@ -1837,6 +1846,46 @@ def _serve_agentless_ssh(args, target: str) -> int:
     ready_window = max(getattr(args, "ready_timeout", 0) or 0, _SCHED_READY_FLOOR)
     deadline = time.time() + 24 * 3600
     last_state = None
+    proxy_healed = False
+
+    def _maybe_proxy_heal(tail: str) -> bool:
+        """The job died reaching the FORWARDED proxy (field: eldorado can't reach
+        the proxy hops needs). Resubmit ONCE without the proxy — the node may hit
+        the registry directly / via its own proxy. Returns True after resubmitting
+        (job_id/last_state updated); the poll loop then continues on the new job."""
+        nonlocal job_id, pfx, last_state, proxy_healed
+        if proxy_healed or not pfx or not _looks_like_proxy_failure(tail):
+            return False
+        proxy_healed = True
+        print(f"boxy: the compute node couldn't reach the forwarded proxy "
+              f"({pfx.strip()}); resubmitting WITHOUT it — this cluster may reach the "
+              f"registry directly or via its own proxy (set BOXY_PROXY= to skip it here)...",
+              file=sys.stderr)
+        deploy.set_agentless_ca(ca_remote)
+        try:
+            heal_text = deploy.render_agentless_script(
+                box, location, scheduler_name, name, ep_remote, log_remote, site_args,
+                proxy_prefix="", port=args.port, engine_pulls_model=engine_pull)
+        except deploy.AgentlessError:
+            return False
+        finally:
+            deploy.set_agentless_ca(None)
+        if remote.push_file(target, script_remote, heal_text) != 0:
+            return False
+        remote.ssh_capture(target, f"chmod 600 {shlex.quote(script_remote)}", timeout=10)
+        remote.ssh_capture(target, f"rm -f {shlex.quote(ep_remote)}", timeout=10)   # drop stale endpoint
+        hrc, hout = remote.ssh_capture(target, f"cd {shlex.quote(rhome)} && {submit_cmd}", timeout=60)
+        if hrc != 0:
+            return False
+        pfx = ""
+        job_id = scheduler.parse_job_id(hout)
+        last_state = None
+        jobs.write_record(name, {"name": name, "scheduler": scheduler_name, "job": job_id,
+                                 "model": args.model, "submitted_from": "agentless-ssh",
+                                 "target": target, "endpoint_remote": ep_remote, "log": log_remote})
+        print(f"### Resubmitted {scheduler_name} job {job_id} without the proxy (auto-recovered).")
+        return True
+
     try:
         while time.time() < deadline:
             rc, st = remote.ssh_capture(target, shlex.join(scheduler.state_command(job_id)), timeout=20)
@@ -1845,9 +1894,12 @@ def _serve_agentless_ssh(args, target: str) -> int:
                 print(f"###   job {job_id}: {state}", flush=True)
                 last_state = state
             if state == "DONE":
+                tail = _remote_log_tail(target, log_remote)
+                if _maybe_proxy_heal(tail):
+                    time.sleep(5)
+                    continue
                 print(f"boxy: job {job_id} ended before the server became ready; last log lines:",
                       file=sys.stderr)
-                tail = _remote_log_tail(target, log_remote)
                 print(tail, file=sys.stderr)
                 # turn a raw compute-node failure (blocked image pull, OOM, bad
                 # image tag, …) into a plain-language fix instead of a bare trace.
@@ -1893,9 +1945,12 @@ def _serve_agentless_ssh(args, target: str) -> int:
                     return 0
                 # the wait extends while the job is alive, so reaching here means
                 # the job ENDED before the server answered — diagnose, don't shrug.
+                tail = _remote_log_tail(target, log_remote)
+                if _maybe_proxy_heal(tail):
+                    time.sleep(5)
+                    continue
                 print(f"boxy: {scheduler_name} job {job_id} ended before the server became ready; "
                       f"last log lines:", file=sys.stderr)
-                tail = _remote_log_tail(target, log_remote)
                 print(tail, file=sys.stderr)
                 _print_diagnosis(tail)
                 print(f"###   full log: boxy logs {name}", file=sys.stderr)

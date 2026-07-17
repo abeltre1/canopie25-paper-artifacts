@@ -1063,6 +1063,45 @@ def test_ssh_agentless_autoconfigures_custom_code_vlm(ssh, capfd, monkeypatch):
     assert "--limit-mm-per-prompt" in exec_line and '"image": 1' in exec_line
 
 
+def test_looks_like_proxy_failure_matches_the_field_error():
+    from boxy.cli import _looks_like_proxy_failure
+    assert _looks_like_proxy_failure(
+        'Error: initializing source docker://vllm/vllm-openai-rocm:latest: '
+        'proxyconnect tcp: dial tcp 185.46.212.90:80: i/o timeout')
+    assert not _looks_like_proxy_failure("CUDA out of memory")
+    assert not _looks_like_proxy_failure("")
+
+
+def test_proxy_self_heal_resubmits_without_proxy(ssh, capfd, monkeypatch):
+    # FIELD (eldorado): the compute node can't reach the FORWARDED site proxy
+    # (proxyconnect i/o timeout). boxy resubmits ONCE without the proxy — the
+    # cluster may reach the registry directly. Driven at the unit seam: a stubbed
+    # await returns False once (job died on the proxy) then True (clean rerun).
+    from boxy import cli, remote
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("BOXY_PROXY", "http://proxy.sandia.gov:80")
+    monkeypatch.delenv("BOXY_NO_PROXY_PROPAGATE", raising=False)      # opt in — forward the proxy
+    monkeypatch.setattr(cli, "_remote_log_tail",
+                        lambda *a, **k: "proxyconnect tcp: dial tcp 185.46.212.90:80: i/o timeout")
+
+    calls = {"n": 0}
+
+    def await_stub(host, node, port, *a, **k):
+        calls["n"] += 1
+        return calls["n"] > 1                                          # die once, then ready
+
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", await_stub)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "gpu", "--ssh", "user@eldorado"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "couldn't reach the forwarded proxy" in cap.err
+    assert "Resubmitted slurm job" in cap.out and "without the proxy" in cap.out
+    # the first script carried the proxy; the resubmit dropped it
+    assert ssh["sbatch_log"].read_text().count("--parsable") >= 2
+
+
 def test_ssh_agentless_explicit_trust_remote_code(ssh, capfd, monkeypatch):
     # --trust-remote-code forces it even when the probe can't see the config
     # (gated/offline) — the flag still reaches the rendered vLLM command.
