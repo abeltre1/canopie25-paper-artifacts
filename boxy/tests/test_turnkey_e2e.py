@@ -1652,3 +1652,27 @@ def test_ssh_agentless_app_rerun_heals_ucx_mpi_pin(ssh, capfd, monkeypatch):
     assert "export OMPI_MCA_pml=ob1" in script
     assert "export OMPI_MCA_btl=self,vader,tcp" in script
     assert "### Submitted slurm job 12345" in cap.out
+
+
+def test_ssh_agentless_serve_from_bundle_is_fully_offline(ssh, capfd, monkeypatch):
+    # AIR-GAP: --bundle serves entirely from a `boxy bundle` directory on the
+    # cluster — image podman-load'ed from its oci-archive, model + custom code
+    # from its HF cache (HF_HUB_OFFLINE), wheels installed --no-index — and NO
+    # proxy appears anywhere even when one is configured.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("BOXY_PROXY", "http://proxy.sandia.gov:80")   # must be ignored
+    rc = main(["serve", "hf://nvidia/NVIDIA-Nemotron-Parse-v1.2", "--scheduler", "slurm",
+               "--accelerator", "cuda", "--ssh", "user@hops",
+               "--bundle", "/projects/me/nemotron-bundle", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "AIR-GAPPED" in cap.out
+    script = cap.out[cap.out.index("### Batch script"):]
+    assert "podman load -i /projects/me/nemotron-bundle/image.oci.tar" in script
+    assert "/projects/me/nemotron-bundle/hfcache:/root/.cache/huggingface" in script
+    assert "HF_HUB_OFFLINE=1" in script and "TRANSFORMERS_OFFLINE=1" in script
+    assert "pip install --no-cache-dir --quiet --no-index --find-links /opt/boxy-wheels" in script
+    assert "/projects/me/nemotron-bundle/wheels:/opt/boxy-wheels" in script
+    assert "--trust-remote-code" in script                     # card args still ride
+    assert "proxy.sandia.gov" not in script                    # zero egress config

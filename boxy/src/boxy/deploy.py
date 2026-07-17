@@ -189,7 +189,8 @@ class AgentlessError(RuntimeError):
 def render_agentless_script(box: Box, location: Location, scheduler_name: str, name: str,
                             endpoint_file: str, log_file: str, site_args: list[str],
                             proxy_prefix: str = "", port: int | None = None,
-                            engine_pulls_model: bool = False) -> str:
+                            engine_pulls_model: bool = False,
+                            prelude: list[str] | None = None) -> str:
     """A FULLY SELF-CONTAINED batch script — no boxy/Python/RamaLama on the
     cluster. The compute node runs only `podman run` (resolved HERE) plus a
     bash endpoint-write to the shared FS; the laptop submits it and polls that
@@ -260,8 +261,10 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
     resolved_port = deployment.port or port or 0
     scheduler = get_scheduler(scheduler_name)
     # atomic endpoint publish + foreground container; $(hostname) is the compute node.
+    prelude_block = ("\n".join(prelude) + "\n") if prelude else ""
     body = (
         'set -e\n'
+        f'{prelude_block}'
         '_H="$(hostname)"\n'
         f'_EP={shlex.quote(endpoint_file)}\n'
         f'{mk_cache}'
@@ -343,6 +346,16 @@ def _propagate_ca_bundle(env: dict, mounts: list) -> None:
         env.setdefault(var, CA_CONTAINER_PATH)  # box.env still wins (already merged)
 
 
+_AIRGAP_RENDER = False
+
+
+def set_airgap(on: bool) -> None:
+    """Toggle air-gapped rendering (serve --bundle): suppresses proxy/CA
+    propagation into the container plan. Reset by the caller / test conftest."""
+    global _AIRGAP_RENDER
+    _AIRGAP_RENDER = bool(on)
+
+
 def _propagate_proxy(env: dict) -> None:
     """Carry the host's proxy vars INTO the container so in-container downloads
     (vLLM fetching remote code/weights at load) reach the corporate proxy — the
@@ -371,8 +384,11 @@ def _plan(
     if extra_env:
         env.update(extra_env)
     mounts = resolve_mounts(box, location) + extra_mounts
-    _propagate_ca_bundle(env, mounts)
-    _propagate_proxy(env)
+    if not _AIRGAP_RENDER:
+        # an air-gapped --bundle serve must carry ZERO network configuration —
+        # no proxy, no CA (everything resolves from the bundle, offline).
+        _propagate_ca_bundle(env, mounts)
+        _propagate_proxy(env)
     warnings: list[str] = []
     # Podman (unlike Docker) refuses to start when the workdir doesn't exist
     # in the image; a workdir no volume provides is usually a box bug.

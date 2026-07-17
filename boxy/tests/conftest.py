@@ -65,6 +65,7 @@ def _isolate_config(monkeypatch, tmp_path):
     from boxy import deploy as _deploy
 
     _deploy.set_agentless_ca(None)
+    _deploy.set_airgap(False)
     # agentless pre-staging is on-by-default in prod, but the existing agentless e2e
     # tests assert the engine-pull render; keep it off for the suite and let the
     # prestage tests opt in with BOXY_AGENTLESS_PRESTAGE=auto/always.
@@ -73,6 +74,7 @@ def _isolate_config(monkeypatch, tmp_path):
     yield
     config.reset()
     _deploy.set_agentless_ca(None)
+    _deploy.set_airgap(False)
 
 
 @pytest.fixture

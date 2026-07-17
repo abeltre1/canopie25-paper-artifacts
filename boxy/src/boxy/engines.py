@@ -92,8 +92,11 @@ def build_serve_cmd(
 
         pkgs = " ".join(_shlex.quote(p) for p in box.pip)
         inner = _shlex.join(c for c in cmd if c)
+        # air-gapped: install ONLY from the bundle's mounted wheel dir (no egress)
+        offline = (f"--no-index --find-links {_shlex.quote(box.pip_find_links)} "
+                   if box.pip_find_links else "")
         cmd = ["sh", "-c",
-               f"pip install --no-cache-dir --quiet {pkgs} && exec {inner}"]
+               f"pip install --no-cache-dir --quiet {offline}{pkgs} && exec {inner}"]
     return cmd
 
 

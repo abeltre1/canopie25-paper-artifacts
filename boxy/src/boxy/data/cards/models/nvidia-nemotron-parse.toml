@@ -13,6 +13,9 @@ min_vram_gb = 8
 # vLLM image doesn't ship — installed in the container at start (PyPI package is
 # open_clip_torch; the model's own error message names the IMPORT, not the package).
 pip = ["open_clip_torch"]
+# the custom code DYNAMICALLY fetches its vision encoder repo — `boxy bundle`
+# pre-caches it so air-gapped serves don't die mid-import.
+aux_repos = ["nvidia/C-RADIOv2-H"]
 [model.args]
 trust_remote_code = true
 limit-mm-per-prompt = '{"image": 1}'

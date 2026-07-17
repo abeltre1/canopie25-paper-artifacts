@@ -328,6 +328,28 @@ flux run -N2 --gpus-per-node=4 bash -lc 'module load rocm/6.4.0 && exec \
   --tensor-parallel-size=4 --seed=12345 --gpu-memory-utilization=0.7'
 ```
 
+## Air-gapped deployments
+
+Build a **bundle** on a connected machine, carry it across the gap, serve
+entirely from it — no proxy, no egress, nothing fetched:
+
+```bash
+# connected side: model + aux custom-code repos (HF cache), engine image
+# (oci-archive), the card's pip deps (wheels), manifest
+boxy bundle nvidia/NVIDIA-Nemotron-Parse-v1.2 -o nemotron-bundle/
+
+# move nemotron-bundle/ to the cluster (scp -r / tar / media), then:
+boxy serve nvidia/NVIDIA-Nemotron-Parse-v1.2 \
+    --bundle /projects/me/nemotron-bundle --ssh <cluster>
+```
+
+The batch script `podman load`s the image from the bundle's oci-archive, mounts
+its HF cache into the container with `HF_HUB_OFFLINE=1` (model *and* the custom
+code it would otherwise fetch dynamically resolve from cache — the card's
+`aux_repos` are pre-bundled), and the card's pip deps install `--no-index` from
+the bundle's wheels. Card knowledge (trust flags, geometry) applies exactly as
+online.
+
 ## Smoke test on a real cluster
 
 1. `boxy info` on a login node — confirm runtime + scheduler detection.

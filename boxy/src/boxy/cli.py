@@ -1047,6 +1047,35 @@ def _print_provenance() -> None:
     print(f"### boxy {version_string()} from {where}{hint}")
 
 
+def cmd_bundle(args: argparse.Namespace) -> int:
+    """Build an AIR-GAP bundle for MODEL on a CONNECTED machine: the HF cache
+    (model + the card's aux repos — custom code fetches them dynamically), the
+    engine image as an oci-archive, the card's pip deps as wheels, a manifest.
+    Carry the directory across the gap, then:
+        boxy serve MODEL --bundle /path/on/cluster --ssh <host>"""
+    from boxy import airgap, cards, ramalama_shim
+
+    _print_provenance()
+    bare = cards.model_key(args.model)
+    card = cards.find_card(bare)
+    engine = (card.engine if card and card.engine else "vllm")
+    image = args.image or ramalama_shim.default_image(engine, args.accelerator or "cuda")
+    pip_pkgs = cards.layered_pip(bare)
+    aux = cards.layered_aux_repos(bare)
+    out = args.output or (bare.rsplit("/", 1)[-1].lower() + "-bundle")
+    print(f"### bundling {bare} -> {out}/  (image {image}"
+          + (f"; aux repos {', '.join(aux)}" if aux else "")
+          + (f"; pip {', '.join(pip_pkgs)}" if pip_pkgs else "") + ")")
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+    try:
+        airgap.build_bundle(bare, out, image, aux_repos=aux, pip_pkgs=pip_pkgs,
+                            token=token, skip_image=args.skip_image)
+    except airgap.BundleError as e:
+        print(f"boxy bundle: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_app(args: argparse.Namespace) -> int:
     """Run an HPC application/benchmark from an APP CARD — the deployment-OS
     counterpart of `boxy serve MODEL`: the card carries what to build (a spack
@@ -2273,7 +2302,8 @@ def _serve_agentless_ssh(args, target: str) -> int:
     # laptop has it, the HF token for gated repos — INTO the container env. The
     # token lands in the batch script on the shared FS, so the script is written
     # mode 600 (below); prefer exporting HF_TOKEN on the cluster if that worries you.
-    extra_env = dict(remote.remote_proxy_env())
+    bundle = (getattr(args, "bundle", None) or "").rstrip("/")
+    extra_env = {} if bundle else dict(remote.remote_proxy_env())
     hf_tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if hf_tok and engine_pull:
         extra_env["HF_TOKEN"] = hf_tok
@@ -2347,7 +2377,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
     # model downloads ONCE and every rerun (and every compute node) reuses it —
     # no per-run 16GB re-download, no prestage wait. The batch script mkdir -p's
     # the dir at job runtime (shared FS, so it exists wherever the job lands).
-    if engine_pull:
+    if engine_pull and not bundle:
         from boxy.box import Volume
 
         hf_cache = f"{rdir}/hfcache"
@@ -2362,13 +2392,13 @@ def _serve_agentless_ssh(args, target: str) -> int:
     #     compute-node-valid path into the container, so an in-container HuggingFace
     #     pull trusts the site's TLS interceptor (field: hops CERTIFICATE_VERIFY_
     #     FAILED). The laptop's SSL_CERT_FILE path is invalid on the node.
-    ca_remote = _stage_agentless_ca(target, host, rdir, dryrun=args.dryrun)
+    ca_remote = None if bundle else _stage_agentless_ca(target, host, rdir, dryrun=args.dryrun)
 
     # 7) render the self-contained script LAPTOP-side. Forward the corporate proxy
     #    to the COMPUTE-NODE `podman pull` (Docker Hub/ghcr 403 behind Zscaler): the
     #    submitter's ambient proxy env (or --proxy) is carried over — same as every
     #    other agentless render. Without this the isolated node can't reach the registry.
-    pfx = _proxy_prefix(args)
+    pfx = "" if bundle else _proxy_prefix(args)
     if pfx:
         print(f"  auto: proxy: forwarding {pfx.strip()}to the compute-node image pull "
               f"(reach the registry behind the site proxy)")
@@ -2380,7 +2410,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
     #     path model's image; 'never'/--no-prestage skips it. Best-effort: a failure
     #     falls back to engine-pull (only works on a networked node). Skipped under
     #     --dryrun (a real network/disk op); the plan line prints instead.
-    pmode = _prestage_mode(args)
+    pmode = "never" if bundle else _prestage_mode(args)
     if pmode != "never" and (engine_pull or pmode == "always"):
         image = args.image or box.image or ramalama_shim.default_image(box.engine, accel)
         if args.dryrun:
@@ -2411,11 +2441,42 @@ def _serve_agentless_ssh(args, target: str) -> int:
     if late_note:
         print(f"  auto: {late_note}")
 
+    prelude: list[str] = []
+    if bundle:
+        # AIR-GAPPED: everything comes from the bundle directory on the cluster —
+        # image loaded from its oci-archive, model + custom code resolved from its
+        # HF cache (offline), pip deps from its wheel dir. No proxy, no egress.
+        from boxy import airgap
+        from boxy.box import Volume
+
+        man = {} if args.dryrun else airgap.read_remote_manifest(target, bundle)
+        if man.get("image") and not args.image:
+            box = dc_replace(box, image=man["image"])
+        location = dc_replace(location, offline=True)
+        deploy.set_airgap(True)                          # no proxy/CA in the plan
+        env = {k: v for k, v in box.env.items()
+               if k.lower() not in ("http_proxy", "https_proxy", "all_proxy", "hf_token")}
+        box = dc_replace(
+            box,
+            env={**env, "HF_HOME": "/root/.cache/huggingface",
+                 "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+            volumes=[*[v for v in box.volumes if v.target != "/root/.cache/huggingface"],
+                     Volume(source=f"{bundle}/hfcache", target="/root/.cache/huggingface")])
+        if box.pip:
+            box = dc_replace(
+                box, pip_find_links="/opt/boxy-wheels",
+                volumes=[*box.volumes, Volume(source=f"{bundle}/wheels", target="/opt/boxy-wheels")])
+        prelude.append(f"podman load -i {shlex.quote(bundle + '/image.oci.tar')} "
+                       f">/dev/null 2>&1 || true")
+        print(f"  auto: bundle: {bundle} (AIR-GAPPED — image from its oci-archive, model + "
+              f"custom code from its HF cache, wheels offline; no proxy, no egress)")
+
     deploy.set_agentless_ca(ca_remote)
     try:
         script_text = deploy.render_agentless_script(
             box, location, scheduler_name, name, ep_remote, log_remote, site_args,
-            proxy_prefix=pfx, port=args.port, engine_pulls_model=engine_pull)
+            proxy_prefix=pfx, port=args.port, engine_pulls_model=engine_pull,
+            prelude=prelude)
     except deploy.AgentlessError as e:
         deploy.set_agentless_ca(None)
         print(f"boxy: agentless: {e}", file=sys.stderr)
@@ -2465,7 +2526,8 @@ def _serve_agentless_ssh(args, target: str) -> int:
             try:
                 script_text = deploy.render_agentless_script(
                     box, location, scheduler_name, name, ep_remote, log_remote, site_args,
-                    proxy_prefix=_proxy_prefix(args), port=args.port, engine_pulls_model=engine_pull)
+                    proxy_prefix=_proxy_prefix(args), port=args.port, engine_pulls_model=engine_pull,
+                    prelude=prelude)
             except deploy.AgentlessError:
                 break
             shown = _gpu_form_label(gform, gtype)
@@ -2494,7 +2556,8 @@ def _serve_agentless_ssh(args, target: str) -> int:
             try:
                 script_text = deploy.render_agentless_script(
                     box, location, scheduler_name, name, ep_remote, log_remote, site_args,
-                    proxy_prefix=_proxy_prefix(args), port=args.port, engine_pulls_model=engine_pull)
+                    proxy_prefix=_proxy_prefix(args), port=args.port, engine_pulls_model=engine_pull,
+                    prelude=prelude)
             except deploy.AgentlessError:
                 script_text = ""
             if script_text and remote.push_file(target, script_remote, script_text) == 0:
@@ -2553,7 +2616,8 @@ def _serve_agentless_ssh(args, target: str) -> int:
         try:
             heal_text = deploy.render_agentless_script(
                 box, location, scheduler_name, name, ep_remote, log_remote, site_args,
-                proxy_prefix=pfx, port=args.port, engine_pulls_model=engine_pull)
+                proxy_prefix=pfx, port=args.port, engine_pulls_model=engine_pull,
+                prelude=prelude)
         except deploy.AgentlessError:
             return False
         finally:
@@ -5177,6 +5241,20 @@ def build_parser() -> argparse.ArgumentParser:
                                      "(turnkey: `boxy serve MODEL --scheduler slurm`)")
     p.set_defaults(func=cmd_cards, location=None)
 
+    p = sub.add_parser("bundle", help="build an AIR-GAP bundle for MODEL (HF cache incl. "
+                                     "aux custom-code repos, engine image oci-archive, pip "
+                                     "wheels, manifest); carry it across, then "
+                                     "`boxy serve MODEL --bundle DIR --ssh host`")
+    p.add_argument("model", help="HuggingFace model id (hf:// optional)")
+    p.add_argument("-o", "--output", default=None,
+                   help="bundle directory (default: <model>-bundle)")
+    p.add_argument("--image", default=None, help="engine image (default: card engine + accelerator map)")
+    p.add_argument("--accelerator", default="cuda",
+                   help="accelerator of the TARGET cluster, for the default image pick (default cuda)")
+    p.add_argument("--skip-image", dest="skip_image", action="store_true",
+                   help="skip pulling/saving the container image (stage it out of band)")
+    p.set_defaults(func=cmd_bundle, location=None, box=None)
+
     p = sub.add_parser("app", help="run an HPC application/benchmark from an APP CARD "
                                    "(spack build or container) or any container image — "
                                    "agentless over --ssh: `boxy app osu-benchmarks --ssh cluster`, "
@@ -5380,6 +5458,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-prestage", dest="prestage", action="store_const", const="never",
                    help="agentless --ssh: do NOT pre-stage; let the compute node pull the image/model "
                         "itself (only works on a NETWORKED compute node).")
+    p.add_argument("--bundle", default=None, metavar="CLUSTER_DIR",
+                   help="AIR-GAPPED serve: a `boxy bundle` directory ON the cluster (image,\n"
+                        "model cache, wheels all come from it; no proxy, no egress)")
     p.add_argument("--no-preflight", action="store_true",
                    help="skip the laptop-side HF architecture sanity check that refuses plainly "
                         "unservable models (ASR/audio/embedding) before a GPU allocation is burned")

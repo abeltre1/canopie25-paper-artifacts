@@ -45,6 +45,9 @@ class Box:
     # Installed at container START through the forwarded proxy, before exec'ing
     # the engine — no derived image, works on any cluster.
     pip: list[str] = field(default_factory=list)
+    # Air-gapped installs: an IN-CONTAINER directory of pre-downloaded wheels;
+    # when set the pip wrapper uses --no-index --find-links here (no egress).
+    pip_find_links: str = ""
 
     def __post_init__(self) -> None:
         if self.engine not in ENGINES:

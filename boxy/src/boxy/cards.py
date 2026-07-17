@@ -65,6 +65,10 @@ class ModelCard:
     # extra pip packages the model's custom code imports that the engine image
     # doesn't ship (installed at container start; field: Nemotron-Parse/open_clip)
     pip: list = field(default_factory=list)
+    # auxiliary HF repos the model's custom code fetches DYNAMICALLY (e.g. its
+    # vision encoder) — `boxy bundle` must pre-cache them or an air-gapped serve
+    # dies mid-import (field: Nemotron-Parse pulls nvidia/C-RADIOv2-H)
+    aux_repos: list = field(default_factory=list)
 
     @property
     def label(self) -> str:
@@ -109,6 +113,7 @@ def _parse_card(text: str, card_name: str, source: str, path: str) -> ModelCard:
         min_vram_gb=int(section.get("min_vram_gb", 0)),
         args=dict(args),
         pip=[str(x) for x in section.get("pip", [])],
+        aux_repos=[str(x) for x in section.get("aux_repos", [])],
     )
 
 
@@ -205,6 +210,26 @@ def layered_pip(model: str) -> list:
         for p in (c.pip if c else []):
             if p not in out:
                 out.append(p)
+    return out
+
+
+def layered_aux_repos(model: str) -> list:
+    """Auxiliary HF repos (dynamically fetched by the model's custom code) from
+    the best packaged + user cards — `boxy bundle` pre-caches every one so an
+    air-gapped serve never reaches for the network mid-import."""
+    key = model_key(model)
+    best: dict[str, ModelCard] = {}
+    for card in load_cards():
+        if not (fnmatch.fnmatchcase(key, card.match) or key == card.match):
+            continue
+        cur = best.get(card.source)
+        if cur is None or len(card.match) > len(cur.match):
+            best[card.source] = card
+    out: list = []
+    for c in (best.get("packaged"), best.get("user")):
+        for r in (c.aux_repos if c else []):
+            if r not in out:
+                out.append(r)
     return out
 
 
