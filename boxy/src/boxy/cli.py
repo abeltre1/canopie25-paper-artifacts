@@ -1032,6 +1032,21 @@ def cmd_cards(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_provenance() -> None:
+    """One line saying WHICH boxy is executing — version and import path. A
+    field session lost hours to a stale frozen copy in a venv shadowing a fresh
+    checkout (git pull 'updated' code that never ran); this makes that mismatch
+    visible on every run: if the path isn't your checkout's src/boxy, the code
+    you edited/pulled is NOT the code running."""
+    import boxy as _pkg
+
+    where = os.path.dirname(os.path.abspath(_pkg.__file__))
+    hint = ""
+    if f"site-packages{os.sep}boxy" in where:
+        hint = "  (frozen install — a git pull does NOT affect this; use `pip/uv pip install -e`)"
+    print(f"### boxy {version_string()} from {where}{hint}")
+
+
 def cmd_app(args: argparse.Namespace) -> int:
     """Run an HPC application/benchmark from an APP CARD — the deployment-OS
     counterpart of `boxy serve MODEL`: the card carries what to build (a spack
@@ -1041,6 +1056,7 @@ def cmd_app(args: argparse.Namespace) -> int:
     Agentless over --ssh: the cluster needs only spack (or podman), never boxy."""
     from boxy import appcards
 
+    _print_provenance()
     image = getattr(args, "image", None)
     if image:
         # AD-HOC container app — no card needed: boxy app --image quay.io/x/y:tag
@@ -3529,6 +3545,7 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
+    _print_provenance()
     # A --system card is a built-in deployment profile: materialize it to a TOML
     # and feed it through the SAME --location machinery (explicit flags still win
     # via the overlay). --location wins if both are given.

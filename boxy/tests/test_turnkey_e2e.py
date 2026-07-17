@@ -1121,9 +1121,12 @@ def test_proxy_self_heal_resubmits_without_proxy(ssh, capfd, monkeypatch):
 
 
 def test_trust_remote_code_self_heal_resubmits_with_flag(ssh, capfd, monkeypatch):
-    # FIELD (Nemotron-Parse): vLLM died at config validation — 'Please pass the
-    # argument `trust_remote_code=True`'. Works even when the laptop can't reach
-    # the Hub to pre-detect: the death path folds the flag in and resubmits once.
+    # FIELD (Nemotron-Parse, generalized): vLLM died at config validation —
+    # 'Please pass the argument `trust_remote_code=True`'. Works even when the
+    # laptop can't reach the Hub to pre-detect: the death path folds the flag in
+    # and resubmits once. Uses a CARDLESS custom-code id — Nemotron-Parse itself
+    # now ships a packaged card that sets the flag on the first submit, so the
+    # heal (correctly) never fires for it.
     from boxy import cli, remote
 
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
@@ -1142,7 +1145,7 @@ def test_trust_remote_code_self_heal_resubmits_with_flag(ssh, capfd, monkeypatch
         return calls["n"] > 1                                      # die once, then ready
 
     monkeypatch.setattr(remote, "await_ready_and_tunnel", await_stub)
-    rc = main(["serve", "hf://nvidia/NVIDIA-Nemotron-Parse-v1.2", "--scheduler", "slurm",
+    rc = main(["serve", "hf://acme/Custom-Code-VLM-1B", "--scheduler", "slurm",
                "--partition", "gpu", "--ssh", "user@eldorado"])
     cap = capfd.readouterr()
     assert rc == 0
@@ -1151,7 +1154,7 @@ def test_trust_remote_code_self_heal_resubmits_with_flag(ssh, capfd, monkeypatch
     assert ssh["sbatch_log"].read_text().count("--parsable") >= 2   # first + heal resubmit
     # the healed script on the shared FS really carries the flag
     script = (ssh["tmp"] / "home" / ".local" / "share" / "boxy" / "agentless" / "eldorado"
-              / "boxy-nvidia-nemotron-parse-v1.2.sh")
+              / "boxy-custom-code-vlm-1b.sh")
     assert "--trust-remote-code" in script.read_text()
 
 
