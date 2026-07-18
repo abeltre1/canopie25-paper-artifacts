@@ -41,9 +41,9 @@ def test_cmd_bundle_pulls_card_knowledge(tmp_path, monkeypatch, capfd):
     seen = {}
 
     def fake_build(model, dest, image, *, aux_repos=None, pip_pkgs=None, token="",
-                   runtime="podman", skip_image=False):
+                   runtime="podman", skip_image=False, bake=False):
         seen.update(model=model, dest=dest, image=image, aux=aux_repos, pip=pip_pkgs,
-                    skip=skip_image)
+                    skip=skip_image, bake=bake)
         return dest + "/manifest.toml"
 
     monkeypatch.setattr(airgap, "build_bundle", fake_build)
@@ -114,3 +114,23 @@ def test_trust_refuses_non_interactive_without_yes(tmp_path, monkeypatch, capfd)
     assert rc == 1
     assert "rerun with --yes" in capfd.readouterr().err
     assert not (tmp_path / "store" / "site-trusted-ca.pem").exists()
+
+
+def test_build_bundle_bake_builds_derived_image(tmp_path, monkeypatch):
+    # --bake: the card's pip deps get INSTALLED into a derived image (FROM engine
+    # image + pip install) and THAT is what lands in image.oci.tar — the
+    # air-gapped container starts with no pip step.
+    calls = []
+    monkeypatch.setattr(airgap, "_hf_download", lambda *a, **k: None)
+    monkeypatch.setattr(airgap, "_run", lambda cmd, env=None, what="": calls.append(" ".join(cmd)))
+    monkeypatch.setattr("shutil.which", lambda n: f"/usr/bin/{n}")
+    dest = tmp_path / "nb"
+    airgap.build_bundle("nvidia/NVIDIA-Nemotron-Parse-v1.2", str(dest),
+                        "docker.io/vllm/vllm-openai:latest",
+                        pip_pkgs=["open_clip_torch"], bake=True)
+    assert any("build -t localhost/boxy-nvidia-nemotron-parse-v1.2:baked" in c for c in calls)
+    cf = (dest / "Containerfile.boxy").read_text()
+    assert cf.startswith("FROM docker.io/vllm/vllm-openai:latest")
+    assert "pip install --no-cache-dir open_clip_torch" in cf
+    assert any("save --format oci-archive" in c and ":baked" in c for c in calls)
+    assert 'image = "localhost/boxy-nvidia-nemotron-parse-v1.2:baked"' in (dest / "manifest.toml").read_text()

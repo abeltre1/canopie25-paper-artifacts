@@ -85,7 +85,10 @@ def test_ray_worker_inner_joins_head_and_blocks():
     worker = distributed.ray_worker_inner(gpus_per_node=4)
     assert worker[:2] == ["bash", "-lc"]
     # head IP comes from the env var the launcher bakes in; --block holds the node
-    assert worker[2] == "ray start --address=${BOXY_RAY_HEAD}:6379 --num-gpus=4 --block"
+    assert "ray start --address=${BOXY_RAY_HEAD}:6379 --num-gpus=4 --block" in worker[2]
+    # the join RETRIES — workers race the head's `ray start --head` (field: the
+    # agentless batch script launches both into the allocation together)
+    assert "for _i in" in worker[2] and "sleep 10" in worker[2]
 
 
 # ---- launcher dispatch -------------------------------------------------------

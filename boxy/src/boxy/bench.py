@@ -60,6 +60,15 @@ class BenchResult:
     latency_mean_ms: float
     latency_p50_ms: float
     latency_p95_ms: float
+    # vLLM-bench-style serving metrics, measured via STREAMING requests
+    # (`vllm bench serve` reports the same fields): TTFT = time to first token,
+    # ITL = inter-token latency (per-chunk gaps), TPOT = (E2E-TTFT)/(tokens-1).
+    ttft_mean_ms: float = 0.0
+    ttft_p50_ms: float = 0.0
+    ttft_p99_ms: float = 0.0
+    tpot_mean_ms: float = 0.0
+    itl_p50_ms: float = 0.0
+    itl_p99_ms: float = 0.0
 
 
 @dataclass
@@ -132,6 +141,66 @@ def _one_request(url: str, model: str, prompt: str, max_tokens: int) -> tuple[fl
         return time.perf_counter() - start, None
 
 
+def _one_stream_request(url: str, model: str, prompt: str, max_tokens: int) -> dict:
+    """One STREAMING completion, instrumented like vLLM's bench: returns
+    {e2e, ttft, itls, out_tokens, ok}. Token count comes from the final usage
+    chunk when the server sends one (stream_options include_usage — vLLM does),
+    else from the number of content chunks (≈ tokens for vLLM/llama.cpp)."""
+    req = urllib.request.Request(
+        f"{url}/v1/completions",
+        data=json.dumps({"model": model, "prompt": prompt, "max_tokens": max_tokens,
+                         "stream": True,
+                         "stream_options": {"include_usage": True}}).encode(),
+        headers={"Content-Type": "application/json"})
+    start = time.perf_counter()
+    ttft = 0.0
+    itls: list[float] = []
+    chunks = 0
+    usage_tokens = 0
+    last = start
+    body_lines: list[str] = []
+    try:
+        with urllib.request.urlopen(req, timeout=300.0) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    body_lines.append(line)
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                now = time.perf_counter()
+                try:
+                    obj = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("usage"):
+                    usage_tokens = obj["usage"].get("completion_tokens", 0)
+                    continue                       # the usage chunk isn't a token
+                if chunks == 0:
+                    ttft = now - start
+                else:
+                    itls.append(now - last)
+                last = now
+                chunks += 1
+        if chunks == 0 and body_lines:
+            # Server ignored `stream: true` and sent one plain JSON completion
+            # (some OpenAI-compatible servers do). Still a valid measurement —
+            # E2E and throughput are real; TTFT/ITL just aren't observable.
+            try:
+                obj = json.loads("".join(body_lines))
+                tokens = obj.get("usage", {}).get("completion_tokens", 0) or len(obj.get("choices", []))
+                return {"e2e": time.perf_counter() - start, "ttft": 0.0, "itls": [],
+                        "out_tokens": tokens, "ok": bool(obj.get("choices")), "streamed": False}
+            except json.JSONDecodeError:
+                pass
+        return {"e2e": time.perf_counter() - start, "ttft": ttft, "itls": itls,
+                "out_tokens": usage_tokens or chunks, "ok": chunks > 0, "streamed": True}
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        return {"e2e": time.perf_counter() - start, "ttft": 0.0, "itls": [],
+                "out_tokens": 0, "ok": False, "streamed": True}
+
+
 def run_level(url: str, model: str, prompts: list[str], batch_size: int, max_tokens: int) -> BenchResult:
     """One sweep level: `batch_size` concurrent requests (one wave, paper-style)."""
     return run_level_endpoints([(url, model)], prompts, batch_size, max_tokens)
@@ -148,13 +217,18 @@ def run_level_endpoints(endpoints: list[tuple[str, str]], prompts: list[str],
     start = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, batch_size)) as pool:
         outcomes = list(pool.map(
-            lambda ep_p: _one_request(ep_p[0][0], ep_p[0][1], ep_p[1], max_tokens), wave))
+            lambda ep_p: _one_stream_request(ep_p[0][0], ep_p[0][1], ep_p[1], max_tokens), wave))
     elapsed = time.perf_counter() - start
 
-    latencies = sorted(lat for lat, _ in outcomes)
-    usages = [u for _, u in outcomes if u is not None]
-    prompt_tokens = sum(u.get("prompt_tokens", 0) for u in usages)
-    completion_tokens = sum(u.get("completion_tokens", 0) for u in usages)
+    good = [o for o in outcomes if o["ok"]]
+    streamed = [o for o in good if o.get("streamed", True)]
+    latencies = sorted(o["e2e"] for o in outcomes)
+    ttfts = sorted(o["ttft"] for o in streamed)
+    itls = sorted(gap for o in streamed for gap in o["itls"])
+    completion_tokens = sum(o["out_tokens"] for o in good)
+    # TPOT per request = (E2E - TTFT) / (out_tokens - 1); mean over requests
+    tpots = [(o["e2e"] - o["ttft"]) / (o["out_tokens"] - 1)
+             for o in streamed if o["out_tokens"] > 1]
 
     def pct(p: float) -> float:
         return percentile_ms(latencies, p)
@@ -162,16 +236,22 @@ def run_level_endpoints(endpoints: list[tuple[str, str]], prompts: list[str],
     return BenchResult(
         batch_size=batch_size,
         requests=len(wave),
-        ok=len(usages),
-        errors=len(wave) - len(usages),
+        ok=len(good),
+        errors=len(wave) - len(good),
         elapsed_s=elapsed,
-        requests_per_s=len(usages) / elapsed if elapsed else 0.0,
-        prompt_tokens=prompt_tokens,
+        requests_per_s=len(good) / elapsed if elapsed else 0.0,
+        prompt_tokens=0,
         completion_tokens=completion_tokens,
         tokens_per_s=completion_tokens / elapsed if elapsed else 0.0,
         latency_mean_ms=statistics.mean(latencies) * 1000 if latencies else 0.0,
         latency_p50_ms=pct(0.50),
         latency_p95_ms=pct(0.95),
+        ttft_mean_ms=statistics.mean(ttfts) * 1000 if ttfts else 0.0,
+        ttft_p50_ms=percentile_ms(ttfts, 0.50),
+        ttft_p99_ms=percentile_ms(ttfts, 0.99),
+        tpot_mean_ms=statistics.mean(tpots) * 1000 if tpots else 0.0,
+        itl_p50_ms=percentile_ms(itls, 0.50),
+        itl_p99_ms=percentile_ms(itls, 0.99),
     )
 
 

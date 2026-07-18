@@ -51,6 +51,11 @@ def _isolate_config(monkeypatch, tmp_path):
     # first-pick. Picker tests opt in with BOXY_PICK_ACCOUNT=always + a fake input().
     monkeypatch.setenv("BOXY_PICK_ACCOUNT", "never")
     monkeypatch.setenv("BOXY_PICK_PARTITION", "never")
+    # model-store discovery probes the login node (mkdir/df over ssh) for a big
+    # scratch FS — nondeterministic on a dev/CI box (the fake ssh runs it
+    # LOCALLY, and a root runner could really create /tscratch). Pin the store
+    # per test; the discovery tests blank this to opt back in.
+    monkeypatch.setenv("BOXY_MODEL_DIR", str(tmp_path / "model-store"))
     # site.license defaults to tscratch:1 (Sandia); neutralize it for the broad
     # suite so goldens/e2e stay site-agnostic. The license tests opt back in.
     monkeypatch.setenv("BOXY_LICENSE", "")

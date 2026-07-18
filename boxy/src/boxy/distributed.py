@@ -76,9 +76,17 @@ def ray_head_inner(vllm_argv: list[str], gpus_per_node: int, world: int) -> list
 def ray_worker_inner(gpus_per_node: int) -> list[str]:
     """Container inner command for a WORKER node: join the head's Ray cluster and
     --block (keeps the node in the cluster for the job's lifetime). The head IP
-    arrives via the BOXY_RAY_HEAD env var set on the srun that launches it."""
-    script = (f"ray start --address=${{{HEAD_ENV}}}:{config.get_int('network.ray_port')} "
-              f"--num-gpus={gpus_per_node} --block")
+    arrives via the BOXY_RAY_HEAD env var set on the srun that launches it.
+
+    The join RETRIES: the worker containers race the head container's `ray start
+    --head` (both are launched into the allocation together), and `ray start
+    --address` exits non-zero while the head port isn't up yet. On a clean join,
+    --block holds until the cluster shuts down and the loop breaks."""
+    join = (f"ray start --address=${{{HEAD_ENV}}}:{config.get_int('network.ray_port')} "
+            f"--num-gpus={gpus_per_node} --block")
+    script = (f"for _i in $(seq 30); do {join} && break; "
+              f"echo \"boxy: ray join attempt $_i failed (head still starting?) — retrying in 10s\" >&2; "
+              f"sleep 10; done")
     return ["bash", "-lc", script]
 
 

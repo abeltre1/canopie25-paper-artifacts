@@ -138,3 +138,73 @@ def test_serve_agentless_live_submit_reaches_ready(staged_gguf, jobs_dir, monkey
     # the submitted script was boxy-free and named the container after the job
     assert "boxy serve" not in seen["script"] and "--name=boxy-al" in seen["script"]
     assert jobs.read_record("boxy-al")["job"] == "4242"
+
+
+# ---- multi-node (Ray) agentless: one vLLM instance across the allocation ------
+
+
+def _vllm_loc(nodes, gpus, scheduler="slurm"):
+    from boxy.location import Resources
+    return Location(name="hops", scheduler=scheduler, accelerator="cuda", runtime="podman",
+                    resources=Resources(nodes=nodes, gpus_per_node=gpus))
+
+
+def test_render_multinode_fans_ray_workers_from_the_script(tmp_path):
+    # --nodes 2 over the agentless path: the head node runs `ray start --head` +
+    # vllm (TP=gpus x PP=nodes), and the batch script itself sruns ONE worker
+    # container onto the other node — still zero boxy on the cluster.
+    script = deploy.render_agentless_script(
+        _box("meta-llama/Llama-3.1-70B-Instruct", engine="vllm"), _vllm_loc(2, 4),
+        "slurm", "boxy-70b", str(tmp_path / "ep.json"), str(tmp_path / "%j.log"),
+        [], port=8000, engine_pulls_model=True)
+    assert "#SBATCH --nodes=2" in script and "#SBATCH --ntasks-per-node=1" in script
+    # head: ray head + wait-for-8-GPUs + vllm with the derived geometry
+    assert "ray start --head" in script
+    assert "--tensor-parallel-size=4" in script and "--pipeline-parallel-size=2" in script
+    assert "--distributed-executor-backend=ray" in script
+    # worker fan-out: srun places it on the non-head node, head IP found at runtime
+    assert 'srun --nodes=1 --ntasks=1 --ntasks-per-node=1 --exclude "$(hostname -s)"' in script
+    assert '_HEAD_IP="$(hostname -I' in script
+    assert 'BOXY_RAY_HEAD="${_HEAD_IP}"' in script
+    assert "ray start --address=${BOXY_RAY_HEAD}" in script
+    assert "boxy serve" not in script                     # still zero-install
+    # workers launch in the BACKGROUND; the head podman stays the foreground exec
+    head_line = [line for line in script.splitlines() if line.startswith("exec ")][-1]
+    assert "ray start --head" in head_line
+
+
+def test_render_multinode_flux_uses_flux_run(tmp_path):
+    script = deploy.render_agentless_script(
+        _box("meta-llama/Llama-3.1-70B-Instruct", engine="vllm"), _vllm_loc(3, 4, "flux"),
+        "flux", "boxy-70b", str(tmp_path / "ep.json"), str(tmp_path / "%j.log"),
+        [], port=8000, engine_pulls_model=True)
+    assert "flux run -N2 -n2 --tasks-per-node=1" in script
+    assert "--pipeline-parallel-size=3" in script
+
+
+def test_render_multinode_opt_out_and_single_node_unchanged(staged_gguf, tmp_path):
+    # --no-distributed renders the plain single-node script even at nodes=2 …
+    script = deploy.render_agentless_script(
+        _box("meta-llama/Llama-3.1-70B-Instruct", engine="vllm"), _vllm_loc(2, 4),
+        "slurm", "b", str(tmp_path / "ep.json"), str(tmp_path / "l.log"),
+        [], port=8000, engine_pulls_model=True, distributed=False)
+    assert "ray start" not in script and "srun" not in script
+    # … llama.cpp is never distributed …
+    script = deploy.render_agentless_script(
+        _box(staged_gguf), _vllm_loc(2, 1), "slurm", "b",
+        str(tmp_path / "ep2.json"), str(tmp_path / "l2.log"), [], port=8090)
+    assert "ray start" not in script
+    # … and nodes=1 never grows Ray, even with distributed requested
+    script = deploy.render_agentless_script(
+        _box("meta-llama/Llama-3.1-8B-Instruct", engine="vllm"), _vllm_loc(1, 4),
+        "slurm", "b", str(tmp_path / "ep3.json"), str(tmp_path / "l3.log"),
+        [], port=8000, engine_pulls_model=True, distributed=True)
+    assert "ray start" not in script
+
+
+def test_render_multinode_needs_gpu_count(tmp_path):
+    with pytest.raises(deploy.AgentlessError, match="gpus"):
+        deploy.render_agentless_script(
+            _box("meta-llama/Llama-3.1-70B-Instruct", engine="vllm"), _vllm_loc(2, 0),
+            "slurm", "b", str(tmp_path / "ep.json"), str(tmp_path / "l.log"),
+            [], port=8000, engine_pulls_model=True)

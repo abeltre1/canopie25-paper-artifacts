@@ -222,6 +222,17 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
             help="accelerator assumed for a GPU job submitted from a GPU-less login node "
                  "(where detection sees no device). --accelerator / a --location profile win."),
 
+    # -- model storage on the cluster ------------------------------------------
+    Setting("storage.model_dir", "BOXY_MODEL_DIR", "",
+            help="cluster directory for the model cache (HF downloads) on --ssh serves. "
+                 "Empty = auto-discover a big shared scratch FS ($SCRATCH, /tscratch, "
+                 "/pscratch, /scratch — first writable one with room) so multi-GB models "
+                 "never land on the $HOME quota. Set to pin an exact path."),
+    Setting("storage.min_free_gb", "BOXY_MIN_FREE_GB", 100, int,
+            help="minimum free space (GB) a discovered scratch FS must have to be picked "
+                 "for the model cache; below this the next candidate is tried (the best "
+                 "one is still used, with a warning, when none clears the bar)."),
+
     # -- external binaries (test shims / site spellings) -----------------------
     Setting("binaries.ssh", "BOXY_SSH", "ssh", help="ssh binary."),
     Setting("binaries.oc", "BOXY_OC", "oc", help="OpenShift oc binary."),

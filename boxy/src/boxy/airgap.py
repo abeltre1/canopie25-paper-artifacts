@@ -74,7 +74,8 @@ def _hf_download(repo: str, hf_home: str, token: str = "") -> None:
 
 def build_bundle(model_id: str, dest: str, image: str, *, aux_repos: list[str] | None = None,
                  pip_pkgs: list[str] | None = None, token: str = "",
-                 runtime: str = "podman", skip_image: bool = False) -> str:
+                 runtime: str = "podman", skip_image: bool = False,
+                 bake: bool = False) -> str:
     """Create <dest>/ with everything an air-gapped serve needs. Returns the
     manifest path. Each stage prints what it's doing; a missing tool fails with
     the exact remedy."""
@@ -101,6 +102,18 @@ def build_bundle(model_id: str, dest: str, image: str, *, aux_repos: list[str] |
                               f"(or pass --skip-image and load the image out of band)")
         print(f"### bundle: pulling {image} ...")
         _run([rt, "pull", image], what=f"{runtime} pull")
+        if bake and pip_pkgs:
+            # BAKE the card's pip deps into a derived image so the air-gapped
+            # container starts instantly with no pip step at all (the wheels/
+            # dir still ships as belt-and-suspenders for user-added deps).
+            slug = model_id.rsplit("/", 1)[-1].lower()
+            baked = f"localhost/boxy-{slug}:baked"
+            cf = d / "Containerfile.boxy"
+            cf.write_text(f"FROM {image}\n"
+                          f"RUN pip install --no-cache-dir {' '.join(pip_pkgs)}\n")
+            print(f"### bundle: baking {', '.join(pip_pkgs)} into {baked} ...")
+            _run([rt, "build", "-t", baked, "-f", str(cf), str(d)], what=f"{runtime} build")
+            image = baked
         print("### bundle: saving image.oci.tar ...")
         _run([rt, "save", "--format", "oci-archive", "-o", str(d / "image.oci.tar"), image],
              what=f"{runtime} save")

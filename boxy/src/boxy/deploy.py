@@ -190,7 +190,8 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
                             endpoint_file: str, log_file: str, site_args: list[str],
                             proxy_prefix: str = "", port: int | None = None,
                             engine_pulls_model: bool = False,
-                            prelude: list[str] | None = None) -> str:
+                            prelude: list[str] | None = None,
+                            distributed: bool | None = None) -> str:
     """A FULLY SELF-CONTAINED batch script — no boxy/Python/RamaLama on the
     cluster. The compute node runs only `podman run` (resolved HERE) plus a
     bash endpoint-write to the shared FS; the laptop submits it and polls that
@@ -218,10 +219,29 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
         raise AgentlessError(
             "agentless can't detect hardware on the compute node — pin --accelerator "
             "(cuda|rocm|…) so the podman command is fully resolved here.")
+    # Multi-node = ONE vLLM instance across the allocation via Ray (same policy
+    # as the boxy-on-cluster path: auto for vllm + nodes>1, --no-distributed
+    # opts out; llama.cpp is never distributed). The head node runs `ray start
+    # --head` + vllm; the N-1 workers are fanned out by srun / flux run from
+    # inside the batch script — still zero boxy on the cluster.
+    eng = _apply_defaults(box, local.resolve_accelerator()).engine
+    from boxy import distributed as distmod
+    multinode = distmod.is_distributed(eng, location.resources.nodes, distributed)
+    if multinode and scheduler_name not in ("slurm", "flux"):
+        raise AgentlessError(
+            f"multi-node serving needs a scheduler that can place the Ray workers "
+            f"(slurm or flux), not {scheduler_name!r}")
     global _AGENTLESS_RENDER
     _AGENTLESS_RENDER = True
     try:
-        deployment = plan_serve(box, local, port=port, dryrun=True)  # dryrun: no pull, no verify
+        if multinode:
+            try:
+                deployment = plan_serve(box, local, port=port, dryrun=True,
+                                        distributed=True, head_ip=_HEAD_IP_TOKEN)
+            except RuntimeError as e:  # e.g. gpus_per_node unknown
+                raise AgentlessError(str(e)) from e
+        else:
+            deployment = plan_serve(box, local, port=port, dryrun=True)  # dryrun: no pull, no verify
     finally:
         _AGENTLESS_RENDER = False
 
@@ -256,10 +276,44 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
     # engine-pull: the model lands in the container's HF cache, which the caller
     # bind-mounts from the shared FS (download once, reuse every run) — create it
     # here so podman never fails on a missing bind source.
-    mk_cache = 'mkdir -p "$(dirname "${_EP}")/hfcache"\n' if engine_pulls_model else ''
+    # engine-pull: create the HF-cache bind source (shared FS) at job runtime so
+    # podman never fails on a missing mount. The REAL mounted path is read off the
+    # planned --volume args (the cache may live on the big scratch FS, not next to
+    # the endpoint file — see cli._remote_model_store); the endpoint-adjacent dir
+    # is the fallback for a plan without an HF-cache mount.
+    mk_cache = ""
+    if engine_pulls_model:
+        hf_srcs = [a.split("=", 1)[1].split(":")[0] for a in cmd
+                   if a.startswith("--volume=") and ":/root/.cache/huggingface" in a]
+        mk_cache = "".join(f"mkdir -p {shlex.quote(s)}\n" for s in hf_srcs) \
+            or 'mkdir -p "$(dirname "${_EP}")/hfcache"\n'
 
     resolved_port = deployment.port or port or 0
     scheduler = get_scheduler(scheduler_name)
+
+    # Multi-node: discover the head's IP AT JOB RUNTIME (unknowable laptop-side)
+    # and fan ONE worker container out to the N-1 non-head nodes in the
+    # background; the head podman (ray head + wait-for-cluster + vllm) then
+    # runs in the foreground exactly like the single-node case. Workers retry
+    # their Ray join, so the head/worker start race is harmless.
+    worker_block = ""
+    if multinode:
+        nodes = location.resources.nodes
+        wcmd = shlex.join(deployment.worker_command or [])
+        wcmd = wcmd.replace(_HEAD_IP_TOKEN, '"${_HEAD_IP}"')
+        if scheduler_name == "slurm":
+            fan = (f'srun --nodes={nodes - 1} --ntasks={nodes - 1} --ntasks-per-node=1 '
+                   f'--exclude "$(hostname -s)" ')
+        else:  # flux (guarded above); flux run has no --exclude — ranks 1..N-1 via -x is
+            # not portable across flux versions, so the head rank may double as a worker
+            # host; podman container names differ, so they coexist.
+            fan = f'flux run -N{nodes - 1} -n{nodes - 1} --tasks-per-node=1 '
+        worker_block = (
+            '_HEAD_IP="$(hostname -I 2>/dev/null | awk \'{print $1}\')"\n'
+            '[ -n "$_HEAD_IP" ] || _HEAD_IP="$(getent hosts "$_H" | awk \'{print $1}\')"\n'
+            f'{fan}{proxy_prefix}{wcmd} &\n'
+        )
+
     # atomic endpoint publish + foreground container; $(hostname) is the compute node.
     prelude_block = ("\n".join(prelude) + "\n") if prelude else ""
     body = (
@@ -269,6 +323,7 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
         f'_EP={shlex.quote(endpoint_file)}\n'
         f'{mk_cache}'
         f'{ca_block}'
+        f'{worker_block}'
         'cat > "${_EP}.tmp" <<EOF_BOXY_EP\n'
         f'{{"name": "{name}", "host": "${{_H}}", "port": {resolved_port}, '
         f'"url": "http://${{_H}}:{resolved_port}", "job": "${{SLURM_JOB_ID:-${{FLUX_JOB_ID:-}}}}"}}\n'
@@ -276,7 +331,8 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
         'mv -f "${_EP}.tmp" "${_EP}"\n'
         f'exec {proxy_prefix}{podman}'
     )
-    return scheduler.batch_script("", location, name, log_file, site_args, body=body)
+    return scheduler.batch_script("", location, name, log_file, site_args, body=body,
+                                  distributed=multinode)
 
 
 def plan_run(box: Box, location: Location, user_args: list[str], dryrun: bool = False) -> Deployment:
@@ -287,6 +343,12 @@ def plan_run(box: Box, location: Location, user_args: list[str], dryrun: bool = 
 
 
 CA_CONTAINER_PATH = "/etc/ssl/certs/boxy-ca-merged.pem"
+
+# Multi-node agentless: the head's IP is only knowable at job runtime, but the
+# worker plan is rendered laptop-side. This token stands in for it in the planned
+# worker command and is swapped for the script's ${_HEAD_IP} after shlex-joining
+# (it contains no shell metacharacters, so the join never quotes it).
+_HEAD_IP_TOKEN = "__BOXY_HEAD_IP__"
 
 # Agentless CA handling: over --ssh the compute node can't see the LAPTOP's
 # SSL_CERT_FILE path, so a static mount of it bind-mounts nothing and the

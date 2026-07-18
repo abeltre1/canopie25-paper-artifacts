@@ -607,3 +607,65 @@ def resolve_license(explicit: str | None) -> tuple[str, str]:
         return explicit, "--license"
     cfg = config.get_str("site.license").strip()
     return (cfg, "config site.license") if cfg else ("", "")
+
+
+# ---- model store: where multi-GB HF downloads land on the CLUSTER ----------------
+#
+# $HOME on lab clusters carries a small quota; a single 70B model (~140 GB) blows
+# through it (field: user ran out of space mid-serve). The model cache belongs on
+# the big SHARED scratch FS. The ladder is deterministic — same pick every run on
+# a given cluster, so the cache is downloaded once and always reused — and every
+# candidate must be shared (visible from the compute nodes), so node-local
+# /lscratch|/tmp are deliberately absent.
+
+MODEL_STORE_LADDER = (
+    '"$SCRATCH"',                    # many sites export the canonical per-user scratch
+    '"/tscratch/users/$USER"',       # Sandia big scratch (hops class)
+    '"/tscratch/$USER"',
+    '"/pscratch/users/$USER"',
+    '"/pscratch/$USER"',
+    '"/scratch/users/$USER"',
+    '"/scratch/$USER"',
+    '"/gscratch/$USER"',
+)
+
+
+def model_store_probe(saved: str = "") -> str:
+    """One login-node shell probe: for each candidate (a previously PICKED path
+    first, so the choice stays sticky across reruns), try to create it, keep it
+    when it's a writable directory, and report its free space in KB as
+    '<path> <free_kb>' lines. Runs with plain POSIX tools — no boxy on the cluster."""
+    cands = ([f'"{saved}"'] if saved else []) + list(MODEL_STORE_LADDER)
+    return (
+        'for d in ' + " ".join(cands) + '; do '
+        '[ -n "$d" ] || continue; '
+        'mkdir -p "$d" 2>/dev/null; '
+        '[ -d "$d" ] && [ -w "$d" ] || continue; '
+        'f=$(df -Pk "$d" 2>/dev/null | awk \'NR==2{print $4}\'); '
+        'echo "$d ${f:-0}"; '
+        'done'
+    )
+
+
+def pick_model_store(probe_out: str, min_free_gb: int) -> tuple[str, int, str]:
+    """(path, free_gb, why) from the probe's '<path> <free_kb>' lines — the FIRST
+    candidate with at least min_free_gb free, else the roomiest one (with a why
+    that says it's tight), else ('', 0, why-nothing-found). Ladder order (not max
+    free) keeps the pick stable run-over-run so the cache is reused."""
+    rows: list[tuple[str, int]] = []
+    for line in probe_out.splitlines():
+        parts = line.strip().rsplit(None, 1)
+        if len(parts) != 2 or not parts[0].startswith("/"):
+            continue
+        try:
+            rows.append((parts[0], int(parts[1]) // (1024 * 1024)))
+        except ValueError:
+            continue
+    if not rows:
+        return "", 0, "no shared scratch FS found on the login node"
+    for path, free_gb in rows:
+        if free_gb >= min_free_gb:
+            return path, free_gb, f"first scratch FS with >= {min_free_gb} GB free"
+    path, free_gb = max(rows, key=lambda r: r[1])
+    return path, free_gb, (f"roomiest scratch FS found, but only {free_gb} GB free "
+                           f"(< storage.min_free_gb={min_free_gb})")

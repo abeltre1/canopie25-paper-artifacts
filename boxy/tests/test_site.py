@@ -494,3 +494,37 @@ def test_gpu_request_from_gres_none_when_no_gpu():
 def test_gpu_request_from_gres_socket_suffix():
     # sinfo may append a socket affinity suffix — still parses the type
     assert site.gpu_request_from_gres("gpu|up|1/1/0/2|gpu:h100:8(S:0-1)\n") == ("gres", "h100")
+
+
+# ---- model store: scratch-FS pick (never the $HOME quota) ------------------------
+
+
+def test_pick_model_store_first_with_room():
+    from boxy import site
+
+    out = "/tscratch/users/me 52428800\n/pscratch/me 1073741824\n"   # 50 GB, 1 TB
+    path, free, why = site.pick_model_store(out, min_free_gb=100)
+    assert path == "/pscratch/me" and free == 1024                   # first to clear 100 GB
+    # ladder order (not max free) when the first candidate has room:
+    path, free, why = site.pick_model_store(out, min_free_gb=10)
+    assert path == "/tscratch/users/me" and free == 50
+
+
+def test_pick_model_store_tight_and_empty():
+    from boxy import site
+
+    path, free, why = site.pick_model_store("/scratch/me 10485760\n", min_free_gb=100)
+    assert path == "/scratch/me" and free == 10 and "only 10 GB" in why   # roomiest, flagged
+    path, free, why = site.pick_model_store("", min_free_gb=100)
+    assert path == "" and "no shared scratch" in why
+    # garbage lines (motd noise, non-absolute paths) never crash the parse
+    path, _, _ = site.pick_model_store("Welcome to hops!\nfoo bar baz\n", min_free_gb=1)
+    assert path == ""
+
+
+def test_model_store_probe_is_posix_and_sticky_first():
+    from boxy import site
+
+    cmd = site.model_store_probe(saved="/tscratch/users/me/boxy")
+    assert cmd.index("/tscratch/users/me/boxy") < cmd.index("$SCRATCH")  # saved pick first
+    assert "df -Pk" in cmd and "mkdir -p" in cmd and "boxy" not in cmd.split()[0]

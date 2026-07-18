@@ -335,3 +335,30 @@ def test_ompi_ucx_failure_detected_and_card_gets_tcp_transport():
     text = appcards.render_app_script(healed, "slurm", "app-osu", "/tmp/x.log", [])
     body = text[text.index("set -e"):]
     assert body.index("export OMPI_MCA_pml=ob1") < body.index("osu_bw")   # before the ranks launch
+
+
+def test_stop_all_and_clean_lifecycle(tmp_path, monkeypatch, capfd):
+    # the panic button + the sweep: `boxy stop --all` cancels every recorded
+    # job; `boxy clean` removes finished-job debris and keeps live jobs.
+    import json as _json
+
+    from boxy.cli import main as _main
+
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
+    rc = _main(["clean", "--dryrun"])
+    assert rc == 0 and "would clean 0" in capfd.readouterr().out
+    rc = _main(["stop", "--all"])
+    assert rc == 0 and "stopped 0 job(s)" in capfd.readouterr().out
+    # a finished (unreachable-scheduler => not live... FOREIGN) record is KEPT;
+    # a local-cluster DONE record is cleaned
+    import socket
+
+    (tmp_path / "dead.json").write_text(_json.dumps(
+        {"name": "dead", "scheduler": "slurm", "job": "1",
+         "submitted_from": socket.gethostname()}))
+    (tmp_path / "dead-1.log").write_text("old log")
+    rc = _main(["clean"])
+    out = capfd.readouterr().out
+    assert rc == 0 and "cleaned 1 finished job(s)" in out
+    assert not (tmp_path / "dead.json").exists()
+    assert not (tmp_path / "dead-1.log").exists()

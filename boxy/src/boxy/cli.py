@@ -1133,6 +1133,81 @@ def cmd_trust(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_clean(args: argparse.Namespace) -> int:
+    """Sweep the deployment debris: remove records/endpoints/scripts/logs of
+    FINISHED jobs (laptop side and, for agentless records, the matching files on
+    the cluster's shared FS over the master), and prune EXITED boxy containers.
+    Live jobs are never touched (use `boxy stop --all` first to kill them).
+    --deep also removes the cluster's per-host agentless dir EXCEPT the model
+    cache (hfcache is the expensive part — clear it explicitly with --hfcache)."""
+    from boxy import jobs, remote
+    from boxy.schedulers import get_scheduler
+
+    removed, kept = 0, 0
+    targets: set[str] = set()
+    for rec in jobs.list_records():
+        name = rec["name"]
+        if rec.get("submitted_from") in ("agentless-ssh", "app-agentless-ssh") and rec.get("target"):
+            state = _agentless_state(rec)
+        else:
+            foreign, _o = _record_is_foreign(rec)
+            state = "FOREIGN" if foreign else _job_state(get_scheduler(rec["scheduler"]), rec["job"])
+        if state in ("PENDING", "RUNNING", "FOREIGN"):
+            kept += 1
+            continue
+        if not args.dryrun:
+            jobs.endpoint_path(name).unlink(missing_ok=True)
+            jobs.script_path(name).unlink(missing_ok=True)
+            for lg in jobs._dir().glob(f"{name}*.log"):
+                lg.unlink(missing_ok=True)
+            if rec.get("target"):
+                targets.add(rec["target"])
+                pat = shlex.quote(f"{name}") + "*"
+                remote.ssh_capture(
+                    rec["target"],
+                    f"cd ~/{AGENTLESS_REMOTE_SUBDIR}/{rec['target'].split('@')[-1]} 2>/dev/null "
+                    f"&& rm -f {pat}", timeout=20)
+            jobs.remove(name)
+        removed += 1
+    verb = "would clean" if args.dryrun else "cleaned"
+    print(f"### {verb} {removed} finished job(s); kept {kept} live/foreign")
+
+    # exited boxy containers on THIS machine (crashed/finished local serves)
+    try:
+        runtime = args.runtime or _container_runtime(None)
+    except RuntimeError:
+        runtime = ""
+    if runtime:
+        ps = subprocess.run([runtime, "ps", "-a", "--filter", "label=boxy.box",
+                             "--filter", "status=exited", "-q"], capture_output=True, text=True)
+        ids = ps.stdout.split()
+        if ids and not args.dryrun:
+            subprocess.run([runtime, "rm", *ids], capture_output=True, text=True)
+        if ids:
+            print(f"### {verb} {len(ids)} exited {runtime} container(s)")
+
+    if getattr(args, "deep", False) and (args.ssh or targets):
+        for tgt in ({args.ssh} if args.ssh else targets):
+            host = tgt.split("@")[-1]
+            keep = "" if getattr(args, "hfcache", False) else " ! -name hfcache"
+            cmd = (f"cd ~/{AGENTLESS_REMOTE_SUBDIR}/{host} 2>/dev/null && "
+                   f"find . -maxdepth 1 -mindepth 1{keep} -exec rm -rf {{}} +")
+            print(f"### deep clean on {host}: {'(dryrun) ' if args.dryrun else ''}{cmd}")
+            if not args.dryrun:
+                remote.ssh_capture(tgt, cmd, timeout=60)
+            # the model cache may live on the big scratch FS, not under $HOME —
+            # the per-cluster sticky pick knows where (see _remote_model_store).
+            if getattr(args, "hfcache", False):
+                sticky = jobs._dir() / f".model-store-{jobs.cluster_id(host)}"
+                store = sticky.read_text().strip() if sticky.exists() else ""
+                if store:
+                    scmd = f"rm -rf {shlex.quote(store + '/boxy/hfcache')} {shlex.quote(store + '/boxy/models')}"
+                    print(f"### model-store clean on {host}: {'(dryrun) ' if args.dryrun else ''}{scmd}")
+                    if not args.dryrun:
+                        remote.ssh_capture(tgt, scmd, timeout=120)
+    return 0
+
+
 def cmd_bundle(args: argparse.Namespace) -> int:
     """Build an AIR-GAP bundle for MODEL on a CONNECTED machine: the HF cache
     (model + the card's aux repos — custom code fetches them dynamically), the
@@ -1155,7 +1230,8 @@ def cmd_bundle(args: argparse.Namespace) -> int:
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
     try:
         airgap.build_bundle(bare, out, image, aux_repos=aux, pip_pkgs=pip_pkgs,
-                            token=token, skip_image=args.skip_image)
+                            token=token, skip_image=args.skip_image,
+                            bake=getattr(args, "bake", False))
     except airgap.BundleError as e:
         print(f"boxy bundle: {e}", file=sys.stderr)
         return 1
@@ -2162,8 +2238,46 @@ def _prestage_mode(args) -> str:
     return mode if mode in ("auto", "always", "never") else "auto"
 
 
+def _remote_model_store(target: str, host: str, rdir: str, dryrun: bool = False) -> str:
+    """Where multi-GB model downloads live on the CLUSTER: a big SHARED scratch
+    FS (tscratch class), never the $HOME quota (field: a 100GB+ model exhausted
+    the user's home quota mid-serve). storage.model_dir/BOXY_MODEL_DIR pins an
+    exact path; otherwise the login node is probed once ($SCRATCH, /tscratch,
+    /pscratch, /scratch ladder + free-space check) and the pick is remembered
+    per cluster laptop-side, so the cache never wanders between filesystems.
+    Falls back to the agentless dir under $HOME with a loud quota warning."""
+    from boxy import jobs, remote, site
+
+    pinned = config.get_str("storage.model_dir").strip()
+    if pinned:
+        store = pinned.rstrip("/")
+        print(f"  auto: model store: {host}:{store} (pinned via storage.model_dir)")
+        return store
+    sticky = jobs._dir() / f".model-store-{jobs.cluster_id(host)}"
+    saved = sticky.read_text().strip() if sticky.exists() else ""
+    rc, out = remote.ssh_capture(target, site.model_store_probe(saved), timeout=30)
+    picked, free_gb, why = site.pick_model_store(
+        out if rc == 0 else "", config.get_int("storage.min_free_gb"))
+    if picked:
+        store = picked.rstrip("/") + "/boxy"
+        print(f"  auto: model store: {host}:{store} ({free_gb} GB free — {why})")
+        if "only" in why:
+            print(f"boxy: warning: {host}:{picked} has just {free_gb} GB free — a large model "
+                  f"may not fit; set BOXY_MODEL_DIR to a roomier shared FS.", file=sys.stderr)
+        if not dryrun:
+            try:
+                sticky.write_text(picked)
+            except OSError:
+                pass
+        return store
+    print(f"boxy: warning: {why} on {host} — the model cache stays under $HOME "
+          f"({rdir}/hfcache), which can exhaust your quota; set BOXY_MODEL_DIR to a big "
+          f"shared FS the compute nodes can see.", file=sys.stderr)
+    return rdir
+
+
 def _prestage_agentless_model(args, target: str, host: str, box, image: str,
-                              pfx: str, rdir: str, ca_remote: str | None):
+                              pfx: str, store_dir: str, ca_remote: str | None):
     """PRE-STAGE the container image + hf:// model on the LOGIN node (which has the
     SSH session's network + the forwarded proxy), onto the cluster's shared FS, so a
     fully ISOLATED compute node needs no runtime network. Returns the staged
@@ -2190,7 +2304,7 @@ def _prestage_agentless_model(args, target: str, host: str, box, image: str,
         print(f"  auto: prestage: {box.engine} model left to the engine (only the image is "
               "pre-pulled); pass a shared-FS GGUF path for a fully offline node.")
         return None
-    stage_dir = f"{rdir}/models/{_model_slug(repo)}"
+    stage_dir = f"{store_dir}/models/{_model_slug(repo)}"
     hf_tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
     # proxy vars for INSIDE the download container (the pull reaches HF via the proxy)
     penv = remote.remote_proxy_env()
@@ -2463,10 +2577,15 @@ def _serve_agentless_ssh(args, target: str) -> int:
     # model downloads ONCE and every rerun (and every compute node) reuses it —
     # no per-run 16GB re-download, no prestage wait. The batch script mkdir -p's
     # the dir at job runtime (shared FS, so it exists wherever the job lands).
+    # The cache lives on the big SHARED SCRATCH FS (tscratch class), never the
+    # $HOME quota (field: a 100GB+ model exhausted the user's home quota).
+    store_dir = rdir
+    if not bundle and (engine_pull or _prestage_mode(args) != "never"):
+        store_dir = _remote_model_store(target, host, rdir, dryrun=args.dryrun)
     if engine_pull and not bundle:
         from boxy.box import Volume
 
-        hf_cache = f"{rdir}/hfcache"
+        hf_cache = f"{store_dir}/hfcache"
         box = dc_replace(
             box,
             volumes=[*box.volumes, Volume(source=hf_cache, target="/root/.cache/huggingface")],
@@ -2506,7 +2625,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
             print(f"  auto: prestage: would stage {what} on {host} (login node), {tail} "
                   "(--no-prestage to skip; not run under --dryrun)")
         elif engine_pull:
-            staged = _prestage_agentless_model(args, target, host, box, image, pfx, rdir, ca_remote)
+            staged = _prestage_agentless_model(args, target, host, box, image, pfx, store_dir, ca_remote)
             if staged:
                 box = dc_replace(box, model=staged)
                 engine_pull = False
@@ -2561,13 +2680,20 @@ def _serve_agentless_ssh(args, target: str) -> int:
     try:
         script_text = deploy.render_agentless_script(
             box, location, scheduler_name, name, ep_remote, log_remote, site_args,
-            proxy_prefix=pfx, port=args.port, engine_pulls_model=engine_pull,
+            proxy_prefix=pfx, port=args.port, engine_pulls_model=engine_pull, distributed=getattr(args, "distributed", None),
             prelude=prelude)
     except deploy.AgentlessError as e:
         deploy.set_agentless_ca(None)
         print(f"boxy: agentless: {e}", file=sys.stderr)
         return 2
 
+    if "ray start --head" in script_text:
+        from boxy import distributed as _dist
+
+        _tp, _pp, _world = _dist.derive_parallelism(location.resources)
+        print(f"  auto: distributed vLLM across {location.resources.nodes} nodes via Ray — "
+              f"tensor-parallel={_tp} (intra-node) x pipeline-parallel={_pp} (inter-node), "
+              f"world {_world} GPUs; the batch script fans the Ray workers out itself")
     print("### Agentless (no boxy on the cluster): a self-contained podman batch script, "
           "submitted + polled from your laptop over SSH.")
     print(f"### Batch script ({script_remote}):")
@@ -2612,7 +2738,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
             try:
                 script_text = deploy.render_agentless_script(
                     box, location, scheduler_name, name, ep_remote, log_remote, site_args,
-                    proxy_prefix=_proxy_prefix(args), port=args.port, engine_pulls_model=engine_pull,
+                    proxy_prefix=_proxy_prefix(args), port=args.port, engine_pulls_model=engine_pull, distributed=getattr(args, "distributed", None),
                     prelude=prelude)
             except deploy.AgentlessError:
                 break
@@ -2642,7 +2768,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
             try:
                 script_text = deploy.render_agentless_script(
                     box, location, scheduler_name, name, ep_remote, log_remote, site_args,
-                    proxy_prefix=_proxy_prefix(args), port=args.port, engine_pulls_model=engine_pull,
+                    proxy_prefix=_proxy_prefix(args), port=args.port, engine_pulls_model=engine_pull, distributed=getattr(args, "distributed", None),
                     prelude=prelude)
             except deploy.AgentlessError:
                 script_text = ""
@@ -2702,7 +2828,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
         try:
             heal_text = deploy.render_agentless_script(
                 box, location, scheduler_name, name, ep_remote, log_remote, site_args,
-                proxy_prefix=pfx, port=args.port, engine_pulls_model=engine_pull,
+                proxy_prefix=pfx, port=args.port, engine_pulls_model=engine_pull, distributed=getattr(args, "distributed", None),
                 prelude=prelude)
         except deploy.AgentlessError:
             return False
@@ -3064,7 +3190,8 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
         try:
             script_text = deploy.render_agentless_script(
                 box, aloc, scheduler_name, name, str(jobs.endpoint_path(name)),
-                output_log, site_args, proxy_prefix=_proxy_prefix(args), port=args.port)
+                output_log, site_args, proxy_prefix=_proxy_prefix(args), port=args.port,
+                distributed=getattr(args, "distributed", None))
         except deploy.AgentlessError as e:
             print(f"boxy: agentless: {e}", file=sys.stderr)
             return 2
@@ -3102,7 +3229,8 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
                 if getattr(args, "agentless", False):
                     script_text = deploy.render_agentless_script(
                         box, aloc, scheduler_name, name, str(jobs.endpoint_path(name)),
-                        output_log, site_args, proxy_prefix=_proxy_prefix(args), port=args.port)
+                        output_log, site_args, proxy_prefix=_proxy_prefix(args), port=args.port,
+                        distributed=getattr(args, "distributed", None))
                 else:
                     script_text = scheduler.batch_script(inner, location, name, output_log,
                                                          site_args, distributed=want_distributed)
@@ -3521,16 +3649,16 @@ def _delegate_remote(args, tunnel_ready: bool = False) -> int | None:
 
     # Fully-agentless serve is the DEFAULT over --ssh — NOTHING is installed on the
     # HPC. A batch-eligible model serve (not --foreground/--box/--here, single
-    # instance) is rendered + submitted + polled from the laptop. Opt out with
-    # --delegate / BOXY_SSH_DELEGATE=1 to run the cluster's own boxy (needed for
-    # --replicas / --distributed / --box, which the agentless path doesn't cover yet).
+    # instance) is rendered + submitted + polled from the laptop. Multi-node
+    # (--nodes N / --distributed) is covered: the batch script fans the Ray
+    # workers out itself. Opt out with --delegate / BOXY_SSH_DELEGATE=1 to run
+    # the cluster's own boxy (needed for --replicas, which agentless doesn't cover).
     if (getattr(args, "subcommand", None) == "serve"
             and bool(getattr(args, "model", None))
             and not getattr(args, "foreground", False)
             and not getattr(args, "box", None)
             and not getattr(args, "here", False)
             and (getattr(args, "replicas", 1) or 1) == 1
-            and getattr(args, "distributed", None) is not True
             and not getattr(args, "delegate", False)
             and not os.environ.get("BOXY_SSH_DELEGATE")
             and config.get_bool("serve.agentless_ssh")):
@@ -4354,7 +4482,8 @@ def _agentless_script(box: Box, location: Location, scheduler_name: str, name: s
                    else jobs.log_path(name))
     ep = endpoint_file or str(jobs.endpoint_path(name))
     return deploy.render_agentless_script(box, location, scheduler_name, name, ep, log_file,
-                                          site_args, proxy_prefix=_proxy_prefix(args), port=args.port)
+                                          site_args, proxy_prefix=_proxy_prefix(args), port=args.port,
+                                          distributed=getattr(args, "distributed", None))
 
 
 def _generate_agentless(args: argparse.Namespace) -> int:
@@ -4622,6 +4751,22 @@ def _agentless_stop(args, record: dict, name: str) -> int:
 def cmd_stop(args: argparse.Namespace) -> int:
     from boxy import jobs as _jobs
 
+    if getattr(args, "all", False):
+        # kill EVERY live boxy job this machine knows about (agentless + local
+        # scheduler records) — the panic button / end-of-demo sweep.
+        stopped = failed = 0
+        for rec in _jobs.list_records():
+            sub = argparse.Namespace(**{**vars(args), "name": rec["name"], "all": False})
+            try:
+                rc1 = cmd_stop(sub)
+            except (UsageError, RuntimeError) as e:
+                print(f"boxy stop: {rec['name']}: {e}", file=sys.stderr)
+                rc1 = 1
+            stopped += (rc1 == 0)
+            failed += (rc1 != 0)
+        print(f"### stopped {stopped} job(s)" + (f", {failed} failed" if failed else ""))
+        return 0 if failed == 0 else 1
+
     # an AGENTLESS record is handled from HERE over the master — even with --ssh
     # (boxy's own output says `boxy stop NAME --ssh <target>`): the cluster's boxy
     # (if any) has no record of this job and would no-op/fail.
@@ -4775,8 +4920,12 @@ def _list_local_containers(runtime: str, dryrun: bool, have_records: bool) -> in
         print(f"  (no local {runtime} containers on this host — instances run on the "
               f"compute nodes listed above)")
         return 0
-    sys.stderr.write(proc.stderr)                       # nothing else to show — be honest
-    return proc.returncode
+    # nothing served anywhere is an EMPTY list, not an error (field: a dead
+    # docker daemon made plain `boxy list` exit 1) — say so, keep the runtime's
+    # own complaint visible on stderr for the curious, and exit 0.
+    print(f"no boxy instances found (no job records, and {runtime} isn't responding here)")
+    sys.stderr.write(proc.stderr)
+    return 0
 
 
 def _report_exited_containers(runtime: str) -> None:
@@ -5056,17 +5205,29 @@ def cmd_open(args: argparse.Namespace) -> int:
 
 
 def cmd_bench(args: argparse.Namespace) -> int:
-    from boxy import bench
+    """Benchmark WHATEVER is being served — turnkey like curl/open: no args =
+    the newest live instance's endpoint from the job records; NAME picks one;
+    --ssh runs the bench ON the cluster (where compute-node hostnames resolve);
+    --url / legacy --box pin the endpoint explicitly."""
+    rc = _delegate_remote(args)
+    if rc is not None:
+        return rc
 
-    from boxy import engines
+    from boxy import bench, engines
 
-    box = Box.from_toml(args.box)
-    # the port precedence bench sees must match what serve binds (r2 audit):
-    # [box.args] port > ports[0] > engine default
-    args_port = box.args.get("port")
-    default = (int(args_port) if isinstance(args_port, int) and not isinstance(args_port, bool)
-               else box.ports[0] if box.ports else engines.default_port(box.engine))
-    url = args.url or f"http://127.0.0.1:{default}"
+    if args.url:
+        url = args.url.rstrip("/").removesuffix("/v1")
+    elif args.box:
+        box = Box.from_toml(args.box)
+        # the port precedence bench sees must match what serve binds (r2 audit):
+        # [box.args] port > ports[0] > engine default
+        args_port = box.args.get("port")
+        default = (int(args_port) if isinstance(args_port, int) and not isinstance(args_port, bool)
+                   else box.ports[0] if box.ports else engines.default_port(box.engine))
+        url = f"http://127.0.0.1:{default}"
+    else:
+        _name, ep = _select_endpoint(getattr(args, "name", None), "bench")
+        url = ep["url"]
     try:
         batch_sizes = ([int(b) for b in args.batch_sizes.split(",")]
                        if args.batch_sizes else bench.DEFAULT_BATCH_SIZES)
@@ -5090,10 +5251,15 @@ def cmd_bench(args: argparse.Namespace) -> int:
         print(report.to_json())
     else:
         print(f"# model={report.model} url={report.url} max_tokens={report.max_tokens}")
-        print(f"{'batch':>6} {'ok':>4} {'err':>4} {'req/s':>8} {'tok/s':>9} {'p50 ms':>9} {'p95 ms':>9}")
+        print(f"{'batch':>6} {'ok':>4} {'err':>4} {'req/s':>8} {'tok/s':>9} "
+              f"{'TTFT p50':>9} {'TTFT p99':>9} {'TPOT':>7} {'ITL p99':>8} {'E2E p50':>9} {'E2E p95':>9}")
         for r in report.results:
             print(f"{r.batch_size:>6} {r.ok:>4} {r.errors:>4} {r.requests_per_s:>8.2f} "
-                  f"{r.tokens_per_s:>9.1f} {r.latency_p50_ms:>9.1f} {r.latency_p95_ms:>9.1f}")
+                  f"{r.tokens_per_s:>9.1f} {r.ttft_p50_ms:>9.1f} {r.ttft_p99_ms:>9.1f} "
+                  f"{r.tpot_mean_ms:>7.1f} {r.itl_p99_ms:>8.1f} "
+                  f"{r.latency_p50_ms:>9.1f} {r.latency_p95_ms:>9.1f}")
+        print("# ms columns; TTFT=time to first token, TPOT=mean per-token, ITL=inter-token gap "
+              "(vLLM bench-serve metric set, measured via streaming)")
     if args.output:
         with open(args.output, "w") as f:
             f.write(report.to_csv())
@@ -5363,6 +5529,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="accelerator of the TARGET cluster, for the default image pick (default cuda)")
     p.add_argument("--skip-image", dest="skip_image", action="store_true",
                    help="skip pulling/saving the container image (stage it out of band)")
+    p.add_argument("--bake", action="store_true",
+                   help="build a derived image with the card's pip deps INSTALLED "
+                        "(FROM engine image + pip install) and bundle THAT — the "
+                        "air-gapped container then starts with no pip step")
     p.set_defaults(func=cmd_bundle, location=None, box=None)
 
     p = sub.add_parser("app", help="run an HPC application/benchmark from an APP CARD "
@@ -5650,9 +5820,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", default=None, help="write to file instead of stdout")
     p.set_defaults(func=cmd_generate)
 
-    p = sub.add_parser("bench", help="throughput/latency sweep against a served box (paper's step 5)")
-    p.add_argument("--box", required=True)
-    p.add_argument("--url", default=None, help="endpoint (default: http://127.0.0.1:<box port>)")
+    p = sub.add_parser("bench", help="throughput/latency sweep against a SERVED model: "
+                                     "`boxy bench` (newest instance), `boxy bench NAME`, "
+                                     "`boxy bench --ssh user@login` (bench ON the cluster), "
+                                     "or --url/--box explicitly (paper's step 5)")
+    p.add_argument("name", nargs="?", default=None,
+                   help="served instance name from `boxy list` (default: the newest live one)")
+    p.add_argument("--box", default=None, help="legacy: a box TOML (port taken from it)")
+    p.add_argument("--ssh", default=None, metavar="USER@HOST",
+                   help="run the bench ON that cluster (compute-node hostnames resolve there)")
+    p.add_argument("--url", default=None, help="endpoint (default: the instance's recorded endpoint)")
     p.add_argument("--batch-sizes", default=None, help="comma list, default 1,2,4,...,1024")
     p.add_argument("--max-tokens", type=int, default=32)
     p.add_argument("--dataset", default=None, help="JSON list of prompts or ShareGPT JSON")
@@ -5763,6 +5940,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dryrun", action="store_true")
     p.set_defaults(func=cmd_launch)
 
+    p = sub.add_parser("clean", help="sweep deployment debris: records/scripts/logs of "
+                                     "FINISHED jobs (laptop + cluster shared FS), exited boxy "
+                                     "containers; --deep clears the cluster agentless dir "
+                                     "(model cache kept unless --hfcache)")
+    p.add_argument("--ssh", default=None, metavar="USER@HOST",
+                   help="also deep-clean this cluster's agentless dir (with --deep)")
+    p.add_argument("--deep", action="store_true",
+                   help="remove the cluster agentless dir contents (except hfcache)")
+    p.add_argument("--hfcache", action="store_true",
+                   help="with --deep: ALSO delete the shared-FS model cache (re-download next serve)")
+    p.add_argument("--runtime", default=None, help="container runtime for the exited-container prune")
+    p.add_argument("--dryrun", action="store_true", help="show what would be removed")
+    p.set_defaults(func=cmd_clean, location=None, box=None)
+
     p = sub.add_parser("stop", help="stop (and remove) a boxy-served container")
     p.add_argument("name", nargs="?", default=None,
                    help="container name from the READY banner or `boxy list`; alternative: --box")
@@ -5772,6 +5963,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ssh", default=None, metavar="USER@HOST",
                    help="run on that cluster's login node over SSH (reuses the boxy SSH session)")
     p.add_argument("--dryrun", action="store_true")
+    p.add_argument("--all", action="store_true",
+                   help="stop EVERY live boxy job this machine has records for")
     p.set_defaults(func=cmd_stop)
 
     p = sub.add_parser("list", help="list running boxy-launched containers")

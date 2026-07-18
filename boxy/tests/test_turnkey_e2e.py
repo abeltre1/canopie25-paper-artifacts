@@ -612,7 +612,7 @@ def test_ssh_agentless_default_renders_self_contained_script(ssh, capfd, monkeyp
 
 def test_ssh_delegate_flag_forces_the_cluster_boxy(ssh, capfd, monkeypatch):
     # --delegate opts out of agentless and runs the cluster's own boxy (the old
-    # path) — for --replicas/--distributed/--box, or a cluster that has boxy.
+    # path) — for --replicas/--box, or a cluster that has boxy.
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
     monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
     rc = main(["serve", MODEL, "--scheduler", "slurm", "--delegate", "--ssh", "user@hops", "--dryrun"])
@@ -621,6 +621,27 @@ def test_ssh_delegate_flag_forces_the_cluster_boxy(ssh, capfd, monkeypatch):
     assert "Agentless (no boxy on the cluster)" not in cap.out
     assert "$ boxy serve" in cap.out                       # delegated to the cluster boxy
     assert "--delegate" not in ssh["ssh_log"].read_text()  # laptop-only flag, not forwarded
+
+
+def test_ssh_agentless_multinode_ray(ssh, capfd, monkeypatch):
+    # `boxy serve MODEL --nodes 2 --gpus 4 --ssh hops`: STILL agentless — the
+    # batch script itself runs the Ray head + vllm (TP=4 x PP=2) on the head
+    # node and sruns the worker container onto the other node. No cluster boxy.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--nodes", "2", "--gpus", "4",
+               "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "Agentless (no boxy on the cluster)" in cap.out
+    assert "auto: distributed vLLM across 2 nodes via Ray" in cap.out
+    assert "tensor-parallel=4" in cap.out and "pipeline-parallel=2" in cap.out
+    assert "#SBATCH --nodes=2" in cap.out and "#SBATCH --ntasks-per-node=1" in cap.out
+    assert "ray start --head" in cap.out
+    assert "srun --nodes=1 --ntasks=1 --ntasks-per-node=1" in cap.out
+    assert "ray start --address=${BOXY_RAY_HEAD}" in cap.out
+    assert "--tensor-parallel-size=4" in cap.out and "--pipeline-parallel-size=2" in cap.out
+    assert "$ boxy serve" not in cap.out                   # never the delegated path
 
 
 def test_ssh_agentless_flux_bank_and_engine_pull(ssh, capfd, monkeypatch):
@@ -802,7 +823,50 @@ def test_ssh_agentless_persistent_hf_cache_on_shared_fs(ssh, capfd, monkeypatch)
     assert "auto: model cache:" in cap.out and "hfcache" in cap.out
     assert "hfcache:/root/.cache/huggingface" in cap.out           # the bind mount
     assert "HF_HOME=/root/.cache/huggingface" in cap.out           # engine writes there
-    assert 'mkdir -p "$(dirname "${_EP}")/hfcache"' in cap.out     # created at runtime
+    assert "mkdir -p " in cap.out and "/hfcache" in cap.out        # bind source made at runtime
+    assert "auto: model store:" in cap.out                         # where it lives is a decision
+
+
+def test_ssh_agentless_model_store_discovers_scratch_fs(ssh, capfd, monkeypatch, tmp_path):
+    # FIELD: the HF cache under ~/.local/share/... exhausted the user's $HOME
+    # quota. Unpinned, boxy probes the login node's scratch ladder ($SCRATCH
+    # first) and puts the cache THERE — and remembers the pick per cluster so
+    # the location never wanders between runs.
+    scratch = tmp_path / "big-scratch"
+    scratch.mkdir()
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("BOXY_MODEL_DIR", "")                # opt back into discovery
+    monkeypatch.setenv("BOXY_MIN_FREE_GB", "0")             # any tmpfs passes in CI
+    monkeypatch.setenv("SCRATCH", str(scratch))             # fake ssh probes locally
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert f"auto: model store: hops:{scratch}/boxy" in cap.out
+    assert "GB free" in cap.out
+    assert f"{scratch}/boxy/hfcache:/root/.cache/huggingface" in cap.out
+    assert f"mkdir -p {scratch}/boxy/hfcache" in cap.out    # bind source, not $HOME
+    # dryrun never persists the pick; a real submit writes the per-cluster sticky
+    from boxy import jobs
+    assert not (jobs._dir() / ".model-store-hops").exists()
+
+
+def test_ssh_agentless_model_store_home_fallback_warns(ssh, capfd, monkeypatch):
+    # No scratch FS found (probe finds nothing): cache stays under $HOME — but
+    # LOUDLY, with the quota warning and the BOXY_MODEL_DIR escape hatch.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("BOXY_MODEL_DIR", "")
+    monkeypatch.delenv("SCRATCH", raising=False)
+    monkeypatch.setenv("BOXY_MIN_FREE_GB", "1000000")       # nothing can clear the bar…
+    from boxy import site
+    monkeypatch.setattr(site, "MODEL_STORE_LADDER", ('"$SCRATCH"',))  # …and no real /scratch
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "no shared scratch FS found" in cap.err
+    assert "BOXY_MODEL_DIR" in cap.err
+    assert ".local/share/boxy/agentless/hops/hfcache:/root/.cache/huggingface" in cap.out
 
 
 def test_agentless_list_logs_stop_answer_from_laptop_records(ssh, capfd, monkeypatch, tmp_path):
