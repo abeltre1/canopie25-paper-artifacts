@@ -376,3 +376,35 @@ def generate(repo: str, *, engine: str = "", max_model_len: int | None = None,
     text = render_card(repo, eng, sizing, trust_remote_code=trust, vlm=vlm)
     validate(text, repo)
     return text, eng, warnings
+
+
+def auto_card(model: str):
+    """SERVE-TIME determinism: no card matched `model`, so derive one from the
+    model's own HuggingFace metadata (config.json + safetensors index — exact
+    on-disk bytes, dtype, quantization; nvidia/* models publish there too) and
+    WRITE it to the user cards dir. The serve then runs off a durable card, not
+    a name guess — and every later serve (or air-gap bundle) loads the same
+    file without re-fetching. Returns (ModelCard, written_path_or_"") on
+    success, (None, why) on any failure — autogen must never break a serve."""
+    from boxy import cards
+
+    repo = cards.model_key(model)
+    try:
+        text, _eng, _warns = generate(repo)
+    except CardGenError as e:
+        return None, str(e)
+    except Exception as e:  # noqa: BLE001 — a serve must survive any autogen surprise
+        return None, f"card generation failed unexpectedly: {e}"
+    dest = cards._user_dir() / f"{slug(repo)}.toml"
+    wrote = ""
+    try:
+        if not dest.exists():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(text)
+            wrote = str(dest)
+    except OSError:
+        pass  # read-only FS: the in-memory card still serves this run
+    try:
+        return cards._parse_card(text, slug(repo), "generated", str(dest)), wrote
+    except ValueError as e:
+        return None, f"generated card failed validation: {e}"

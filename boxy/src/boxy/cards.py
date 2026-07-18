@@ -253,9 +253,55 @@ def size_heuristic(model: str) -> ModelCard | None:
     return None
 
 
+# provenance of the LAST resolve_model_card autogen attempt, for the decision
+# lines: "note" = path a generated card was written to, "fail" = why generation
+# fell back to the name heuristic. apply_to_args consumes (and clears) these.
+_last_autogen = {"note": "", "fail": ""}
+
+
+def _autogen_model_id(model: str) -> str:
+    """The bare HF id `model` names, or '' when autogen must not fire: only a
+    plain 'org/name' (bare or hf://-prefixed) can be looked up on the Hub —
+    never local paths, GGUF file refs, oci/ollama/modelscope URIs."""
+    low = model.strip().lower()
+    if low.startswith(("oci://", "docker://", "ollama://", "ms://", "modelscope://", "rlcr://", "s3://")):
+        return ""
+    key = model_key(model)
+    if key.count("/") != 1 or key.startswith(("/", ".", "~")) or os.path.exists(key):
+        return ""
+    if key.lower().endswith((".gguf", ".safetensors", ".bin")):
+        return ""
+    return key
+
+
+def _autogen_enabled() -> bool:
+    if os.environ.get("HF_HUB_OFFLINE") == "1":  # air-gapped: never call the Hub
+        return False
+    from boxy import config
+
+    return config.get_bool("cards.autogen")
+
+
 def resolve_model_card(model: str) -> ModelCard | None:
-    """Card if one matches, else the size heuristic, else None."""
-    return find_card(model) or size_heuristic(model)
+    """Card if one matches; else GENERATE one deterministically from the model's
+    HuggingFace metadata (written to the user cards dir — fetched once, loaded
+    as a plain user card forever after); else the name-size heuristic (loudly
+    labeled a guess by apply_to_args). The guess is now the last resort, not
+    the default for unknown models."""
+    card = find_card(model)
+    if card:
+        return card
+    _last_autogen["note"] = _last_autogen["fail"] = ""
+    hf_id = _autogen_model_id(model)
+    if hf_id and _autogen_enabled():
+        from boxy import cardgen
+
+        generated, msg = cardgen.auto_card(hf_id)
+        if generated is not None:
+            _last_autogen["note"] = msg
+            return generated
+        _last_autogen["fail"] = msg
+    return size_heuristic(model)
 
 
 # ---- system cards (per-system-type deployment profiles) ---------------------------
@@ -365,6 +411,15 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None) -> list[str]:
     card = resolve_model_card(model)
     if card is None:
         return decisions
+    if card.source == "generated":
+        wrote = f" -> {_last_autogen['note']}" if _last_autogen["note"] else ""
+        decisions.append(
+            f"card: generated deterministically from HuggingFace metadata "
+            f"(~{card.min_vram_gb}GB weights, engine {card.engine or 'vllm'}){wrote}")
+    elif card.source == "heuristic" and _last_autogen["fail"]:
+        decisions.append(
+            f"card: {_last_autogen['fail']} — geometry below is a NAME GUESS; run "
+            f"`boxy generate card {model_key(model)}` from a connected machine for the real numbers")
     gpus_free = getattr(args, "gpus", None) is None
     nodes_free = getattr(args, "nodes", None) is None
     if gpus_free and nodes_free and card.min_vram_gb and not card.nodes:

@@ -283,6 +283,15 @@ boxy serve <model> --scheduler flux --gpus 4 --partition pbatch      # Flux: ide
 boxy serve <model> --scheduler flux --gpus 4 --unique   # repeat freely, no name clash
 # (default name is a stable singleton so a plain rerun reconnects instead of duplicating.)
 
+# CARDS ARE DETERMINISTIC, NOT GUESSED. Serving an UNCARDED model generates its
+# card on the spot from the model's own HuggingFace metadata (config.json +
+# safetensors index — exact on-disk bytes, dtype, quantization; nvidia/* models
+# publish there too) and writes it to ~/.config/boxy/cards/models/ — fetched
+# once, loaded as a plain user card forever after (and carried into air-gap
+# bundles). The old name-size guess only fires when the Hub is unreachable, and
+# says so: "geometry below is a NAME GUESS; run `boxy generate card <id>`".
+# BOXY_CARD_AUTOGEN=false disables the lookup (HF_HUB_OFFLINE=1 also skips it).
+
 # GEOMETRY IS SOLVED FROM CARDS — no --gpus/--nodes needed. The model card's
 # min_vram_gb (demand) is fit against the cluster's node shape (supply): write a
 # SYSTEM card for your cluster once and every serve sizes itself —

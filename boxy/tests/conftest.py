@@ -36,6 +36,9 @@ def _isolate_config(monkeypatch, tmp_path):
     # the HF architecture preflight does a live Hub fetch; keep it off for the
     # suite (no network calls per test) — the preflight tests opt back in.
     monkeypatch.setenv("BOXY_NO_PREFLIGHT", "1")
+    # ditto serve-time card AUTOGEN (a live HuggingFace fetch for uncarded
+    # models): off for the suite; the autogen tests opt in with a fixture Hub.
+    monkeypatch.setenv("BOXY_CARD_AUTOGEN", "false")
     # ditto remote account injection (a dev box may carry sacctmgr/mywcid,
     # making --ssh serve tests nondeterministic); e2e tests opt back in.
     monkeypatch.setenv("BOXY_NO_REMOTE_ACCOUNT", "1")

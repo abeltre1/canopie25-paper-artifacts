@@ -1785,3 +1785,28 @@ def test_ssh_model_bigger_than_a_node_goes_multinode_zero_flags(ssh, capfd, monk
     assert "#SBATCH --nodes=4" in cap.out and "#SBATCH --ntasks-per-node=1" in cap.out
     assert "ray start --head" in cap.out                  # the multinode agentless script
     assert "--tensor-parallel-size=4" in cap.out and "--pipeline-parallel-size=4" in cap.out
+
+
+def test_ssh_uncarded_model_autogenerates_card_deterministically(ssh, capfd, monkeypatch, tmp_path):
+    # Full turnkey determinism: an UNCARDED model over --ssh generates its card
+    # from HF metadata (fixture Hub here), the GEOMETRY comes from that card's
+    # real byte count (the name would have guessed 8 GPUs for "450B" — the index
+    # says ~18GB -> 1), and the card lands on disk for every later serve.
+    from boxy import cardgen
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    monkeypatch.setenv("BOXY_CARD_AUTOGEN", "true")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    fixture = {"config": {"architectures": ["LlamaForCausalLM"], "torch_dtype": "bfloat16",
+                          "max_position_embeddings": 131072},
+               "index": {"metadata": {"total_size": 18_000_000_000}}, "generation": None}
+    monkeypatch.setattr(cardgen, "fetch_model", lambda repo, token="", **kw: fixture)
+    rc = main(["serve", "acme/Custom-Dense-450B", "--scheduler", "slurm",
+               "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "generated deterministically from HuggingFace metadata" in cap.out
+    assert "auto: gpus: 1 per node" in cap.out            # bytes, not the 450B name
+    assert "#SBATCH --gpus-per-node=1" in cap.out
+    assert (tmp_path / "xdg" / "boxy" / "cards" / "models" / "acme-custom-dense-450b.toml").exists()

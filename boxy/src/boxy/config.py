@@ -222,6 +222,14 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
             help="accelerator assumed for a GPU job submitted from a GPU-less login node "
                  "(where detection sees no device). --accelerator / a --location profile win."),
 
+    # -- model cards -----------------------------------------------------------
+    Setting("cards.autogen", "BOXY_CARD_AUTOGEN", "true",
+            help="when no card matches a served model, GENERATE one deterministically "
+                 "from its HuggingFace metadata (config.json + safetensors index) and "
+                 "write it to the user cards dir — the name-size heuristic then only "
+                 "fires when the Hub is unreachable, loudly labeled a guess. false "
+                 "disables the Hub lookup (air-gapped sites; HF_HUB_OFFLINE=1 also skips it)."),
+
     # -- node hardware (the geometry solver's supply side) ---------------------
     Setting("site.gpus_per_node", "BOXY_GPUS_PER_NODE", 0, int,
             help="GPUs per compute node on the target system, for the model-card "

@@ -35,6 +35,13 @@ FIXTURES = {
         "index": {"metadata": {"total_size": 11_000_000_000}},   # MXFP4 ~11 GB
         "generation": None,
     },
+    "acme/Custom-Dense-450B": {
+        # the NAME lies (450B); the index says ~9B bf16 — autogen must trust the bytes
+        "config": {"architectures": ["LlamaForCausalLM"], "torch_dtype": "bfloat16",
+                   "max_position_embeddings": 131072},
+        "index": {"metadata": {"total_size": 18_000_000_000}},
+        "generation": None,
+    },
     "meta-llama/Llama-3.3-70B-Instruct": {
         "config": {"architectures": ["LlamaForCausalLM"], "torch_dtype": "bfloat16",
                    "max_position_embeddings": 131072},
@@ -243,3 +250,55 @@ def test_network_unreachable_is_actionable(monkeypatch):
     with pytest.raises(cardgen.CardGenError) as e:
         cardgen.hf_get_json("meta-llama/X", "config.json")
     assert "cannot reach HuggingFace" in str(e.value)
+
+
+# ---- serve-time AUTOGEN: the card replaces the name guess ----------------------------
+
+
+@pytest.fixture
+def autogen_on(monkeypatch, tmp_path):  # _fake_hub is autouse — no live Hub here
+    monkeypatch.setenv("BOXY_CARD_AUTOGEN", "true")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    return tmp_path / "xdg" / "boxy" / "cards" / "models"
+
+
+def test_serve_resolution_generates_card_instead_of_guessing(autogen_on):
+    # an UNCARDED model resolves through the Hub fixtures — deterministic
+    # metadata, not the '-405B' name token — and the card lands on disk.
+    import argparse
+    cards._user_dir().mkdir(parents=True, exist_ok=True)  # fresh user dir
+    a = argparse.Namespace(model="acme/Custom-Dense-450B", gpus=None, nodes=None,
+                          engine=None, args=None)
+    lines = cards.apply_to_args(a)
+    assert any("generated deterministically from HuggingFace metadata" in ln for ln in lines)
+    assert a.gpus == 1                       # 18GB of real bytes -> 1 GPU (name said 450B!)
+    written = autogen_on / "acme-custom-dense-450b.toml"
+    assert written.exists()
+    # second resolution: the FILE serves it — no Hub call, plain user card
+    card = cards.find_card("acme/Custom-Dense-450B")
+    assert card is not None and card.source == "user"
+
+
+def test_autogen_falls_back_to_loud_name_guess(autogen_on):
+    import argparse
+    a = argparse.Namespace(model="acme/Unknown-70B-Instruct", gpus=None, nodes=None,
+                          engine=None, args=None)
+    lines = cards.apply_to_args(a)                         # fixture hub 404s acme/*
+    assert a.gpus == 4                                     # heuristic still sizes it
+    assert any("NAME GUESS" in ln and "boxy generate card" in ln for ln in lines)
+
+
+def test_autogen_never_fires_for_non_hub_refs(autogen_on, monkeypatch):
+    def _explode(model):
+        raise AssertionError("auto_card must not be called")
+
+    monkeypatch.setattr(cardgen, "auto_card", _explode)
+    for ref in ("/lustre/models/llama.q4.gguf", "llama.q4.gguf", "oci://reg/img:tag",
+                "ollama://llama3", "org/repo/file.gguf"):
+        assert cards.resolve_model_card(ref) is None or True   # no raise = pass
+
+
+def test_autogen_disabled_by_offline_env(autogen_on, monkeypatch):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    card = cards.resolve_model_card("acme/Custom-Dense-450B")
+    assert card is not None and card.source == "heuristic"     # straight to the guess
