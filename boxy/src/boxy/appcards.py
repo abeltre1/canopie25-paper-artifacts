@@ -77,7 +77,11 @@ class AppCard:
     # any microservice) instead of a finite run — the job publishes an endpoint
     # file and stays up; boxy waits for the URL rather than the exit.
     service: bool = False
-    port: int = 0                                 # the port the service listens on
+    port: int = 0                                 # HOST port — the URL's port
+    # port INSIDE the container when it differs (whoami/nginx-class images bind
+    # 80 internally; rootless podman can't bind 80 on the HOST, but 8080:80 maps
+    # cleanly — inside its own netns the container may bind 80). 0 = same as port.
+    container_port: int = 0
     env: dict = field(default_factory=dict)       # [app.env] -> container -e K=V
     volumes: list = field(default_factory=list)   # ["src:dst", ...] -> container -v
 
@@ -126,6 +130,7 @@ def _parse_card(text: str, card_name: str, source: str, path: str) -> AppCard:
         run=[str(r) for r in a.get("run", [])],
         sources=[str(s) for s in a.get("sources", [])], sha256=str(a.get("sha256", "")),
         service=service, port=int(a.get("port", 0)),
+        container_port=int(a.get("container_port", 0)),
         env={str(k): str(v) for k, v in env.items()},
         volumes=[str(v) for v in a.get("volumes", [])],
     )
@@ -260,10 +265,22 @@ def render_app_script(card: AppCard, scheduler_name: str, name: str, log_file: s
         # node's hostname:port is the URL.
         if not endpoint_file:
             raise ValueError(f"service card {card.card_name!r} needs an endpoint file to render")
+        if card.port < 1024:
+            raise ValueError(
+                f"service card {card.card_name!r}: host port {card.port} is privileged — "
+                f"rootless podman cannot bind it on a compute node. Use a host port >= 1024 "
+                f"and map the container's own port: port = 8080, container_port = 80 "
+                f"(CLI: --port 8080:80).")
         run_cmd = str(card.run[0]) if card.run else ""
         extra = "".join(f" -e {shlex.quote(f'{k}={v}')}" for k, v in card.env.items())
         extra += "".join(f" -v {shlex.quote(v)}" for v in card.volumes)
-        inner = (f"podman run --rm --name={name} --network=host --label=boxy.box={name}"
+        # -p HOST:CONTAINER instead of host networking: the app keeps its own
+        # internal port (often a privileged 80 it may bind INSIDE its netns) and
+        # the host side publishes an unprivileged one (field: whoami died with
+        # 'listen tcp :80: bind: permission denied' under --network=host).
+        cport = card.container_port or card.port
+        inner = (f"podman run --rm --name={name} -p {card.port}:{cport} "
+                 f"--label=boxy.box={name}"
                  f"{extra} {shlex.quote(card.image)}" + (f" {run_cmd}" if run_cmd else ""))
         body_lines += [
             '_H="$(hostname)"',

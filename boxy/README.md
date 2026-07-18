@@ -98,7 +98,10 @@ choice (nothing is hidden, only the *work*):
   with `--nodes/--tasks-per-node` geometry (`--container` is an alias).
 - **service cards** deploy LONG-RUNNING services — a web server, an MCP
   server, a database, any microservice — with the same agentless pipeline:
-  `boxy app --image docker.io/traefik/whoami --port 8080 --ssh <cluster>`
+  `boxy app --image docker.io/traefik/whoami --port 8080:80 --ssh <cluster>`
+  (`--port HOST[:CONTAINER]` — HOST must be >= 1024: rootless podman can't bind
+  privileged ports on a compute node, so an image that listens on 80 internally
+  gets published as `8080:80`; boxy rejects a privileged host port laptop-side)
   submits a job that publishes its endpoint to the shared FS and stays up;
   boxy waits for the URL (not the exit), prints the `ssh -L` line to reach it,
   and `boxy stop <name> --ssh <cluster>` is the off switch. `--env K=V`

@@ -394,6 +394,7 @@ kind = "container"
 service = true
 image = "docker.io/traefik/whoami:latest"
 port = 8080
+container_port = 80
 [app.env]
 WHOAMI_NAME = "boxy"
 """
@@ -415,7 +416,11 @@ def test_service_script_publishes_endpoint_and_execs_foreground(tmp_path):
     script = appcards.render_app_script(card, "slurm", "app-whoami", "/x/%j.log", [],
                                         endpoint_file="/shared/app-whoami.endpoint.json")
     assert 'cat > "${_EP}.tmp"' in script and '"port": 8080' in script
-    assert "exec podman run --rm --name=app-whoami --network=host" in script
+    # -p HOST:CONTAINER, never --network=host: rootless podman can't bind the
+    # image's own privileged port on the HOST (field: whoami 'listen tcp :80:
+    # bind: permission denied'); inside its netns the container may bind 80.
+    assert "exec podman run --rm --name=app-whoami -p 8080:80" in script
+    assert "--network=host" not in script
     assert "-e 'WHOAMI_NAME=boxy'" in script or "-e WHOAMI_NAME=boxy" in script
     assert "srun" not in script                            # foreground, not a launcher fan-out
     with pytest.raises(ValueError, match="endpoint"):
@@ -425,16 +430,37 @@ def test_service_script_publishes_endpoint_and_execs_foreground(tmp_path):
 def test_cli_adhoc_image_with_port_becomes_service(ssh_cluster, capfd, monkeypatch):
     # `boxy app --image X --port N --ssh HOST`: the user's "deploy any
     # microservice" command — long-running, endpoint published, URL awaited.
-    rc = main(["app", "--image", "docker.io/traefik/whoami:latest", "--port", "8080",
+    rc = main(["app", "--image", "docker.io/traefik/whoami:latest", "--port", "8080:80",
                "--env", "WHOAMI_NAME=boxy", "--ssh", "user@hops", "--dryrun"])
     cap = capfd.readouterr()
     assert rc == 0
     assert "Agentless SERVICE" in cap.out and "boxy stop app-whoami" in cap.out
     assert '"url": "http://${_H}:8080"' in cap.out
+    assert "-p 8080:80" in cap.out
     # exec'd in the FOREGROUND (a proxy env prefix may sit between exec and podman)
-    assert "podman run --rm --name=app-whoami --network=host" in cap.out
     assert any(ln.strip().startswith("exec ") and "--name=app-whoami" in ln
                for ln in cap.out.splitlines())
+
+
+def test_cli_service_privileged_host_port_fails_laptop_side(ssh_cluster, capfd):
+    # FIELD: whoami's entrypoint bound :80 under host networking and died with
+    # 'bind: permission denied' ON THE NODE. Now the mistake is caught before
+    # anything is submitted, with the mapping syntax in the message.
+    rc = main(["app", "--image", "docker.io/traefik/whoami:latest", "--port", "80",
+               "--ssh", "user@hops", "--dryrun"])
+    err = capfd.readouterr().err
+    assert rc == 2
+    assert "privileged" in err and "--port 8080:80" in err
+
+
+def test_svc_ports_parsing():
+    from boxy import cli
+
+    assert cli._svc_ports(None) == (0, 0)
+    assert cli._svc_ports("8080") == (8080, 0)
+    assert cli._svc_ports("8080:80") == (8080, 80)
+    with pytest.raises(cli.UsageError):
+        cli._svc_ports("eighty")
 
 
 def test_cli_service_without_ssh_is_a_clear_error(capfd, monkeypatch, tmp_path):

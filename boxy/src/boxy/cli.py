@@ -1283,9 +1283,12 @@ def cmd_app(args: argparse.Namespace) -> int:
             tasks_per_node=getattr(args, "tasks_per_node", 0) or 1,
             run=[getattr(args, "cmd", None) or ""],   # "" = the image's own entrypoint
             # --port makes the ad-hoc container a SERVICE: long-running, endpoint
-            # published, boxy waits for the URL instead of the exit.
+            # published, boxy waits for the URL instead of the exit. HOST[:CONTAINER]
+            # (8080:80 = publish the image's internal 80 at host 8080 — rootless
+            # podman can't bind privileged ports on the host).
             service=bool(getattr(args, "port", None)),
-            port=getattr(args, "port", None) or 0,
+            port=_svc_ports(getattr(args, "port", None))[0],
+            container_port=_svc_ports(getattr(args, "port", None))[1],
             env=dict(kv.split("=", 1) for kv in (getattr(args, "env", None) or []) if "=" in kv))
         target = getattr(args, "ssh", None) or os.environ.get("BOXY_SSH_HOST", "")
         if card.service and not target:
@@ -1597,6 +1600,20 @@ def _print_tcp_mpi_caveat() -> None:
           "spack install osu-micro-benchmarks ^openmpi fabrics=ucx", file=sys.stderr)
 
 
+def _svc_ports(spec) -> tuple[int, int]:
+    """--port HOST[:CONTAINER] -> (host_port, container_port). (0, 0) when unset;
+    a malformed spec raises a clean UsageError at parse time, not on the node."""
+    if not spec:
+        return 0, 0
+    parts = str(spec).split(":")
+    try:
+        host = int(parts[0])
+        cont = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+    except ValueError:
+        raise UsageError(f"--port wants HOST or HOST:CONTAINER (numbers), not {spec!r}") from None
+    return host, cont
+
+
 def _app_agentless_ssh(args, card, target: str) -> int:
     """Agentless app run over --ssh: render the card's batch script laptop-side,
     push + submit over the one master, then (unless --detach) poll the job to
@@ -1651,12 +1668,16 @@ def _app_agentless_ssh(args, card, target: str) -> int:
     # cluster's fetch and the archive has to be staged from the laptop.
     mirror_remote = f"{rdir}/spack-mirror"
     ep_remote = f"{rdir}/{name}.endpoint.json"
-    script_text = appcards.render_app_script(
-        card, scheduler_name, name, log_remote, site_args,
-        nodes=getattr(args, "nodes", 0) or 0,
-        tasks_per_node=getattr(args, "tasks_per_node", 0) or 0,
-        proxy_prefix=pfx, spack_mirror_dir=(mirror_remote if card.kind == "spack" else ""),
-        proxy_env=penv, endpoint_file=ep_remote)
+    try:
+        script_text = appcards.render_app_script(
+            card, scheduler_name, name, log_remote, site_args,
+            nodes=getattr(args, "nodes", 0) or 0,
+            tasks_per_node=getattr(args, "tasks_per_node", 0) or 0,
+            proxy_prefix=pfx, spack_mirror_dir=(mirror_remote if card.kind == "spack" else ""),
+            proxy_env=penv, endpoint_file=ep_remote)
+    except ValueError as e:  # e.g. a privileged host port — caught laptop-side, not on the node
+        print(f"boxy: {e}", file=sys.stderr)
+        return 2
 
     if card.service:
         print(f"### Agentless SERVICE from {card.label} (no boxy on the cluster): the job "
@@ -5735,11 +5756,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cmd", default=None, metavar="COMMAND",
                    help="command to run inside the --image container (default: the image's "
                         "own entrypoint)")
-    p.add_argument("--port", type=int, default=None,
-                   help="the port the container LISTENS on — makes it a SERVICE (web server, "
-                        "MCP server, database, any microservice): long-running, endpoint "
-                        "published to the shared FS, boxy waits for the URL, `boxy stop` "
-                        "kills it. Service cards set this in [app] port.")
+    p.add_argument("--port", default=None, metavar="HOST[:CONTAINER]",
+                   help="publish the container as a SERVICE (web server, MCP server, database, "
+                        "any microservice): long-running, endpoint published to the shared FS, "
+                        "boxy waits for the URL, `boxy stop` kills it. HOST must be >= 1024 "
+                        "(rootless); use HOST:CONTAINER when the image binds its own port "
+                        "internally — e.g. --port 8080:80 for an nginx/whoami-class image. "
+                        "Service cards set [app] port / container_port.")
     p.add_argument("--env", action="append", default=None, metavar="K=V",
                    help="environment for the service container (repeatable)")
     p.add_argument("--ssh", default=None, metavar="USER@HOST",
