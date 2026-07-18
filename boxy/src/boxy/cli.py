@@ -1267,6 +1267,12 @@ def cmd_app(args: argparse.Namespace) -> int:
     from boxy import appcards
 
     _print_provenance()
+    if getattr(args, "colocate", None) or getattr(args, "nodelist", None):
+        print("boxy: --colocate/--nodelist are DESIGNED but not implemented yet — the "
+              "mechanisms, guardrails, and open questions are in COLOCATION.md (step "
+              "injection vs pinned job, port/CPU/mem non-interference). Nothing was "
+              "submitted.", file=sys.stderr)
+        return 2
     image = getattr(args, "image", None)
     if image:
         # AD-HOC container app — no card needed: boxy app --image quay.io/x/y:tag
@@ -1775,9 +1781,14 @@ def _app_agentless_ssh(args, card, target: str) -> int:
         while _time.time() < deadline:
             erc, eout = remote.ssh_capture(target, f"cat {shlex.quote(ep_remote)} 2>/dev/null",
                                            timeout=15)
-            if erc == 0 and eout.strip().startswith("{"):
+            # ssh output may carry a login BANNER/MOTD before the JSON (field:
+            # cronus — READY never fired because the output didn't START with
+            # '{'; same noise the job-id parser tolerates). Scan for the JSON.
+            ep_lines = [ln.strip() for ln in (eout or "").splitlines()
+                        if ln.strip().startswith("{")]
+            if erc == 0 and ep_lines:
                 try:
-                    ep = json.loads(eout.strip().splitlines()[-1])
+                    ep = json.loads(ep_lines[-1])
                 except json.JSONDecodeError:
                     ep = {}
                 url = ep.get("url", "")
@@ -4490,6 +4501,46 @@ def cmd_generate_card(args: argparse.Namespace) -> int:
     return 0
 
 
+def _generate_local_system_card(args, cap, cluster: str) -> int:
+    """System card for THIS machine (no scheduler): its own CPUs/memory/GPUs,
+    one node, scheduler 'none' — so the geometry solver sizes local serves the
+    same way it sizes cluster ones."""
+    from boxy import cards, site
+
+    rc, nout = cap("nproc 2>/dev/null")
+    cpus = int(nout.strip() or 0) if rc == 0 and nout.strip().isdigit() else 0
+    rc, mout = cap("grep MemTotal /proc/meminfo 2>/dev/null")
+    mem_gb = 0
+    m = re.search(r"(\d+)\s*kB", mout or "")
+    if rc == 0 and m:
+        mem_gb = int(int(m.group(1)) / 1024 / 1024)
+    hrc, hout = cap(site.gpu_hw_probe(), timeout=60)
+    gtype, gvram, gcount = site.parse_gpu_hw(hout if hrc == 0 else "")
+    accel = "cuda" if (gtype and "nvidia" in gtype.lower()) else ("rocm" if gtype else "")
+    inv = {"total_nodes": 1, "total_gpu_nodes": 1 if gcount else 0,
+           "gpus_per_node": gcount, "gpu_type": gtype,
+           "gpu_vram_gb": gvram, "vram_note": "measured on this machine",
+           "cpus_per_node": cpus, "mem_gb_per_node": mem_gb,
+           "modal_count": 1, "shapes": []}
+    print(f"  auto: local hardware: {cpus} CPUs, {mem_gb}GB RAM"
+          + (f", {gcount}x {gtype} ({gvram}GB)" if gcount else ", no GPUs"))
+    text = site.render_system_card(cluster, "none", accel, "", inv, [])
+    if getattr(args, "dryrun", False):
+        print(text, end="")
+        return 0
+    dest = cards._user_systems_dir() / f"{cluster}.toml"
+    if dest.exists() and not getattr(args, "force", False):
+        print(f"boxy: {dest} already exists — pass --force to regenerate (keeps a .bak), "
+              f"or --dry-run to preview", file=sys.stderr)
+        return 1
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.replace(dest.with_suffix(".toml.bak"))
+    dest.write_text(text)
+    print(f"### System card written: {dest}")
+    return 0
+
+
 def cmd_generate_system(args: argparse.Namespace) -> int:
     """`boxy generate system --ssh HOST`: probe the CLUSTER's own inventory —
     scheduler (sinfo/flux know every compute node's CPUs/memory/GRES), the
@@ -4520,9 +4571,14 @@ def cmd_generate_system(args: argparse.Namespace) -> int:
     rc, avail = cap(site.remote_scheduler_probe())
     scheduler, why = site.pick_scheduler(avail if rc == 0 else "", None)
     if scheduler not in ("slurm", "flux"):
-        print(f"boxy: no live scheduler found on {host} ({why}) — a system card needs "
-              f"one for the node inventory", file=sys.stderr)
-        return 1
+        if target:
+            print(f"boxy: no live scheduler found on {host} ({why}) — a system card for a "
+                  f"CLUSTER needs one for the node inventory", file=sys.stderr)
+            return 1
+        # LOCAL machine (laptop/workstation): card THIS host's own hardware —
+        # scheduler 'none', one node, GPUs straight from nvidia-smi/rocm.
+        print("  auto: no scheduler here — carding the LOCAL machine itself")
+        return _generate_local_system_card(args, cap, cluster)
     print(f"  auto: scheduler: {scheduler} ({why})")
     rc, aout = cap(site.remote_accel_probe())
     accel = site.parse_remote_accel(aout if rc == 0 else "")
@@ -4543,6 +4599,22 @@ def cmd_generate_system(args: argparse.Namespace) -> int:
         print(f"boxy: the {scheduler} inventory probe returned nothing usable on {host} — "
               f"is the scheduler answering? (sinfo -N / flux resource list)", file=sys.stderr)
         return 1
+    if inv.get("gpus_per_node") and not site.gpu_vram_from_type(inv.get("gpu_type", ""))[0]:
+        # TYPELESS GRES ('gpu:4') or an unknown token: ask the HARDWARE — load
+        # the rocm module and read rocm-smi/rocminfo, or nvidia-smi (which
+        # reports VRAM exactly). Field: a 274-node system whose card came out
+        # 'unknown GPU type'.
+        hrc, hout = cap(site.gpu_hw_probe(), timeout=60)
+        htype, hvram, _hcount = site.parse_gpu_hw(hout if hrc == 0 else "")
+        if htype:
+            inv["gpu_type"] = inv.get("gpu_type") or htype
+            if hvram:
+                inv["gpu_vram_gb"] = hvram
+                inv["vram_note"] = (f"probed on {host}'s login node ({htype}) — verify the "
+                                    f"COMPUTE nodes carry the same parts")
+            print(f"  auto: gpu hardware probe: {htype}"
+                  + (f" ({hvram}GB)" if hvram else "")
+                  + f" (rocm/nvidia userland on {host} — the scheduler's GRES was typeless)")
     shape = (f"{inv['gpus_per_node']}x {inv.get('gpu_type') or 'gpu'}" if inv.get("gpus_per_node")
              else "no GPUs")
     print(f"  auto: inventory: {inv['total_nodes']} nodes ({inv.get('total_gpu_nodes', 0)} with GPUs); "
@@ -5780,6 +5852,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "Service cards set [app] port / container_port.")
     p.add_argument("--env", action="append", default=None, metavar="K=V",
                    help="environment for the service container (repeatable)")
+    p.add_argument("--colocate", default=None, metavar="NAME",
+                   help="PLANNED (not implemented): bin-pack this service onto the node of an "
+                        "already-running boxy service/job — see COLOCATION.md for the design")
+    p.add_argument("--nodelist", default=None, metavar="NODE",
+                   help="PLANNED (not implemented): pin this service to a specific node — "
+                        "see COLOCATION.md")
     p.add_argument("--ssh", default=None, metavar="USER@HOST",
                    help="run on that cluster over one multiplexed SSH session (agentless: "
                         "the cluster needs only spack or podman, never boxy)")

@@ -627,3 +627,81 @@ def test_generate_system_cli_end_to_end(tmp_path, monkeypatch, capsys):
     assert main(["generate", "system", "--ssh", "user@hops"]) == 1
     assert main(["generate", "system", "--ssh", "user@hops", "--force"]) == 0
     assert dest.with_suffix(".toml.bak").exists()
+
+
+def test_gpu_hw_probe_parses_nvidia_rocm_gfx():
+    from boxy import site
+
+    t, v, c = site.parse_gpu_hw("NV: NVIDIA H200, 143771 MiB\nNVCOUNT: 4\n")
+    assert (t, v, c) == ("NVIDIA H200", 140, 4)              # VRAM measured, no table
+    t, v, _ = site.parse_gpu_hw("banner noise\nROCM: Card series: AMD Instinct MI300A\n")
+    assert t == "MI300A" and v == 128                        # name -> table
+    t, v, _ = site.parse_gpu_hw("GFX: gfx942\n")
+    assert t == "mi300a" and v == 128                        # arch -> family -> table
+    assert site.parse_gpu_hw("") == ("", 0, 0)
+
+
+def test_generate_system_typeless_gres_falls_back_to_hw_probe(tmp_path, monkeypatch, capsys):
+    # FIELD: 274-node system whose GRES is 'gpu:4' (no type token) — the card
+    # came out 'unknown GPU type'. Now the generator loads the rocm module and
+    # asks the hardware.
+    from boxy import cards, remote
+    from boxy.cli import main
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(remote, "ensure_master", lambda host: 0)
+
+    def fake_capture(target, cmd, timeout=30):
+        if "sinfo -h -N" in cmd:
+            return 0, "n[001]|96|768000|gpu:4\nn002|96|768000|gpu:4\n"
+        if "rocm-smi" in cmd or "nvidia-smi" in cmd:         # the hw probe
+            return 0, "ROCM: Card series: AMD Instinct MI300A\nGFX: gfx942\n"
+        if "instance-level" in cmd or "sbatch" in cmd:
+            return 0, "slurm-bin\nslurm-ctld\nslurm-live\n"
+        if "sinfo -h -o %G" in cmd:
+            return 0, "rocm\n"
+        if "df -Pk" in cmd:
+            return 0, ""
+        if "podman" in cmd:
+            return 0, "podman\n"
+        return 1, ""
+
+    monkeypatch.setattr(remote, "ssh_capture", fake_capture)
+    rc = main(["generate", "system", "--ssh", "user@eldorado"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "gpu hardware probe: MI300A (128GB)" in out
+    assert cards.system_shape("eldorado") == (4, 128, "eldorado")
+    text = (tmp_path / "boxy" / "cards" / "systems" / "eldorado.toml").read_text()
+    assert "gpu_vram_gb = 128" in text and "verify the COMPUTE nodes" in text
+
+
+def test_generate_system_local_machine_without_scheduler(tmp_path, monkeypatch, capsys):
+    # `boxy generate system` on a laptop/workstation: no scheduler -> card THIS
+    # machine (nproc/meminfo/GPU probe, scheduler 'none', one node).
+    from boxy import cards
+    from boxy.cli import main
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=30):
+        import types
+        c = cmd[-1]
+        if "nproc" in c:
+            return types.SimpleNamespace(returncode=0, stdout="32\n", stderr="")
+        if "MemTotal" in c:
+            return types.SimpleNamespace(returncode=0, stdout="MemTotal: 131072000 kB\n", stderr="")
+        if "nvidia-smi" in c or "rocm-smi" in c:
+            return types.SimpleNamespace(returncode=0,
+                                         stdout="NV: NVIDIA RTX A6000, 49140 MiB\nNVCOUNT: 2\n",
+                                         stderr="")
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    rc = main(["generate", "system"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "carding the LOCAL machine itself" in out
+    assert "32 CPUs, 125GB RAM, 2x NVIDIA RTX A6000 (48GB)" in out
+    shape = cards.system_shape(__import__("boxy.jobs", fromlist=["x"]).local_cluster())
+    assert shape and shape[0] == 2 and shape[1] == 48

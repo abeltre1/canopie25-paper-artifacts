@@ -525,3 +525,46 @@ def test_service_follow_opens_local_tunnel_at_ready(monkeypatch, tmp_path, capfd
     assert "### LOCAL  http://127.0.0.1:8080/" in out
     assert "curl -s http://127.0.0.1:8080/" in out
     assert "NOT reachable from your laptop directly" in out
+
+
+def test_service_ready_tolerates_login_banner(monkeypatch, tmp_path, capfd):
+    # FIELD (cronus): the login node prints a banner on EVERY ssh command, so the
+    # endpoint cat came back as 'WARNING: ...\n{json}' — and READY never fired
+    # (the loop sat at RUNNING forever). The gate must scan for the JSON line.
+    from boxy import remote
+
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setattr(remote, "ensure_master", lambda host: 0)
+    monkeypatch.setattr(remote, "push_file", lambda t, p, c: 0)
+    monkeypatch.setattr(remote, "add_forward", lambda t, lp, rh, rp: 0)
+    monkeypatch.setattr(remote, "_local_port_free", lambda p: True)
+
+    def cap(target, cmd, timeout=30):
+        if cmd.startswith("cat ") and "endpoint" in cmd:
+            return 0, ("*** NOTICE: This is a U.S. Government system ***\n"
+                       '{"name": "app-whoami", "host": "cn056", "port": 8080, '
+                       '"url": "http://cn056:8080", "job": "42265"}')
+        if "--parsable" in cmd:
+            return 0, "42265\n"
+        if "$HOME" in cmd:
+            return 0, "/ascldap/users/ambelt"
+        if "sbatch" in cmd or "instance-level" in cmd:
+            return 0, "slurm-bin\nslurm-ctld\nslurm-live\n"
+        return 0, ""
+
+    monkeypatch.setattr(remote, "ssh_capture", cap)
+    rc = main(["app", "--image", "docker.io/traefik/whoami:latest", "--port", "8080:80",
+               "--ssh", "ambelt@cronus"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "### READY  http://cn056:8080" in out
+    assert "### LOCAL  http://127.0.0.1:8080/" in out
+
+
+def test_colocate_is_shelled_not_implemented(capfd, monkeypatch, tmp_path):
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    rc = main(["app", "--image", "docker.io/traefik/whoami:latest", "--port", "8080:80",
+               "--colocate", "app-service-a", "--ssh", "user@cronus"])
+    err = capfd.readouterr().err
+    assert rc == 2
+    assert "not implemented" in err and "COLOCATION.md" in err

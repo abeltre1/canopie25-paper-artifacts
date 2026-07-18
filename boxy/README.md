@@ -39,6 +39,7 @@ quirks (modules, tuning, offline mode, GPU counts) are pinned once and reused.
 | [DEMO-turnkey.md](DEMO-turnkey.md) | the one-command-per-target demo script + prove-it checklist |
 | [DEMO-chisel.md](DEMO-chisel.md) | everyone-URL sharing through the OpenShift chisel relay |
 | [AIRGAP.md](AIRGAP.md) | air-gap readiness checklist: bundles, baked images, cleanup, kill switches |
+| [COLOCATION.md](COLOCATION.md) | DESIGN DRAFT: bin-packing services onto shared nodes (not implemented) |
 | [RELEASING.md](RELEASING.md) | wheel/PyPI (public + local Nexus), repo extraction |
 | [VALIDATION.md](VALIDATION.md) | how the test suite maps to the field guarantees |
 
