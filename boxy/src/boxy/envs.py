@@ -27,6 +27,12 @@ BASE_ENV: dict[str, str] = {
 VLLM_ENV: dict[str, str] = {
     "VLLM_DISABLE_COMPILE_CACHE": "1",
     "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+    # NCCL/RCCL print NOTHING on failure by default — a dead ncclCommInitRank
+    # surfaces only as 'unhandled system error' with no cause (field: eldorado
+    # MI300A TP=2). WARN is silent on healthy runs and names the failing
+    # transport ('Error while creating shared memory segment', peer-access
+    # denials, ...) when it isn't. box.env / --env can override.
+    "NCCL_DEBUG": "WARN",
 }
 
 # vLLM-on-ROCm quirks (prototype: clusterA/MI300a).
