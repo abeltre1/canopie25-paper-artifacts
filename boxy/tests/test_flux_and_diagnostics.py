@@ -589,3 +589,23 @@ def test_flux_time_converted_to_fsd():
     from boxy.schedulers import get_scheduler
     assert get_scheduler("flux").site_directive("time", "30:00") == "-t 1800s"
     assert get_scheduler("slurm").site_directive("time", "30:00") == "--time=30:00"  # slurm untouched
+
+
+def test_engine_core_wrapper_extracts_root_cause():
+    # FIELD (eldorado): the user pasted 60 lines of the vLLM wrapper traceback;
+    # the real exception had scrolled away. The generic wrapper diagnosis now
+    # extracts the inner error line itself when the window contains it.
+    from boxy import diagnostics
+
+    log = ("(EngineCore_DP0 pid=44) Traceback (most recent call last):\n"
+           '(EngineCore_DP0 pid=44)   File "worker.py", line 12, in init_device\n'
+           "(EngineCore_DP0 pid=44) Weird.ObscureError: /dev/shm too small for MoE buffers\n"
+           "(APIServer pid=1) RuntimeError: Engine core initialization failed. "
+           "See root cause above. Failed core proc(s): {}\n")
+    out = diagnostics.diagnose(log)
+    assert "root cause extracted" in out
+    assert "/dev/shm too small for MoE buffers" in out
+    # window too small to contain it: still the pointer, never a fabricated cause
+    out = diagnostics.diagnose("RuntimeError: Engine core initialization failed. "
+                               "See root cause above.")
+    assert "actionable error is higher up" in out and "extracted" not in out

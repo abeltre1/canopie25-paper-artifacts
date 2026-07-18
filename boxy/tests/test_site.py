@@ -705,3 +705,30 @@ def test_generate_system_local_machine_without_scheduler(tmp_path, monkeypatch, 
     assert "32 CPUs, 125GB RAM, 2x NVIDIA RTX A6000 (48GB)" in out
     shape = cards.system_shape(__import__("boxy.jobs", fromlist=["x"]).local_cluster())
     assert shape and shape[0] == 2 and shape[1] == 48
+
+
+def test_gpu_hw_probe_rejects_nvidia_driver_failure_prose():
+    # FIELD: a GPU-less login node has nvidia-smi ON PATH but no driver; its
+    # failure message goes to STDOUT and became the card's 'GPU type'. The NV
+    # line must be a real csv row ('<name>, NNNN MiB'), its bogus -L count dies
+    # with it, and the ROCm answer wins.
+    from boxy import site
+
+    field = ("NV: NVIDIA-SMI has failed because it couldn't communicate with the "
+             "NVIDIA driver. Make sure that the latest NVIDIA driver is installed "
+             "and running.\n"
+             "NVCOUNT: 1\n"
+             "ROCM: Card series: AMD Instinct MI300A\n")
+    assert site.parse_gpu_hw(field) == ("MI300A", 128, 0)
+    # same failure with NO rocm answer: cleanly unknown, never the prose
+    alone = field.splitlines()[0] + "\nNVCOUNT: 1\n"
+    assert site.parse_gpu_hw(alone) == ("", 0, 0)
+
+
+def test_gpu_hw_probe_prefers_detected_accelerator():
+    from boxy import site
+
+    cmd = site.gpu_hw_probe(prefer="rocm")
+    assert cmd.index("rocm-smi") < cmd.index("nvidia-smi")   # rocm asked first
+    cmd = site.gpu_hw_probe()
+    assert cmd.index("nvidia-smi") < cmd.index("rocm-smi")

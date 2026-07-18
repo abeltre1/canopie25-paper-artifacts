@@ -104,16 +104,46 @@ def _rocm_arch_mismatch(m: "re.Match[str]", log: str) -> str:
     )
 
 
+_ROOT_CAUSE_RE = re.compile(
+    r"^.*?((?:\w+\.)*\w+(?:Error|Exception): .+|torch\.OutOfMemoryError.*|"
+    r".*(?:HIP|CUDA) (?:error|out of memory).*|.*out of memory.*|"
+    r".*(?:is not|not) supported.*|.*Unsupported.*)\s*$",
+    re.IGNORECASE)
+
+
+def extract_root_cause(log: str, before: str = "Engine core initialization failed") -> str:
+    """The INNER exception line the vLLM wrapper is hiding: the last
+    error-looking line ABOVE the wrapper (EngineCore worker tracebacks print
+    first). '' when the window doesn't reach far enough back."""
+    cut = log.find(before)
+    body = log[:cut] if cut > 0 else log
+    hits = []
+    for line in body.splitlines():
+        line = line.strip()
+        if "See root cause above" in line or line.endswith("_Error: "):
+            continue
+        m2 = _ROOT_CAUSE_RE.match(line)
+        if m2 and "initialization failed" not in line.lower():
+            hits.append(m2.group(1).strip())
+    return hits[-1] if hits else ""
+
+
 def _engine_core_generic(m: "re.Match[str]", log: str) -> str:
-    # Last-resort: the outer vLLM wrapper with no signature we recognise. Point
-    # the user at where the REAL exception is so they stop pasting the wrapper.
+    # Last-resort: the outer vLLM wrapper. FIRST try to pull the REAL exception
+    # out of the log window ourselves (field: users keep pasting the wrapper —
+    # the 60-line tail had already scrolled the root cause away).
+    root = extract_root_cause(log)
+    root_block = (f"extracted ROOT CAUSE (from earlier in this log):\n  >>> {root}\n\n"
+                  if root else "")
     return _fmt(
-        "vLLM engine core failed to start — the actionable error is higher up",
-        "'Engine core initialization failed. See root cause above' is only the\n"
+        "vLLM engine core failed to start"
+        + (" — root cause extracted below" if root else " — the actionable error is higher up"),
+        root_block
+        + "'Engine core initialization failed. See root cause above' is only the\n"
         "outer wrapper. The real exception is printed ABOVE this line in the\n"
         "container log — usually a Python Traceback ending in ValueError/RuntimeError,\n"
         "an out-of-memory line, or a HIP/CUDA error.\n"
-        "  See it all:  <podman|docker> logs <container>   (or the job --output log)\n"
+        "  See it all:  boxy logs <name> --ssh <host>   (or the job --output log)\n"
         "  Then match it to: model<->vLLM version, GPU OOM, or GPU-arch/image mismatch.",
     )
 

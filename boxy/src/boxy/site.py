@@ -707,7 +707,9 @@ def gpu_vram_from_type(gpu_type: str) -> tuple[int, str]:
             if token == "gh200":
                 note += " (96GB HBM3; 144 for the HBM3e variant)"
             return gb, note
-    return 0, f"unknown GPU type '{gpu_type}' — fill in gpu_vram_gb from your site docs"
+    shown = " ".join((gpu_type or "").split())[:40]
+    return 0, (f"unknown GPU type '{shown}' — fill in gpu_vram_gb from your site docs"
+               if shown else "GPU type unknown — fill in gpu_vram_gb from your site docs")
 
 
 def sinfo_inventory_probe() -> str:
@@ -841,25 +843,27 @@ def render_system_card(cluster: str, scheduler: str, accelerator: str, runtime: 
     return "\n".join(lines) + "\n"
 
 
-def gpu_hw_probe() -> str:
+def gpu_hw_probe(prefer: str = "") -> str:
     """DIRECT hardware probe for GPU type/VRAM, for when the scheduler's GRES is
     TYPELESS (field: 'gpu:4' with no type token — the table had nothing to look
     up). Best-effort on whatever host runs it: load the rocm module if the site
-    ships one, then ask nvidia-smi (name + exact VRAM), rocm-smi (product name),
-    rocminfo (gfx arch). Runs under a login shell so `module` exists. Prints
-    tagged lines; parse_gpu_hw() reads them."""
-    inner = (
-        "module load rocm >/dev/null 2>&1 || true; "
-        "if command -v nvidia-smi >/dev/null 2>&1; then "
-        "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null "
-        "| head -1 | sed 's/^/NV: /'; "
-        "nvidia-smi -L 2>/dev/null | wc -l | sed 's/^/NVCOUNT: /'; fi; "
-        "if command -v rocm-smi >/dev/null 2>&1; then "
-        "rocm-smi --showproductname 2>/dev/null | grep -im1 'series\\|card model\\|name' "
-        "| sed 's/^/ROCM: /'; fi; "
-        "if command -v rocminfo >/dev/null 2>&1; then "
-        "rocminfo 2>/dev/null | grep -iom1 'gfx[0-9a-f]*' | sed 's/^/GFX: /'; fi"
-    )
+    ships one, then ask rocm-smi (product name), rocminfo (gfx arch) and
+    nvidia-smi (name + exact VRAM). `prefer` = the DETECTED accelerator: on a
+    rocm system the ROCm queries run first, so stale CUDA userland on the login
+    node can never answer ahead of them (field: nvidia-smi's driver-failure
+    message was swallowed as the 'GPU type'). Runs under a login shell so
+    `module` exists. Prints tagged lines; parse_gpu_hw() reads them."""
+    nv = ("if command -v nvidia-smi >/dev/null 2>&1; then "
+          "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null "
+          "| head -1 | sed 's/^/NV: /'; "
+          "nvidia-smi -L 2>/dev/null | wc -l | sed 's/^/NVCOUNT: /'; fi; ")
+    rocm = ("module load rocm >/dev/null 2>&1 || true; "
+            "if command -v rocm-smi >/dev/null 2>&1; then "
+            "rocm-smi --showproductname 2>/dev/null | grep -im1 'series\\|card model\\|name' "
+            "| sed 's/^/ROCM: /'; fi; "
+            "if command -v rocminfo >/dev/null 2>&1; then "
+            "rocminfo 2>/dev/null | grep -iom1 'gfx[0-9a-f]*' | sed 's/^/GFX: /'; fi; ")
+    inner = (rocm + nv) if prefer == "rocm" else (nv + rocm)
     return f"bash -lc {__import__('shlex').quote(inner)}"
 
 
@@ -868,31 +872,52 @@ def gpu_hw_probe() -> str:
 _GFX_TO_PART = {"gfx942": "mi300a", "gfx90a": "mi250", "gfx908": "mi100", "gfx906": "mi50"}
 
 
+def _plausible_gpu_name(name: str) -> bool:
+    """A real part name, not tool noise. FIELD: on a GPU-less login node
+    nvidia-smi prints 'NVIDIA-SMI has failed because it couldn't communicate
+    with the NVIDIA driver…' ON STDOUT — which then became the card's 'GPU
+    type'. Reject error prose and anything name-length implausible."""
+    n = (name or "").strip()
+    if not n or len(n) > 40:
+        return False
+    low = n.lower()
+    return not any(bad in low for bad in
+                   ("fail", "error", "driver", "communicate", "not found", "no devices",
+                    "couldn't", "cannot", "unable", "warning"))
+
+
 def parse_gpu_hw(out: str) -> tuple[str, int, int]:
     """(gpu_type, vram_gb, count) from the tagged hardware-probe output.
     nvidia-smi gives VRAM EXACTLY (no table); rocm-smi/rocminfo give the part
-    name/arch that the table then sizes. ('' , 0, 0) when nothing answered."""
+    name/arch that the table then sizes. An NV line only counts when it is a
+    REAL csv row ('<name>, NNNN MiB') — nvidia-smi failure prose is rejected,
+    and its bogus -L count with it. ('' , 0, 0) when nothing answered."""
     gpu_type, vram_gb, count = "", 0, 0
+    nv_valid = False
     for line in (out or "").splitlines():
         line = line.strip()
         if line.startswith("NV: "):
             body = line[4:]
-            parts = [p.strip() for p in body.split(",")]
-            if parts and parts[0]:
-                gpu_type = gpu_type or parts[0]
-            m = re.search(r"(\d+)\s*MiB", body)
-            if m:
-                vram_gb = round(int(m.group(1)) / 1024)
-        elif line.startswith("NVCOUNT: "):
+            m = re.search(r"^(.+?),\s*(\d+)\s*MiB", body)
+            if m and _plausible_gpu_name(m.group(1)):
+                if not gpu_type:
+                    gpu_type = m.group(1).strip()
+                vram_gb = vram_gb or round(int(m.group(2)) / 1024)
+                nv_valid = True
+        elif line.startswith("NVCOUNT: ") and nv_valid:
             try:
                 count = int(line[9:].strip() or 0)
             except ValueError:
                 pass
         elif line.startswith("ROCM: ") and not gpu_type:
             m = re.search(r"(MI\d+\w*|Instinct\s+\S+)", line, re.IGNORECASE)
-            gpu_type = (m.group(1).split()[-1] if m else line[6:].split(":")[-1]).strip()
+            cand = (m.group(1).split()[-1] if m else line[6:].split(":")[-1]).strip()
+            if _plausible_gpu_name(cand):
+                gpu_type = cand
         elif line.startswith("GFX: ") and not gpu_type:
-            gpu_type = _GFX_TO_PART.get(line[5:].strip().lower(), line[5:].strip())
+            cand = _GFX_TO_PART.get(line[5:].strip().lower(), line[5:].strip())
+            if _plausible_gpu_name(cand):
+                gpu_type = cand
     if gpu_type and not vram_gb:
         vram_gb = gpu_vram_from_type(gpu_type)[0]
     return gpu_type, vram_gb, count

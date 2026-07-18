@@ -2839,10 +2839,15 @@ def _serve_agentless_ssh(args, target: str) -> int:
         deploy.set_agentless_ca(None)
         return 0
 
-    # 8) write the script (mode 600 — it may carry HF_TOKEN) + submit, over the master
+    # 8) write the script (mode 600 — it may carry HF_TOKEN) + submit, over the master.
+    # Drop the PREVIOUS run's endpoint first: the name is a stable singleton, so a
+    # stale endpoint.json still names the OLD compute node — the follow loop then
+    # tunnels to the wrong host and readiness never confirms (field: eldorado,
+    # 'server starting on eldo1066' while the job ran on eldo1321).
     if remote.push_file(target, script_remote, script_text) != 0:
         return 1
     remote.ssh_capture(target, f"chmod 600 {shlex.quote(script_remote)}", timeout=10)
+    remote.ssh_capture(target, f"rm -f {shlex.quote(ep_remote)}", timeout=10)
     rc, out = remote.ssh_capture(target, f"cd {shlex.quote(rhome)} && {submit_cmd}", timeout=60)
 
     # AUTO-RECOVER from a rejected GPU request line: some sites reject
@@ -3063,7 +3068,14 @@ def _serve_agentless_ssh(args, target: str) -> int:
                 print(tail, file=sys.stderr)
                 # turn a raw compute-node failure (blocked image pull, OOM, bad
                 # image tag, …) into a plain-language fix instead of a bare trace.
-                _print_diagnosis(tail)
+                # vLLM's engine-core WRAPPER scrolls its real exception far above
+                # the human-sized tail — refetch a wide window so the diagnosis
+                # can extract the actual root cause (field: eldorado, only the
+                # wrapper visible in the last 60 lines).
+                if "Engine core initialization failed" in tail:
+                    _print_diagnosis(_remote_log_tail(target, log_remote, n=1500))
+                else:
+                    _print_diagnosis(tail)
                 if _looks_like_pull_block(tail):
                     try:
                         from boxy import ramalama_shim
@@ -4604,7 +4616,7 @@ def cmd_generate_system(args: argparse.Namespace) -> int:
         # the rocm module and read rocm-smi/rocminfo, or nvidia-smi (which
         # reports VRAM exactly). Field: a 274-node system whose card came out
         # 'unknown GPU type'.
-        hrc, hout = cap(site.gpu_hw_probe(), timeout=60)
+        hrc, hout = cap(site.gpu_hw_probe(prefer=accel), timeout=60)
         htype, hvram, _hcount = site.parse_gpu_hw(hout if hrc == 0 else "")
         if htype:
             inv["gpu_type"] = inv.get("gpu_type") or htype
@@ -6416,6 +6428,15 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(f"'boxy {args.subcommand}' takes no engine args after --")
             args.args = list(args.args or []) + extra
         return args.func(args)
+    except BrokenPipeError:
+        # `boxy cards | head` — the reader closed the pipe; that's fine, not a
+        # traceback. Detach stdout so the interpreter's shutdown flush can't
+        # re-raise (Python prints 'Exception ignored ...' otherwise).
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        return 0
     except UsageError as e:
         print(f"boxy: error: {e}", file=sys.stderr)
         return 2
