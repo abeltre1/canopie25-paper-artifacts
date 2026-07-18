@@ -40,6 +40,7 @@ quirks (modules, tuning, offline mode, GPU counts) are pinned once and reused.
 | [DEMO-chisel.md](DEMO-chisel.md) | everyone-URL sharing through the OpenShift chisel relay |
 | [AIRGAP.md](AIRGAP.md) | air-gap readiness checklist: bundles, baked images, cleanup, kill switches |
 | [COLOCATION.md](COLOCATION.md) | DESIGN DRAFT: bin-packing services onto shared nodes (not implemented) |
+| [COOKBOOK-NEMOTRON3.md](COOKBOOK-NEMOTRON3.md) | NVIDIA's Nemotron-3 cookbook mapped onto this fleet, one boxy command per recipe |
 | [RELEASING.md](RELEASING.md) | wheel/PyPI (public + local Nexus), repo extraction |
 | [VALIDATION.md](VALIDATION.md) | how the test suite maps to the field guarantees |
 
@@ -83,10 +84,12 @@ choice (nothing is hidden, only the *work*):
   (NAS arch — trust-remote-code set), and the full Nemotron 3 line — Nano
   30B-A3B (BF16/FP8/NVFP4), Super 120B-A12B (BF16/FP8/NVFP4) and Ultra
   550B-A55B (BF16/NVFP4) — each card carrying NVIDIA's cookbook flags per
-  ACCELERATOR: `[model.args.cuda]` gets the FlashInfer knobs + the PINNED
-  vLLM image the recipe was validated on, `[model.args.rocm]`/`[model.env.rocm]`
-  gets the portable set (triton mamba backend, AITER MoE kernels, no
-  FlashInfer). On MI300-class AMD: FP8 variants run at full hardware speed,
+  ACCELERATOR: `[model.args.cuda]` gets the Hopper/H200 configuration this
+  fleet runs (float16 mamba cache + stochastic rounding for Ultra-NVFP4; the
+  Blackwell FlashInfer set is documented in the card) + the PINNED vLLM image
+  the recipe was validated on, `[model.args.rocm]`/`[model.env.rocm]` gets the
+  portable set (triton mamba backend, AITER MoE kernels, no FlashInfer).
+  See [COOKBOOK-NEMOTRON3.md](COOKBOOK-NEMOTRON3.md) for the per-system map. On MI300-class AMD: FP8 variants run at full hardware speed,
   NVFP4 loads via ROCm vLLM's dequant emulation (unvalidated), and Ultra BF16
   becomes a 3-node Ray instance automatically. NIM microservices run
   via the services path: `boxy app --image nvcr.io/nim/... --port 8000

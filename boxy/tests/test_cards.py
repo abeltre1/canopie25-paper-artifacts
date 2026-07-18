@@ -559,14 +559,16 @@ def test_nemotron3_family_per_accelerator_serving():
     # Research-backed (vLLM day-0 blog + NVIDIA cookbooks + AMD ROCm blogs):
     # one card per checkpoint serves BOTH kinds of metal honestly.
     ultra = cards.find_card("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4")
-    # cuda: NVIDIA's validated recipe — flashinfer knobs + the PINNED v0.22.0
-    # image (VLLM_USE_FLASHINFER_MOE_FP4 was REMOVED in vLLM 0.24)
+    # cuda overlay = the cookbook's HOPPER/H200 configuration (this fleet has
+    # no Blackwell): float16 mamba cache + stochastic rounding, NO FlashInfer
+    # (FP4 MoE kernels are Blackwell-only), pinned v0.22.0 image (the
+    # FlashInfer FP4 env switch was REMOVED in vLLM 0.24).
     cuda = cards.effective_args(ultra.args, "cuda")
-    assert cuda["enable_flashinfer_autotune"] is True and cuda["kv_cache_dtype"] == "fp8"
+    assert cuda["mamba_cache_dtype"] == "float16"
+    assert cuda["enable_mamba_cache_stochastic_rounding"] is True
+    assert cuda["max_num_seqs"] == 128
+    assert "enable_flashinfer_autotune" not in cuda
     assert ultra.images["cuda"] == "docker.io/vllm/vllm-openai:v0.22.0"
-    assert cards.effective_args(cards.layered_env(
-        "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4"), "cuda")[
-        "VLLM_USE_FLASHINFER_MOE_FP4"] == "1"
     # rocm: NO flashinfer anywhere; AITER on; mamba stays on the portable
     # triton backend (the only ROCm-viable one)
     rocm = cards.effective_args(ultra.args, "rocm")

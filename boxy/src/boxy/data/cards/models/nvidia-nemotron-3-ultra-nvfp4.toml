@@ -1,12 +1,18 @@
-# Nemotron-3 Ultra 550B-A55B, NVFP4 checkpoint (~300GB packed weights).
-# NVIDIA-validated on Blackwell/Hopper with vLLM v0.22.0 EXACTLY — the
-# VLLM_USE_FLASHINFER_MOE_FP4 switch was REMOVED in vLLM 0.24, so the cuda
-# image is PINNED to the recipe's tag. On AMD (MI300-class) NVFP4 loads via
-# ROCm vLLM's BF16 dequant emulation (AMD blog, 2026-07) — unvalidated by
-# NVIDIA and slower than native; the BF16 variant is the conservative path.
-# MTP speculative decoding is optional (add after --:
-#   -- --speculative-config '{"method":"mtp","num_speculative_tokens":5}')
-# and known to conflict with Mamba prefix caching.
+# Nemotron-3 Ultra 550B-A55B, NVFP4 (~300GB packed). NVIDIA's cookbook pins
+# vLLM v0.22.0 for BOTH variants (the FlashInfer FP4 env switch was REMOVED
+# in vLLM 0.24), and gives two CUDA configs:
+#   * Blackwell (8x B200): TP8, kv fp8, flashinfer autotune,
+#     VLLM_USE_FLASHINFER_MOE_FP4=1
+#   * Hopper/H200 (8x H100): TP1 x DP8, float16 mamba cache with stochastic
+#     rounding, max-num-seqs 128 — NO FlashInfer (FP4 MoE kernels are
+#     Blackwell-only; Hopper uses the Marlin W4A16 software path)
+# This card's cuda overlay carries the HOPPER/H200 set (the fleet this repo
+# deploys to has no Blackwell); on a B200 system add the Blackwell lines
+# after `--`. Geometry note: boxy's solver places this TP-style (e.g. 1 node
+# x4 on H200/MI300A nodes; 2-node Ray on 4x80GB nodes) rather than the
+# cookbook's DP8 — replicate DP with `--replicas` if you want that shape.
+# On AMD (MI300-class) the checkpoint loads via ROCm vLLM's NVFP4 dequant
+# emulation (AMD blog 2026-07) — unvalidated by NVIDIA; BF16 is conservative.
 [model]
 match = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4*"
 engine = "vllm"
@@ -15,19 +21,21 @@ min_vram_gb = 300
 [model.args]
 trust_remote_code = true
 max_model_len = 262144
-max_num_seqs = 16
-max_num_batched_tokens = 32768
 gpu_memory_utilization = 0.90
 mamba_backend = "triton"
-mamba_ssm_cache_dtype = "float32"
 reasoning_parser = "nemotron_v3"
 tool_call_parser = "qwen3_coder"
 enable_auto_tool_choice = true
 [model.args.cuda]
-kv_cache_dtype = "fp8"
-enable_flashinfer_autotune = true
-[model.env.cuda]
-VLLM_USE_FLASHINFER_MOE_FP4 = "1"
+mamba_cache_dtype = "float16"
+mamba_ssm_cache_dtype = "float16"
+mamba_cache_philox_rounds = 5
+enable_mamba_cache_stochastic_rounding = true
+max_num_seqs = 128
+[model.args.rocm]
+mamba_ssm_cache_dtype = "float32"
+max_num_seqs = 16
+max_num_batched_tokens = 32768
 [model.env.rocm]
 VLLM_ROCM_USE_AITER = "1"
 [model.images]
