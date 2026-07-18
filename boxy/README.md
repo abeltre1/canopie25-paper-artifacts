@@ -77,6 +77,15 @@ choice (nothing is hidden, only the *work*):
   `boxy generate card <hf-model-id>` fetches the config, derives the engine +
   GPU/VRAM sizing + a capped context, and writes a card into
   `~/.config/boxy/cards/models/` so `boxy serve <id>` just works (see below).
+- **the NVIDIA Nemotron family ships carded**: Nemotron-Parse (vision/OCR,
+  custom code + aux repos handled), Nemotron Nano v2 (hybrid Mamba — float32
+  SSM cache set per NVIDIA's guidance), Llama-Nemotron-70B, Nemotron Super 49B
+  (NAS arch — trust-remote-code set), and Nemotron 3 Nano (brand-new hybrid
+  MoE — the card PINS a current vLLM image per accelerator via `[model.images]`,
+  because older images' vLLM predates the architecture). NIM microservices run
+  via the services path: `boxy app --image nvcr.io/nim/... --port 8000
+  --env NGC_API_KEY=... --ssh <cluster>`. Anything else Nemotron auto-generates
+  its card from HF metadata.
 - **system cards** are deployment profiles per system type —
   `--system slurm-cuda | flux-rocm | laptop-podman | cloud-aws-gpu | openshift-gpu`
   (3 per type; the cloud ones drive SkyPilot via `boxy generate sky`).

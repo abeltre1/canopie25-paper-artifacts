@@ -1,0 +1,16 @@
+# NVIDIA Nemotron 3 Nano (30B-A3B and siblings) — brand-new hybrid Mamba MoE.
+# FIELD (eldorado): dies with 'Engine core initialization failed' in older
+# engine images whose vLLM predates the architecture — so this card PINS a
+# current vLLM per accelerator ([model.images]; --image overrides). 30B total
+# / ~3B active; bf16 weights ~60GB -> one 80GB+ GPU.
+[model]
+match = "nvidia/NVIDIA-Nemotron-3-Nano-*"
+engine = "vllm"
+gpus = 1
+min_vram_gb = 60
+[model.args]
+max_model_len = 8192
+mamba_ssm_cache_dtype = "float32"
+[model.images]
+cuda = "docker.io/vllm/vllm-openai:latest"
+rocm = "docker.io/rocm/vllm:latest"

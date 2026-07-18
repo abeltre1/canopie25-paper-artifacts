@@ -1,0 +1,11 @@
+# NVIDIA Nemotron Nano v2 (9B/12B) — hybrid Mamba-Transformer (NemotronH).
+# Native vLLM arch (no remote code). NVIDIA's model card recommends the
+# float32 Mamba SSM cache for accuracy.
+[model]
+match = "nvidia/NVIDIA-Nemotron-Nano-*"
+engine = "vllm"
+gpus = 1
+min_vram_gb = 24
+[model.args]
+max_model_len = 8192
+mamba_ssm_cache_dtype = "float32"

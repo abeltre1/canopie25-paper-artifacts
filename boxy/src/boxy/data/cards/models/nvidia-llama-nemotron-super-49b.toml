@@ -1,0 +1,10 @@
+# Llama-3.3-Nemotron-Super-49B (v1/v1.5) — NAS-derived DeciLM architecture:
+# the repo ships its own modeling code, so vLLM needs --trust-remote-code.
+[model]
+match = "nvidia/Llama-3*Nemotron-Super-49B*"
+engine = "vllm"
+gpus = 2
+min_vram_gb = 100
+[model.args]
+max_model_len = 8192
+trust_remote_code = true

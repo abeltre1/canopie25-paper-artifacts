@@ -434,3 +434,42 @@ def test_zero_flag_geometry_solved_end_to_end(monkeypatch, tmp_path, capsys):
     assert rc == 0
     assert "auto: gpus: 2 per node" in out
     assert "#SBATCH --gpus-per-node=2" in out
+
+
+# ---- card-pinned engine images ([model.images]) --------------------------------------
+
+
+def test_card_pins_engine_image_per_accelerator():
+    # FIELD (Nemotron-3-Nano on eldorado): a brand-new architecture dies with
+    # 'Engine core initialization failed' in an older engine image — the card
+    # now pins a CURRENT vLLM per accelerator; --image always wins.
+    a = _args("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+    a.image, a.accelerator = None, "rocm"
+    lines = cards.apply_to_args(a)
+    assert a.image == "docker.io/rocm/vllm:latest"
+    assert any("pins a rocm image" in ln for ln in lines)
+    b = _args("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+    b.image, b.accelerator = None, "cuda"
+    cards.apply_to_args(b)
+    assert b.image == "docker.io/vllm/vllm-openai:latest"
+    c = _args("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+    c.image, c.accelerator = "my/own:img", "rocm"          # power user wins
+    cards.apply_to_args(c)
+    assert c.image == "my/own:img"
+
+
+def test_nemotron_family_cards_resolve():
+    # every family member hits its card, and the parity contract above already
+    # validates each card's gpus against its min_vram_gb
+    for mid, expect in (("nvidia/NVIDIA-Nemotron-Nano-9B-v2", "nvidia-nemotron-nano-v2"),
+                        ("nvidia/NVIDIA-Nemotron-Nano-12B-v2-Base", "nvidia-nemotron-nano-v2"),
+                        ("nvidia/Llama-3.1-Nemotron-70B-Instruct-HF", "nvidia-llama-nemotron-70b"),
+                        ("nvidia/Llama-3_3-Nemotron-Super-49B-v1_5", "nvidia-llama-nemotron-super-49b"),
+                        ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "nvidia-nemotron-3-nano"),
+                        ("nvidia/NVIDIA-Nemotron-Parse-v1.2", "nvidia-nemotron-parse")):
+        card = cards.find_card(mid)
+        assert card is not None and card.card_name == expect, mid
+    # the hybrid-Mamba members carry NVIDIA's recommended SSM cache dtype
+    assert cards.find_card("nvidia/NVIDIA-Nemotron-Nano-9B-v2").args["mamba_ssm_cache_dtype"] == "float32"
+    # the NAS-derived Super needs remote code
+    assert cards.find_card("nvidia/Llama-3_3-Nemotron-Super-49B-v1").args["trust_remote_code"] is True

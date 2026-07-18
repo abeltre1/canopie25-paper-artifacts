@@ -72,6 +72,11 @@ class ModelCard:
     # vision encoder) — `boxy bundle` must pre-cache them or an air-gapped serve
     # dies mid-import (field: Nemotron-Parse pulls nvidia/C-RADIOv2-H)
     aux_repos: list = field(default_factory=list)
+    # [model.images]: pin the ENGINE IMAGE per accelerator (keys: cuda, rocm,
+    # default). For models NEWER than the default images' vLLM — a brand-new
+    # architecture dies with 'Engine core initialization failed' in an old
+    # image (field: Nemotron-3-Nano on eldorado). --image always wins.
+    images: dict = field(default_factory=dict)
 
     @property
     def label(self) -> str:
@@ -117,6 +122,7 @@ def _parse_card(text: str, card_name: str, source: str, path: str) -> ModelCard:
         args=dict(args),
         pip=[str(x) for x in section.get("pip", [])],
         aux_repos=[str(x) for x in section.get("aux_repos", [])],
+        images={str(k): str(v) for k, v in (section.get("images") or {}).items()},
     )
 
 
@@ -442,6 +448,13 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None) -> list[str]:
     if getattr(args, "engine", None) is None and card.engine:
         args.engine = card.engine
         decisions.append(f"engine: {card.engine} ({card.label})")
+    if getattr(args, "image", None) is None and card.images:
+        accel = getattr(args, "accelerator", None) or "cuda"
+        pinned = card.images.get(accel) or card.images.get("default", "")
+        if pinned:
+            args.image = pinned
+            decisions.append(f"image: {pinned} ({card.label} pins a {accel} image — this "
+                             f"model needs it; --image overrides)")
     # engine args from the card (e.g. max_model_len so vLLM doesn't profile KV
     # cache for the model's full 128K context and OOM). Card flags go FIRST so
     # the user's own post-`--` engine args, appended after, win (last-wins in the
