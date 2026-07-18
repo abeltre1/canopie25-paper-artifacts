@@ -1,0 +1,25 @@
+# Nemotron-3 Super 120B-A12B, BF16 variant. Flags from NVIDIA's Super vLLM
+# cookbook (vLLM >= 0.17.1); reasoning parser nemotron_v3 is built in since
+# vLLM 0.17.1/0.18. FP8 is the best AMD path (full-speed FNUZ FP8 on
+# MI300-class); NVFP4 runs on ROCm only via dequant emulation.
+[model]
+match = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16*"
+engine = "vllm"
+gpus = 4
+min_vram_gb = 240
+[model.args]
+trust_remote_code = true
+max_model_len = 262144
+kv_cache_dtype = "fp8"
+gpu_memory_utilization = 0.9
+enable_chunked_prefill = true
+mamba_backend = "triton"
+mamba_ssm_cache_dtype = "float32"
+reasoning_parser = "nemotron_v3"
+tool_call_parser = "qwen3_coder"
+enable_auto_tool_choice = true
+[model.env.rocm]
+VLLM_ROCM_USE_AITER = "1"
+[model.images]
+cuda = "docker.io/vllm/vllm-openai:latest"
+rocm = "docker.io/rocm/vllm:latest"

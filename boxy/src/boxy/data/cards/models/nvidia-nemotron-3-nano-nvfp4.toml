@@ -1,0 +1,24 @@
+# Nemotron-3 Nano 30B-A3B NVFP4 (~18GB, QAD-quantized): native on Blackwell;
+# on AMD it loads only via ROCm vLLM's dequant emulation — prefer the FP8
+# variant on MI300-class hardware.
+[model]
+match = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4*"
+engine = "vllm"
+gpus = 1
+min_vram_gb = 18
+[model.args]
+trust_remote_code = true
+max_model_len = 262144
+max_num_seqs = 8
+kv_cache_dtype = "fp8"
+mamba_ssm_cache_dtype = "float32"
+tool_call_parser = "qwen3_coder"
+enable_auto_tool_choice = true
+[model.env.cuda]
+VLLM_USE_FLASHINFER_MOE_FP4 = "1"
+VLLM_FLASHINFER_MOE_BACKEND = "throughput"
+[model.env.rocm]
+VLLM_ROCM_USE_AITER = "1"
+[model.images]
+cuda = "docker.io/vllm/vllm-openai:latest"
+rocm = "docker.io/rocm/vllm:latest"

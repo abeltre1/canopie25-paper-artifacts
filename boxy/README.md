@@ -80,9 +80,15 @@ choice (nothing is hidden, only the *work*):
 - **the NVIDIA Nemotron family ships carded**: Nemotron-Parse (vision/OCR,
   custom code + aux repos handled), Nemotron Nano v2 (hybrid Mamba — float32
   SSM cache set per NVIDIA's guidance), Llama-Nemotron-70B, Nemotron Super 49B
-  (NAS arch — trust-remote-code set), and Nemotron 3 Nano (brand-new hybrid
-  MoE — the card PINS a current vLLM image per accelerator via `[model.images]`,
-  because older images' vLLM predates the architecture). NIM microservices run
+  (NAS arch — trust-remote-code set), and the full Nemotron 3 line — Nano
+  30B-A3B (BF16/FP8/NVFP4), Super 120B-A12B (BF16/FP8/NVFP4) and Ultra
+  550B-A55B (BF16/NVFP4) — each card carrying NVIDIA's cookbook flags per
+  ACCELERATOR: `[model.args.cuda]` gets the FlashInfer knobs + the PINNED
+  vLLM image the recipe was validated on, `[model.args.rocm]`/`[model.env.rocm]`
+  gets the portable set (triton mamba backend, AITER MoE kernels, no
+  FlashInfer). On MI300-class AMD: FP8 variants run at full hardware speed,
+  NVFP4 loads via ROCm vLLM's dequant emulation (unvalidated), and Ultra BF16
+  becomes a 3-node Ray instance automatically. NIM microservices run
   via the services path: `boxy app --image nvcr.io/nim/... --port 8000
   --env NGC_API_KEY=... --ssh <cluster>`. Anything else Nemotron auto-generates
   its card from HF metadata.

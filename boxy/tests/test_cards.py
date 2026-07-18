@@ -355,7 +355,12 @@ def test_fit_geometry_parity_with_hand_sized_cards():
         if card.source != "packaged" or not card.min_vram_gb or card.nodes:
             continue
         nodes, gpus, _ = cards.fit_geometry(card.min_vram_gb, 0, 0)
-        assert (nodes, gpus) == (1, card.gpus), card.card_name
+        if nodes == 1:
+            assert gpus == card.gpus, card.card_name
+        else:
+            # a card too big for one assumed node spills to FULL nodes — its
+            # advisory gpus must be the full assumed width
+            assert gpus == card.gpus == 4, card.card_name
 
 
 def test_fit_geometry_fat_vram_uses_fewer_gpus():
@@ -473,3 +478,111 @@ def test_nemotron_family_cards_resolve():
     assert cards.find_card("nvidia/NVIDIA-Nemotron-Nano-9B-v2").args["mamba_ssm_cache_dtype"] == "float32"
     # the NAS-derived Super needs remote code
     assert cards.find_card("nvidia/Llama-3_3-Nemotron-Super-49B-v1").args["trust_remote_code"] is True
+
+
+# ---- per-accelerator card knowledge (env / arg overlays / hardware constraints) ------
+
+
+ULTRA_CARD = """
+[model]
+match = "acme/Test-Ultra-550B-NVFP4*"
+engine = "vllm"
+gpus = 8
+min_vram_gb = 300
+accelerators = ["cuda"]
+unsupported_hint = "NVFP4 is Blackwell/CUDA-only - on ROCm serve the FP8 variant."
+[model.env]
+VLLM_USE_FLASHINFER_MOE_FP4 = "1"
+[model.args]
+max_model_len = 262144
+trust_remote_code = true
+[model.args.cuda]
+enable_flashinfer_autotune = true
+kv_cache_dtype = "fp8"
+[model.args.rocm]
+mamba_backend = "triton"
+"""
+
+
+@pytest.fixture
+def ultra_card(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    d = tmp_path / "boxy" / "cards" / "models"
+    d.mkdir(parents=True)
+    (d / "ultra-test.toml").write_text(ULTRA_CARD)
+
+
+def test_effective_args_overlays_per_accelerator(ultra_card):
+    # NVIDIA reference commands carry CUDA-only knobs (FlashInfer) that would
+    # crash a ROCm vLLM — one card stays honest on both kinds of metal.
+    card = cards.find_card("acme/Test-Ultra-550B-NVFP4")
+    cuda = cards.effective_args(card.args, "cuda")
+    rocm = cards.effective_args(card.args, "rocm")
+    assert cuda["enable_flashinfer_autotune"] is True and "mamba_backend" not in cuda
+    assert rocm["mamba_backend"] == "triton" and "enable_flashinfer_autotune" not in rocm
+    assert cuda["max_model_len"] == rocm["max_model_len"] == 262144   # shared base
+    # nested overlay tables never leak into flags
+    assert "--cuda" not in cards.engine_flags(card.args)
+
+
+def test_card_env_layered_and_merged(ultra_card):
+    assert cards.layered_env("acme/Test-Ultra-550B-NVFP4") == {"VLLM_USE_FLASHINFER_MOE_FP4": "1"}
+    from boxy.cli import _ensure_card_args
+    from boxy.box import Box
+    box = Box(name="b", model="acme/Test-Ultra-550B-NVFP4", engine="vllm")
+    box2, note = _ensure_card_args(box, "acme/Test-Ultra-550B-NVFP4", accel="cuda")
+    assert box2.env["VLLM_USE_FLASHINFER_MOE_FP4"] == "1"
+    assert box2.args["kv_cache_dtype"] == "fp8"                # cuda overlay flattened
+    assert "mamba_backend" not in box2.args
+    assert "env:" in note
+    # user box.env wins over the card
+    box3 = Box(name="b", model="acme/Test-Ultra-550B-NVFP4", engine="vllm",
+               env={"VLLM_USE_FLASHINFER_MOE_FP4": "0"})
+    box4, _ = _ensure_card_args(box3, "acme/Test-Ultra-550B-NVFP4", accel="cuda")
+    assert box4.env["VLLM_USE_FLASHINFER_MOE_FP4"] == "0"
+
+
+def test_hardware_bound_checkpoint_refuses_up_front(ultra_card):
+    # an NVFP4 quant on a ROCm system fails deep in kernel init an hour into
+    # the queue — the card refuses BEFORE submission, naming the alternative.
+    a = _args("acme/Test-Ultra-550B-NVFP4")
+    a.image, a.accelerator = None, "rocm"
+    with pytest.raises(ValueError, match="cuda only, not rocm.*FP8 variant"):
+        cards.apply_to_args(a)
+    b = _args("acme/Test-Ultra-550B-NVFP4")
+    b.image, b.accelerator = None, "cuda"
+    lines = cards.apply_to_args(b)                            # cuda proceeds
+    assert any("--enable-flashinfer-autotune" in ln for ln in lines)
+
+
+def test_nemotron3_family_per_accelerator_serving():
+    # Research-backed (vLLM day-0 blog + NVIDIA cookbooks + AMD ROCm blogs):
+    # one card per checkpoint serves BOTH kinds of metal honestly.
+    ultra = cards.find_card("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4")
+    # cuda: NVIDIA's validated recipe — flashinfer knobs + the PINNED v0.22.0
+    # image (VLLM_USE_FLASHINFER_MOE_FP4 was REMOVED in vLLM 0.24)
+    cuda = cards.effective_args(ultra.args, "cuda")
+    assert cuda["enable_flashinfer_autotune"] is True and cuda["kv_cache_dtype"] == "fp8"
+    assert ultra.images["cuda"] == "docker.io/vllm/vllm-openai:v0.22.0"
+    assert cards.effective_args(cards.layered_env(
+        "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4"), "cuda")[
+        "VLLM_USE_FLASHINFER_MOE_FP4"] == "1"
+    # rocm: NO flashinfer anywhere; AITER on; mamba stays on the portable
+    # triton backend (the only ROCm-viable one)
+    rocm = cards.effective_args(ultra.args, "rocm")
+    assert "enable_flashinfer_autotune" not in rocm
+    assert rocm["mamba_backend"] == "triton" and rocm["mamba_ssm_cache_dtype"] == "float32"
+    renv = cards.effective_args(cards.layered_env(
+        "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4"), "rocm")
+    assert renv == {"VLLM_ROCM_USE_AITER": "1"}
+    # geometry on eldorado's MI300A shape (4x128): NVFP4 fits ONE node,
+    # BF16 (~1.1TB) becomes a 3-node Ray instance
+    assert cards.fit_geometry(ultra.min_vram_gb, 4, 128)[:2] == (1, 4)
+    bf16 = cards.find_card("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16")
+    assert cards.fit_geometry(bf16.min_vram_gb, 4, 128)[:2] == (3, 4)
+    # Super FP8 — the best AMD path — needs 2 MI300A
+    sup = cards.find_card("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8")
+    assert cards.fit_geometry(sup.min_vram_gb, 4, 128)[:2] == (1, 2)
+    # variant-specific cards beat the generic Nano match
+    assert cards.find_card("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8").min_vram_gb == 30
+    assert cards.find_card("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4").min_vram_gb == 18

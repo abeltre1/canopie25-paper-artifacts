@@ -77,6 +77,16 @@ class ModelCard:
     # architecture dies with 'Engine core initialization failed' in an old
     # image (field: Nemotron-3-Nano on eldorado). --image always wins.
     images: dict = field(default_factory=dict)
+    # [model.env]: environment the ENGINE needs — NVIDIA reference commands set
+    # kernel selectors as env vars (VLLM_USE_FLASHINFER_MOE_FP4=1), which flags
+    # cannot express. Merged into the container env; user box.env wins.
+    env: dict = field(default_factory=dict)
+    # Which accelerators this CHECKPOINT runs on at all: a quant format can be
+    # hardware-bound (NVFP4 = Blackwell/CUDA-only) and fails deep in kernel
+    # init elsewhere — the card refuses UP FRONT instead, and unsupported_hint
+    # names the variant to serve there. Empty = runs anywhere.
+    accelerators: list = field(default_factory=list)
+    unsupported_hint: str = ""
 
     @property
     def label(self) -> str:
@@ -123,6 +133,10 @@ def _parse_card(text: str, card_name: str, source: str, path: str) -> ModelCard:
         pip=[str(x) for x in section.get("pip", [])],
         aux_repos=[str(x) for x in section.get("aux_repos", [])],
         images={str(k): str(v) for k, v in (section.get("images") or {}).items()},
+        env={str(k): (dict(v) if isinstance(v, dict) else str(v))
+             for k, v in (section.get("env") or {}).items()},
+        accelerators=[str(a) for a in section.get("accelerators", [])],
+        unsupported_hint=str(section.get("unsupported_hint", "")),
     )
 
 
@@ -219,6 +233,25 @@ def layered_pip(model: str) -> list:
         for p in (c.pip if c else []):
             if p not in out:
                 out.append(p)
+    return out
+
+
+def layered_env(model: str) -> dict:
+    """[model.env] with the same packaged-base / user-overlay layering as
+    layered_args: engine env vars the model needs (kernel selectors like
+    VLLM_USE_FLASHINFER_MOE_FP4). User box.env still wins at merge time."""
+    key = model_key(model)
+    best: dict[str, ModelCard] = {}
+    for card in load_cards():
+        if not (fnmatch.fnmatchcase(key, card.match) or key == card.match):
+            continue
+        cur = best.get(card.source)
+        if cur is None or len(card.match) > len(cur.match):
+            best[card.source] = card
+    out: dict = {}
+    for c in (best.get("packaged"), best.get("user")):
+        if c:
+            out.update(c.env)
     return out
 
 
@@ -417,6 +450,8 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None) -> list[str]:
     card = resolve_model_card(model)
     if card is None:
         return decisions
+    accel = getattr(args, "accelerator", None) or "cuda"
+    check_accelerator(card, getattr(args, "accelerator", None) or "")
     if card.source == "generated":
         wrote = f" -> {_last_autogen['note']}" if _last_autogen["note"] else ""
         decisions.append(
@@ -449,7 +484,6 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None) -> list[str]:
         args.engine = card.engine
         decisions.append(f"engine: {card.engine} ({card.label})")
     if getattr(args, "image", None) is None and card.images:
-        accel = getattr(args, "accelerator", None) or "cuda"
         pinned = card.images.get(accel) or card.images.get("default", "")
         if pinned:
             args.image = pinned
@@ -460,19 +494,56 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None) -> list[str]:
     # the user's own post-`--` engine args, appended after, win (last-wins in the
     # engine's argparse). Field failure: bare 8B serve OOM'd because this table
     # was never applied.
-    flags = engine_flags(card.args)
+    flags = engine_flags(effective_args(card.args, accel))
     if flags:
         args.args = flags + list(getattr(args, "args", None) or [])
         decisions.append(f"engine args: {' '.join(flags)} ({card.label})")
     return decisions
 
 
+_ACCEL_OVERLAY_KEYS = ("cuda", "rocm")
+
+
+def effective_args(card_args: dict, accel: str) -> dict:
+    """Flatten a card's [model.args] for ONE accelerator: scalar keys are the
+    portable base; a nested [model.args.cuda]/[model.args.rocm] table overlays
+    it for that accelerator (overlay wins key-by-key). NVIDIA's reference
+    commands are full of CUDA-only knobs (FlashInfer autotune, FP4 MoE) that
+    would crash a ROCm vLLM — per-accelerator overlays keep ONE card honest on
+    both kinds of metal."""
+    base = {k: v for k, v in (card_args or {}).items()
+            if not (k in _ACCEL_OVERLAY_KEYS and isinstance(v, dict))}
+    overlay = (card_args or {}).get(accel)
+    if isinstance(overlay, dict):
+        base.update(overlay)
+    return base
+
+
+def check_accelerator(card: ModelCard, accel: str) -> None:
+    """Refuse UP FRONT when the checkpoint cannot run on this hardware (e.g. an
+    NVFP4 quant on a ROCm system) — the alternative is a kernel-init death an
+    hour into the queue. Raises ValueError with the card's redirect hint."""
+    if card.accelerators and accel and accel not in card.accelerators:
+        hint = f" {card.unsupported_hint}" if card.unsupported_hint else ""
+        raise ValueError(
+            f"{model_hint_name(card)}: this checkpoint runs on "
+            f"{'/'.join(card.accelerators)} only, not {accel}.{hint}")
+
+
+def model_hint_name(card: ModelCard) -> str:
+    return f"{card.label} (match {card.match!r})"
+
+
 def engine_flags(card_args: dict) -> list[str]:
     """Turn a card's [model.args] table into engine CLI flags:
     {max_model_len: 8192} -> ['--max-model-len', '8192']; a True bool -> a bare
-    '--flag' (store_true), False -> omitted. Underscores become dashes."""
+    '--flag' (store_true), False -> omitted. Underscores become dashes. Nested
+    tables (per-accelerator overlays) never leak — flatten with effective_args
+    first; anything dict-valued here is skipped defensively."""
     out: list[str] = []
     for key, val in (card_args or {}).items():
+        if isinstance(val, dict):
+            continue
         flag = f"--{str(key).replace('_', '-')}"
         if isinstance(val, bool):
             if val:

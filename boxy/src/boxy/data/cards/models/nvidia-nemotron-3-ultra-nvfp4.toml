@@ -1,0 +1,35 @@
+# Nemotron-3 Ultra 550B-A55B, NVFP4 checkpoint (~300GB packed weights).
+# NVIDIA-validated on Blackwell/Hopper with vLLM v0.22.0 EXACTLY — the
+# VLLM_USE_FLASHINFER_MOE_FP4 switch was REMOVED in vLLM 0.24, so the cuda
+# image is PINNED to the recipe's tag. On AMD (MI300-class) NVFP4 loads via
+# ROCm vLLM's BF16 dequant emulation (AMD blog, 2026-07) — unvalidated by
+# NVIDIA and slower than native; the BF16 variant is the conservative path.
+# MTP speculative decoding is optional (add after --:
+#   -- --speculative-config '{"method":"mtp","num_speculative_tokens":5}')
+# and known to conflict with Mamba prefix caching.
+[model]
+match = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4*"
+engine = "vllm"
+gpus = 4
+min_vram_gb = 300
+[model.args]
+trust_remote_code = true
+max_model_len = 262144
+max_num_seqs = 16
+max_num_batched_tokens = 32768
+gpu_memory_utilization = 0.90
+mamba_backend = "triton"
+mamba_ssm_cache_dtype = "float32"
+reasoning_parser = "nemotron_v3"
+tool_call_parser = "qwen3_coder"
+enable_auto_tool_choice = true
+[model.args.cuda]
+kv_cache_dtype = "fp8"
+enable_flashinfer_autotune = true
+[model.env.cuda]
+VLLM_USE_FLASHINFER_MOE_FP4 = "1"
+[model.env.rocm]
+VLLM_ROCM_USE_AITER = "1"
+[model.images]
+cuda = "docker.io/vllm/vllm-openai:v0.22.0"
+rocm = "docker.io/rocm/vllm:latest"

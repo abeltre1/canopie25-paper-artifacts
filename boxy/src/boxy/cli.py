@@ -2510,7 +2510,7 @@ def _missing_py_packages(text: str) -> list[str]:
     return out
 
 
-def _ensure_card_args(box, model_ref: str):
+def _ensure_card_args(box, model_ref: str, accel: str = ""):
     """Belt-and-suspenders: make sure the model card's [model.args] are on the
     box that is ABOUT TO BE RENDERED. resolve() merges them at build time, but
     the agentless path mutates the box afterwards (bare-id rewrite, prestage
@@ -2522,23 +2522,32 @@ def _ensure_card_args(box, model_ref: str):
 
     from boxy import cards
 
-    card_args, label, card_pip = {}, "", []
+    card_args, label, card_pip, card_env = {}, "", [], {}
     for ref in (model_ref, getattr(box, "model", "")):
         if ref:
             card_args, label = cards.layered_args(ref)
             card_pip = cards.layered_pip(ref)
-            if card_args or card_pip:
+            card_env = cards.layered_env(ref)
+            if card_args or card_pip or card_env:
                 break
+    # flatten per-accelerator overlays ([model.args.cuda]/.rocm, [model.env.cuda]/
+    # .rocm) for THIS metal
+    card_args = cards.effective_args(card_args, accel or "cuda")
+    card_env = cards.effective_args(card_env, accel or "cuda")
     missing = {k: v for k, v in card_args.items() if k not in box.args}
     missing_pip = [p for p in card_pip if p not in box.pip]
-    if not missing and not missing_pip:
+    missing_env = {k: v for k, v in card_env.items() if k not in box.env}
+    if not missing and not missing_pip and not missing_env:
         return box, ""
     notes = []
     if missing:
         notes.append(", ".join(f"{k}={v}" for k, v in missing.items()))
     if missing_pip:
         notes.append(f"pip: {' '.join(missing_pip)}")
-    return (dc_replace(box, args={**box.args, **missing}, pip=[*box.pip, *missing_pip]),
+    if missing_env:
+        notes.append(f"env: {' '.join(f'{k}={v}' for k, v in missing_env.items())}")
+    return (dc_replace(box, args={**box.args, **missing}, pip=[*box.pip, *missing_pip],
+                       env={**missing_env, **box.env}),
             f"engine args: {'; '.join(notes)} ({label} — merged into the final command)")
 
 
@@ -2776,7 +2785,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
     # model reference mutated into above (bare-id rewrite, prestage path swap):
     # the field kept producing scripts whose vLLM line lacked the card's
     # --trust-remote-code. Idempotent when resolve already merged them.
-    box, late_note = _ensure_card_args(box, args.model)
+    box, late_note = _ensure_card_args(box, args.model, accel=accel)
     if late_note:
         print(f"  auto: {late_note}")
 
@@ -4056,7 +4065,9 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
     engine_tail = list(user_tail)
     if getattr(args, "model", None):
         card = cards.resolve_model_card(args.model)
-        flags = cards.engine_flags(card.args) if (card and card.args) else []
+        flags = (cards.engine_flags(
+            cards.effective_args(card.args, getattr(args, "accelerator", None) or "cuda"))
+            if (card and card.args) else [])
         if flags:
             engine_tail = flags + engine_tail
             print(f"  auto: engine args: {' '.join(flags)} ({card.label} — placed after --)")
