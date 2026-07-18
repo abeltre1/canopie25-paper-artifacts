@@ -477,10 +477,15 @@ def test_ssh_explicit_scheduler_not_re_injected(ssh, capfd, monkeypatch):
 def test_ssh_here_stays_a_direct_serve(ssh, capfd, monkeypatch):
     # --here is an explicit "serve directly on that node": scheduler auto-detection
     # must NOT turn it into a batch job even though sbatch is on the host.
+    # NOTE: the DELEGATED boxy may print its own "auto: scheduler: none (…)" line
+    # when its resolution succeeds (on CI podman works, and the accel ladder now
+    # reads the fake cluster's GRES) — only a slurm/flux verdict would mean a
+    # batch job, so that is what must be absent.
     monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
     main(["serve", MODEL, "--here", "--ssh", "user@hops", "--dryrun"])
     cap = capfd.readouterr()
-    assert "auto: scheduler:" not in cap.out
+    assert "auto: scheduler: slurm" not in cap.out
+    assert "auto: scheduler: flux" not in cap.out
     assert "--scheduler" not in ssh["ssh_log"].read_text()
 
 
