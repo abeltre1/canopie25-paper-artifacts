@@ -29,6 +29,22 @@ Every `auto:` decision is overridable by a flag (`--engine --runtime
 (`--box` = the *what*, `--location` = the *where*). Profiles are how a site's
 quirks (modules, tuning, offline mode, GPU counts) are pinned once and reused.
 
+## Documentation map
+
+| Doc | What it's for |
+|-----|---------------|
+| [README](README.md) | front door: install, turnkey serve, cards, `push`, air-gap intro |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | the layered design (cards → resolution → drivers → agentless) |
+| [RUNBOOK.md](RUNBOOK.md) | field operations: TLS/proxy/registry failures and their fixes |
+| [DEMO-turnkey.md](DEMO-turnkey.md) | the one-command-per-target demo script + prove-it checklist |
+| [DEMO-chisel.md](DEMO-chisel.md) | everyone-URL sharing through the OpenShift chisel relay |
+| [AIRGAP.md](AIRGAP.md) | air-gap readiness checklist: bundles, baked images, cleanup, kill switches |
+| [RELEASING.md](RELEASING.md) | wheel/PyPI (public + local Nexus), repo extraction |
+| [VALIDATION.md](VALIDATION.md) | how the test suite maps to the field guarantees |
+
+(Older session runbooks were retired; anything still useful was folded into the
+docs above. `archive/` keeps superseded material for reference.)
+
 ## Turnkey: one command, from laptop to cluster
 
 A user with **zero SLURM/container knowledge** serves a model with one command —
@@ -268,8 +284,11 @@ boxy serve <model> --scheduler flux --gpus 4 --unique   # repeat freely, no name
 # (default name is a stable singleton so a plain rerun reconnects instead of duplicating.)
 
 # SCALE OUT — three orthogonal modes (all --dryrun-able; see RUNBOOK §4.5):
-# 1) One instance ACROSS nodes (model-parallel via Ray; auto-on for vLLM+nodes>1):
-boxy serve <model> --scheduler slurm --nodes 2 --gpus 4   # TP=GPUs/node, PP=nodes
+# 1) One instance ACROSS nodes (model-parallel via Ray; auto-on for vLLM+nodes>1).
+#    Works agentless over --ssh too: the batch script runs the Ray head + vllm on
+#    the head node and sruns the worker containers onto the rest — no boxy on the
+#    cluster (--no-distributed opts out):
+boxy serve <model> --ssh hops --nodes 2 --gpus 4          # TP=GPUs/node, PP=nodes
 # 2) N INDEPENDENT replicas (data-parallel), BIN-PACKED onto node GPUs
 #    (4 replicas x 1 GPU = 1 node, not 4). --nodes N spreads across N nodes
 #    (12 replicas --nodes 4 = 3/node); --gpus-per-replica R gives each TP=R;
@@ -293,6 +312,13 @@ boxy serve hf://org/model --scheduler slurm --gpus 4 --accelerator cuda --foregr
 # Pre-stage a model on the login node (network) for compute nodes (no network):
 boxy pull hf://org/repo/file.gguf
 boxy pull hf://org/repo --force    # wipe a partial/corrupt cache and re-pull clean
+
+# WHERE models land on the cluster (--ssh serves): boxy probes the login node for
+# a big SHARED scratch FS ($SCRATCH, /tscratch, /pscratch, /scratch — first
+# writable one with >= storage.min_free_gb free, default 100) and puts the HF
+# cache THERE, never on your $HOME quota. The pick is remembered per cluster so
+# the cache is downloaded once and always reused. Pin it explicitly with:
+#   export BOXY_MODEL_DIR=/tscratch/users/$USER/boxy    # (or config storage.model_dir)
 
 # vLLM note: boxy defaults `--safetensors-load-strategy eager` (vLLM's recommendation
 # for the NFS/Lustre stores HPC uses; vLLM>=0.24's NFS auto-prefetch can misload shards).

@@ -97,3 +97,15 @@ Then update `[project.urls]` in `pyproject.toml` and the absolute GitHub links i
 publisher's *Repository name* / *Workflow name* to match. The live monorepo
 workflows stay at the repo root; the `.github-export/` copies are the
 standalone-repo versions (no `boxy/` path prefix, no `working-directory`).
+
+## Standing up boxy as a private repository (one command)
+
+Repo creation needs YOUR authenticated `gh` (the CI integration cannot create
+repos). From the monorepo root:
+
+```bash
+gh repo create <you>/boxy --private --source boxy --push
+```
+
+Then follow "Extracting boxy into its own repository" above for the history
+carve-out and workflow templates.
