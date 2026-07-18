@@ -26,6 +26,24 @@ ROCM_ARGS = [
 ]
 
 
+# Where the built command will RUN, when that differs from where it is BUILT.
+# The agentless renderer builds the podman command on the laptop (often macOS)
+# for execution on a Linux compute node — sys.platform must not decide there.
+# FIELD (eldorado, TP=2 Nemotron): a Mac-rendered agentless script took the
+# darwin branch below (-p port publishing, no --ipc=host), so the container
+# ran with podman's default 64MB /dev/shm and RCCL died at ncclCommInitRank
+# with 'NCCL error: unhandled system error' the moment a second GPU joined.
+_target_os: str | None = None  # None = this host; "linux" pinned by the agentless renderer
+
+
+def set_target_os(value: str | None) -> None:
+    """Pin the platform the rendered command targets ('linux'), or None to
+    follow sys.platform again. Process-global (same pattern as the Slurm
+    auto-GRES override); the agentless renderer resets it in a finally."""
+    global _target_os
+    _target_os = value
+
+
 def _serve_ports(box: Box, inner_cmd: list[str]) -> list[int]:
     """Ports to publish. A --port in the engine args is the port the server
     will ACTUALLY bind, so it replaces (not augments) the box's declared
@@ -43,11 +61,16 @@ class PodmanBackend(RuntimeBackend):
     run_verb = "run"
 
     def network_args(self, box: Box, inner_cmd: list[str]) -> list[str]:
-        """Linux (HPC nodes): host networking, per the paper's prototype.
+        """Linux (HPC nodes): host networking + host IPC, per the paper's
+        prototype — --ipc=host also gives the container the host's /dev/shm,
+        which NCCL/RCCL need for multi-GPU communicators (podman's default
+        64MB is fatally small: 'NCCL error: unhandled system error').
         macOS: podman-machine/Docker Desktop run containers in a Linux VM,
         where --network=host binds inside the VM and is unreachable from the
-        host — publish ports instead. (Field finding #11, 2026-07.)"""
-        if sys.platform == "darwin":
+        host — publish ports instead. (Field finding #11, 2026-07.)
+        The platform is the TARGET's when pinned (agentless render for a
+        Linux cluster from a Mac), else this host's."""
+        if (_target_os or sys.platform) == "darwin":
             args: list[str] = []
             for port in _serve_ports(box, inner_cmd):
                 args += ["-p", f"{port}:{port}"]

@@ -208,3 +208,28 @@ def test_render_multinode_needs_gpu_count(tmp_path):
             _box("meta-llama/Llama-3.1-70B-Instruct", engine="vllm"), _vllm_loc(2, 0),
             "slurm", "b", str(tmp_path / "ep.json"), str(tmp_path / "l.log"),
             [], port=8000, engine_pulls_model=True)
+
+
+# ---- target platform: the script RUNS on Linux no matter where it is BUILT ----
+
+
+def test_render_from_mac_still_targets_linux(staged_gguf, tmp_path, monkeypatch):
+    # FIELD (eldorado, Nemotron TP=2): rendered on a Mac laptop, the podman
+    # command took the darwin branch (-p publishing, NO --ipc=host) — so the
+    # container ran on podman's 64MB /dev/shm and RCCL died at ncclCommInitRank
+    # ('NCCL error: unhandled system error') as soon as a second GPU joined.
+    # The agentless render must pin the TARGET platform (Linux), not follow
+    # the laptop's.
+    import sys as _sys
+
+    monkeypatch.setattr(_sys, "platform", "darwin")
+    script = deploy.render_agentless_script(
+        _box(staged_gguf), _loc(), "slurm", "boxy-al",
+        str(tmp_path / "e.json"), str(tmp_path / "l-%j.log"), [], port=8090)
+    assert "--network=host" in script and "--ipc=host" in script
+    assert "-p 8090:8090" not in script                      # not the mac port-publish branch
+    # and the pin does not leak: a plain local darwin build publishes ports again
+    from boxy.backends.podman import PodmanBackend
+
+    args = PodmanBackend().network_args(_box(staged_gguf), ["llama-server", "--port", "8090"])
+    assert args == ["-p", "8090:8090"]

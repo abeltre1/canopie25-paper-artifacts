@@ -609,3 +609,23 @@ def test_engine_core_wrapper_extracts_root_cause():
     out = diagnostics.diagnose("RuntimeError: Engine core initialization failed. "
                                "See root cause above.")
     assert "actionable error is higher up" in out and "extracted" not in out
+
+
+def test_diagnose_nccl_shm_too_small_beats_generic_wrapper():
+    # FIELD (eldorado, Nemotron-3 Nano TP=2 on ROCm): both workers died at
+    # ncclCommInitRank with 'NCCL error: unhandled system error' — RCCL could
+    # not create its shared-memory segments in podman's default 64MB /dev/shm
+    # (the Mac-rendered agentless script had dropped --ipc=host). The specific
+    # remedy must beat the generic engine-core wrapper even when both appear.
+    log = (
+        "(Worker pid=120) ERROR [multiproc_executor.py:898] WorkerProc failed to start.\n"
+        "(Worker pid=120) ERROR ...   self.comm: ncclComm_t = self.nccl.ncclCommInitRank(\n"
+        "(Worker pid=120) ERROR ... RuntimeError: NCCL error: unhandled system error "
+        "(run with NCCL_DEBUG=INFO for details)\n"
+        "(EngineCore pid=85) ERROR ... Engine core initialization failed.\n"
+    )
+    hint = diagnostics.diagnose(log)
+    assert hint is not None
+    assert "shared memory" in hint
+    assert "--ipc=host" in hint and "--shm-size" in hint
+    assert "NCCL_DEBUG=INFO" in hint

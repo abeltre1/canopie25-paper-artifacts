@@ -233,6 +233,13 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
             f"(slurm or flux), not {scheduler_name!r}")
     global _AGENTLESS_RENDER
     _AGENTLESS_RENDER = True
+    # the command RUNS on a Linux compute node no matter where it is RENDERED:
+    # a Mac laptop's darwin branch (-p publishing, no --ipc=host) left the
+    # container on podman's 64MB /dev/shm, and RCCL died at ncclCommInitRank
+    # the moment TP>1 needed a communicator (field: eldorado, Nemotron TP=2).
+    from boxy.backends import podman as podman_backend
+
+    podman_backend.set_target_os("linux")
     try:
         if multinode:
             try:
@@ -244,6 +251,7 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
             deployment = plan_serve(box, local, port=port, dryrun=True)  # dryrun: no pull, no verify
     finally:
         _AGENTLESS_RENDER = False
+        podman_backend.set_target_os(None)
 
     # CA into the container, picked ON THE COMPUTE NODE at job runtime: the
     # engine's in-container HuggingFace fetch must trust the site's TLS

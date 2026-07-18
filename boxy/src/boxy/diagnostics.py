@@ -273,6 +273,24 @@ def _not_a_text_generation_model(m: "re.Match[str]", log: str) -> str:
     )
 
 
+def _nccl_shm_too_small(m: "re.Match[str]", log: str) -> str:
+    return _fmt(
+        "NCCL/RCCL could not create its multi-GPU communicator (shared memory)",
+        "ncclCommInitRank failed with 'unhandled system error' — on TP/PP >= 2 the\n"
+        "GPU communicator needs /dev/shm segments, and a rootless podman container\n"
+        "defaults to a 64MB /dev/shm that RCCL/NCCL cannot live in. Single-GPU runs\n"
+        "never hit this (no communicator is created).\n"
+        "  fix: re-deploy with an updated boxy — the container now runs with\n"
+        "  --ipc=host (the host's /dev/shm) on Linux compute nodes, including\n"
+        "  agentless scripts rendered on a Mac (the bug: the render followed the\n"
+        "  LAPTOP's platform and dropped --ipc=host).\n"
+        "  by hand: add --ipc=host (or --shm-size=8g) to the podman run line in the\n"
+        "  batch script and resubmit.\n"
+        "  confirm: rerun with --env NCCL_DEBUG=INFO — the failing transport prints\n"
+        "  'Error while creating shared memory segment'.",
+    )
+
+
 RULES: list[Rule] = [
     # only the DEFINITIVE signature: the 'has no vLLM implementation' warning alone
     # is benign (the Transformers fallback often works); this error is fatal.
@@ -365,6 +383,17 @@ RULES: list[Rule] = [
         re.compile(r"(?:failed to load model|unable to load model|llama_load_model_from_file|"
                    r"invalid magic|unknown model architecture|error loading model)", re.IGNORECASE),
         _gguf_load_fail,
+    ),
+    Rule(
+        # NCCL/RCCL communicator init died (multi-GPU only: TP=1 never creates
+        # one). In a rootless container the near-universal cause is podman's
+        # default 64MB /dev/shm — the SHM transport can't allocate its segments
+        # (field: eldorado MI300A, Nemotron TP=2, Mac-rendered agentless script
+        # without --ipc=host).
+        "nccl-shm-too-small",
+        re.compile(r"NCCL error: unhandled system error|ncclSystemError|"
+                   r"Error while creating shared memory segment", re.IGNORECASE),
+        _nccl_shm_too_small,
     ),
     # LAST: the generic vLLM wrapper. Only fires when nothing specific matched,
     # so a real signature above always wins.
