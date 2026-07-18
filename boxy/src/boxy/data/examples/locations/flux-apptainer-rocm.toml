@@ -9,6 +9,7 @@ offline = true
 [location.resources]
 nodes = 2
 gpus_per_node = 4
+gpu_vram_gb = 128    # MI300A-class parts; the model-card geometry solver sizes against this
 
 [location.modules]
 load = ["rocm/6.4.0"]

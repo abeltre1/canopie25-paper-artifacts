@@ -283,12 +283,28 @@ boxy serve <model> --scheduler flux --gpus 4 --partition pbatch      # Flux: ide
 boxy serve <model> --scheduler flux --gpus 4 --unique   # repeat freely, no name clash
 # (default name is a stable singleton so a plain rerun reconnects instead of duplicating.)
 
+# GEOMETRY IS SOLVED FROM CARDS — no --gpus/--nodes needed. The model card's
+# min_vram_gb (demand) is fit against the cluster's node shape (supply): write a
+# SYSTEM card for your cluster once and every serve sizes itself —
+#   ~/.config/boxy/cards/systems/cronus.toml:
+#       [location]
+#       name = "cronus"
+#       [location.resources]
+#       gpus_per_node = 4
+#       gpu_vram_gb = 140          # H200-class parts
+# then `boxy serve meta-llama/Llama-3.3-70B-Instruct --ssh cronus` requests
+# 2x140GB GPUs (not the 80GB-class default of 4), and a model bigger than one
+# node automatically becomes an N-node Ray instance. Without a system card the
+# solver assumes 4x80GB and says so. BOXY_GPUS_PER_NODE/BOXY_GPU_VRAM_GB pin the
+# shape via env; --gpus/--nodes always override everything (power users).
+
 # SCALE OUT — three orthogonal modes (all --dryrun-able; see RUNBOOK §4.5):
-# 1) One instance ACROSS nodes (model-parallel via Ray; auto-on for vLLM+nodes>1).
+# 1) One instance ACROSS nodes (model-parallel via Ray; auto-on for vLLM+nodes>1,
+#    and AUTO-CHOSEN when the model card exceeds one node — see above).
 #    Works agentless over --ssh too: the batch script runs the Ray head + vllm on
 #    the head node and sruns the worker containers onto the rest — no boxy on the
 #    cluster (--no-distributed opts out):
-boxy serve <model> --ssh hops --nodes 2 --gpus 4          # TP=GPUs/node, PP=nodes
+boxy serve <model> --ssh hops --nodes 2 --gpus 4          # explicit TP=GPUs/node, PP=nodes
 # 2) N INDEPENDENT replicas (data-parallel), BIN-PACKED onto node GPUs
 #    (4 replicas x 1 GPU = 1 node, not 4). --nodes N spreads across N nodes
 #    (12 replicas --nodes 4 = 3/node); --gpus-per-replica R gives each TP=R;

@@ -342,3 +342,95 @@ def test_single_node_multi_gpu_gets_tensor_parallel():
 
     loc1 = Location(name="l", resources=Resources(nodes=1, gpus_per_node=1))
     assert "--tensor-parallel-size" not in " ".join(engines.build_serve_cmd(box, loc1, "m"))
+
+
+# ---- fit_geometry: the card solver (demand x supply -> nodes/gpus) -------------------
+
+
+def test_fit_geometry_parity_with_hand_sized_cards():
+    # CALIBRATION CONTRACT: on the assumed 4x80GB shape the solver reproduces
+    # every packaged card's hand-sized gpus exactly — so shipping the solver
+    # changes NO existing deployment until a system card declares real hardware.
+    for card in cards.load_cards():
+        if card.source != "packaged" or not card.min_vram_gb or card.nodes:
+            continue
+        nodes, gpus, _ = cards.fit_geometry(card.min_vram_gb, 0, 0)
+        assert (nodes, gpus) == (1, card.gpus), card.card_name
+
+
+def test_fit_geometry_fat_vram_uses_fewer_gpus():
+    # 70B (140GB weights): 4 GPUs on 80GB parts, but TWO on 140GB parts (cronus)
+    assert cards.fit_geometry(140, 4, 80)[:2] == (1, 4)
+    assert cards.fit_geometry(140, 4, 140)[:2] == (1, 2)
+
+
+def test_fit_geometry_spills_to_full_nodes_and_says_ray():
+    nodes, gpus, why = cards.fit_geometry(810, 4, 80)     # 405B-class
+    assert (nodes, gpus) == (4, 4)
+    assert "exceeds one node" in why
+
+
+def test_fit_geometry_states_assumptions_when_shape_unknown():
+    _, _, why = cards.fit_geometry(24, 0, 0)
+    assert "assuming 80GB-class GPUs" in why and "assuming 4 GPUs/node" in why
+
+
+# ---- system cards carry the node shape ----------------------------------------------
+
+
+def test_system_shape_from_user_cluster_card(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    d = tmp_path / "boxy" / "cards" / "systems"
+    d.mkdir(parents=True)
+    (d / "cronus.toml").write_text(
+        '[location]\nname = "cronus"\nscheduler = "slurm"\n'
+        '[location.resources]\ngpus_per_node = 4\ngpu_vram_gb = 140\n')
+    assert cards.system_shape("cronus") == (4, 140, "cronus")
+    assert cards.system_shape("no-such-cluster") is None
+
+
+def test_apply_solves_geometry_from_shape():
+    # same command, different metal: the 70B card needs 2 GPUs on a 4x140 node…
+    a = _args("meta-llama/Llama-3.3-70B-Instruct")
+    lines = cards.apply_to_args(a, shape=(4, 140, "system card 'cronus' for cronus"))
+    assert a.gpus == 2 and a.nodes is None
+    assert any("gpus: 2 per node" in ln and "cronus" in ln for ln in lines)
+    # …and becomes a 2-node Ray instance on skinny 2x80 nodes — zero flags either way
+    b = _args("meta-llama/Llama-3.3-70B-Instruct")
+    lines = cards.apply_to_args(b, shape=(2, 80, "system card 'small' for small"))
+    assert b.gpus == 2 and b.nodes == 2
+    assert any("nodes: 2" in ln and "Ray" in ln for ln in lines)
+
+
+def test_apply_solver_bypassed_by_power_user_flags_and_card_nodes(tmp_path, monkeypatch):
+    # explicit --gpus/--nodes: the solver never runs
+    a = _args("meta-llama/Llama-3.3-70B-Instruct", gpus=8)
+    cards.apply_to_args(a, shape=(4, 140, "x"))
+    assert a.gpus == 8 and a.nodes is None
+    a = _args("meta-llama/Llama-3.3-70B-Instruct", nodes=3)
+    cards.apply_to_args(a, shape=(4, 140, "x"))
+    assert a.nodes == 3 and a.gpus == 4                   # card copy, not the solver
+    # a card that PINS nodes is author intent — also bypasses the solver
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    d = tmp_path / "boxy" / "cards" / "models"
+    d.mkdir(parents=True)
+    (d / "pinned.toml").write_text(
+        '[model]\nmatch = "acme/Pinned-Geo-70B*"\nengine = "vllm"\n'
+        'gpus = 4\nnodes = 2\nmin_vram_gb = 140\n')
+    b = _args("acme/Pinned-Geo-70B-Instruct")
+    cards.apply_to_args(b, shape=(4, 140, "x"))
+    assert b.gpus == 4 and b.nodes == 2
+
+
+def test_zero_flag_geometry_solved_end_to_end(monkeypatch, tmp_path, capsys):
+    # config-pinned shape (the env power-user path): 4x140GB parts -> the same
+    # zero-flag 70B serve now requests 2 GPUs, not 4
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setenv("BOXY_GPUS_PER_NODE", "4")
+    monkeypatch.setenv("BOXY_GPU_VRAM_GB", "140")
+    rc = main(["serve", "hf://meta-llama/Llama-3.3-70B-Instruct",
+               "--scheduler", "slurm", "--dryrun"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "auto: gpus: 2 per node" in out
+    assert "#SBATCH --gpus-per-node=2" in out

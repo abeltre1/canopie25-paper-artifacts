@@ -951,6 +951,25 @@ def _resolve_proxy(args) -> str:
     return config.get_str("network.proxy")
 
 
+def _node_shape(host: str | None) -> tuple[int, int, str] | None:
+    """The target system's node hardware for the model-card geometry solver:
+    (gpus_per_node, gpu_vram_gb, provenance). Sources, most-durable first: a
+    SYSTEM CARD matching the cluster's name (the card-native home — write
+    ~/.config/boxy/cards/systems/<cluster>.toml once), then config
+    site.gpus_per_node / site.gpu_vram_gb (BOXY_GPUS_PER_NODE / BOXY_GPU_VRAM_GB).
+    None -> the solver states its 4x80GB-class assumptions instead."""
+    from boxy import cards, jobs
+
+    cluster = jobs.cluster_id(host.split("@")[-1]) if host else jobs.local_cluster()
+    shape = cards.system_shape(cluster)
+    if shape:
+        return shape[0], shape[1], f"system card '{shape[2]}' for {cluster}"
+    g, v = config.get_int("site.gpus_per_node"), config.get_int("site.gpu_vram_gb")
+    if g or v:
+        return g, v, "config site.gpus_per_node/gpu_vram_gb"
+    return None
+
+
 def _proxy_prefix(args) -> str:
     """`env VAR=val ...` prefix for the COMPUTE-NODE command, so its host-side
     `podman pull` (and the inner boxy) reach the corporate proxy — the usual fix
@@ -2462,8 +2481,12 @@ def _serve_agentless_ssh(args, target: str) -> int:
             args.accelerator = probed
             print(f"  auto: accelerator: {probed} (via the GPU stack on {host}'s login node)")
 
-    # 2) model card -> gpus/engine/args (all laptop-side; nothing needed on the cluster)
-    for line in cards.apply_to_args(args):
+    # 2) model card -> geometry/engine/args (all laptop-side; nothing needed on
+    #    the cluster). The card's min_vram_gb is solved against the TARGET
+    #    cluster's node shape (its system card), so a fat-VRAM system uses fewer
+    #    GPUs and an over-one-node model becomes an N-node Ray instance — same
+    #    bare `boxy serve MODEL --ssh HOST` command either way.
+    for line in cards.apply_to_args(args, shape=_node_shape(host)):
         print(f"  auto: {line}")
 
     # 3) box + location, accelerator/runtime PINNED so no local hardware probe runs
@@ -3971,10 +3994,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
         if scheduler_name in ("slurm", "flux"):
             # Turnkey: fill --gpus/--nodes/--engine from the model's card (or the
             # size heuristic) when the flags are absent — a novice types only the
-            # model name; explicit flags always win (cards.apply_to_args).
+            # model name; explicit flags always win (cards.apply_to_args). The
+            # local cluster's system card (if any) supplies the node shape so the
+            # geometry is solved, not assumed.
             from boxy import cards
 
-            for line in cards.apply_to_args(args):
+            for line in cards.apply_to_args(args, shape=_node_shape(None)):
                 print(f"  auto: {line}")
             replicas = getattr(args, "replicas", 1) or 1
             if replicas > 1:

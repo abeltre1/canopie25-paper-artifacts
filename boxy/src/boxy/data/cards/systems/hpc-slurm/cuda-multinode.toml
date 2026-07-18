@@ -9,3 +9,4 @@ offline = true
 [location.resources]
 nodes = 2
 gpus_per_node = 4
+gpu_vram_gb = 80    # A100/H100-class parts; the model-card geometry solver sizes against this

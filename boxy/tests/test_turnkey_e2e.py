@@ -1740,3 +1740,48 @@ def test_ssh_agentless_serve_from_bundle_is_fully_offline(ssh, capfd, monkeypatc
     assert "/projects/me/nemotron-bundle/wheels:/opt/boxy-wheels" in script
     assert "--trust-remote-code" in script                     # card args still ride
     assert "proxy.sandia.gov" not in script                    # zero egress config
+
+
+def test_ssh_geometry_from_system_card_zero_flags(ssh, capfd, monkeypatch, tmp_path):
+    # THE abstraction: `boxy serve MODEL --ssh hops` with a system card declaring
+    # hops's node hardware — the geometry is SOLVED from cards alone. A 70B on
+    # 4x140GB parts gets 2 GPUs (not the 80GB-class 4), no flags typed.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    d = tmp_path / "xdg" / "boxy" / "cards" / "systems"
+    d.mkdir(parents=True)
+    (d / "hops.toml").write_text(
+        '[location]\nname = "hops"\nscheduler = "slurm"\n'
+        '[location.resources]\ngpus_per_node = 4\ngpu_vram_gb = 140\n')
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    rc = main(["serve", "hf://meta-llama/Llama-3.3-70B-Instruct",
+               "--scheduler", "slurm", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: gpus: 2 per node" in cap.out
+    assert "system card 'hops' for hops" in cap.out
+    assert "#SBATCH --gpus-per-node=2" in cap.out
+    assert "ray start" not in cap.out                     # fits one node -> no Ray
+
+
+def test_ssh_model_bigger_than_a_node_goes_multinode_zero_flags(ssh, capfd, monkeypatch, tmp_path):
+    # A model whose card says it CANNOT fit one node: same bare command, and the
+    # solver turns it into an N-node Ray instance end to end (batch script fans
+    # the workers out). Nothing typed beyond the model name and the host.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    d = tmp_path / "xdg" / "boxy" / "cards" / "models"
+    d.mkdir(parents=True)
+    (d / "acme-mega.toml").write_text(
+        '[model]\nmatch = "acme/Mega-405B*"\nengine = "vllm"\nmin_vram_gb = 810\n'
+        '[model.args]\nmax_model_len = 8192\n')
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    rc = main(["serve", "acme/Mega-405B-Instruct", "--scheduler", "slurm",
+               "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: gpus: 4 per node" in cap.out
+    assert "auto: nodes: 4" in cap.out and "Ray" in cap.out
+    assert "#SBATCH --nodes=4" in cap.out and "#SBATCH --ntasks-per-node=1" in cap.out
+    assert "ray start --head" in cap.out                  # the multinode agentless script
+    assert "--tensor-parallel-size=4" in cap.out and "--pipeline-parallel-size=4" in cap.out

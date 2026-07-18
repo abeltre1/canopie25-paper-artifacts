@@ -26,6 +26,10 @@ class Resources:
     gpus_per_node: int = 0
     accelerator_type: str = ""  # e.g. "H100", "MI300"; used by the cloud/sky path
     distributed: bool | None = None  # multi-node Ray serving; None = auto (on for vllm+nodes>1)
+    # per-GPU memory (GB) of THIS system's parts — the supply side of the card
+    # geometry solver (a model card's min_vram_gb is the demand side). 0 = unknown;
+    # the solver then assumes config cardgen.gpu_class_gb (80, A100/H100-class).
+    gpu_vram_gb: int = 0
 
 
 @dataclass

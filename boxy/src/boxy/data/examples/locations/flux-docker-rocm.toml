@@ -8,5 +8,6 @@ offline = true
 [location.resources]
 nodes = 1
 gpus_per_node = 4
+gpu_vram_gb = 128    # MI300A-class parts; the model-card geometry solver sizes against this
 [location.staging]
 models_dir = "./models"

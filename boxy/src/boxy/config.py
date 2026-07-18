@@ -222,6 +222,16 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
             help="accelerator assumed for a GPU job submitted from a GPU-less login node "
                  "(where detection sees no device). --accelerator / a --location profile win."),
 
+    # -- node hardware (the geometry solver's supply side) ---------------------
+    Setting("site.gpus_per_node", "BOXY_GPUS_PER_NODE", 0, int,
+            help="GPUs per compute node on the target system, for the model-card "
+                 "geometry solver. 0 = take it from a system card matching the cluster, "
+                 "else assume 4. A system card is the durable home for this."),
+    Setting("site.gpu_vram_gb", "BOXY_GPU_VRAM_GB", 0, int,
+            help="per-GPU memory (GB) on the target system, for the model-card geometry "
+                 "solver (e.g. 140 for H200-class parts). 0 = system card, else the "
+                 "cardgen.gpu_class_gb 80GB-class assumption."),
+
     # -- model storage on the cluster ------------------------------------------
     Setting("storage.model_dir", "BOXY_MODEL_DIR", "",
             help="cluster directory for the model cache (HF downloads) on --ssh serves. "

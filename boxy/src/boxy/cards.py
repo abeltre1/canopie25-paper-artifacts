@@ -17,7 +17,10 @@ Card format (TOML):
     engine = "vllm"          # optional; image still comes from the RamaLama map
     gpus = 4                 # job geometry; tensor-parallel derives from this
     nodes = 1                # optional
-    min_vram_gb = 140        # advisory, printed in the decision line
+    min_vram_gb = 140        # weight footprint — drives the geometry SOLVER (fit_geometry):
+                             # solved against the target's node shape (a system card's
+                             # gpus_per_node x gpu_vram_gb), it picks the fewest GPUs that
+                             # fit, spilling to N-node Ray when the model exceeds one node
     [model.args]             # engine args, merged tack-on-last (user args win)
     max_model_len = 8192
 
@@ -60,7 +63,7 @@ class ModelCard:
     engine: str = ""               # "" -> inferred as today
     gpus: int = 0                  # 0 -> no opinion
     nodes: int = 0                 # 0 -> no opinion
-    min_vram_gb: int = 0           # advisory only
+    min_vram_gb: int = 0           # weight footprint; 0 -> geometry solver stays off
     args: dict = field(default_factory=dict)
     # extra pip packages the model's custom code imports that the engine image
     # doesn't ship (installed at container start; field: Nemotron-Parse/open_clip)
@@ -342,12 +345,19 @@ def system_card_path(name: str) -> str:
     return f.name
 
 
-def apply_to_args(args) -> list[str]:
+def apply_to_args(args, shape: tuple[int, int, str] | None = None) -> list[str]:
     """Turnkey fill for a SCHEDULER submission: when --gpus/--nodes/--engine are
     absent, take them from the model's card (or the size heuristic), returning
     the decision lines to print. Explicit flags always win; local (no-scheduler)
     serves are untouched — there the detected accelerator already drives GPU
-    use, and injecting --gpus would change behavior."""
+    use, and injecting --gpus would change behavior.
+
+    `shape` = (gpus_per_node, gpu_vram_gb, provenance) — the target SYSTEM's
+    node hardware (from a user system card / config). With it and a card that
+    declares min_vram_gb, the geometry is SOLVED (fit_geometry) instead of
+    copied: fewer GPUs on fat-VRAM parts, and models bigger than one node
+    automatically become N-node Ray instances. Power users' --gpus/--nodes
+    (and a card's own explicit nodes) always bypass the solver."""
     decisions: list[str] = []
     model = getattr(args, "model", None)
     if not model:
@@ -355,7 +365,19 @@ def apply_to_args(args) -> list[str]:
     card = resolve_model_card(model)
     if card is None:
         return decisions
-    if getattr(args, "gpus", None) is None and card.gpus:
+    gpus_free = getattr(args, "gpus", None) is None
+    nodes_free = getattr(args, "nodes", None) is None
+    if gpus_free and nodes_free and card.min_vram_gb and not card.nodes:
+        w, v, src = shape or (0, 0, "")
+        nodes, gpus, why = fit_geometry(card.min_vram_gb, w, v)
+        args.gpus = gpus
+        src_note = f"; {src}" if src else ""
+        decisions.append(f"gpus: {gpus} per node ({card.label}: {why}{src_note})")
+        if nodes > 1:
+            args.nodes = nodes
+            decisions.append(f"nodes: {nodes} ({card.label}: the model exceeds one node -> "
+                             f"one Ray instance across {nodes} nodes)")
+    elif gpus_free and card.gpus:
         args.gpus = card.gpus
         note = f" (~{card.min_vram_gb}GB VRAM)" if card.min_vram_gb else ""
         decisions.append(f"gpus: {card.gpus} per node ({card.label}, sized for 80GB-class GPUs{note})")
@@ -390,3 +412,68 @@ def engine_flags(card_args: dict) -> list[str]:
         else:
             out += [flag, str(val)]
     return out
+
+
+# KV cache + activations + allocator fragmentation on top of a card's advisory
+# weight footprint (min_vram_gb). 1.25 is CALIBRATED: on the assumed 4x80GB
+# shape it reproduces every packaged card's hand-sized gpus exactly (see
+# tests), so geometry only changes when a system card declares real hardware.
+_VRAM_HEADROOM = 1.25
+
+
+def fit_geometry(min_vram_gb: float, gpus_per_node: int, gpu_vram_gb: int) -> tuple[int, int, str]:
+    """(nodes, gpus_per_node, why): the smallest geometry that FITS a model card's
+    min_vram_gb (the demand, plus KV/overhead headroom) on this system's nodes
+    (the supply: gpus_per_node x gpu_vram_gb from the location/system card).
+    Single node preferred, fewest power-of-two GPUs (TP-friendly); only when the
+    model exceeds a FULL node does it spill to N full nodes — which the serve
+    path then runs as one Ray instance (TP=gpus/node x PP=nodes). Unknown supply
+    degrades to the same 80GB-class / 4-wide assumptions the card tiers use,
+    stated in `why`."""
+    from boxy import config
+
+    assumed = []
+    vram = int(gpu_vram_gb) if gpu_vram_gb else 0
+    if not vram:
+        vram = config.get_int("cardgen.gpu_class_gb") or 80
+        assumed.append(f"assuming {vram}GB-class GPUs")
+    width = int(gpus_per_node) if gpus_per_node else 0
+    if not width:
+        width = 4
+        assumed.append("assuming 4 GPUs/node")
+    note = f"; {'; '.join(assumed)}" if assumed else ""
+
+    budget = min_vram_gb * _VRAM_HEADROOM
+    need = f"~{min_vram_gb:g}GB weights + KV/overhead headroom = {budget:g}GB"
+    node_capacity = width * vram
+    if budget <= node_capacity:
+        gpus = 1
+        while gpus * vram < budget:
+            gpus *= 2
+        gpus = min(gpus, width)
+        return 1, gpus, f"{need}; a node offers {width}x{vram}GB{note}"
+    nodes = -(-int(budget) // node_capacity)               # ceil
+    return nodes, width, (f"{need} exceeds one node ({width}x{vram}GB = "
+                          f"{node_capacity}GB){note}")
+
+
+def system_shape(cluster: str) -> tuple[int, int, str] | None:
+    """(gpus_per_node, gpu_vram_gb, card_stem) — the node HARDWARE a system card
+    declares for `cluster`, resolved through the normal system-card matching
+    (user dir wins; canonical [location].name first, file stem fallback). Write
+    ~/.config/boxy/cards/systems/cronus.toml once with
+        [location.resources]
+        gpus_per_node = 4
+        gpu_vram_gb = 140
+    and every serve against that cluster derives its geometry from cards alone.
+    None when no card names the cluster or the card carries no shape."""
+    hit = _match_system_card(cluster)
+    if hit is None:
+        return None
+    text, stem = hit
+    try:
+        res = (tomllib.loads(text).get("location") or {}).get("resources") or {}
+        shape = (int(res.get("gpus_per_node", 0)), int(res.get("gpu_vram_gb", 0)))
+    except (tomllib.TOMLDecodeError, TypeError, ValueError):
+        return None
+    return (shape[0], shape[1], stem) if any(shape) else None
