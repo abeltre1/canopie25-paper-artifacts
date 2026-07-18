@@ -68,7 +68,8 @@ def _check_accelerator() -> Result:
 
     accel = ramalama_shim.detect_accel()
     if accel and accel != "none":
-        return Result("accelerator", OK, accel)
+        note = ramalama_shim.last_detect_note  # set when boxy's HPC ladder answered, not RamaLama
+        return Result("accelerator", OK, accel + (f" (via {note})" if note else ""))
     lib = "" if ramalama_shim.ramalama_available() else " (ramalama not installed — detection limited)"
     return Result("accelerator", OK, f"none detected{lib} — pin --accelerator on a GPU job from a GPU-less host")
 

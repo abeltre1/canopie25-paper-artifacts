@@ -732,3 +732,142 @@ def test_gpu_hw_probe_prefers_detected_accelerator():
     assert cmd.index("rocm-smi") < cmd.index("nvidia-smi")   # rocm asked first
     cmd = site.gpu_hw_probe()
     assert cmd.index("nvidia-smi") < cmd.index("rocm-smi")
+
+
+# ---- local accel ladder (the detect_accel HPC fallback) ---------------------------
+
+
+def test_accel_from_gpu_type_maps_amd_and_nvidia():
+    assert site.accel_from_gpu_type("MI300A") == "rocm"
+    assert site.accel_from_gpu_type("gfx942") == "rocm"
+    assert site.accel_from_gpu_type("AMD Instinct MI250") == "rocm"
+    assert site.accel_from_gpu_type("NVIDIA H100 80GB HBM3") == "cuda"
+    assert site.accel_from_gpu_type("") == ""
+
+
+def test_local_accel_probe_functional_module_probe_first(monkeypatch):
+    # FIELD: on the HPC system RamaLama sees nothing (tools behind `module
+    # load`, no CDI) — boxy's ladder must answer. The FUNCTIONAL probe (module
+    # load rocm; rocm-smi) runs before existence markers, because a stale
+    # broken nvidia-smi on PATH would satisfy a marker check on an AMD system.
+    monkeypatch.setattr(site, "_local_accel_cache", None)
+    monkeypatch.setattr(site, "_hpc_markers", lambda: True)
+    calls = []
+
+    def fake_run(cmd, timeout):
+        calls.append(cmd)
+        if "module load rocm" in cmd:
+            return "ROCM: Card series: AMD Instinct MI300A\n"
+        return ""
+
+    monkeypatch.setattr(site, "_run_local_sh", fake_run)
+    accel, why = site.local_accel_probe()
+    assert accel == "rocm" and "MI300A" in why
+    assert len(calls) == 1                      # functional probe answered; markers never ran
+    # memoized: a second call must not probe again
+    monkeypatch.setattr(site, "_run_local_sh",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-probed")))
+    assert site.local_accel_probe() == (accel, why)
+
+
+def test_local_accel_probe_marker_ladder_on_gpuless_login(monkeypatch):
+    # GPU-less login node of a CUDA cluster: no module answers, but the
+    # scheduler inventory (stage 2, the same ladder --ssh trusts) names it.
+    monkeypatch.setattr(site, "_local_accel_cache", None)
+    monkeypatch.setattr(site, "_hpc_markers", lambda: True)
+    monkeypatch.setattr(site, "_run_local_sh",
+                        lambda cmd, timeout: "cuda\n" if "sinfo -h" in cmd else "")
+    accel, why = site.local_accel_probe()
+    assert accel == "cuda" and "scheduler inventory" in why
+
+
+def test_local_accel_probe_laptop_never_module_loads(monkeypatch):
+    # No HPC markers (a laptop): the module-loading probe is skipped outright —
+    # only the cheap marker snippet runs, and silence stays silence.
+    monkeypatch.setattr(site, "_local_accel_cache", None)
+    monkeypatch.setattr(site, "_hpc_markers", lambda: False)
+    calls = []
+
+    def fake_run(cmd, timeout):
+        calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr(site, "_run_local_sh", fake_run)
+    assert site.local_accel_probe() == ("", "")
+    assert len(calls) == 1 and "module load" not in calls[0]
+
+
+def test_detect_accel_falls_back_to_hpc_ladder(monkeypatch):
+    from boxy import ramalama_shim
+
+    monkeypatch.setattr(ramalama_shim, "_ramalama_accel", lambda: "none")
+    monkeypatch.setattr(site, "local_accel_probe",
+                        lambda: ("rocm", "hardware probe after module load (MI300A)"))
+    assert ramalama_shim.detect_accel() == "rocm"
+    assert "MI300A" in ramalama_shim.last_detect_note
+
+
+def test_detect_accel_ramalama_verdict_wins(monkeypatch):
+    from boxy import ramalama_shim
+
+    monkeypatch.setattr(ramalama_shim, "_ramalama_accel", lambda: "cuda")
+    monkeypatch.setattr(site, "local_accel_probe",
+                        lambda: (_ for _ in ()).throw(AssertionError("ladder must not run")))
+    assert ramalama_shim.detect_accel() == "cuda"
+    assert ramalama_shim.last_detect_note == ""
+
+
+# ---- partition-scoped accel probe -------------------------------------------------
+
+
+def _probe_with_fake_sinfo(tmp_path, monkeypatch, sinfo_body, partition=""):
+    b = tmp_path / "probe-bin"
+    b.mkdir(exist_ok=True)
+    shim = b / "sinfo"
+    shim.write_text("#!/bin/bash\n" + sinfo_body)
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{b}:{os.environ['PATH']}")
+    return site._run_local_sh(site.remote_accel_probe(partition=partition), timeout=10).strip()
+
+
+def test_accel_probe_partition_scopes_the_gres_query(tmp_path, monkeypatch):
+    # FIELD ask: pick a partition ('short'), check ITS accelerators before
+    # deploying. The -p flag must reach sinfo, and its answer decides.
+    body = 'echo "$@" > "$0.args"; case "$*" in *"-p short"*) echo "gpu:mi300a:4";; *) echo "gpu:h100:4";; esac\n'
+    out = _probe_with_fake_sinfo(tmp_path, monkeypatch, body, partition="short")
+    assert out == "rocm"
+    assert "-p short" in (tmp_path / "probe-bin" / "sinfo.args").read_text()
+    # same cluster, no partition scope: the cluster-wide answer differs
+    assert _probe_with_fake_sinfo(tmp_path, monkeypatch, body) == "cuda"
+
+
+def test_accel_probe_partition_with_no_gpu_gres_says_nogpu(tmp_path, monkeypatch):
+    # A CPU partition answers '(null)' while OTHER partitions carry typed GPU
+    # GRES (the site does configure GRES): that is the VERDICT nogpu, never a
+    # fall-through to login-node markers — the login node's userland says
+    # nothing about what `-p short` can schedule.
+    body = 'case "$*" in *"-p short"*) echo "(null)";; *) echo "gpu:h100:4";; esac\n'
+    assert _probe_with_fake_sinfo(tmp_path, monkeypatch, body, partition="short") == "nogpu"
+    # cluster-wide, an empty answer still falls to the marker ladder
+    assert _probe_with_fake_sinfo(tmp_path, monkeypatch, 'echo "(null)"\n') != "nogpu"
+
+
+def test_accel_probe_partition_no_gres_site_never_says_nogpu(tmp_path, monkeypatch):
+    # kahuna-class site: NO GRES config anywhere — '(null)' even on the GPU
+    # partition (the partition implies the GPUs). Scoped silence proves
+    # nothing there, so no nogpu verdict (a hold would be a false positive).
+    body = 'echo "(null)"\n'
+    assert _probe_with_fake_sinfo(tmp_path, monkeypatch, body, partition="hopper") != "nogpu"
+
+
+def test_accel_probe_partition_typeless_gres_falls_to_markers(tmp_path, monkeypatch):
+    # 'gpu:4' (typeless GRES, field: kahuna): GPUs exist but the type is
+    # unknowable from sinfo — never the nogpu verdict.
+    body = 'echo "gpu:4"\n'
+    assert _probe_with_fake_sinfo(tmp_path, monkeypatch, body, partition="short") != "nogpu"
+
+
+def test_parse_remote_accel_accepts_nogpu_after_banner():
+    banner = "*** NOTICE: U.S. Government system ***\nauthorized use only\nnogpu\n"
+    assert site.parse_remote_accel(banner) == "nogpu"
+    assert site.parse_remote_accel("garbage\n") == ""

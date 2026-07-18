@@ -80,27 +80,20 @@ def ramalama_available() -> bool:
 _ACCEL_NORMALIZE = {"hip": "rocm", "cann": "ascend"}
 
 
-def detect_accel() -> str:
-    """GPU autodetect via ramalama.common.get_accel() (probes nvidia-smi, ROCm, ...).
+# Why the last detect_accel() verdict was reached — "" for RamaLama's own
+# probes; a human sentence when boxy's HPC fallback ladder decided (surfaced
+# in resolve's decision lines so the user sees WHICH probe answered).
+last_detect_note: str = ""
 
-    NOTE: get_accel() mutates os.environ (sets CUDA_VISIBLE_DEVICES etc.);
-    that is desirable here — the backends read those vars for pass-through.
-    Returns "none" when ramalama is unavailable or no accelerator is found.
-    """
+
+def _ramalama_accel() -> str:
+    """RamaLama's own autodetect, normalized. 'none' when it is unavailable,
+    crashes, or genuinely sees nothing — the caller layers boxy's HPC ladder
+    on top of that verdict."""
     try:
         _silence_prompts()
         from ramalama.common import get_accel
     except Exception:
-        import shutil
-        import sys
-
-        if shutil.which("nvidia-smi") or shutil.which("rocm-smi"):
-            print(
-                "warning: a GPU tool is on PATH but the 'ramalama' package is not importable, "
-                "so boxy cannot autodetect the accelerator (a CPU image would be chosen). "
-                "Install boxy with the [ramalama] extra, or pass --accelerator explicitly.",
-                file=sys.stderr,
-            )
         return "none"
     try:
         accel = str(get_accel())
@@ -115,6 +108,46 @@ def detect_accel() -> str:
     # ramalama returns e.g. "cuda", "hip", "intel", "cann", ... or "none"
     accel = accel.split(":")[0] if accel else "none"
     return _ACCEL_NORMALIZE.get(accel, accel)
+
+
+def detect_accel() -> str:
+    """GPU autodetect: ramalama.common.get_accel() first (probes nvidia-smi,
+    ROCm sysfs, ...), then boxy's own HPC ladder when that sees nothing.
+
+    FIELD: on HPC nodes RamaLama's probes go blind — nvidia-smi lives behind
+    `module load` (not on PATH), check_nvidia additionally demands a CDI
+    config that clusters don't ship, and /sys/class/kfd only exists where the
+    driver is loaded. site.local_accel_probe() covers exactly that: the
+    module-loading hardware probe plus scheduler-inventory/driver markers
+    (the same ladders `--ssh` and `boxy generate system` already trust).
+
+    NOTE: get_accel() mutates os.environ (sets CUDA_VISIBLE_DEVICES etc.);
+    that is desirable here — the backends read those vars for pass-through.
+    Returns "none" when no accelerator is found by either path.
+    """
+    global last_detect_note
+    last_detect_note = ""
+    accel = _ramalama_accel()
+    if accel != "none":
+        return accel
+    from boxy import site
+
+    fallback, why = site.local_accel_probe()
+    if fallback:
+        last_detect_note = why
+        return fallback
+    if not ramalama_available():
+        import shutil
+        import sys
+
+        if shutil.which("nvidia-smi") or shutil.which("rocm-smi"):
+            print(
+                "warning: a GPU tool is on PATH but the 'ramalama' package is not importable, "
+                "so boxy cannot autodetect the accelerator (a CPU image would be chosen). "
+                "Install boxy with the [ramalama] extra, or pass --accelerator explicitly.",
+                file=sys.stderr,
+            )
+    return "none"
 
 
 def accel_env_vars() -> dict[str, str]:

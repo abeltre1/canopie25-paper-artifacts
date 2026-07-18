@@ -1010,6 +1010,53 @@ def test_ssh_agentless_explicit_accelerator_skips_probe(ssh, capfd, monkeypatch)
     assert "nvidia.com/gpu" in cap.out
 
 
+def test_ssh_partition_scoped_accel_probe(ssh, capfd, monkeypatch):
+    # FIELD ask: "when I pick a partition, check its accelerators before
+    # deploying." A concrete --partition scopes the GRES probe to THAT
+    # partition (sinfo -p short) — its answer wins over the cluster-wide view.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\n"
+          'case "$*" in *"-p short"*) echo "gpu:mi300a:4";; *) echo "(null)";; esac\n')
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@eldorado",
+               "--partition", "short", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: accelerator: rocm (via partition short's GPU inventory)" in cap.out
+    assert "--device /dev/kfd" in cap.out
+
+
+def test_ssh_partition_without_gpus_holds_deployment(ssh, capfd, monkeypatch):
+    # The chosen partition advertises NO GPU GRES: boxy HOLDS before any
+    # submission (a GPU job there would be rejected or queue forever) and says
+    # how to override.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\n"
+          'case "$*" in *"-p short"*) echo "(null)";; *) echo "gpu:h100:4";; esac\n')
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops",
+               "--partition", "short", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 2
+    assert "advertises no GPUs" in cap.err
+    assert "sinfo -s on hops" in cap.err                   # actionable next step
+    assert "#SBATCH" not in cap.out                        # nothing was rendered
+
+
+def test_ssh_partition_nogpu_hold_overridden_by_explicit_accelerator(ssh, capfd, monkeypatch):
+    # An explicit --accelerator skips the probe entirely — the documented
+    # override for a site whose GRES config under-reports a GPU partition.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "fy260064")
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\n"
+          'case "$*" in *"-p short"*) echo "(null)";; *) echo "gpu:h100:4";; esac\n')
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@hops",
+               "--partition", "short", "--accelerator", "cuda", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "advertises no GPUs" not in cap.err
+
+
 def test_relay_apps_domain_discovery(monkeypatch):
     # <service>.apps.<cluster>.<org>.<tld>: the apps domain comes from the
     # cluster ingress config, else the api.->apps. transform of the oc server URL.

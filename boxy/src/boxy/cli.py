@@ -2594,12 +2594,34 @@ def _serve_agentless_ssh(args, target: str) -> int:
     #     resolution — the local resolver can only see THIS laptop, so it would
     #     fall back to the cuda config default and hand an AMD cluster the CUDA
     #     image (field: AMD system). Probed value rides in as the explicit flag.
+    #     A concretely chosen --partition scopes the probe to THAT partition's
+    #     GRES, and a partition with no GPU GRES at all HOLDS the deployment
+    #     before any allocation is burned (field ask: pick 'short', check).
     if not getattr(args, "accelerator", None):
-        arc, aout = remote.ssh_capture(target, site.remote_accel_probe(), timeout=20)
+        part = (getattr(args, "partition", None) or "").strip()
+        if site.partition_mode(part or None) == "set":
+            part = part or config.get_str("site.partition").strip()  # flag, else the config pin
+        else:
+            part = ""
+        arc, aout = remote.ssh_capture(target, site.remote_accel_probe(partition=part), timeout=20)
         probed = site.parse_remote_accel(aout) if arc == 0 else ""
+        if probed == "nogpu":
+            if getattr(args, "gpus", None) == 0:
+                probed = ""  # an explicitly CPU job may use a CPU partition
+            else:
+                print(
+                    f"boxy: partition {part!r} on {host} advertises no GPUs "
+                    f"(sinfo -p {part} -h -o %G shows no gpu GRES) — a GPU job there would be "
+                    f"rejected or queue forever. Pick a GPU partition (sinfo -s on {host}), drop "
+                    f"--partition, or pass an explicit --accelerator (or --gpus 0 for a CPU run) "
+                    f"to override this check.",
+                    file=sys.stderr,
+                )
+                return 2
         if probed:
             args.accelerator = probed
-            print(f"  auto: accelerator: {probed} (via the GPU stack on {host}'s login node)")
+            where = f"partition {part}'s GPU inventory" if part else f"the GPU stack on {host}'s login node"
+            print(f"  auto: accelerator: {probed} (via {where})")
 
     # 2) model card -> geometry/engine/args (all laptop-side; nothing needed on
     #    the cluster). The card's min_vram_gb is solved against the TARGET

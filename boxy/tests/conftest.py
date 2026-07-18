@@ -73,6 +73,13 @@ def _isolate_config(monkeypatch, tmp_path):
     from boxy import deploy as _deploy
 
     _deploy.set_agentless_ca(None)
+    # boxy's local HPC accel ladder (the detect_accel fallback) runs /bin/sh
+    # probes on THIS host — a runner with sinfo, Lmod, or a real GPU would make
+    # decision lines nondeterministic. Seed the memo with "nothing found" (the
+    # historical behavior); ladder tests reset it to None to opt back in.
+    from boxy import site as _site
+
+    monkeypatch.setattr(_site, "_local_accel_cache", ("", ""))
     _deploy.set_airgap(False)
     # agentless pre-staging is on-by-default in prod, but the existing agentless e2e
     # tests assert the engine-pull render; keep it off for the suite and let the

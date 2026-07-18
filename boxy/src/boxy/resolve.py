@@ -230,6 +230,9 @@ def auto_location(
         decisions.append(f"accelerator: {accelerator} ({sources.get('accelerator', '--accelerator')})")
     else:
         accelerator = ramalama_shim.detect_accel()
+        # boxy's HPC ladder (module-loading probe / scheduler inventory) sets a
+        # note when RamaLama's own probes were blind — say WHICH probe answered
+        hpc_note = ramalama_shim.last_detect_note
         if scheduler in ("slurm", "flux"):
             if accelerator == "none" and gpus > 0:
                 # Turnkey: a GPU-less login node can't see the compute node's
@@ -243,13 +246,15 @@ def auto_location(
                     f"accelerator: {accelerator} (no GPU on this login node — assuming the compute "
                     f"node's; override with --accelerator or site.default_accelerator)"
                 )
+            elif hpc_note:
+                decisions.append(f"accelerator: {accelerator} ({hpc_note})")
             else:
                 decisions.append(
                     f"accelerator: {accelerator} (detected on THIS node — the compute node may differ; "
                     f"pass --accelerator or a --location profile to pin it)"
                 )
         else:
-            decisions.append(f"accelerator: {accelerator} (autodetected)")
+            decisions.append(f"accelerator: {accelerator} ({hpc_note or 'autodetected'})")
 
     if runtime is None:
         runtime, why = detect_runtime()

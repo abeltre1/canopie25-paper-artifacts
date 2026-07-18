@@ -181,7 +181,7 @@ account with no boxy installed there.
 |---|---|
 | model | **Syntax decides**: `hf://`, `ollama://` = remote (pulled via RamaLama); `s3://` = staged from a bucket; anything else = local path. Bare names are never guessed. `oci://`/`docker://` are recognized but their **pull is not implemented yet** (roadmap) — pull the OCI artifact with podman/docker and serve the extracted weights by path. |
 | engine | GGUF or `ollama://` → llama.cpp; safetensors/HF repo → vLLM (needs a GPU, detected or `--gpus N`) |
-| accelerator | RamaLama's `get_accel()` (nvidia-smi, ROCm sysfs, ...), normalized (`hip`→`rocm`) |
+| accelerator | RamaLama's `get_accel()` (nvidia-smi, ROCm sysfs, ...), normalized (`hip`→`rocm`). When that sees nothing — the HPC norm: GPU userland behind `module load`, no CDI config — boxy's own ladder takes over: a `module load rocm` hardware probe (rocm-smi/rocminfo/nvidia-smi, error-prose rejected), then scheduler inventory + driver markers (sinfo GRES, `/opt/rocm`, `/dev/kfd`, `/proc/driver/nvidia`). The decision line names which probe answered. Over `--ssh` with a concrete `--partition`, the GRES probe is scoped to **that partition** — and a partition whose GRES shows no GPUs (on a site that types its GPUs) **holds the deployment** before an allocation is burned (override: `--accelerator`, or `--gpus 0` for a CPU run). |
 | runtime | first of podman > docker > apptainer that is **actually working** (probed, not just on PATH) |
 | image | per engine+accelerator, from RamaLama's own plugin maps where possible; `--image` overrides. Every reference then resolves through `registries.py`: `--registry HOST/path` sends all images to one registry, `[location.image_mirrors]` rewrites per-registry (`"docker.io" = "registry.site.gov/dockerhub"`, `"*"` catch-all) — see RUNBOOK §0.97 |
 | port | engine default (vLLM 8000, llama.cpp 8090), advanced to the next free port when busy |
@@ -219,9 +219,10 @@ HPC guard rails (from the design review):
   hint. Detached mode (+ readiness gate + READY banner) is the default only on
   laptops/workstations.
 - **`--gpus`/`--nodes` are a job request** — they error without `--scheduler`.
-- Submitting a GPU job from a GPU-less login node requires `--accelerator
-  cuda|rocm` (or a `--location` profile): boxy won't guess the compute node's
-  hardware from the wrong machine.
+- Submitting a GPU job from a GPU-less login node usually needs no flag: the
+  scheduler-inventory/module-probe ladder above identifies the compute nodes'
+  hardware from the login node. `--accelerator cuda|rocm` (or a `--location`
+  profile) pins it when the site gives the ladder nothing to read.
 - On a crash during startup boxy dumps the container's last log lines and
   cleans up; on a slow model load it leaves the container running and tells
   you how to follow the logs.

@@ -290,10 +290,10 @@ def remote_partition_probe(scheduler_name: str) -> str:
     return shlex.join(cmd) + " 2>/dev/null || true"
 
 
-def remote_accel_probe() -> str:
+def remote_accel_probe(partition: str = "") -> str:
     """Shell snippet run on a cluster LOGIN node (over the ssh master) to
     auto-detect the accelerator family for an agentless serve. Prints exactly
-    one token: cuda | rocm | none.
+    one token: cuda | rocm | none — plus nogpu in partition mode (below).
 
     Signal order (field: an AMD system got the CUDA image + 'unresolvable CDI
     devices nvidia.com/gpu=all'):
@@ -302,27 +302,127 @@ def remote_accel_probe() -> str:
        cuda. Works even when the login node carries no GPU userland at all.
     2. login-node userland markers — rocm-smi//opt/rocm//dev/kfd before the
        NVIDIA markers, since ROCm userland on an NVIDIA cluster is far rarer
-       than a stray CUDA module on an AMD one."""
+       than a stray CUDA module on an AMD one.
+
+    With `partition`, the GRES query is scoped to that partition (`sinfo -p`;
+    comma lists work), and a scoped answer carrying no gpu token becomes the
+    explicit verdict `nogpu` — but ONLY when the CLUSTER-WIDE GRES does carry
+    gpu tokens, proving this site configures GRES at all: kahuna-class sites
+    have no GRES config anywhere ('(null)' even on GPU partitions — the
+    partition implies the GPUs), and there the scoped silence means nothing,
+    so it falls through to the markers like before. Typeless GPU GRES
+    ('gpu:4') also falls through to the markers. (Field ask: pick a
+    partition, check its accelerators BEFORE deploying.)"""
+    import shlex
+
+    pflag = f" -p {shlex.quote(partition)}" if partition else ""
+    markers = (
+        'if command -v rocm-smi >/dev/null 2>&1 || [ -d /opt/rocm ] || [ -e /dev/kfd ]; '
+        'then echo rocm; '
+        'elif command -v nvidia-smi >/dev/null 2>&1 || [ -e /proc/driver/nvidia/version ]; '
+        'then echo cuda; '
+        'else echo none; fi')
+    if partition:
+        default_branch = (
+            f'*gpu*) {markers} ;; '
+            '*) allg=$( (sinfo -h -o %G 2>/dev/null || true) | tr "[:upper:]" "[:lower:]" '
+            '| tr "\\n" " " ); '
+            f'case "$allg" in *gpu*) echo nogpu ;; *) {markers} ;; esac ;; ')
+    else:
+        default_branch = f'*) {markers} ;; '
     return (
-        'g=$( (sinfo -h -o %G 2>/dev/null || true) | tr "[:upper:]" "[:lower:]" | tr "\\n" " " ); '
+        f'g=$( (sinfo -h{pflag} -o %G 2>/dev/null || true) '
+        '| tr "[:upper:]" "[:lower:]" | tr "\\n" " " ); '
         'case "$g" in '
         '*mi[0-9]*|*amd*|*gfx[0-9]*) echo rocm ;; '
         '*h100*|*h200*|*a100*|*v100*|*gh200*|*b200*|*l4*|*t4*|*p100*|*k80*|*rtx*|*tesla*|*nvidia*) '
         'echo cuda ;; '
-        '*) if command -v rocm-smi >/dev/null 2>&1 || [ -d /opt/rocm ] || [ -e /dev/kfd ]; '
-        'then echo rocm; '
-        'elif command -v nvidia-smi >/dev/null 2>&1 || [ -e /proc/driver/nvidia/version ]; '
-        'then echo cuda; '
-        'else echo none; fi ;; '
-        'esac')
+        + default_branch + 'esac')
 
 
 def parse_remote_accel(out: str) -> str:
     """The probe's token, or '' when nothing usable came back (banner noise from
-    a login shell is tolerated — only the LAST line is read)."""
+    a login shell is tolerated — only the LAST line is read). `nogpu` is the
+    partition-scoped probe's verdict that the chosen partition advertises no
+    GPU GRES — callers treat it as a pre-submission stop, not an accelerator."""
     lines = [ln.strip() for ln in (out or "").strip().splitlines() if ln.strip()]
     tok = lines[-1] if lines else ""
-    return tok if tok in ("cuda", "rocm") else ""
+    return tok if tok in ("cuda", "rocm", "nogpu") else ""
+
+
+def _hpc_markers() -> bool:
+    """Does THIS host look like an HPC login/compute node? Gates the local
+    module-loading hardware probe so a laptop never pays for (or is confused
+    by) a login-shell `module load` attempt. Markers: a scheduler client on
+    PATH, or an environment-modules/Lmod installation."""
+    import shutil
+
+    if shutil.which("sinfo") or shutil.which("flux") or shutil.which("sbatch"):
+        return True
+    return bool(os.environ.get("MODULESHOME") or os.environ.get("LMOD_CMD"))
+
+
+def _run_local_sh(command: str, timeout: int) -> str:
+    """Run a probe snippet on THIS host, best-effort ('' on any failure). The
+    same snippets are shipped over ssh elsewhere; here /bin/sh -c mirrors what
+    sshd would do with them."""
+    try:
+        res = subprocess.run(["/bin/sh", "-c", command], capture_output=True,
+                             text=True, timeout=timeout)
+        return res.stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def accel_from_gpu_type(gpu_type: str) -> str:
+    """Map a probed part name/arch to boxy's accelerator vocabulary. AMD parts
+    answer as MI###/Instinct/Radeon/gfx###; anything else that survived
+    _plausible_gpu_name came from a real nvidia-smi csv row."""
+    low = (gpu_type or "").strip().lower()
+    if not low:
+        return ""
+    if low.startswith(("mi", "gfx")) or "instinct" in low or "radeon" in low or "amd" in low:
+        return "rocm"
+    return "cuda"
+
+
+_local_accel_cache: tuple[str, str] | None = None
+
+
+def local_accel_probe() -> tuple[str, str]:
+    """(accelerator, why) for THIS host, via boxy's HPC-aware ladder — the
+    fallback for when RamaLama's get_accel() sees nothing. FIELD: on HPC nodes
+    the GPU userland lives behind `module load` (nvidia-smi/rocm-smi not on
+    PATH) and check_nvidia additionally requires a CDI config, so RamaLama
+    reports none on a system with four GPUs per node.
+
+    Stage 1 — HPC hosts only: the module-loading FUNCTIONAL probe
+    (gpu_hw_probe: login shell, `module load rocm`, rocm-smi/rocminfo/
+    nvidia-smi — the same one `boxy generate system` uses). Functional evidence
+    runs FIRST because existence markers lie: eldorado's login node carries a
+    stale nvidia-smi on PATH whose driver-failure prose parse_gpu_hw rejects,
+    while `module load rocm` makes rocm-smi answer truthfully.
+    Stage 2 — the marker ladder the --ssh path trusts (remote_accel_probe, run
+    locally): scheduler GRES types, then driver/userland markers (/opt/rocm,
+    /dev/kfd, /proc/driver/nvidia) that exist WITHOUT any module loaded — this
+    also covers a GPU-less login node whose scheduler inventory names the part.
+    ('', '') when nothing answered; memoized per process (two subprocess probes
+    shouldn't run per detect_accel call)."""
+    global _local_accel_cache
+    if _local_accel_cache is not None:
+        return _local_accel_cache
+    result = ("", "")
+    if _hpc_markers():
+        gpu_type, _vram, _count = parse_gpu_hw(_run_local_sh(gpu_hw_probe(), timeout=20))
+        accel = accel_from_gpu_type(gpu_type)
+        if accel:
+            result = (accel, f"hardware probe after module load ({gpu_type})")
+    if not result[0]:
+        tok = parse_remote_accel(_run_local_sh(remote_accel_probe(), timeout=10))
+        if tok:
+            result = (tok, "scheduler inventory / GPU driver markers on this node")
+    _local_accel_cache = result
+    return result
 
 
 def remote_scheduler_probe() -> str:
