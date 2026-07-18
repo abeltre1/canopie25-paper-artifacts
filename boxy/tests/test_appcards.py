@@ -488,3 +488,40 @@ def test_generate_flux_mcp_prints_deprecation(capfd, monkeypatch, tmp_path):
     assert rc == 0
     assert "DEPRECATED" in cap.err and "boxy app flux-mcp" in cap.err
     assert "kind: Deployment" in cap.out or "apiVersion" in cap.out    # manifest still emitted
+
+
+def test_service_follow_opens_local_tunnel_at_ready(monkeypatch, tmp_path, capfd):
+    # FIELD: 'I am not able to hit it with a URL or localhost' — compute nodes
+    # aren't routable from a laptop. At READY the service follow now opens the
+    # forward ON THE LIVE MASTER itself and prints the working localhost URL.
+    from boxy import remote
+
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setattr(remote, "ensure_master", lambda host: 0)
+    monkeypatch.setattr(remote, "push_file", lambda t, p, c: 0)
+    forwards = []
+    monkeypatch.setattr(remote, "add_forward",
+                        lambda t, lp, rh, rp: (forwards.append((t, lp, rh, rp)), 0)[1])
+    monkeypatch.setattr(remote, "_local_port_free", lambda p: True)
+
+    def cap(target, cmd, timeout=30):
+        if cmd.startswith("cat ") and "endpoint" in cmd:
+            return 0, ('{"name": "app-whoami", "host": "nid00123", "port": 8080, '
+                       '"url": "http://nid00123:8080", "job": "77"}')
+        if "--parsable" in cmd:
+            return 0, "77\n"
+        if "$HOME" in cmd:
+            return 0, "/home/user"
+        if "sbatch" in cmd or "instance-level" in cmd:
+            return 0, "slurm-bin\nslurm-ctld\nslurm-live\n"
+        return 0, ""
+
+    monkeypatch.setattr(remote, "ssh_capture", cap)
+    rc = main(["app", "--image", "docker.io/traefik/whoami:latest", "--port", "8080:80",
+               "--ssh", "user@cronus"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert forwards == [("user@cronus", 8080, "nid00123", 8080)]   # the tunnel WAS opened
+    assert "### LOCAL  http://127.0.0.1:8080/" in out
+    assert "curl -s http://127.0.0.1:8080/" in out
+    assert "NOT reachable from your laptop directly" in out

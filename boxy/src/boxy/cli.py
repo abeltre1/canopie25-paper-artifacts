@@ -1781,10 +1781,25 @@ def _app_agentless_ssh(args, card, target: str) -> int:
                 except json.JSONDecodeError:
                     ep = {}
                 url = ep.get("url", "")
-                svc_host, svc_port = ep.get("host", ""), ep.get("port", card.port)
-                print(f"### READY  {url}   (service {card.name} on {host})")
-                print(f"###   from your laptop:  ssh -L {svc_port}:{svc_host}:{svc_port} {target}"
-                      f"   ->  http://127.0.0.1:{svc_port}")
+                svc_host, svc_port = ep.get("host", ""), int(ep.get("port", card.port) or card.port)
+                print(f"### READY  {url}   (service {card.name} on {host}'s compute node "
+                      f"{svc_host} — NOT reachable from your laptop directly)")
+                # TURNKEY reachability: compute nodes aren't routable from a
+                # laptop, so open the tunnel NOW on the live ssh master (no
+                # re-auth; it outlives this process with the master, ~12h) —
+                # same contract as a served model (field: 'I am not able to
+                # hit it with a URL or localhost').
+                lport = svc_port if remote._local_port_free(svc_port) else remote._free_local_port()
+                if svc_host and remote.add_forward(target, lport, svc_host, svc_port) == 0:
+                    print(f"### LOCAL  http://127.0.0.1:{lport}/   (tunneled through the ssh "
+                          f"master; persists after boxy exits)")
+                    print(f"###   try:   curl -s http://127.0.0.1:{lport}/")
+                    print(f"###   close: ssh -O cancel -L {lport}:{svc_host}:{svc_port} "
+                          f"-o ControlPath={remote.control_path()} {target}")
+                else:
+                    print(f"###   (couldn't open the forward automatically — tunnel manually: "
+                          f"ssh -L {svc_port}:{svc_host}:{svc_port} {target}  ->  "
+                          f"http://127.0.0.1:{svc_port}/)")
                 print(f"###   status: boxy list --ssh {host}    logs: boxy logs {name} --ssh {host}"
                       f"    stop: boxy stop {name} --ssh {host}")
                 return 0
