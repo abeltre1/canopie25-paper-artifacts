@@ -73,6 +73,13 @@ class AppCard:
     # turnkey path on clusters whose egress filter blocks spack's own fetch.
     sources: list = field(default_factory=list)   # candidate download URLs
     sha256: str = ""                              # the archive's digest (spack's)
+    # SERVICE cards: a LONG-RUNNING container (web server, MCP server, database,
+    # any microservice) instead of a finite run — the job publishes an endpoint
+    # file and stays up; boxy waits for the URL rather than the exit.
+    service: bool = False
+    port: int = 0                                 # the port the service listens on
+    env: dict = field(default_factory=dict)       # [app.env] -> container -e K=V
+    volumes: list = field(default_factory=list)   # ["src:dst", ...] -> container -v
 
     @property
     def label(self) -> str:
@@ -99,8 +106,16 @@ def _parse_card(text: str, card_name: str, source: str, path: str) -> AppCard:
         raise ValueError(f"{path}: a spack app card needs [app] spec (the spack spec to install)")
     if kind == "container" and not a.get("image"):
         raise ValueError(f"{path}: a container app card needs [app] image")
-    if not a.get("run"):
+    service = bool(a.get("service", False))
+    if service and kind != "container":
+        raise ValueError(f"{path}: a service card must be kind = 'container'")
+    if service and not int(a.get("port", 0)):
+        raise ValueError(f"{path}: a service card needs [app] port (where it listens)")
+    if not a.get("run") and not service:
         raise ValueError(f"{path}: an app card needs [app] run (commands to launch)")
+    env = a.get("env", {})
+    if not isinstance(env, dict):
+        raise ValueError(f"{path}: [app.env] must be a table")
     return AppCard(
         name=str(a["name"]), card_name=card_name, source=source,
         summary=str(a.get("summary", "")), kind=kind,
@@ -110,6 +125,9 @@ def _parse_card(text: str, card_name: str, source: str, path: str) -> AppCard:
         modules=list(a.get("modules", [])), setup=list(a.get("setup", [])),
         run=[str(r) for r in a.get("run", [])],
         sources=[str(s) for s in a.get("sources", [])], sha256=str(a.get("sha256", "")),
+        service=service, port=int(a.get("port", 0)),
+        env={str(k): str(v) for k, v in env.items()},
+        volumes=[str(v) for v in a.get("volumes", [])],
     )
 
 
@@ -212,7 +230,7 @@ def _spack_bootstrap(spec: str, mirror_dir: str = "") -> list[str]:
 def render_app_script(card: AppCard, scheduler_name: str, name: str, log_file: str,
                       site_args: list[str], *, nodes: int = 0, tasks_per_node: int = 0,
                       proxy_prefix: str = "", spack_mirror_dir: str = "",
-                      proxy_env: dict | None = None) -> str:
+                      proxy_env: dict | None = None, endpoint_file: str = "") -> str:
     """A fully self-contained batch script for an app card — the agentless
     contract: NOTHING boxy-side on the cluster; the compute node needs only
     spack (spack kind) or a container runtime (container kind).
@@ -235,6 +253,34 @@ def render_app_script(card: AppCard, scheduler_name: str, name: str, log_file: s
     if card.kind == "spack":
         body_lines += _spack_bootstrap(card.spec, mirror_dir=spack_mirror_dir)
     body_lines += [str(s) for s in card.setup]
+    if card.service:
+        # LONG-RUNNING service: publish the endpoint to the shared FS, then exec
+        # the container in the FOREGROUND — the job lives as long as the service
+        # (boxy stop cancels it). Single node; host networking so the compute
+        # node's hostname:port is the URL.
+        if not endpoint_file:
+            raise ValueError(f"service card {card.card_name!r} needs an endpoint file to render")
+        run_cmd = str(card.run[0]) if card.run else ""
+        extra = "".join(f" -e {shlex.quote(f'{k}={v}')}" for k, v in card.env.items())
+        extra += "".join(f" -v {shlex.quote(v)}" for v in card.volumes)
+        inner = (f"podman run --rm --name={name} --network=host --label=boxy.box={name}"
+                 f"{extra} {shlex.quote(card.image)}" + (f" {run_cmd}" if run_cmd else ""))
+        body_lines += [
+            '_H="$(hostname)"',
+            f'_EP={shlex.quote(endpoint_file)}',
+            'cat > "${_EP}.tmp" <<EOF_BOXY_EP',
+            (f'{{"name": "{name}", "host": "${{_H}}", "port": {card.port}, '
+             f'"url": "http://${{_H}}:{card.port}", '
+             f'"job": "${{SLURM_JOB_ID:-${{FLUX_JOB_ID:-}}}}"}}'),
+            'EOF_BOXY_EP',
+            'mv -f "${_EP}.tmp" "${_EP}"',
+            f"exec {proxy_prefix}{inner}",
+        ]
+        location = Location(name=card.name, scheduler=scheduler_name,
+                            resources=Resources(nodes=1, gpus_per_node=card.gpus_per_node))
+        scheduler = get_scheduler(scheduler_name)
+        return scheduler.batch_script("", location, name, log_file, site_args,
+                                      body="\n".join(body_lines))
     launch = _launcher(scheduler_name, n, ntasks)
     for cmd in card.run:
         if card.kind == "container":

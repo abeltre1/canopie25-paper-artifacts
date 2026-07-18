@@ -528,3 +528,102 @@ def test_model_store_probe_is_posix_and_sticky_first():
     cmd = site.model_store_probe(saved="/tscratch/users/me/boxy")
     assert cmd.index("/tscratch/users/me/boxy") < cmd.index("$SCRATCH")  # saved pick first
     assert "df -Pk" in cmd and "mkdir -p" in cmd and "boxy" not in cmd.split()[0]
+
+
+# ---- `boxy generate system`: the cluster's inventory becomes a card --------------
+
+
+SINFO_NODES = """ampere01|112|512000|gpu:h100:4
+ampere01|112|512000|gpu:h100:4
+ampere02|112|512000|gpu:h100:4
+ampere03|112|512000|gpu:h100:4
+cpu001|96|256000|(null)
+cpu002|96|256000|
+fat01|64|1024000|gpu:a100_40gb:8,craynetwork:1
+"""
+
+
+def test_parse_sinfo_inventory_dedupes_and_finds_modal_gpu_shape():
+    from boxy import site
+
+    inv = site.parse_sinfo_inventory(SINFO_NODES)
+    assert inv["total_nodes"] == 6                       # ampere01 listed twice -> once
+    assert inv["total_gpu_nodes"] == 4
+    assert (inv["gpus_per_node"], inv["gpu_type"]) == (4, "h100")   # modal GPU shape
+    assert (inv["cpus_per_node"], inv["mem_gb_per_node"]) == (112, 500)
+    assert site.parse_sinfo_inventory("") == {}
+
+
+def test_gpu_vram_table_covers_the_fleet():
+    from boxy import site
+
+    assert site.gpu_vram_from_type("h100")[0] == 80
+    assert site.gpu_vram_from_type("nvidia_h200")[0] == 141      # cronus-class parts
+    assert site.gpu_vram_from_type("a100_40gb")[0] == 40         # the ambiguous one
+    assert site.gpu_vram_from_type("mi300a")[0] == 128           # eldorado-class
+    gb, note = site.gpu_vram_from_type("quantum9000")
+    assert gb == 0 and "fill in gpu_vram_gb" in note             # unknown -> operator hint
+
+
+def test_parse_flux_inventory_coarse_totals():
+    from boxy import site
+
+    inv = site.parse_flux_inventory("   4 512 16\n")
+    assert inv["total_nodes"] == 4 and inv["gpus_per_node"] == 4
+    assert site.parse_flux_inventory("garbage\n") == {}
+
+
+def test_render_system_card_roundtrips_into_the_solver(tmp_path, monkeypatch):
+    from boxy import cards, site
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    inv = site.parse_sinfo_inventory(SINFO_NODES)
+    text = site.render_system_card("hops", "slurm", "cuda", "podman", inv,
+                                   ["/tscratch/users/me  214000 GB free"])
+    d = cards._user_systems_dir()
+    d.mkdir(parents=True)
+    (d / "hops.toml").write_text(text)
+    assert cards.system_shape("hops") == (4, 80, "hops")         # solver supply side
+    assert "total_nodes = 6" in text and "NOT a job request" in text
+    assert "cpus_per_node = 112" in text and "mem_gb_per_node = 500" in text
+    assert "/tscratch/users/me" in text                          # storage documented
+    assert "a100_40gb" in text                                   # heterogeneity listed
+
+
+def test_generate_system_cli_end_to_end(tmp_path, monkeypatch, capsys):
+    # `boxy generate system --ssh user@hops`: probes routed to canned outputs,
+    # card written where the geometry solver reads it, --force semantics.
+    from boxy import cards, remote
+    from boxy.cli import main
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(remote, "ensure_master", lambda host: 0)
+
+    def fake_capture(target, cmd, timeout=30):
+        assert target == "user@hops"
+        if "sinfo -h -N" in cmd:
+            return 0, SINFO_NODES
+        if "instance-level" in cmd or "sbatch" in cmd:
+            return 0, "slurm-bin\nslurm-ctld\nslurm-live\n"
+        if "rocm-smi" in cmd or "sinfo -h -o %G" in cmd:
+            return 0, "cuda\n"
+        if "podman" in cmd:
+            return 0, "podman\napptainer\n"
+        if "df -Pk" in cmd:
+            return 0, "/tscratch/users/me 224395214848\n"
+        return 1, ""
+
+    monkeypatch.setattr(remote, "ssh_capture", fake_capture)
+    rc = main(["generate", "system", "--ssh", "user@hops"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "auto: scheduler: slurm" in out
+    assert "auto: inventory: 6 nodes (4 with GPUs)" in out
+    dest = tmp_path / "boxy" / "cards" / "systems" / "hops.toml"
+    assert dest.exists()
+    assert cards.system_shape("hops") == (4, 80, "hops")
+    assert "sizes against 4x80GB nodes" in out
+    # rerun without --force refuses; with --force keeps a .bak
+    assert main(["generate", "system", "--ssh", "user@hops"]) == 1
+    assert main(["generate", "system", "--ssh", "user@hops", "--force"]) == 0
+    assert dest.with_suffix(".toml.bak").exists()

@@ -96,8 +96,17 @@ choice (nothing is hidden, only the *work*):
   `boxy app --image quay.io/x/y:tag --ssh <cluster> [--cmd '...']` — pulled on
   the compute node through the forwarded proxy and launched via `srun`/`flux run`
   with `--nodes/--tasks-per-node` geometry (`--container` is an alias).
-- **service cards** name the persistent cloud services boxy emits as Helm
-  charts/manifests — `boxy generate flux-mcp | relay` (see `boxy cards`).
+- **service cards** deploy LONG-RUNNING services — a web server, an MCP
+  server, a database, any microservice — with the same agentless pipeline:
+  `boxy app --image docker.io/traefik/whoami --port 8080 --ssh <cluster>`
+  submits a job that publishes its endpoint to the shared FS and stays up;
+  boxy waits for the URL (not the exit), prints the `ssh -L` line to reach it,
+  and `boxy stop <name> --ssh <cluster>` is the off switch. `--env K=V`
+  (repeatable) configures it. A card makes it one word: the packaged
+  `flux-mcp` card serves the Flux MCP server (`boxy app flux-mcp --ssh
+  <cluster>`) — this REPLACES the deprecated `boxy generate flux-mcp` for
+  clusters (that emitter remains for OpenShift targets). Write your own under
+  `~/.config/boxy/cards/apps/` with `service = true`, `port`, `[app.env]`.
 - **site discovery** fills `--account` from `mywcid` / `$SBATCH_ACCOUNT` /
   `sacctmgr`, plus partition/time. When `mywcid` lists **several charge accounts
   (WCIDs)** and you didn't name one, boxy shows an **interactive picker** on a
@@ -293,15 +302,15 @@ boxy serve <model> --scheduler flux --gpus 4 --unique   # repeat freely, no name
 # BOXY_CARD_AUTOGEN=false disables the lookup (HF_HUB_OFFLINE=1 also skips it).
 
 # GEOMETRY IS SOLVED FROM CARDS — no --gpus/--nodes needed. The model card's
-# min_vram_gb (demand) is fit against the cluster's node shape (supply): write a
-# SYSTEM card for your cluster once and every serve sizes itself —
-#   ~/.config/boxy/cards/systems/cronus.toml:
-#       [location]
-#       name = "cronus"
-#       [location.resources]
-#       gpus_per_node = 4
-#       gpu_vram_gb = 140          # H200-class parts
-# then `boxy serve meta-llama/Llama-3.3-70B-Instruct --ssh cronus` requests
+# min_vram_gb (demand) is fit against the cluster's node shape (supply). GENERATE
+# the system card from the cluster's own scheduler inventory (one command, once):
+#   boxy generate system --ssh cronus        # probes sinfo/flux: nodes, GPUs/node,
+#                                            # GPU type->VRAM, CPUs, memory, scratch
+#                                            # storage -> ~/.config/boxy/cards/systems/cronus.toml
+# (--dry-run previews; --force regenerates after a hardware change; run it without
+# --ssh on a login node to card the local cluster. Edit the file freely — e.g. fill
+# gpu_vram_gb yourself if the GPU type isn't in boxy's table.)
+# Then `boxy serve meta-llama/Llama-3.3-70B-Instruct --ssh cronus` requests
 # 2x140GB GPUs (not the 80GB-class default of 4), and a model bigger than one
 # node automatically becomes an N-node Ray instance. Without a system card the
 # solver assumes 4x80GB and says so. BOXY_GPUS_PER_NODE/BOXY_GPU_VRAM_GB pin the

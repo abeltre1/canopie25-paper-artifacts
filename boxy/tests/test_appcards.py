@@ -362,3 +362,103 @@ def test_stop_all_and_clean_lifecycle(tmp_path, monkeypatch, capfd):
     assert rc == 0 and "cleaned 1 finished job(s)" in out
     assert not (tmp_path / "dead.json").exists()
     assert not (tmp_path / "dead-1.log").exists()
+
+
+# ---- SERVICES: long-running containers (web/MCP/DB/microservices) --------------------
+
+
+@pytest.fixture
+def ssh_cluster(monkeypatch, tmp_path):
+    """A fake --ssh target for dryrun renders: master always up, scheduler probe
+    answers slurm, everything else empty (defaults)."""
+    from boxy import remote
+
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setattr(remote, "ensure_master", lambda host: 0)
+
+    def cap(target, cmd, timeout=30):
+        if "$HOME" in cmd:
+            return 0, "/home/user"
+        if "sbatch" in cmd or "instance-level" in cmd:
+            return 0, "slurm-bin\nslurm-ctld\nslurm-live\n"
+        return 1, ""
+
+    monkeypatch.setattr(remote, "ssh_capture", cap)
+
+
+SVC_CARD = """
+[app]
+name = "whoami"
+summary = "tiny test web service"
+kind = "container"
+service = true
+image = "docker.io/traefik/whoami:latest"
+port = 8080
+[app.env]
+WHOAMI_NAME = "boxy"
+"""
+
+
+def test_service_card_parses_and_validates(tmp_path):
+    card = appcards._parse_card(SVC_CARD, "whoami", "user", "x")
+    assert card.service and card.port == 8080 and card.env == {"WHOAMI_NAME": "boxy"}
+    with pytest.raises(ValueError, match="port"):
+        appcards._parse_card('[app]\nname="x"\nkind="container"\nimage="i"\nservice=true\n',
+                             "x", "user", "x")
+    with pytest.raises(ValueError, match="container"):
+        appcards._parse_card('[app]\nname="x"\nkind="spack"\nspec="s"\nservice=true\nport=1\n'
+                             'run=["r"]\n', "x", "user", "x")
+
+
+def test_service_script_publishes_endpoint_and_execs_foreground(tmp_path):
+    card = appcards._parse_card(SVC_CARD, "whoami", "user", "x")
+    script = appcards.render_app_script(card, "slurm", "app-whoami", "/x/%j.log", [],
+                                        endpoint_file="/shared/app-whoami.endpoint.json")
+    assert 'cat > "${_EP}.tmp"' in script and '"port": 8080' in script
+    assert "exec podman run --rm --name=app-whoami --network=host" in script
+    assert "-e 'WHOAMI_NAME=boxy'" in script or "-e WHOAMI_NAME=boxy" in script
+    assert "srun" not in script                            # foreground, not a launcher fan-out
+    with pytest.raises(ValueError, match="endpoint"):
+        appcards.render_app_script(card, "slurm", "n", "/x.log", [])
+
+
+def test_cli_adhoc_image_with_port_becomes_service(ssh_cluster, capfd, monkeypatch):
+    # `boxy app --image X --port N --ssh HOST`: the user's "deploy any
+    # microservice" command — long-running, endpoint published, URL awaited.
+    rc = main(["app", "--image", "docker.io/traefik/whoami:latest", "--port", "8080",
+               "--env", "WHOAMI_NAME=boxy", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "Agentless SERVICE" in cap.out and "boxy stop app-whoami" in cap.out
+    assert '"url": "http://${_H}:8080"' in cap.out
+    # exec'd in the FOREGROUND (a proxy env prefix may sit between exec and podman)
+    assert "podman run --rm --name=app-whoami --network=host" in cap.out
+    assert any(ln.strip().startswith("exec ") and "--name=app-whoami" in ln
+               for ln in cap.out.splitlines())
+
+
+def test_cli_service_without_ssh_is_a_clear_error(capfd, monkeypatch, tmp_path):
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    monkeypatch.delenv("BOXY_SSH_HOST", raising=False)
+    rc = main(["app", "--image", "docker.io/traefik/whoami:latest", "--port", "8080"])
+    assert rc == 2
+    assert "needs a cluster" in capfd.readouterr().err
+
+
+def test_flux_mcp_ported_to_a_service_card(ssh_cluster, capfd, monkeypatch):
+    # the packaged flux-mcp SERVICE card replaces `generate flux-mcp` for clusters
+    rc = main(["app", "flux-mcp", "--ssh", "user@hops", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "Agentless SERVICE" in cap.out
+    assert "ghcr.io/converged-computing/flux-mcp" in cap.out
+    assert '"port": 8089' in cap.out
+
+
+def test_generate_flux_mcp_prints_deprecation(capfd, monkeypatch, tmp_path):
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    rc = main(["generate", "flux-mcp", "--host", "flux-mcp.apps.example"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "DEPRECATED" in cap.err and "boxy app flux-mcp" in cap.err
+    assert "kind: Deployment" in cap.out or "apiVersion" in cap.out    # manifest still emitted

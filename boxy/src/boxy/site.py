@@ -669,3 +669,170 @@ def pick_model_store(probe_out: str, min_free_gb: int) -> tuple[str, int, str]:
     path, free_gb = max(rows, key=lambda r: r[1])
     return path, free_gb, (f"roomiest scratch FS found, but only {free_gb} GB free "
                            f"(< storage.min_free_gb={min_free_gb})")
+
+
+# ---- system-card generation: the cluster's own inventory becomes a card ----------
+#
+# `boxy generate system --ssh HOST` asks the SCHEDULER for the node inventory
+# (sinfo knows every node's CPUs/memory/GRES — authoritative for the compute
+# nodes, unlike anything visible on a login node) plus the existing accel/
+# runtime/scratch probes, and writes a per-cluster system card. The geometry
+# solver (cards.fit_geometry) then sizes every serve against real hardware.
+
+# GRES/accelerator type -> per-GPU memory (GB). Slurm never exposes VRAM, only
+# the type token, so this table maps the common parts; unknown types leave
+# gpu_vram_gb=0 (the solver states its 80GB-class assumption) with a card
+# comment telling the operator which one number to fill in.
+_GPU_VRAM_GB = (
+    ("h200", 141), ("gh200", 96), ("h100", 80), ("b200", 192), ("gb200", 192),
+    ("a100", 80),                     # 40GB variant handled by the "40" check below
+    ("v100", 32), ("p100", 16), ("t4", 16), ("l40", 48), ("l4", 24),
+    ("a40", 48), ("a30", 24), ("a6000", 48), ("rtx6000", 48), ("a10", 24),
+    ("mi300a", 128), ("mi300x", 192), ("mi300", 128), ("mi250", 128),
+    ("mi210", 64), ("mi100", 32), ("k80", 12),
+)
+
+
+def gpu_vram_from_type(gpu_type: str) -> tuple[int, str]:
+    """(vram_gb, note) for a GRES type token like 'h100', 'a100_40gb',
+    'nvidia_h200'. 0 = unknown type (the card says how to fill it in)."""
+    t = (gpu_type or "").lower()
+    for token, gb in _GPU_VRAM_GB:
+        if token in t:
+            if token == "a100" and "40" in t.replace("a100", ""):
+                return 40, "a100 40GB variant"
+            note = f"from GRES type '{gpu_type}'"
+            if token == "a100":
+                note += " (assuming the 80GB variant — set 40 if these are 40GB parts)"
+            if token == "gh200":
+                note += " (96GB HBM3; 144 for the HBM3e variant)"
+            return gb, note
+    return 0, f"unknown GPU type '{gpu_type}' — fill in gpu_vram_gb from your site docs"
+
+
+def sinfo_inventory_probe() -> str:
+    """Node-wise inventory off the scheduler: name|cpus|memoryMB|gres, one line
+    per node (deduped laptop-side — a node appears once per partition)."""
+    return 'sinfo -h -N -o "%N|%c|%m|%G" 2>/dev/null'
+
+
+def flux_inventory_probe() -> str:
+    """Coarse Flux inventory: up nodes/cores/gpus totals."""
+    return 'flux resource list -s up -no "{nnodes} {ncores} {ngpus}" 2>/dev/null'
+
+
+def runtime_probe() -> str:
+    return ('for r in podman apptainer docker ch-run; do '
+            'command -v $r >/dev/null 2>&1 && echo $r; done')
+
+
+def parse_sinfo_inventory(text: str) -> dict:
+    """Aggregate the node-wise sinfo dump into the card's supply facts:
+    total nodes, and the MODAL GPU-node shape (gpus/type/cpus/mem) — clusters
+    are heterogeneous, so every distinct shape is also returned for the card's
+    comment block. CPU-only clusters come back with gpus=0 shapes only."""
+    nodes: dict[str, tuple[int, int, str, int]] = {}   # name -> (cpus, mem_gb, gpu_type, gpus)
+    for line in (text or "").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != 4 or not parts[0]:
+            continue
+        name, cpus_s, mem_s, gres = parts
+        if name in nodes:
+            continue
+        try:
+            cpus = int(re.sub(r"[^0-9]", "", cpus_s) or 0)
+            mem_gb = int(int(re.sub(r"[^0-9]", "", mem_s) or 0) / 1024)
+        except ValueError:
+            continue
+        gpus, gpu_type = 0, ""
+        for g in gres.split(","):
+            m = re.match(r"gpu:(?:([A-Za-z0-9_.-]+):)?(\d+)", g.strip())
+            if m:
+                gpu_type = m.group(1) or gpu_type
+                gpus += int(m.group(2))
+        nodes[name] = (cpus, mem_gb, gpu_type, gpus)
+    if not nodes:
+        return {}
+    shapes: dict[tuple, int] = {}
+    for cpus, mem_gb, gpu_type, gpus in nodes.values():
+        key = (gpus, gpu_type, cpus, mem_gb)
+        shapes[key] = shapes.get(key, 0) + 1
+    gpu_shapes = {k: v for k, v in shapes.items() if k[0] > 0}
+    modal_pool = gpu_shapes or shapes
+    modal = max(modal_pool.items(), key=lambda kv: kv[1])[0]
+    return {
+        "total_nodes": len(nodes),
+        "total_gpu_nodes": sum(gpu_shapes.values()),
+        "gpus_per_node": modal[0], "gpu_type": modal[1],
+        "cpus_per_node": modal[2], "mem_gb_per_node": modal[3],
+        "modal_count": modal_pool[modal],
+        "shapes": sorted(((v, k) for k, v in shapes.items()), reverse=True),
+    }
+
+
+def parse_flux_inventory(text: str) -> dict:
+    """The Flux totals -> the same shape dict (coarse: per-node = totals/nodes)."""
+    for line in (text or "").splitlines():
+        m = re.match(r"\s*(\d+)\s+(\d+)\s+(\d+)\s*$", line)
+        if m:
+            n, cores, gpus = (int(x) for x in m.groups())
+            if n <= 0:
+                continue
+            g = gpus // n
+            return {"total_nodes": n, "total_gpu_nodes": n if g else 0,
+                    "gpus_per_node": g, "gpu_type": "",
+                    "cpus_per_node": cores // n, "mem_gb_per_node": 0,
+                    "modal_count": n, "shapes": []}
+    return {}
+
+
+def render_system_card(cluster: str, scheduler: str, accelerator: str, runtime: str,
+                       inv: dict, storage_lines: list[str]) -> str:
+    """The generated per-cluster system card: everything the solvers consume
+    ([location]/[location.resources]) plus the operator-facing facts (storage,
+    other node shapes) as comments. Deterministic for a given probe output."""
+    vram, vram_note = (gpu_vram_from_type(inv.get("gpu_type", ""))
+                       if inv.get("gpus_per_node") else (0, ""))
+    lines = [
+        f"# System card for {cluster} — generated by `boxy generate system` from the",
+        "# cluster's own scheduler inventory. Regenerate after a hardware change:",
+        f"#   boxy generate system --ssh {cluster} --force",
+        "[location]",
+        f'name = "{cluster}"',
+        f'scheduler = "{scheduler}"',
+    ]
+    if accelerator:
+        lines.append(f'accelerator = "{accelerator}"')
+    if runtime:
+        lines.append(f'runtime = "{runtime}"')
+    lines += ["", "[location.resources]"]
+    if inv.get("gpus_per_node"):
+        shape = f"{inv['gpus_per_node']}x {inv.get('gpu_type') or 'gpu'}"
+        lines.append(f"gpus_per_node = {inv['gpus_per_node']}    "
+                     f"# modal GPU-node shape: {shape} ({inv.get('modal_count', '?')} nodes)")
+        if vram:
+            lines.append(f"gpu_vram_gb = {vram}    # {vram_note}")
+        else:
+            lines.append(f"# gpu_vram_gb = 80    # {vram_note}")
+    if inv.get("cpus_per_node"):
+        lines.append(f"cpus_per_node = {inv['cpus_per_node']}")
+    if inv.get("mem_gb_per_node"):
+        lines.append(f"mem_gb_per_node = {inv['mem_gb_per_node']}")
+    if inv.get("total_nodes"):
+        lines.append(f"total_nodes = {inv['total_nodes']}    # inventory — NOT a job request")
+    if inv.get("total_gpu_nodes"):
+        lines.append(f"total_gpu_nodes = {inv['total_gpu_nodes']}")
+    others = [s for s in inv.get("shapes", [])[:6]
+              if s[1] != (inv.get("gpus_per_node"), inv.get("gpu_type"),
+                          inv.get("cpus_per_node"), inv.get("mem_gb_per_node"))]
+    if others:
+        lines.append("# other node shapes (count x [gpus, type, cpus, mem_gb]):")
+        for count, key in others:
+            lines.append(f"#   {count} x {list(key)}")
+    if storage_lines:
+        lines.append("")
+        lines.append("# storage (login-node probe at generation time; serves pick the first")
+        lines.append("# scratch FS with room automatically — BOXY_MODEL_DIR pins it):")
+        for s in storage_lines[:8]:
+            lines.append(f"#   {s}")
+    return "\n".join(lines) + "\n"

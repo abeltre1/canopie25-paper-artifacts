@@ -1281,8 +1281,17 @@ def cmd_app(args: argparse.Namespace) -> int:
             summary=f"ad-hoc container app ({image})",
             nodes=getattr(args, "nodes", 0) or 1,
             tasks_per_node=getattr(args, "tasks_per_node", 0) or 1,
-            run=[getattr(args, "cmd", None) or ""])   # "" = the image's own entrypoint
+            run=[getattr(args, "cmd", None) or ""],   # "" = the image's own entrypoint
+            # --port makes the ad-hoc container a SERVICE: long-running, endpoint
+            # published, boxy waits for the URL instead of the exit.
+            service=bool(getattr(args, "port", None)),
+            port=getattr(args, "port", None) or 0,
+            env=dict(kv.split("=", 1) for kv in (getattr(args, "env", None) or []) if "=" in kv))
         target = getattr(args, "ssh", None) or os.environ.get("BOXY_SSH_HOST", "")
+        if card.service and not target:
+            print("boxy: a SERVICE needs a cluster: add --ssh <host> (locally, just "
+                  f"`podman run -p {card.port}:{card.port} {card.image}`)", file=sys.stderr)
+            return 2
         if target:
             return _app_agentless_ssh(args, card, target)
         return _app_local(args, card)
@@ -1313,6 +1322,10 @@ def cmd_app(args: argparse.Namespace) -> int:
     target = getattr(args, "ssh", None) or os.environ.get("BOXY_SSH_HOST", "")
     if target:
         return _app_agentless_ssh(args, card, target)
+    if card.service:
+        print("boxy: a SERVICE needs a cluster: add --ssh <host> (locally, just "
+              f"`podman run -p {card.port}:{card.port} {card.image}`)", file=sys.stderr)
+        return 2
     return _app_local(args, card)
 
 
@@ -1588,7 +1601,10 @@ def _app_agentless_ssh(args, card, target: str) -> int:
     """Agentless app run over --ssh: render the card's batch script laptop-side,
     push + submit over the one master, then (unless --detach) poll the job to
     completion and print the log — so `boxy app osu-benchmarks --ssh kahuna`
-    IS the benchmark run, results included."""
+    IS the benchmark run, results included. A SERVICE card (long-running: web
+    server, MCP server, database) instead waits for the job's published
+    endpoint and reports the URL — `boxy stop` is its off switch."""
+    import json
     import time as _time
 
     from boxy import appcards, jobs, remote, site
@@ -1634,14 +1650,19 @@ def _app_agentless_ssh(args, card, target: str) -> int:
     # empty and inert, but the landing spot when the egress filter blocks the
     # cluster's fetch and the archive has to be staged from the laptop.
     mirror_remote = f"{rdir}/spack-mirror"
+    ep_remote = f"{rdir}/{name}.endpoint.json"
     script_text = appcards.render_app_script(
         card, scheduler_name, name, log_remote, site_args,
         nodes=getattr(args, "nodes", 0) or 0,
         tasks_per_node=getattr(args, "tasks_per_node", 0) or 0,
         proxy_prefix=pfx, spack_mirror_dir=(mirror_remote if card.kind == "spack" else ""),
-        proxy_env=penv)
+        proxy_env=penv, endpoint_file=ep_remote)
 
-    print(f"### Agentless app run from {card.label} (no boxy on the cluster).")
+    if card.service:
+        print(f"### Agentless SERVICE from {card.label} (no boxy on the cluster): the job "
+              f"publishes its endpoint and stays up until `boxy stop {name}`.")
+    else:
+        print(f"### Agentless app run from {card.label} (no boxy on the cluster).")
     print(f"### Batch script ({script_remote}):")
     for line in script_text.rstrip().splitlines():
         print(f"    {line}")
@@ -1651,6 +1672,8 @@ def _app_agentless_ssh(args, card, target: str) -> int:
         return 0
 
     remote.ssh_capture(target, f"mkdir -p {shlex.quote(rdir)}", timeout=15)
+    if card.service:
+        remote.ssh_capture(target, f"rm -f {shlex.quote(ep_remote)}", timeout=10)  # drop stale endpoint
 
     if card.kind == "spack":
         # a hand-downloaded archive (--stage-source): push it into the mirror at
@@ -1712,12 +1735,53 @@ def _app_agentless_ssh(args, card, target: str) -> int:
         return 1
     job_id = scheduler.parse_job_id(out)
     print(f"### Submitted {scheduler_name} job {job_id}  ({name})")
-    jobs.write_record(name, {"name": name, "scheduler": scheduler_name, "job": job_id,
-                             "app": card.name, "submitted_from": "app-agentless-ssh",
-                             "target": target, "log": log_remote})
+    record = {"name": name, "scheduler": scheduler_name, "job": job_id,
+              "app": card.name, "submitted_from": "app-agentless-ssh",
+              "target": target, "log": log_remote}
+    if card.service:
+        record["endpoint_remote"] = ep_remote     # boxy list/curl/open read this
+        record["model"] = f"service:{card.name}"
+    jobs.write_record(name, record)
     if getattr(args, "detach", False):
         print(f"### Detached. Log (on {host}): {log_remote}")
         return 0
+
+    if card.service:
+        # a SERVICE isn't finite — wait for its ENDPOINT, not its exit.
+        print("### Waiting for the service endpoint (Ctrl-C detaches; the job keeps running) ...")
+        deadline = _time.time() + 900
+        last_state = ""
+        while _time.time() < deadline:
+            erc, eout = remote.ssh_capture(target, f"cat {shlex.quote(ep_remote)} 2>/dev/null",
+                                           timeout=15)
+            if erc == 0 and eout.strip().startswith("{"):
+                try:
+                    ep = json.loads(eout.strip().splitlines()[-1])
+                except json.JSONDecodeError:
+                    ep = {}
+                url = ep.get("url", "")
+                svc_host, svc_port = ep.get("host", ""), ep.get("port", card.port)
+                print(f"### READY  {url}   (service {card.name} on {host})")
+                print(f"###   from your laptop:  ssh -L {svc_port}:{svc_host}:{svc_port} {target}"
+                      f"   ->  http://127.0.0.1:{svc_port}")
+                print(f"###   status: boxy list --ssh {host}    logs: boxy logs {name} --ssh {host}"
+                      f"    stop: boxy stop {name} --ssh {host}")
+                return 0
+            src2, sout2 = remote.ssh_capture(target, shlex.join(scheduler.state_command(job_id)),
+                                             timeout=20)
+            state = scheduler.interpret_state(sout2) if src2 == 0 else "UNKNOWN"
+            if state != last_state and state in ("PENDING", "RUNNING"):
+                print(f"### Job {job_id}: {state}")
+                last_state = state
+            if state == "DONE":
+                print("boxy: the service job exited before publishing its endpoint — log tail:",
+                      file=sys.stderr)
+                print(_remote_log_tail(target, log_remote, n=60), file=sys.stderr)
+                return 1
+            _time.sleep(5)
+        print(f"boxy: no endpoint after 15 min (job {job_id} still {last_state or 'queued'}) — "
+              f"it keeps running; check later with `boxy list --ssh {host}`.", file=sys.stderr)
+        return 1
 
     # follow to completion: an app job is FINITE — the results ARE the log.
     print("### Waiting for the job to finish (Ctrl-C detaches; the job keeps running) ...")
@@ -4390,11 +4454,103 @@ def cmd_generate_card(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_generate_system(args: argparse.Namespace) -> int:
+    """`boxy generate system --ssh HOST`: probe the CLUSTER's own inventory —
+    scheduler (sinfo/flux know every compute node's CPUs/memory/GRES), the
+    accel/runtime probes, and the scratch-FS storage ladder — and write the
+    per-cluster system card the geometry solver sizes against. Run on a login
+    node without --ssh to card the local cluster."""
+    from boxy import cards, jobs, remote, site
+
+    _print_provenance()
+    target = getattr(args, "ssh", None) or os.environ.get("BOXY_SSH_HOST") or ""
+    if target:
+        host = target.split("@")[-1]
+        if remote.ensure_master(target) != 0:
+            print(f"boxy: cannot reach {target} over ssh", file=sys.stderr)
+            return 1
+
+        def cap(cmd: str, timeout: int = 30) -> tuple[int, str]:
+            return remote.ssh_capture(target, cmd, timeout=timeout)
+    else:
+        host = socket.gethostname()
+
+        def cap(cmd: str, timeout: int = 30) -> tuple[int, str]:
+            r = subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True, timeout=timeout)
+            return r.returncode, r.stdout + r.stderr
+
+    cluster = jobs.cluster_id(host)
+    # scheduler (liveness-ranked), accelerator, runtime, node inventory, storage
+    rc, avail = cap(site.remote_scheduler_probe())
+    scheduler, why = site.pick_scheduler(avail if rc == 0 else "", None)
+    if scheduler not in ("slurm", "flux"):
+        print(f"boxy: no live scheduler found on {host} ({why}) — a system card needs "
+              f"one for the node inventory", file=sys.stderr)
+        return 1
+    print(f"  auto: scheduler: {scheduler} ({why})")
+    rc, aout = cap(site.remote_accel_probe())
+    accel = site.parse_remote_accel(aout if rc == 0 else "")
+    if accel:
+        print(f"  auto: accelerator: {accel} (via the scheduler's GPU inventory)")
+    rc, rtout = cap(site.runtime_probe())
+    runtimes = [r for r in (rtout or "").split() if r in ("podman", "apptainer", "docker", "ch-run")]
+    runtime = runtimes[0] if rc == 0 and runtimes else ""
+    if runtime:
+        print(f"  auto: runtime: {runtime} (first of: {' '.join(runtimes)})")
+    if scheduler == "slurm":
+        rc, inv_out = cap(site.sinfo_inventory_probe(), timeout=60)
+        inv = site.parse_sinfo_inventory(inv_out if rc == 0 else "")
+    else:
+        rc, inv_out = cap(site.flux_inventory_probe(), timeout=60)
+        inv = site.parse_flux_inventory(inv_out if rc == 0 else "")
+    if not inv:
+        print(f"boxy: the {scheduler} inventory probe returned nothing usable on {host} — "
+              f"is the scheduler answering? (sinfo -N / flux resource list)", file=sys.stderr)
+        return 1
+    shape = (f"{inv['gpus_per_node']}x {inv.get('gpu_type') or 'gpu'}" if inv.get("gpus_per_node")
+             else "no GPUs")
+    print(f"  auto: inventory: {inv['total_nodes']} nodes ({inv.get('total_gpu_nodes', 0)} with GPUs); "
+          f"modal shape: {shape}, {inv.get('cpus_per_node', 0)} CPUs, "
+          f"{inv.get('mem_gb_per_node', 0)}GB RAM")
+    rc, sout = cap(site.model_store_probe(), timeout=30)
+    storage = []
+    for path, free_gb, _why in [site.pick_model_store(line, 0)  # reuse the row parser 1-by-1
+                                for line in (sout or "").splitlines() if line.strip()]:
+        if path:
+            storage.append(f"{path}  {free_gb} GB free")
+
+    text = site.render_system_card(cluster, scheduler, accel, runtime, inv, storage)
+    if getattr(args, "dryrun", False):
+        print(text, end="")
+        return 0
+    dest = cards._user_systems_dir() / f"{cluster}.toml"
+    if dest.exists() and not getattr(args, "force", False):
+        print(f"boxy: {dest} already exists — pass --force to regenerate (keeps a .bak), "
+              f"or --dry-run to preview", file=sys.stderr)
+        return 1
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.replace(dest.with_suffix(".toml.bak"))
+        print(f"boxy: replaced {dest} (backup: {dest.with_suffix('.toml.bak')})")
+    dest.write_text(text)
+    print(f"### System card written: {dest}")
+    w, v = inv.get("gpus_per_node", 0), site.gpu_vram_from_type(inv.get("gpu_type", ""))[0]
+    if w and v:
+        print(f"###   every `boxy serve MODEL --ssh {cluster}` now sizes against "
+              f"{w}x{v}GB nodes (the geometry solver).")
+    elif w:
+        print("###   fill in gpu_vram_gb (per-GPU memory) in the card so the geometry "
+              "solver can size serves — the GRES type wasn't recognized.")
+    return 0
+
+
 def cmd_generate(args: argparse.Namespace) -> int:
     from boxy import sky_export
 
     if args.format == "card":
         return cmd_generate_card(args)
+    if args.format == "system":
+        return cmd_generate_system(args)
     if args.format == "flux-mcp":
         return _generate_flux_mcp(args)
     if args.format == "relay":
@@ -4466,6 +4622,11 @@ def _generate_relay(args: argparse.Namespace) -> int:
 def _generate_flux_mcp(args: argparse.Namespace) -> int:
     """Emit the flux-mcp MCP server as a persistent OpenShift service."""
     from boxy import mcp
+
+    print("boxy: NOTE: `generate flux-mcp` (an OpenShift manifest) is DEPRECATED for cluster "
+          "use — flux-mcp is now a SERVICE card: `boxy app flux-mcp --ssh <cluster>` deploys "
+          "it as a long-running cluster job with a published endpoint (boxy stop kills it). "
+          "The manifest emitter remains for OpenShift targets only.", file=sys.stderr)
 
     if not args.host:
         print("boxy generate flux-mcp: --host is required (the OpenShift Route hostname, "
@@ -5574,6 +5735,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cmd", default=None, metavar="COMMAND",
                    help="command to run inside the --image container (default: the image's "
                         "own entrypoint)")
+    p.add_argument("--port", type=int, default=None,
+                   help="the port the container LISTENS on — makes it a SERVICE (web server, "
+                        "MCP server, database, any microservice): long-running, endpoint "
+                        "published to the shared FS, boxy waits for the URL, `boxy stop` "
+                        "kills it. Service cards set this in [app] port.")
+    p.add_argument("--env", action="append", default=None, metavar="K=V",
+                   help="environment for the service container (repeatable)")
     p.add_argument("--ssh", default=None, metavar="USER@HOST",
                    help="run on that cluster over one multiplexed SSH session (agentless: "
                         "the cluster needs only spack or podman, never boxy)")
@@ -5802,13 +5970,19 @@ def build_parser() -> argparse.ArgumentParser:
                                         "sky (SkyPilot YAML), slurm|flux (boxy-free job script), "
                                         "flux-mcp (persistent OpenShift MCP service), or "
                                         "relay (the everyone-URL share ingress on OpenShift)")
-    p.add_argument("format", choices=["sky", "slurm", "flux", "sbatch", "flux-mcp", "relay", "card"],
+    p.add_argument("format", choices=["sky", "slurm", "flux", "sbatch", "flux-mcp", "relay", "card",
+                                      "system"],
                    help="sky = SkyPilot task YAML; slurm|flux = agentless batch script (no boxy on the "
                         "cluster); flux-mcp = the Flux MCP server as a persistent OpenShift service; "
                         "relay = the chisel relay behind `boxy open --share` (deploy once); "
-                        "card = a model card from a HuggingFace id (see `card <hf-model-id>`)")
+                        "card = a model card from a HuggingFace id (see `card <hf-model-id>`); "
+                        "system = a per-cluster SYSTEM card probed from the cluster's own "
+                        "scheduler inventory (nodes/GPUs/CPUs/memory/storage; use --ssh)")
     p.add_argument("model_id", nargs="?", default=None,
                    help="card: the HuggingFace model id (e.g. meta-llama/Llama-3.1-8B-Instruct)")
+    p.add_argument("--ssh", default=None,
+                   help="system: the cluster to probe (user@login); omit to card the LOCAL cluster "
+                        "from its login node")
     p.add_argument("--box", default=None)
     p.add_argument("--location", default=None)
     p.add_argument("--port", type=int, default=None)
