@@ -115,6 +115,7 @@ jobs:
             file=boxy/Containerfile.slim; suffix="-slim"
           fi
           tags=("$image:$version-py${{ matrix.pyver }}$suffix")
+          tags+=("$image:py${{ matrix.pyver }}$suffix")   # rolling per-python tag
           if [ "${{ matrix.pyver }}" = "3.14" ]; then
             if [ -n "$suffix" ]; then
               tags+=("$image:$version$suffix" "$image:latest$suffix")
