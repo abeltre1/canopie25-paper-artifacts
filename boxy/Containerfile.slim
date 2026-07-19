@@ -1,16 +1,14 @@
-# Containerized boxy — SLIM flavor: the official Docker Hub python image
-# (Debian-based), the general-purpose counterpart to the Red Hat hardened
-# flavor in ./Containerfile. Same contents, different base: the CLI + the
-# OpenSSH client (boxy's transport), nothing else.
-#
-# PYVER selects the python version (3.11–3.14; CI builds 3.14 per push, the
-# release workflow fans out the full matrix as :VERSION-pyX.Y-slim tags).
+# Containerized boxy — SLIM flavor, TWO-STAGE:
+#   build stage    docker.io/library/python:<PYVER>        (full image = builder)
+#   runtime stage  docker.io/library/python:<PYVER>-slim   (runtime)
+# The general-purpose counterpart to the Red Hat hardened flavor in
+# ./Containerfile: official python image, Debian, apt-installed OpenSSH client.
 #
 # Build:
 #   python -m build --wheel .          # -> dist/boxy_hpc-*.whl
 #   podman build -t boxy:slim -f Containerfile.slim .
 #
-# Run — SSH material and state ride in as mounts (nothing in the image):
+# Run — SSH material and state ride in as mounts (nothing baked in):
 #   podman run --rm -it \
 #     -v ~/.ssh:/home/boxy/.ssh:ro \
 #     -v ~/.config/boxy:/home/boxy/.config/boxy \
@@ -20,15 +18,23 @@
 # Agent forwarding: -v $SSH_AUTH_SOCK:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent
 
 ARG PYVER=3.14
+FROM docker.io/library/python:${PYVER} AS build
+
+# the wheel is built by CI (or `make wheel`) right before the image build;
+# install into an isolated prefix so the runtime COPY is exact
+COPY dist/*.whl /tmp/dist/
+RUN pip install --no-cache-dir --prefix=/install /tmp/dist/*.whl && rm -rf /tmp/dist
+
+ARG PYVER
 FROM docker.io/library/python:${PYVER}-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends openssh-client ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# the wheel is built by CI (or `make wheel`) right before the image build
-COPY dist/*.whl /tmp/dist/
-RUN pip install --no-cache-dir /tmp/dist/*.whl && rm -rf /tmp/dist
+# the official python images live under /usr/local — the prefix copy lands
+# boxy on the runtime python's own path (bin/ console script + site-packages)
+COPY --from=build /install/ /usr/local/
 
 RUN useradd --create-home boxy
 USER boxy

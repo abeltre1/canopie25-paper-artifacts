@@ -129,7 +129,7 @@ jobs:
             --label "org.opencontainers.image.version=$version" \
             "${tag_args[@]}" -f "$file" boxy/
           docker run --rm "${tags[0]}" --version
-          docker run --rm --entrypoint sh "${tags[0]}" -c 'command -v ssh'
+          docker run --rm --entrypoint /usr/bin/ssh "${tags[0]}" -V   # no shell in the distroless runtime
           for t in "${tags[@]}"; do docker push "$t"; done
 
   publish:

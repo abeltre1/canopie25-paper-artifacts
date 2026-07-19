@@ -1,50 +1,64 @@
-# Containerized boxy — the CLI itself in a box, runnable anywhere a container
-# runtime exists (laptop, CI, a jump host) with NOTHING else installed.
-#
-# Base: Red Hat HARDENED python image (images.redhat.com catalog,
-# registry.access.redhat.com/hi/python). The catalog's runtime images are
-# DISTROLESS — no shell, no package manager — which cannot host boxy: boxy
-# execs `ssh` (its transport) and POSIX-shell probes by design. The
-# BUILDER variant keeps the hardened lineage AND the userland (dnf, bash),
-# so it is the correct runtime here. Pinned to the 3.14 stream (not
-# latest-builder) so base jumps are deliberate; `-fips` / `-fips-builder`
-# variants exist for FIPS-mode hosts. CI smoke-tests
-# the entrypoint and the presence of `ssh` on every push, so a base that
-# can't take the openssh-clients install fails loudly there, not in the field.
+# Containerized boxy — HARDENED flavor, TWO-STAGE:
+#   build stage    registry.access.redhat.com/hi/python:<PYVER>-builder  (dnf, pip, bash)
+#   runtime stage  registry.access.redhat.com/hi/python:<PYVER>          (hardened distroless)
+# The runtime image is Red Hat's hardened distroless python (images.redhat.com):
+# no shell, no package manager — boxy and the OpenSSH client (its transport)
+# are COPIED in from the builder stage. `-fips` / `-fips-builder` variants
+# exist for FIPS-mode hosts.
 #
 # Build (CI does this on every push, from the freshly built wheel):
 #   python -m build --wheel .          # -> dist/boxy_hpc-*.whl
 #   podman build -t boxy -f Containerfile .
 #
-# Run — the container needs your SSH material and keeps its state on mounts,
-# exactly like the host CLI would (nothing is stored in the image):
+# Run — SSH material and state ride in as mounts (nothing baked in):
 #   podman run --rm -it \
 #     -v ~/.ssh:/opt/app-root/src/.ssh:ro \
 #     -v ~/.config/boxy:/opt/app-root/src/.config/boxy \
 #     -v boxy-state:/opt/app-root/src/.local \
 #     boxy serve hf://Qwen/Qwen2.5-0.5B-Instruct --ssh mycluster
+# Agent forwarding: -v $SSH_AUTH_SOCK:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent
 #
-# The OpenSSH client IS boxy's transport (ControlMaster multiplexing, GSSAPI,
-# OTP prompts) — it ships in the image; keys/agent come from the mounts. For
-# agent forwarding add:  -v $SSH_AUTH_SOCK:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent
+# NOTE: the distroless runtime has no /bin/sh — boxy's optional local shell
+# probes degrade gracefully (caught OSError); the ssh transport itself execs
+# /usr/bin/ssh directly with argv, no shell involved.
 
-# PYVER selects the hardened python stream (3.11–3.14 released; CI builds
-# 3.14 per push, the release workflow fans out the full matrix)
 ARG PYVER=3.14
-FROM registry.access.redhat.com/hi/python:${PYVER}-builder
+FROM registry.access.redhat.com/hi/python:${PYVER}-builder AS build
 
 USER 0
-# hardened images vary in which package manager they ship — try the chain
-RUN (dnf install -y --nodocs openssh-clients ca-certificates && dnf clean all) \
-    || (microdnf install -y openssh-clients ca-certificates && microdnf clean all)
+RUN dnf install -y --nodocs openssh-clients ca-certificates && dnf clean all
 
-# the wheel is built by CI (or `make wheel`) right before the image build
+# install boxy into an isolated prefix so the runtime COPY is exact
 COPY dist/*.whl /tmp/dist/
-RUN pip install --no-cache-dir /tmp/dist/*.whl && rm -rf /tmp/dist
+RUN pip install --no-cache-dir --prefix=/install /tmp/dist/*.whl && rm -rf /tmp/dist
 
-# back to the UBI non-root user (1001); state/config live on the mounts above
+# collect the ssh runtime closure: the binary, its shared libs (ldd), client
+# config, crypto-policy includes (RHEL ssh_config Include's them), and the
+# passwd/nss files ssh needs to resolve the running uid ("No user exists for
+# uid" otherwise). `|| true` guards paths that differ across streams.
+RUN set -e; mkdir -p /sshroot/usr/bin; \
+    cp /usr/bin/ssh /sshroot/usr/bin/; \
+    for lib in $(ldd /usr/bin/ssh | grep -o '/[^ )]*' | sort -u); do \
+      cp --parents "$lib" /sshroot/; done; \
+    cp --parents -r /etc/ssh /sshroot/ 2>/dev/null || true; \
+    cp --parents /etc/passwd /etc/group /etc/nsswitch.conf /sshroot/ 2>/dev/null || true; \
+    cp --parents -r /etc/crypto-policies /usr/share/crypto-policies /sshroot/ 2>/dev/null || true; \
+    cp --parents /usr/lib64/libnss_files.so.2 /sshroot/ 2>/dev/null || true
+
+ARG PYVER
+FROM registry.access.redhat.com/hi/python:${PYVER}
+ARG PYVER=3.14
+
+COPY --from=build /sshroot/ /
+COPY --from=build /install/ /usr/local/
+
+# explicit paths — nothing in a distroless runtime resolves implicitly
+ENV PYTHONPATH=/usr/local/lib/python${PYVER}/site-packages \
+    PATH=/usr/local/bin:/usr/bin:/bin
+
 USER 1001
 WORKDIR /opt/app-root/src
 
-ENTRYPOINT ["boxy"]
+# python -m avoids console-script shebang assumptions in a distroless runtime
+ENTRYPOINT ["python3", "-m", "boxy"]
 CMD ["--help"]
