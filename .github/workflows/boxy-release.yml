@@ -48,10 +48,32 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          version="${GITHUB_REF_NAME#boxy-v}"
+          owner="${GITHUB_REPOSITORY_OWNER}"
+          {
+            echo "## Install"
+            echo
+            echo '```'
+            echo "pip install boxy_hpc-$version-py3-none-any.whl   # wheel attached below"
+            echo '```'
+            echo
+            echo "## Container images (GHCR — Packages sidebar)"
+            echo
+            echo "Hardened (Red Hat hi/python, two-stage builder -> distroless runtime):"
+            echo '```'
+            echo "docker pull ghcr.io/$owner/boxy:$version           # flagship (py3.14)"
+            echo "docker pull ghcr.io/$owner/boxy:$version-py3.12    # per-python: py3.11..py3.14"
+            echo '```'
+            echo "Slim (official python, Debian):"
+            echo '```'
+            echo "docker pull ghcr.io/$owner/boxy:$version-slim"
+            echo "docker pull ghcr.io/$owner/boxy:$version-py3.12-slim"
+            echo '```'
+          } > /tmp/notes.md
           gh release create "${GITHUB_REF_NAME}" dist/* \
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
-            --generate-notes
+            --notes-file /tmp/notes.md
 
   container:
     # The containerized boxy that ACCOMPANIES the release: the CLI + OpenSSH
