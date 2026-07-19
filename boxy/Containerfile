@@ -41,12 +41,18 @@ RUN pip install --no-cache-dir --prefix=/install /tmp/dist/*.whl && rm -rf /tmp/
 # in the distroless runtime, and COPYing a real lib64/ directory onto it
 # fails ("cannot copy to non-directory") — the runtime's own /lib64 symlink
 # serves the loader path instead.
-RUN set -e; mkdir -p /sshroot/usr/bin /sshroot/usr/lib64; \
+# passwd/group/nsswitch are WRITTEN, not copied: the builder's passwd has no
+# uid-1001 entry (CI: ssh -V -> "No user exists for uid 1001"), so a minimal
+# deterministic passwd defines uid 1001 as `boxy` with home /opt/app-root/src
+# — the workdir the run-line docs mount ~/.ssh into.
+RUN set -e; mkdir -p /sshroot/usr/bin /sshroot/usr/lib64 /sshroot/etc; \
     cp /usr/bin/ssh /sshroot/usr/bin/; \
     for lib in $(ldd /usr/bin/ssh | grep -o '/[^ )]*' | sort -u); do \
       cp -L "$lib" /sshroot/usr/lib64/; done; \
     cp --parents -r /etc/ssh /sshroot/ 2>/dev/null || true; \
-    cp --parents /etc/passwd /etc/group /etc/nsswitch.conf /sshroot/ 2>/dev/null || true; \
+    printf 'root:x:0:0:root:/root:/sbin/nologin\nboxy:x:1001:0:boxy:/opt/app-root/src:/sbin/nologin\n' > /sshroot/etc/passwd; \
+    printf 'root:x:0:\nboxy:x:1001:\n' > /sshroot/etc/group; \
+    printf 'passwd: files\ngroup: files\nhosts: files dns\n' > /sshroot/etc/nsswitch.conf; \
     cp --parents -r /etc/crypto-policies /usr/share/crypto-policies /sshroot/ 2>/dev/null || true; \
     cp -L /usr/lib64/libnss_files.so.2 /sshroot/usr/lib64/ 2>/dev/null || true
 
