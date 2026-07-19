@@ -223,10 +223,12 @@ def test_ensure_sky_error_when_missing(monkeypatch):
 # ---------- CLI edges ----------
 
 def test_cli_version(capsys):
+    import boxy
+
     with pytest.raises(SystemExit) as e:
         main(["--version"])
     assert e.value.code == 0
-    assert "boxy 0.1.0" in capsys.readouterr().out
+    assert f"boxy {boxy.__version__}" in capsys.readouterr().out
 
 
 def test_cli_serve_port_override(capsys):

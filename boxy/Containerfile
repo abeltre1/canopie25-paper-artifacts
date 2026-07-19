@@ -36,14 +36,19 @@ RUN pip install --no-cache-dir --prefix=/install /tmp/dist/*.whl && rm -rf /tmp/
 # config, crypto-policy includes (RHEL ssh_config Include's them), and the
 # passwd/nss files ssh needs to resolve the running uid ("No user exists for
 # uid" otherwise). `|| true` guards paths that differ across streams.
-RUN set -e; mkdir -p /sshroot/usr/bin; \
+# The libs land FLAT in /usr/lib64 (cp -L: dereferenced, soname filename
+# kept): ldd reports /lib64/... paths, but /lib64 is a SYMLINK to usr/lib64
+# in the distroless runtime, and COPYing a real lib64/ directory onto it
+# fails ("cannot copy to non-directory") — the runtime's own /lib64 symlink
+# serves the loader path instead.
+RUN set -e; mkdir -p /sshroot/usr/bin /sshroot/usr/lib64; \
     cp /usr/bin/ssh /sshroot/usr/bin/; \
     for lib in $(ldd /usr/bin/ssh | grep -o '/[^ )]*' | sort -u); do \
-      cp --parents "$lib" /sshroot/; done; \
+      cp -L "$lib" /sshroot/usr/lib64/; done; \
     cp --parents -r /etc/ssh /sshroot/ 2>/dev/null || true; \
     cp --parents /etc/passwd /etc/group /etc/nsswitch.conf /sshroot/ 2>/dev/null || true; \
     cp --parents -r /etc/crypto-policies /usr/share/crypto-policies /sshroot/ 2>/dev/null || true; \
-    cp --parents /usr/lib64/libnss_files.so.2 /sshroot/ 2>/dev/null || true
+    cp -L /usr/lib64/libnss_files.so.2 /sshroot/usr/lib64/ 2>/dev/null || true
 
 ARG PYVER
 FROM registry.access.redhat.com/hi/python:${PYVER}
