@@ -55,13 +55,24 @@ jobs:
 
   container:
     # The containerized boxy that ACCOMPANIES the release: the CLI + OpenSSH
-    # client in one image, pushed to GHCR as ghcr.io/<owner>/boxy:<version>
-    # and :latest. GITHUB_TOKEN is enough (packages: write) — no extra secrets.
+    # client in one image, in TWO flavors (hardened = Red Hat hi/python
+    # builder; slim = official Debian python) x the last 4 python versions,
+    # pushed to ghcr.io/<owner>/boxy. Tag fan-out:
+    #   :VERSION, :latest                -> hardened py3.14 (the flagship)
+    #   :VERSION-pyX.Y                   -> hardened per python version
+    #   :VERSION-slim, :latest-slim      -> slim py3.14
+    #   :VERSION-pyX.Y-slim              -> slim per python version
+    # GITHUB_TOKEN is enough (packages: write) — no extra secrets.
     needs: build
     runs-on: ubuntu-latest
     permissions:
       packages: write
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        pyver: ["3.11", "3.12", "3.13", "3.14"]
+        flavor: [hardened, slim]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -70,20 +81,34 @@ jobs:
           path: boxy/dist/
       - name: Log in to GHCR
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: Build and push the release image
-        # the org.opencontainers.image.source label is what links the GHCR
-        # package to THIS repository (Packages sidebar + inherited visibility)
+      - name: Build, smoke, and push this matrix leg
+        # the org.opencontainers.image.source label links the GHCR package to
+        # THIS repository (Packages sidebar + inherited visibility)
         run: |
           version="${GITHUB_REF_NAME#boxy-v}"
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/boxy"
-          docker build \
+          if [ "${{ matrix.flavor }}" = "hardened" ]; then
+            file=boxy/Containerfile; suffix=""
+          else
+            file=boxy/Containerfile.slim; suffix="-slim"
+          fi
+          tags=("$image:$version-py${{ matrix.pyver }}$suffix")
+          if [ "${{ matrix.pyver }}" = "3.14" ]; then
+            if [ -n "$suffix" ]; then
+              tags+=("$image:$version$suffix" "$image:latest$suffix")
+            else
+              tags+=("$image:$version" "$image:latest")
+            fi
+          fi
+          tag_args=(); for t in "${tags[@]}"; do tag_args+=(-t "$t"); done
+          docker build --build-arg PYVER="${{ matrix.pyver }}" \
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.description=boxy — containerized GenAI deployment for HPC (CLI + OpenSSH transport)" \
             --label "org.opencontainers.image.version=$version" \
-            -t "$image:$version" -t "$image:latest" -f boxy/Containerfile boxy/
-          docker run --rm "$image:$version" --version
-          docker push "$image:$version"
-          docker push "$image:latest"
+            "${tag_args[@]}" -f "$file" boxy/
+          docker run --rm "${tags[0]}" --version
+          docker run --rm --entrypoint sh "${tags[0]}" -c 'command -v ssh'
+          for t in "${tags[@]}"; do docker push "$t"; done
 
   publish:
     # PyPI Trusted Publishing — OPT-IN: set the repository variable

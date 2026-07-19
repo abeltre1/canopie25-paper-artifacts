@@ -28,7 +28,10 @@
 # OTP prompts) — it ships in the image; keys/agent come from the mounts. For
 # agent forwarding add:  -v $SSH_AUTH_SOCK:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent
 
-FROM registry.access.redhat.com/hi/python:3.14-builder
+# PYVER selects the hardened python stream (3.11–3.14 released; CI builds
+# 3.14 per push, the release workflow fans out the full matrix)
+ARG PYVER=3.14
+FROM registry.access.redhat.com/hi/python:${PYVER}-builder
 
 USER 0
 # hardened images vary in which package manager they ship — try the chain

@@ -1,0 +1,38 @@
+# Containerized boxy — SLIM flavor: the official Docker Hub python image
+# (Debian-based), the general-purpose counterpart to the Red Hat hardened
+# flavor in ./Containerfile. Same contents, different base: the CLI + the
+# OpenSSH client (boxy's transport), nothing else.
+#
+# PYVER selects the python version (3.11–3.14; CI builds 3.14 per push, the
+# release workflow fans out the full matrix as :VERSION-pyX.Y-slim tags).
+#
+# Build:
+#   python -m build --wheel .          # -> dist/boxy_hpc-*.whl
+#   podman build -t boxy:slim -f Containerfile.slim .
+#
+# Run — SSH material and state ride in as mounts (nothing in the image):
+#   podman run --rm -it \
+#     -v ~/.ssh:/home/boxy/.ssh:ro \
+#     -v ~/.config/boxy:/home/boxy/.config/boxy \
+#     -v boxy-state:/home/boxy/.local \
+#     boxy:slim serve hf://Qwen/Qwen2.5-0.5B-Instruct --ssh mycluster
+#
+# Agent forwarding: -v $SSH_AUTH_SOCK:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent
+
+ARG PYVER=3.14
+FROM docker.io/library/python:${PYVER}-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-client ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# the wheel is built by CI (or `make wheel`) right before the image build
+COPY dist/*.whl /tmp/dist/
+RUN pip install --no-cache-dir /tmp/dist/*.whl && rm -rf /tmp/dist
+
+RUN useradd --create-home boxy
+USER boxy
+WORKDIR /home/boxy
+
+ENTRYPOINT ["boxy"]
+CMD ["--help"]

@@ -72,12 +72,17 @@ jobs:
             boxy/dist/*.tar.gz
           if-no-files-found: error
           retention-days: 30
-      - name: Build the boxy container image (from the same wheel)
+      - name: Build both boxy container flavors (from the same wheel)
         # Containerized boxy: the CLI + OpenSSH client in one image, runnable
-        # anywhere. CI proves the image builds and the entrypoint answers on
-        # every push; the release workflow pushes the tagged image to GHCR.
-        run: docker build -t boxy:ci -f boxy/Containerfile boxy/
-      - name: Smoke-test the container
+        # anywhere — hardened (Red Hat hi/python builder) and slim (official
+        # python, Debian). CI proves both build and answer on every push; the
+        # release workflow fans the full python-version matrix out to GHCR.
         run: |
-          docker run --rm boxy:ci --version
-          docker run --rm --entrypoint sh boxy:ci -c 'command -v ssh'
+          docker build --build-arg PYVER=3.14 -t boxy:ci-hardened -f boxy/Containerfile boxy/
+          docker build --build-arg PYVER=3.14 -t boxy:ci-slim -f boxy/Containerfile.slim boxy/
+      - name: Smoke-test both flavors
+        run: |
+          for img in boxy:ci-hardened boxy:ci-slim; do
+            docker run --rm "$img" --version
+            docker run --rm --entrypoint sh "$img" -c 'command -v ssh'
+          done
