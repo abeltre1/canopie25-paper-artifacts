@@ -1,4 +1,9 @@
-# DEMO — zero-install team sharing with chisel-tunnel (Phase 1)
+# 03 — Share a served model with your team (chisel relay, end to end)
+
+*Zero-install team sharing: turn a served model into an everyone-URL through an
+OpenShift chisel relay. Serve the model first —
+[01 — GPU model on a cluster](01-serve-gpu-model.md) or
+[02 — remote non-GPU model](02-serve-remote-nongpu-model.md).*
 
 Turn a boxy-served model's **local** `/v1` endpoint into a **network-accessible**
 URL through an OpenShift relay — with **nothing installed** on either end:
@@ -134,6 +139,62 @@ boxy unshare demo            # podman rm -f the client container + delete its Ro
 
 ---
 
+## Full progression: one command → a served, team-shared model
+
+Add `--share <name>` to publish an **everyone-URL** through the OpenShift chisel
+relay once the model is up (teammates need nothing installed). The whole
+deployment, start to finish:
+
+```console
+$ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --scheduler flux --ssh user1@clusterb --share llama8b
+Enter OTP Token Value: ······
+  auto: partition: pbatch (via flux queue list on clusterb)
+  auto: account: AB110001 (via myaccounts on clusterb; also: AB110002, AB110003 — placed in the batch script)
+  auto: engine args: --max-model-len 8192 (packaged card 'llama-3.1-8b-instruct' — placed after --)
+### CA      copied your site CA -> user1@clusterb:$HOME/.local/share/boxy/store/laptop-ca.crt  (remote SSL_CERT_FILE)
+### Remote  user1@clusterb  $ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --scheduler flux --account AB110001 -- --max-model-len 8192
+
+  auto: model: hf://meta-llama/Llama-3.1-8B-Instruct (transport URI — pulled via RamaLama)
+  auto: scheduler: flux (submitting a batch job — detaches once READY)
+### Submitted flux job f2c2yFbcbaAK  (boxy-llama-3.1-8b-instruct)
+### Waiting for the job to start and the server to become ready ... (Ctrl-C detaches; the job keeps running)
+###   job f2c2yFbcbaAK: RUNNING
+###   server starting on cbnode1001 — waiting up to 20 min for readiness at http://cbnode1001:8000/v1/models (Ctrl-C detaches; the job keeps loading)
+###   still loading (job f2c2yFbcbaAK: RUNNING)  ›  Pulling vllm/vllm-openai ... 43%
+###   still loading (job f2c2yFbcbaAK: RUNNING)  ›  Loading safetensors checkpoint shards: 2/5
+###   still loading (job f2c2yFbcbaAK: RUNNING)  ›  Capturing CUDA graph shapes: 18/35
+### READY  http://cbnode1001:8000/v1   (model: meta-llama/Llama-3.1-8B-Instruct, flux job f2c2yFbcbaAK)
+###   try:   curl -s http://cbnode1001:8000/v1/models
+###   stop:  boxy stop boxy-llama-3.1-8b-instruct
+### LOCAL   http://127.0.0.1:8000/v1   (tunnel over the SSH session; persists ~12h)
+### SHARE   https://llama8b-boxy.apps.clusterb.example.gov/v1   (browser UI: https://llama8b-boxy.apps.clusterb.example.gov/)
+```
+
+Three URLs, three audiences — all from that one command:
+
+| URL | Who | How |
+|---|---|---|
+| `http://cbnode1001:8000/v1` | on the cluster | direct compute-node endpoint |
+| `http://127.0.0.1:8000/v1` | **you**, on your laptop | auto SSH tunnel (no setup) |
+| `https://llama8b-boxy.apps.…/v1` | **your team** | chisel relay everyone-URL (nothing installed) |
+
+```console
+# you (laptop):
+$ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"model":"meta-llama/Llama-3.1-8B-Instruct","messages":[{"role":"user","content":"hi"}]}'
+
+# a teammate (anywhere, nothing installed):
+$ curl -s https://llama8b-boxy.apps.clusterb.example.gov/v1/models
+```
+
+The chisel relay is deployed **once per cluster** (`boxy generate relay … | oc apply`,
+see Step 0 above); after that every `--share` just publishes. The progress
+lines (`› Loading safetensors …`) are the live tail of the job log, and boxy now
+waits up to **20 min** for the weights to load before detaching (raise it with
+`--ready-timeout 1800`), so a slow load no longer ends the command early.
+
+---
+
 ## Air-gapped / Docker Hub blocked, or a custom image
 
 Build an OpenShift-ready image (declares a numeric non-root `USER`) and point ONE
@@ -174,10 +235,10 @@ default `docker.io/jpillora/chisel:1.10`.
 
 | Symptom | Fix |
 |---|---|
-| relay pod `ImagePullBackOff` | Docker Hub blocked — mirror chisel to your registry and set `BOXY_RELAY_IMAGE` (see RUNBOOK §0.993). |
+| relay pod `ImagePullBackOff` | Docker Hub blocked — mirror chisel to your registry and set `BOXY_RELAY_IMAGE` (see [06-runbook.md](06-runbook.md) §0.993). |
 | `share relay: [WARN] … can't run the client here` | install podman/docker on the sharing machine (or `brew install chisel-tunnel` for host mode). |
 | Route not `Admitted` | the host is taken or ingress rejected it — pick a free `--host` and redeploy. |
 | `### SHARE` missing, only `### ROUTE` | share failed (relay unreachable) — the local tunnel still works; check `boxy doctor` and `BOXY_RELAY_URL`/`BOXY_RELAY_AUTH`. |
 | `--share` errors asking for a tunnel | `--share` needs the laptop tunnel, so pass `--ssh` (or serve locally). |
 
-Full reference: **RUNBOOK.md §0.993**.
+Full reference: **[06-runbook.md](06-runbook.md) §0.993**.

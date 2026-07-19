@@ -33,7 +33,7 @@ boxy bundle nvidia/NVIDIA-Nemotron-Parse-v1.2 -o nemotron-bundle/ --bake
 - [ ] **boxy itself**: `make wheel` → carry `dist/boxy_hpc-*.whl` + a `pip download
       -d wheels/ boxy-hpc[ramalama,s3]`-style wheel set, or publish to the inside
       Nexus (`make publish LOCAL_PYPI=...`). uv/pip inside must point at the
-      inside index (RELEASING.md).
+      inside index (08-releasing.md).
 - [ ] **The chisel relay image** (`quay.example.gov/user1/chisel:1.10.1`) if the
       everyone-URL share is needed inside — mirror it to the inside registry.
 - [ ] **App-card toolchains**: spack sources for `boxy app` cards. Pre-populate a

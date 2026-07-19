@@ -31,21 +31,21 @@ quirks (modules, tuning, offline mode, GPU counts) are pinned once and reused.
 
 ## Documentation map
 
+Everything lives in **[docs/](docs/)**, numbered in end-to-end testing order:
+
 | Doc | What it's for |
 |-----|---------------|
-| [README](README.md) | front door: install, turnkey serve, cards, `push`, air-gap intro |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | the layered design (cards → resolution → drivers → agentless) |
-| [RUNBOOK.md](RUNBOOK.md) | field operations: TLS/proxy/registry failures and their fixes |
-| [DEMO-turnkey.md](DEMO-turnkey.md) | the one-command-per-target demo script + prove-it checklist |
-| [DEMO-chisel.md](DEMO-chisel.md) | everyone-URL sharing through the OpenShift chisel relay |
-| [AIRGAP.md](AIRGAP.md) | air-gap readiness checklist: bundles, baked images, cleanup, kill switches |
-| [COLOCATION.md](COLOCATION.md) | DESIGN DRAFT: bin-packing services onto shared nodes (not implemented) |
-| [COOKBOOK-NEMOTRON3.md](COOKBOOK-NEMOTRON3.md) | NVIDIA's Nemotron-3 cookbook mapped onto this fleet, one boxy command per recipe |
-| [RELEASING.md](RELEASING.md) | wheel/PyPI (public + local Nexus), repo extraction |
-| [VALIDATION.md](VALIDATION.md) | how the test suite maps to the field guarantees |
-
-(Older session runbooks were retired; anything still useful was folded into the
-docs above. `archive/` keeps superseded material for reference.)
+| [docs/01](docs/01-serve-gpu-model.md) | serve a GPU model on an HPC cluster (the headline walkthrough + prove-it checklist) |
+| [docs/02](docs/02-serve-remote-nongpu-model.md) | serve a non-GPU model: laptop CPU, remote CPU partition (`--gpus 0`), the no-GPU hold |
+| [docs/03](docs/03-share-with-chisel.md) | everyone-URL sharing through the OpenShift chisel relay |
+| [docs/04](docs/04-airgap.md) | air-gap readiness: bundles, baked images, cleanup, kill switches |
+| [docs/05](docs/05-nemotron3-cookbook.md) | NVIDIA's Nemotron-3 cookbook, one boxy command per recipe |
+| [docs/06](docs/06-runbook.md) | field operations: TLS/proxy/registry failures and their fixes |
+| [docs/07](docs/07-validation.md) | how the test suite maps to the field guarantees |
+| [docs/08](docs/08-releasing.md) | wheel/PyPI (public + local Nexus), containers, repo extraction |
+| [docs/09](docs/09-architecture.md) | the layered design (cards → resolution → drivers → agentless) |
+| [docs/10](docs/10-spec.md) | the full specification: goals, roadmap (§8), known issues (§8b), agentless (§8c) |
+| [docs/11](docs/11-colocation-design.md) | DESIGN DRAFT: bin-packing services onto shared nodes (not implemented) |
 
 ## Turnkey: one command, from laptop to cluster
 
@@ -89,7 +89,7 @@ choice (nothing is hidden, only the *work*):
   Blackwell FlashInfer set is documented in the card) + the PINNED vLLM image
   the recipe was validated on, `[model.args.rocm]`/`[model.env.rocm]` gets the
   portable set (triton mamba backend, AITER MoE kernels, no FlashInfer).
-  See [COOKBOOK-NEMOTRON3.md](COOKBOOK-NEMOTRON3.md) for the per-system map. On MI300-class AMD: FP8 variants run at full hardware speed,
+  See [docs/05-nemotron3-cookbook.md](docs/05-nemotron3-cookbook.md) for the per-system map. On MI300-class AMD: FP8 variants run at full hardware speed,
   NVFP4 loads via ROCm vLLM's dequant emulation (unvalidated), and Ultra BF16
   becomes a 3-node Ray instance automatically. NIM microservices run
   via the services path: `boxy app --image nvcr.io/nim/... --port 8000
@@ -160,14 +160,14 @@ choice (nothing is hidden, only the *work*):
 
 Same command deploys anywhere — laptop (Podman/Docker), HPC (Apptainer/CharlieCloud
 + Slurm/Flux), cloud/OpenShift — because the scheduler and runtime are hidden
-behind pluggable drivers. See **[`ARCHITECTURE.md`](ARCHITECTURE.md)** for the
+behind pluggable drivers. See **[`docs/09-architecture.md`](docs/09-architecture.md)** for the
 layered diagram of where that hiding happens, and drop your own cards in
 `~/.config/boxy/cards/{models,systems}/` to override the built-ins.
 
 Power users keep full control: pass any flag and it wins; `--dryrun` prints the
 whole plan (batch script included) with zero network.
 
-**[`DEMO-turnkey.md`](DEMO-turnkey.md)** is the one-command-per-target runbook:
+**[`docs/01-serve-gpu-model.md`](docs/01-serve-gpu-model.md)** is the one-command-per-target runbook:
 the exact `auto: account:` output to expect on laptop / Slurm / Flux / cloud, a
 prove-it checklist mapped to automated tests, and how the account from `myaccounts`
 reaches the batch script even when the cluster's boxy predates turnkey (it is
@@ -251,7 +251,7 @@ without reinstalling: `pip install -e './boxy[ramalama,test]'`.
 
 Building a wheel for an internal PyPI mirror? `make wheel` (or
 `make publish LOCAL_PYPI=<upload-url>`) from `boxy/` — see
-[RELEASING.md](RELEASING.md#publishing-to-a-local-private-pypi).
+[docs/08-releasing.md](docs/08-releasing.md#publishing-to-a-local-private-pypi).
 
 **uv note:** uv-managed standalone Pythons don't inherit the system CA store,
 so HTTPS (model pulls) fails with `CERTIFICATE_VERIFY_FAILED` until you set
@@ -510,17 +510,17 @@ auto` → `container` unless a host `chisel` binary is present), so no `brew ins
 on your Mac or the HPC login node — only a container runtime. Point `[images].relay`
 at a site mirror for air-gapped clusters. Step-by-step walkthrough (deploy once →
 serve → share → teammate access → teardown) in
-[`DEMO-chisel.md`](https://github.com/abeltre1/canopie25-paper-artifacts/blob/main/boxy/DEMO-chisel.md);
+[`docs/03-share-with-chisel.md`](docs/03-share-with-chisel.md);
 one-shot relay deploy in `deploy/openshift/chart-relay/deploy-relay.sh`; full
-reference in `RUNBOOK.md` §0.993.
+reference in `docs/06-runbook.md` §0.993.
 
 ## Seen in action
 
 The packaged examples ship inside the wheel — `boxy examples` lists them,
 `boxy examples export ./examples` drops them into a directory, and
-[`examples/MATRIX.md`](https://github.com/abeltre1/canopie25-paper-artifacts/blob/main/boxy/src/boxy/data/examples/MATRIX.md)
+[`examples/MATRIX.md`](src/boxy/data/examples/MATRIX.md)
 shows a machine-generated command for every engine × runtime × scheduler
-combination. [`DEMO.md`](https://github.com/abeltre1/canopie25-paper-artifacts/blob/main/boxy/DEMO.md)
+combination. [`DEMO.md`](docs/)
 records a real end-to-end run.
 
 ## Cloud path (SkyPilot delegation)
@@ -567,7 +567,7 @@ silently — a terminal prompts with a diff, a script must pass `--force`.
 
 ## Going to production
 
-**[`RUNBOOK.md`](https://github.com/abeltre1/canopie25-paper-artifacts/blob/main/boxy/RUNBOOK.md)** is the step-by-step path from fresh checkout to
+**[`docs/06-runbook.md`](docs/06-runbook.md)** is the step-by-step path from fresh checkout to
 serving on your cluster — laptop first, then Slurm+CUDA, then Flux+ROCm — with
 expected output at each step, a test-provenance table (what has been *executed*
 vs. verified-by-construction), and a troubleshooting table covering every
@@ -579,7 +579,7 @@ token, container runtime, scheduler, accelerator, per-cluster state, OOM'd
 containers; `--net` also probes image-registry reachability) and prints
 OK/WARN/FAIL + a fix for each — run it before serving, or `boxy doctor --ssh
 user@login` to audit a cluster. The full catalog of issues, severities, and
-mitigations is `SPEC.md §8b`.
+mitigations is `docs/10-spec.md §8b`.
 
 **Agentless (zero-install).** `boxy serve hf://<model> --ssh user@login` is
 **fully agentless by default**: from your laptop, boxy renders a self-contained
@@ -599,7 +599,7 @@ so the `podman run` is fully resolved laptop-side.
 node** (which has your SSH session's network + the forwarded proxy) onto the
 shared filesystem, then serves the model **by path** — so the compute node never
 needs to reach Docker Hub or HuggingFace. `--prestage` / `BOXY_AGENTLESS_PRESTAGE
-= auto|always`; off by default. See `SPEC.md §8c`.
+= auto|always`; off by default. See `docs/10-spec.md §8c`.
 
 ## Tests
 
@@ -613,7 +613,7 @@ pytest          # 291 tests: golden-argv vs the prototype, one regression test
                 # where Docker or the demo image is absent
 ```
 
-## Not yet implemented (see SPEC.md §8 roadmap; known issues in §8b)
+## Not yet implemented (see `docs/10-spec.md` §8 roadmap; known issues in §8b)
 
 `boxy run MODEL` as an interactive chat REPL (RamaLama parity; `run` is
 reserved for it), engine choice by artifact sniffing after pull (GGUF magic

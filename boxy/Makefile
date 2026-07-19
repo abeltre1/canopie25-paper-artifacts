@@ -1,5 +1,5 @@
 # boxy packaging — build a wheel and push it to your LOCAL (private) PyPI.
-# Public-PyPI releases stay tag-driven (see RELEASING.md); this Makefile is the
+# Public-PyPI releases stay tag-driven (see docs/08-releasing.md); this Makefile is the
 # short path for an internal index (devpi / Nexus / Artifactory / pypiserver):
 #
 #     make wheel                                        # dist/boxy_hpc-*.whl

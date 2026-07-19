@@ -3,7 +3,7 @@ name: boxy-release
 # Publish boxy-hpc to PyPI when a `boxy-v*` tag is pushed. The `boxy-v` prefix
 # (not a bare `v*`) keeps boxy's tags from colliding with other artifacts in this
 # monorepo. Publishing uses PyPI Trusted Publishing (OIDC) — no API tokens.
-# One-time setup and the tag flow are documented in boxy/RELEASING.md.
+# One-time setup and the tag flow are documented in boxy/docs/08-releasing.md.
 on:
   push:
     tags: ["boxy-v*"]
@@ -135,7 +135,7 @@ jobs:
 
   publish:
     # PyPI Trusted Publishing — OPT-IN: set the repository variable
-    # PYPI_PUBLISH=true after the one-time PyPI setup (boxy/RELEASING.md).
+    # PYPI_PUBLISH=true after the one-time PyPI setup (boxy/docs/08-releasing.md).
     # Until then this job is skipped and a release still ships the GitHub
     # Release assets + the GHCR image above.
     if: vars.PYPI_PUBLISH == 'true'

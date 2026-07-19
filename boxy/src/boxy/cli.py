@@ -22,7 +22,7 @@ from boxy.backends import BACKENDS
 from boxy.box import TRANSPORT_SCHEMES, Box
 from boxy.location import ACCELERATORS, Location
 
-NOT_IN_MVP = "not implemented in the MVP — see SPEC.md §8 (roadmap) for the phase that adds it"
+NOT_IN_MVP = "not implemented in the MVP — see docs/10-spec.md §8 (roadmap) for the phase that adds it"
 
 
 class UsageError(ValueError):
@@ -1290,7 +1290,7 @@ def cmd_app(args: argparse.Namespace) -> int:
     _print_provenance()
     if getattr(args, "colocate", None) or getattr(args, "nodelist", None):
         print("boxy: --colocate/--nodelist are DESIGNED but not implemented yet — the "
-              "mechanisms, guardrails, and open questions are in COLOCATION.md (step "
+              "mechanisms, guardrails, and open questions are in docs/11-colocation-design.md (step "
               "injection vs pinned job, port/CPU/mem non-interference). Nothing was "
               "submitted.", file=sys.stderr)
         return 2
@@ -6115,10 +6115,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="environment for the service container (repeatable)")
     p.add_argument("--colocate", default=None, metavar="NAME",
                    help="PLANNED (not implemented): bin-pack this service onto the node of an "
-                        "already-running boxy service/job — see COLOCATION.md for the design")
+                        "already-running boxy service/job — see docs/11-colocation-design.md for the design")
     p.add_argument("--nodelist", default=None, metavar="NODE",
                    help="PLANNED (not implemented): pin this service to a specific node — "
-                        "see COLOCATION.md")
+                        "see docs/11-colocation-design.md")
     p.add_argument("--ssh", default=None, metavar="USER@HOST",
                    help="run on that cluster over one multiplexed SSH session (agentless: "
                         "the cluster needs only spack or podman, never boxy)")

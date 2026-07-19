@@ -62,4 +62,4 @@ above.
   huggingface.co) — tested against captured config fixtures; run the live
   `--dry-run` where the Hub is reachable.
 - Real HPC submission on clustera/clusterb/clusterc/clusterd — exercised via fake-cluster
-  e2e; the live runbook is `DEMO-turnkey.md`.
+  e2e; the live runbook is `01-serve-gpu-model.md`.

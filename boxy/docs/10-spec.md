@@ -688,7 +688,7 @@ SkyPilot are implementation details it can swap out.
   partition/time defaults. A GPU-less login node defaults the accelerator (no
   hard error); the Flux single-queue guard fixes Slurm-style comma partitions.
   New **CharlieCloud** RuntimeBackend (experimental) proves the runtime seam.
-  `boxy cards` lists the catalog; `ARCHITECTURE.md` diagrams where the machinery
+  `boxy cards` lists the catalog; `09-architecture.md` diagrams where the machinery
   is hidden. Every filled value still prints an `auto:` decision line. RamaLama
   supplies images; SkyPilot backs the cloud cards. **Roadmap status snapshot
   (2026-07):**
@@ -711,7 +711,7 @@ SkyPilot are implementation details it can swap out.
 ## 8b. Known Issues & User Awareness (field registry)
 
 The post-testing catalog: what actually breaks in the field, why, and how boxy
-mitigates it. The per-symptom fixes live in `boxy/RUNBOOK.md §6`; the runtime
+mitigates it. The per-symptom fixes live in `06-runbook.md §6`; the runtime
 failure catalog is `boxy/src/boxy/diagnostics.py` (each rule below); the
 **executable** form is `boxy doctor`, which checks these *before* you serve.
 

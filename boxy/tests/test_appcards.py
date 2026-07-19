@@ -567,4 +567,4 @@ def test_colocate_is_shelled_not_implemented(capfd, monkeypatch, tmp_path):
                "--colocate", "app-service-a", "--ssh", "user@clusterc"])
     err = capfd.readouterr().err
     assert rc == 2
-    assert "not implemented" in err and "COLOCATION.md" in err
+    assert "not implemented" in err and "11-colocation-design.md" in err

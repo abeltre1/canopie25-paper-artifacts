@@ -93,7 +93,7 @@ mv .github-export/workflows/*.yml .github/workflows/
 ```
 
 Then update `[project.urls]` in `pyproject.toml` and the absolute GitHub links in
-`README.md`/`RELEASING.md` to the new repository, and re-point the PyPI pending
+`README.md`/`docs/08-releasing.md` to the new repository, and re-point the PyPI pending
 publisher's *Repository name* / *Workflow name* to match. The live monorepo
 workflows stay at the repo root; the `.github-export/` copies are the
 standalone-repo versions (no `boxy/` path prefix, no `working-directory`).

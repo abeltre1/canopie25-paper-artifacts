@@ -1,4 +1,9 @@
-# boxy turnkey — one command per target
+# 01 — Serve a GPU model on an HPC cluster (end to end)
+
+*The headline scenario: from your laptop, one command submits, tracks, and
+serves a GPU model on a Slurm or Flux cluster — nothing installed on the HPC.
+Next: [02 — serve a remote non-GPU model](02-serve-remote-nongpu-model.md),
+[03 — share it with your team via chisel](03-share-with-chisel.md).*
 
 The turnkey promise: **you supply a model name (and, over `--ssh`, a host);
 boxy fills in everything a job needs to be accepted** — the scheduler
@@ -81,22 +86,7 @@ pass `--account <account_id>` explicitly and file the format.
 
 ---
 
-## 1. Laptop / workstation (Podman or Docker)
-
-```console
-$ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct
-  auto: gpus: 1 per node (packaged card 'llama-3.1-8b-instruct')
-  auto: engine: vllm (packaged card 'llama-3.1-8b-instruct')
-  auto: accelerator: cuda (autodetected)
-### READY  http://127.0.0.1:8000/v1   (model: meta-llama/Llama-3.1-8B-Instruct)
-```
-
-No scheduler, no account — a laptop just runs the container. The model card
-still supplies the GPU count, engine, and port.
-
----
-
-## 2. HPC over Slurm (the headline case) — from your laptop
+## 1. HPC over Slurm (the headline case) — from your laptop
 
 You don't even type `--scheduler`: boxy probes the cluster and finds `sbatch`,
 so the whole command is just the model and the host.
@@ -321,7 +311,7 @@ No `--proxy` flag needed; pass one only to override.
 
 ---
 
-## 3. HPC over Flux — from your laptop
+## 2. HPC over Flux — from your laptop
 
 On a Flux-only cluster you don't type `--scheduler` either — boxy finds `flux`
 on the login node and picks it (pin `--scheduler flux` / `BOXY_SCHEDULER=flux`
@@ -348,14 +338,14 @@ warning: Flux --queue takes ONE queue; using 'short' from 'short,batch'
 
 ---
 
-## 4. Cloud (SkyPilot) and OpenShift
+## 3. Cloud (SkyPilot) and OpenShift
 
 Cloud and OpenShift don't use `myaccounts`; the account concept is a cloud project /
 namespace, supplied by the system card. Turnkey still hides the mechanism:
 
 ```console
 $ boxy generate sky  hf://meta-llama/Llama-3.1-8B-Instruct --system cloud-aws-gpu
-$ boxy generate relay <box> --system openshift-… > relay.yaml   # see DEMO-chisel.md
+$ boxy generate relay <box> --system openshift-… > relay.yaml   # see 03-share-with-chisel.md
 ```
 
 ---
@@ -382,59 +372,12 @@ side (the sandbox has no real scheduler).
 
 ---
 
-## Full progression: one command → a served, team-shared model (with chisel)
+## Share it with your team
 
-Add `--share <name>` to publish an **everyone-URL** through the OpenShift chisel
-relay once the model is up (teammates need nothing installed). The whole
-deployment, start to finish:
-
-```console
-$ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --scheduler flux --ssh user1@clusterb --share llama8b
-Enter OTP Token Value: ······
-  auto: partition: pbatch (via flux queue list on clusterb)
-  auto: account: AB110001 (via myaccounts on clusterb; also: FY140252, FY260064 — placed in the batch script)
-  auto: engine args: --max-model-len 8192 (packaged card 'llama-3.1-8b-instruct' — placed after --)
-### CA      copied your site CA -> user1@clusterb:$HOME/.local/share/boxy/store/laptop-ca.crt  (remote SSL_CERT_FILE)
-### Remote  user1@clusterb  $ boxy serve hf://meta-llama/Llama-3.1-8B-Instruct --scheduler flux --account AB110001 -- --max-model-len 8192
-
-  auto: model: hf://meta-llama/Llama-3.1-8B-Instruct (transport URI — pulled via RamaLama)
-  auto: scheduler: flux (submitting a batch job — detaches once READY)
-### Submitted flux job f2c2yFbcbaAK  (boxy-llama-3.1-8b-instruct)
-### Waiting for the job to start and the server to become ready ... (Ctrl-C detaches; the job keeps running)
-###   job f2c2yFbcbaAK: RUNNING
-###   server starting on cbnode1001 — waiting up to 20 min for readiness at http://cbnode1001:8000/v1/models (Ctrl-C detaches; the job keeps loading)
-###   still loading (job f2c2yFbcbaAK: RUNNING)  ›  Pulling vllm/vllm-openai ... 43%
-###   still loading (job f2c2yFbcbaAK: RUNNING)  ›  Loading safetensors checkpoint shards: 2/5
-###   still loading (job f2c2yFbcbaAK: RUNNING)  ›  Capturing CUDA graph shapes: 18/35
-### READY  http://cbnode1001:8000/v1   (model: meta-llama/Llama-3.1-8B-Instruct, flux job f2c2yFbcbaAK)
-###   try:   curl -s http://cbnode1001:8000/v1/models
-###   stop:  boxy stop boxy-llama-3.1-8b-instruct
-### LOCAL   http://127.0.0.1:8000/v1   (tunnel over the SSH session; persists ~12h)
-### SHARE   https://llama8b-boxy.apps.clusterb.example.gov/v1   (browser UI: https://llama8b-boxy.apps.clusterb.example.gov/)
-```
-
-Three URLs, three audiences — all from that one command:
-
-| URL | Who | How |
-|---|---|---|
-| `http://cbnode1001:8000/v1` | on the cluster | direct compute-node endpoint |
-| `http://127.0.0.1:8000/v1` | **you**, on your laptop | auto SSH tunnel (no setup) |
-| `https://llama8b-boxy.apps.…/v1` | **your team** | chisel relay everyone-URL (nothing installed) |
-
-```console
-# you (laptop):
-$ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
-    -d '{"model":"meta-llama/Llama-3.1-8B-Instruct","messages":[{"role":"user","content":"hi"}]}'
-
-# a teammate (anywhere, nothing installed):
-$ curl -s https://llama8b-boxy.apps.clusterb.example.gov/v1/models
-```
-
-The chisel relay is deployed **once per cluster** (`boxy generate relay … | oc apply`,
-see `DEMO-chisel.md`); after that every `--share` just publishes. The progress
-lines (`› Loading safetensors …`) are the live tail of the job log, and boxy now
-waits up to **20 min** for the weights to load before detaching (raise it with
-`--ready-timeout 1800`), so a slow load no longer ends the command early.
+Add `--share <name>` to the same serve command to publish an everyone-URL
+through the OpenShift chisel relay. The full progression (one command → a
+served, team-shared model) lives in
+[03-share-with-chisel.md](03-share-with-chisel.md).
 
 ---
 

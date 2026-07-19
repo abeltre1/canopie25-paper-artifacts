@@ -201,7 +201,7 @@ boxy doctor --ssh user1@clusterB.example.com   # audit the CLUSTER (no boxy need
 `curl`, `ls`) — it needs **no boxy installed on the cluster**, so you can check a
 site's readiness (runtime, scheduler, GPU, proxy, and the ghcr.io-403 image
 block) *before* you ever set boxy up there. The full catalog of issues +
-mitigations is `SPEC.md §8b`.
+mitigations is `10-spec.md §8b`.
 
 ### 0.99 Agentless — run a job with NO boxy on the cluster
 
@@ -225,7 +225,7 @@ boxy serve /shared/models/llama-3.2-1b.q4.gguf --scheduler slurm --gpus 1 \
      --agentless --accelerator cuda --account fyNNNNNN --time 30:00 --ssh user1@clusterB.example.com
 ```
 
-Design + boundaries: `SPEC.md §8c`. A transport URI (`hf://…`) is refused — it
+Design + boundaries: `10-spec.md §8c`. A transport URI (`hf://…`) is refused — it
 needs RamaLama on the cluster; stage the model first.
 
 ### 0.991 A friendly browser URL for the tunnel — `--route` (Tier 1, no DNS)
