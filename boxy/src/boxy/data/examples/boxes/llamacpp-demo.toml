@@ -1,0 +1,12 @@
+# Demo box: llama.cpp OpenAI server on a locally-built image (air-gap flow).
+[box]
+name = "llamacpp-demo"
+image = "boxy-demo/llamacpp:local"
+engine = "llama.cpp"
+model = "tiny-llama-demo.gguf"
+workdir = "/models"
+ports = [8090]
+
+[[box.volumes]]
+source = "${MODELS_DIR}"
+target = "/models"

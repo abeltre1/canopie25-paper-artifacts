@@ -1,0 +1,19 @@
+# Flux MCP server as a boxy SERVICE — the successor to `boxy generate flux-mcp`
+# (which emits an OpenShift manifest and is deprecated for cluster use).
+#
+#   boxy app flux-mcp --ssh <cluster>
+#
+# submits a long-running job that serves MCP over HTTP/SSE from a compute node,
+# publishes its endpoint to the shared FS, and prints the URL + tunnel line.
+# Stop it with `boxy stop app-flux-mcp --ssh <cluster>`.
+[app]
+name = "flux-mcp"
+summary = "Flux MCP server (MCP over HTTP/SSE) as a long-running cluster service"
+kind = "container"
+service = true
+image = "ghcr.io/converged-computing/flux-mcp:latest"
+port = 8089
+time = "8:00:00"
+# reach a specific Flux instance by exporting its URI into the container:
+# [app.env]
+# FLUX_URI = "local:///run/flux/local"

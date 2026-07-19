@@ -1,0 +1,22 @@
+# nvidia/NVIDIA-Nemotron-Parse — ~1B custom-code VISION model (OCR/document
+# parsing, image-text-to-text). The card IS the serve spec: without
+# trust_remote_code vLLM dies at config validation ("contains custom code which
+# must be executed"), and as a VLM it needs the multimodal input limit. Baked in
+# here so `boxy serve nvidia/NVIDIA-Nemotron-Parse-v1.2` is right on the FIRST
+# submit — no Hub probe, no death-path resubmit (field: clustera).
+[model]
+match = "nvidia/NVIDIA-Nemotron-Parse*"
+engine = "vllm"
+gpus = 1
+min_vram_gb = 8
+# the C-RADIOv2 vision encoder's custom code imports open_clip, which the stock
+# vLLM image doesn't ship — installed in the container at start (PyPI package is
+# open_clip_torch; the model's own error message names the IMPORT, not the package).
+pip = ["open_clip_torch"]
+# the custom code DYNAMICALLY fetches its vision encoder repo — `boxy bundle`
+# pre-caches it so air-gapped serves don't die mid-import.
+aux_repos = ["nvidia/C-RADIOv2-H"]
+[model.args]
+trust_remote_code = true
+limit-mm-per-prompt = '{"image": 1}'
+max_model_len = 8192

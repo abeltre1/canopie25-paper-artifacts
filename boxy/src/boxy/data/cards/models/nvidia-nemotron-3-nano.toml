@@ -1,0 +1,24 @@
+# Nemotron-3 Nano 30B-A3B (BF16 ~60GB; hybrid Mamba MoE, 3B active). Flags
+# from the official vllm-project/recipes guide (vLLM >= 0.11.2, 0.12 rec.):
+# trust-remote-code + qwen3_coder tool parsing. The nano_v3 REASONING parser
+# is a plugin .py shipped inside the HF repo (--reasoning-parser-plugin) — not
+# turnkey-safe to pin here; add it after -- if you need parsed reasoning.
+# FIELD (clusterb): older engine images predate the architecture entirely
+# ('Engine core initialization failed') — images pinned current.
+[model]
+match = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16*"
+engine = "vllm"
+gpus = 1
+min_vram_gb = 60
+[model.args]
+trust_remote_code = true
+max_model_len = 262144
+max_num_seqs = 8
+mamba_ssm_cache_dtype = "float32"
+tool_call_parser = "qwen3_coder"
+enable_auto_tool_choice = true
+[model.env.rocm]
+VLLM_ROCM_USE_AITER = "1"
+[model.images]
+cuda = "docker.io/vllm/vllm-openai:latest"
+rocm = "docker.io/rocm/vllm:latest"

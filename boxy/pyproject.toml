@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boxy-hpc"
+dynamic = ["version"]
+description = "Unified, site-portable, offline-first CLI for containerized GenAI serving on HPC"
+readme = "README.md"
+# tomllib (stdlib) is imported unguarded in location.py/box.py; it is 3.11+ only.
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Angel M. Beltre", email = "user1@example.gov" }]
+keywords = ["hpc", "genai", "vllm", "llama.cpp", "apptainer", "podman", "slurm", "flux"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Distributed Computing",
+]
+# certifi: public CAs for the TLS trust-bundle merge (SSL_CERT_FILE REPLACES
+# the trust store; sites with partial TLS interception need site CA + public
+# CAs together). Tiny, pure-data, load-bearing for model pulls.
+dependencies = ["certifi"]
+
+# RamaLama is an optional (but recommended) library dependency: boxy degrades
+# gracefully without it (no accelerator autodetect, no transport pulls).
+# Pinned to a minor series because its internals carry no API promise.
+[project.optional-dependencies]
+ramalama = ["ramalama==0.23.*"]
+cloud = ["skypilot>=0.12"]
+s3 = ["boto3"]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/abeltre1/canopie25-paper-artifacts/tree/main/boxy"
+Source = "https://github.com/abeltre1/canopie25-paper-artifacts"
+Issues = "https://github.com/abeltre1/canopie25-paper-artifacts/issues"
+
+[project.scripts]
+boxy = "boxy.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "boxy.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"boxy.data" = ["examples/**/*.toml", "examples/**/*.md", "cards/**/*.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

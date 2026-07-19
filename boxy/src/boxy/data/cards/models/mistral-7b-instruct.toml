@@ -1,0 +1,9 @@
+# mistralai/Mistral-7B-Instruct (any revision) — single GPU.
+[model]
+match = "mistralai/Mistral-7B-Instruct*"
+engine = "vllm"
+gpus = 1
+min_vram_gb = 24
+[model.args]
+# 32K context on Mistral-7B; cap KV-cache profiling to fit a 24-40GB GPU.
+max_model_len = 8192

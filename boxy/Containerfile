@@ -1,0 +1,47 @@
+# Containerized boxy — the CLI itself in a box, runnable anywhere a container
+# runtime exists (laptop, CI, a jump host) with NOTHING else installed.
+#
+# Base: Red Hat HARDENED python image (images.redhat.com catalog,
+# registry.access.redhat.com/hi/python). The catalog's runtime images are
+# DISTROLESS — no shell, no package manager — which cannot host boxy: boxy
+# execs `ssh` (its transport) and POSIX-shell probes by design. The
+# BUILDER variant keeps the hardened lineage AND the userland (dnf, bash),
+# so it is the correct runtime here. Pinned to the 3.14 stream (not
+# latest-builder) so base jumps are deliberate; `-fips` / `-fips-builder`
+# variants exist for FIPS-mode hosts. CI smoke-tests
+# the entrypoint and the presence of `ssh` on every push, so a base that
+# can't take the openssh-clients install fails loudly there, not in the field.
+#
+# Build (CI does this on every push, from the freshly built wheel):
+#   python -m build --wheel .          # -> dist/boxy_hpc-*.whl
+#   podman build -t boxy -f Containerfile .
+#
+# Run — the container needs your SSH material and keeps its state on mounts,
+# exactly like the host CLI would (nothing is stored in the image):
+#   podman run --rm -it \
+#     -v ~/.ssh:/opt/app-root/src/.ssh:ro \
+#     -v ~/.config/boxy:/opt/app-root/src/.config/boxy \
+#     -v boxy-state:/opt/app-root/src/.local \
+#     boxy serve hf://Qwen/Qwen2.5-0.5B-Instruct --ssh mycluster
+#
+# The OpenSSH client IS boxy's transport (ControlMaster multiplexing, GSSAPI,
+# OTP prompts) — it ships in the image; keys/agent come from the mounts. For
+# agent forwarding add:  -v $SSH_AUTH_SOCK:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent
+
+FROM registry.access.redhat.com/hi/python:3.14-builder
+
+USER 0
+# hardened images vary in which package manager they ship — try the chain
+RUN (dnf install -y --nodocs openssh-clients ca-certificates && dnf clean all) \
+    || (microdnf install -y openssh-clients ca-certificates && microdnf clean all)
+
+# the wheel is built by CI (or `make wheel`) right before the image build
+COPY dist/*.whl /tmp/dist/
+RUN pip install --no-cache-dir /tmp/dist/*.whl && rm -rf /tmp/dist
+
+# back to the UBI non-root user (1001); state/config live on the mounts above
+USER 1001
+WORKDIR /opt/app-root/src
+
+ENTRYPOINT ["boxy"]
+CMD ["--help"]

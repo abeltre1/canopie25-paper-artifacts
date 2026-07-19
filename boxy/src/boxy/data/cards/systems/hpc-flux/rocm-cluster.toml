@@ -1,0 +1,13 @@
+# Flux + AMD ROCm (clusterb-like). Apptainer; MI300-class memory tuning.
+[location]
+name = "flux-rocm"
+scheduler = "flux"
+accelerator = "rocm"
+runtime = "apptainer"
+offline = true
+modules = ["rocm/6.4.0"]
+[location.resources]
+gpus_per_node = 4
+gpu_vram_gb = 128    # MI300A-class parts; the model-card geometry solver sizes against this
+[location.tuning]
+gpu_memory_utilization = 0.7

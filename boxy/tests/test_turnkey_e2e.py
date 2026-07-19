@@ -1,0 +1,1932 @@
+"""Turnkey end-to-end: prove the account fetched from `myaccounts` actually reaches
+the batch script — the field promise that failed (2026-07) — in BOTH invocation
+styles, against a FAKE cluster (bash shims on PATH), never a real scheduler.
+
+Two paths are exercised:
+
+  * on the login node — a real submit (`boxy serve MODEL --scheduler slurm`, no
+    --dryrun): a fake `sbatch` writes the endpoint and echoes a job id, so the
+    submit/follow loop runs to `### READY`, and we assert the script ON DISK
+    carries `#SBATCH --account=<from myaccounts>`.
+
+  * from the laptop over `--ssh` — the command is delegated to the CLUSTER's
+    boxy (which may predate turnkey), so the account is resolved laptop-side and
+    injected as `--account`. We assert the delegated argv carries it and the
+    (delegated) boxy's batch script shows it — with the account coming either
+    from a locally-known value or from a `myaccounts` probe run ON the cluster.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+from boxy import readiness, remote
+from boxy.cli import main
+
+SRC = str(Path(__file__).parent.parent / "src")
+
+# The real `myaccounts` table (see tests/test_site.py): header + dashed rule, data
+# rows whose DESCRIPTION opens with a bare numeric id, a 'none' row, and a caps
+# note. The account column is ab110001 / ab110002 / ab110003.
+REAL_MYACCOUNT_ID = """\
+      User    Account                              Description     Parent
+---------- ---------- ---------------------------------------- --------------------
+     jdoe   ab110001        101 project alpha                   nd
+     jdoe   ab110002      102 project beta                   nd
+     jdoe   ab110003         103 project gamma                   nd
+     jdoe       none       default account, no job privileges
+  The Account could be on Caps too: AB110001
+"""
+
+# fake sbatch: log argv, simulate an instant compute-node start by writing the
+# endpoint file next to the script (name.sh -> name.endpoint.json), print a job
+# id like `sbatch --parsable` does. Lets the real submit/follow loop reach READY.
+FAKE_SBATCH = r"""#!/bin/bash
+echo "$@" >> "$SBATCH_LOG"
+script="${!#}"                                   # last positional arg = script path
+ep="${script%.sh}.endpoint.json"
+host="$(hostname)"
+printf '{"name":"x","host":"%s","port":8000,"url":"http://%s:8000","job":"12345"}\n' \
+       "$host" "$host" > "$ep"
+echo "12345"
+"""
+
+# fake ssh (from tests/test_remote.py): records every invocation, runs the
+# "remote" command locally so the delegation is exercised against the real CLI.
+FAKE_SSH = r"""#!/bin/bash
+log() { echo "$*" >> "$SHIM_LOG"; }
+if [ "$1" = "-O" ]; then
+  op="$2"; shift 2
+  log "CTL $op $*"
+  case "$op" in
+    check)   [ -f "$SHIM_STATE" ] && exit 0 || exit 1 ;;
+    forward) exit 0 ;;
+    *)       exit 0 ;;
+  esac
+fi
+host=""; cmd=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) shift 2 ;;
+    *)  if [ -z "$host" ]; then host="$1"; else cmd+=("$1"); fi; shift ;;
+  esac
+done
+log "RUN $host ${cmd[*]}"
+if [ "${cmd[*]}" = "true" ]; then touch "$SHIM_STATE"; exit 0; fi
+exec bash -c "${cmd[*]}"
+"""
+
+MODEL = "hf://meta-llama/Llama-3.1-8B-Instruct"
+
+
+def _shim(directory: Path, name: str, body: str) -> Path:
+    p = directory / name
+    p.write_text(body)
+    p.chmod(0o755)
+    return p
+
+
+@pytest.fixture
+def cluster(tmp_path, monkeypatch):
+    """A fake cluster: myaccounts + sbatch on PATH, an isolated jobs dir, and a
+    non-blocking readiness probe. Account injection over --ssh is off by default
+    in the suite (conftest), so tests that need it re-enable it explicitly."""
+    binp = tmp_path / "bin"
+    binp.mkdir()
+    _shim(binp, "myaccounts", "#!/bin/bash\ncat <<'EOF'\n" + REAL_MYACCOUNT_ID + "EOF\n")
+    # fake sinfo (-o "%R|%a|%F|%G"): name|up-down|A/I/O/T nodes|GRES. GPU
+    # partitions gpu(6 idle) and batch(2 idle); short is CPU-only; down-pt is
+    # down. GPU-aware auto -> "gpu,batch"; --partition all -> "gpu,short,batch".
+    # -N (node-wise inventory, the one-shot probe's INV_SLURM section) answers
+    # nothing: tests that exercise inventory-driven geometry shim their own
+    # arg-aware sinfo; everyone else keeps card/flag-driven geometry.
+    _shim(binp, "sinfo", "#!/bin/bash\n"
+          'case "$*" in *-N*) exit 0;; esac\n'
+          "cat <<'EOF'\n"
+          "gpu|up|2/6/0/8|gpu:a100:8\n"
+          "short|up|3/5/0/8|(null)\n"
+          "batch|up|8/2/0/10|gpu:v100:4\n"
+          "down-pt|down|0/8/0/8|gpu:a100:8\n"
+          "EOF\n")
+    sbatch_log = tmp_path / "sbatch.log"
+    sbatch_log.write_text("")
+    _shim(binp, "sbatch", FAKE_SBATCH)
+    monkeypatch.setenv("SBATCH_LOG", str(sbatch_log))
+    monkeypatch.setenv("PATH", f"{binp}:{__import__('os').environ['PATH']}")
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    # the compute node never really starts a server here — report ready at once
+    monkeypatch.setattr(readiness, "wait_ready", lambda *a, **k: "llama-3.1-8b")
+    return {"bin": binp, "jobs": tmp_path / "jobs", "sbatch_log": sbatch_log,
+            "tmp": tmp_path, "monkeypatch": monkeypatch}
+
+
+def _the_script(jobs_dir: Path) -> str:
+    scripts = list(jobs_dir.glob("*.sh"))
+    assert len(scripts) == 1, f"expected one batch script, found {scripts}"
+    return scripts[0].read_text()
+
+
+# ---- login-node: a REAL submit puts the myaccounts account in the script on disk ----
+
+
+def test_login_node_submit_writes_account_into_the_script(cluster, capfd):
+    rc = main(["serve", MODEL, "--scheduler", "slurm"])   # NO --partition flag
+    out = capfd.readouterr().out
+    assert rc == 0
+    # the turnkey promise: myaccounts -> the batch script the scheduler actually ran
+    script = _the_script(cluster["jobs"])
+    assert "#SBATCH --account=ab110001" in script     # first account from the table
+    assert "#SBATCH --gpus-per-node=1" in script      # 8B model card -> 1 GPU
+    # ...and the partition was auto-picked with NO flag (the "don't set it"
+    # default): a GPU job gets only GPU partitions, idle-first.
+    assert "#SBATCH --partition=gpu,batch" in script
+    # ...and it was really submitted + followed to READY
+    assert "--parsable" in cluster["sbatch_log"].read_text()
+    assert "auto: account: ab110001 (via myaccounts" in out
+    assert "### READY" in out
+    # the endpoint record is discoverable (boxy list would show it)
+    rec = json.loads((cluster["jobs"] / [p.name for p in cluster["jobs"].glob("*.json")
+                                         if not p.name.endswith(".endpoint.json")][0]).read_text())
+    assert rec["job"] == "12345" and rec["scheduler"] == "slurm"
+
+
+def test_login_node_default_partition_is_gpu_aware_auto(cluster, capfd):
+    # bare serve (no --partition) auto-picks GPU partitions only; a job never
+    # parks in a CPU-only partition (the field 'stuck' failure).
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--dryrun"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "#SBATCH --partition=gpu,batch" in out       # 'short' (CPU) excluded
+    assert "with GPUs" in out
+
+
+def test_login_node_partition_all_includes_cpu(cluster, capfd):
+    # power-user override: --partition all offers EVERY up partition.
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "all", "--dryrun"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "#SBATCH --partition=gpu,short,batch" in out
+
+
+def test_login_node_partition_off_uses_site_default(cluster, capfd):
+    # power-user override: --partition off emits no partition directive.
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "off", "--dryrun"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "#SBATCH --partition" not in out
+
+
+def test_login_node_flux_bank_and_single_queue(cluster, capfd):
+    # Flux spells account `--bank` and takes exactly ONE queue: a Slurm-style
+    # comma partition is trimmed with a warning (the field failure).
+    rc = main(["serve", MODEL, "--scheduler", "flux", "--partition", "short,batch",
+               "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "# flux: --bank=ab110001" in cap.out        # account -> flux bank
+    assert "# flux: --queue=short" in cap.out          # one queue only
+    assert "--queue=short,batch" not in cap.out
+    assert "ONE queue" in cap.err                       # the guard warned
+
+
+# ---- auto-unique: never block on a live instance (start an independent one) --------
+
+
+def test_auto_unique_forks_when_a_live_instance_exists(cluster, capfd, monkeypatch):
+    from boxy import jobs, resolve
+
+    _, name, _ = resolve.resolve_submission(MODEL, "slurm", require_exists=False)
+    # a live PENDING instance already holds the deterministic name, no endpoint yet
+    jobs.write_record(name, {"name": name, "scheduler": "slurm", "job": "111", "model": MODEL})
+    _shim(cluster["bin"], "squeue", "#!/bin/bash\necho PENDING\n")   # _job_state -> PENDING
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--dryrun"])   # NO --unique
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "starting an independent instance" in out
+    assert f"--job-name={name}-" in out                 # forked unique name, not the base
+    assert f"#SBATCH --job-name={name}\n" not in out    # the base name was NOT reused
+
+
+def test_no_auto_unique_restores_singleton_block(cluster, capfd):
+    from boxy import jobs, resolve
+
+    _, name, _ = resolve.resolve_submission(MODEL, "slurm", require_exists=False)
+    jobs.write_record(name, {"name": name, "scheduler": "slurm", "job": "111", "model": MODEL})
+    _shim(cluster["bin"], "squeue", "#!/bin/bash\necho RUNNING\n")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--no-auto-unique", "--dryrun"])
+    err = capfd.readouterr().err
+    assert rc == 1
+    assert "already submitted" in err                   # strict singleton preserved
+
+
+# ---- from the laptop over --ssh: the account is injected into the delegated cmd --
+
+
+@pytest.fixture
+def ssh(cluster):
+    """Layer a fake ssh over the fake cluster and turn remote-account injection
+    back on (conftest disables it for the suite at large)."""
+    mp = cluster["monkeypatch"]
+    sshp = _shim(cluster["bin"], "ssh", FAKE_SSH)
+    log = cluster["tmp"] / "ssh.log"
+    log.write_text("")
+    mp.setenv(remote.ENV_SSH_BIN, str(sshp))
+    mp.setenv("SHIM_LOG", str(log))
+    mp.setenv("SHIM_STATE", str(cluster["tmp"] / "master.up"))
+    mp.delenv(remote.ENV_ACTIVE, raising=False)
+    mp.delenv(remote.ENV_HOST, raising=False)
+    mp.setenv(remote.ENV_REMOTE_CMD, f"PYTHONPATH={SRC} {sys.executable} -m boxy.cli")
+    mp.delenv("BOXY_NO_REMOTE_ACCOUNT", raising=False)   # opt back in
+    cluster["ssh_log"] = log
+    return cluster
+
+
+def test_ssh_injects_locally_known_account(ssh, capfd, monkeypatch):
+    # The laptop already knows the account (config/env) — no remote probe needed;
+    # it rides the delegated command as --account so the CLUSTER's boxy (turnkey
+    # or not) builds the script with it.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    ssh_log = ssh["ssh_log"].read_text()
+    assert "RUN user@clustera" in ssh_log                     # delegated over the master
+    assert "--account ab110003" in ssh_log                # ...carrying the account
+    assert "#SBATCH --account=ab110003" in cap.out        # remote boxy put it in the script
+    assert "placed in the batch script" in cap.out        # the laptop-side decision line
+
+
+def test_ssh_default_partition_auto_no_flag(ssh, capfd, monkeypatch):
+    # No --partition at all over --ssh: boxy still auto-picks (GPU-aware) by
+    # probing sinfo on the cluster and APPENDING the concrete list.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: partition: gpu,batch (via sinfo on clustera" in cap.out
+    assert "--partition gpu,batch" in ssh["ssh_log"].read_text()
+    assert "#SBATCH --partition=gpu,batch" in cap.out
+
+
+def test_ssh_resolves_partition_auto_to_concrete_list(ssh, capfd, monkeypatch):
+    # `--partition auto` must be resolved to a CONCRETE list laptop-side (via
+    # sinfo on the cluster) before delegating — an older cluster boxy would pass
+    # the literal 'auto' to sbatch and get 'invalid partition'. GPU-aware.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")            # keep account quiet/deterministic
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "auto",
+               "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: partition: gpu,batch (via sinfo on clustera" in cap.out
+    ssh_log = ssh["ssh_log"].read_text()
+    assert "--partition gpu,batch" in ssh_log                 # concrete GPU list delegated
+    assert "--partition auto" not in ssh_log                  # literal 'auto' never sent
+    assert "#SBATCH --partition=gpu,batch" in cap.out         # remote script built with it
+
+
+def test_ssh_partition_all_includes_cpu(ssh, capfd, monkeypatch):
+    # power-user override survives delegation: --partition all -> every partition.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "all",
+               "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "--partition gpu,short,batch" in ssh["ssh_log"].read_text()
+    assert "#SBATCH --partition=gpu,short,batch" in cap.out
+
+
+def test_ssh_partition_auto_from_config_default(ssh, capfd, monkeypatch):
+    # BOXY_PARTITION=auto with NO --partition flag must still be resolved over
+    # --ssh: there's no flag to rewrite, so the concrete list is appended.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("BOXY_PARTITION", "auto")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: partition: gpu,batch (via sinfo on clustera" in cap.out
+    assert "--partition gpu,batch" in ssh["ssh_log"].read_text()
+    assert "#SBATCH --partition=gpu,batch" in cap.out
+
+
+def test_ssh_injects_unique_when_a_live_instance_is_on_the_cluster(ssh, capfd, monkeypatch):
+    # A live job of this model's name already runs on the cluster -> boxy injects
+    # --unique laptop-side so the (possibly OLD) cluster boxy starts an
+    # independent instance instead of blocking. Works without --unique typed.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    _shim(ssh["bin"], "squeue", "#!/bin/bash\necho 111\n")   # a job with the name is LIVE
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: --unique" in cap.out and "already live on clustera" in cap.out
+    assert "--unique" in ssh["ssh_log"].read_text()          # rode the delegated command
+
+
+def test_ssh_no_unique_when_nothing_live(ssh, capfd, monkeypatch):
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    _shim(ssh["bin"], "squeue", "#!/bin/bash\ntrue\n")       # no job with the name
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: --unique" not in cap.out
+    assert "--unique" not in ssh["ssh_log"].read_text()
+
+
+def test_ssh_power_user_unique_flag_is_respected_not_doubled(ssh, capfd, monkeypatch):
+    # explicit --unique still works and isn't duplicated by the auto-injection.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    _shim(ssh["bin"], "squeue", "#!/bin/bash\necho 111\n")   # even with a live one
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--unique", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: --unique" not in cap.out                   # not re-injected
+    assert ssh["ssh_log"].read_text().count("--unique") == 1
+
+
+def test_ssh_injects_card_max_model_len_after_separator(ssh, capfd, monkeypatch):
+    # the model card's engine args (--max-model-len, so vLLM doesn't OOM on the
+    # 128K default) are injected AFTER `--`, while boxy flags (account/partition)
+    # stay BEFORE it — even against an OLD cluster boxy that won't apply the card.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: engine args: --max-model-len 8192" in cap.out
+    log = ssh["ssh_log"].read_text()
+    assert "-- --max-model-len 8192" in log                 # engine args after --
+    # boxy flags land BEFORE the `--` separator (not passed to vLLM)
+    assert log.index("--account") < log.index(" -- ")
+    assert log.index("--partition") < log.index(" -- ")
+
+
+def test_ssh_user_engine_args_win_over_card(ssh, capfd, monkeypatch):
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun",
+               "--", "--max-model-len", "4096"])
+    capfd.readouterr()
+    assert rc == 0
+    log = ssh["ssh_log"].read_text()
+    # card 8192 FIRST then the user's 4096 -> vLLM last-wins -> user's 4096
+    assert log.index("8192") < log.index("4096")
+
+
+def test_ssh_forwards_proxy_to_the_cluster(ssh, capfd, monkeypatch):
+    # BOXY_PROXY (or ambient http(s)_proxy) is forwarded to the cluster job's
+    # pulls over --ssh, even if the login node's own env lacks it.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("BOXY_PROXY", "http://proxy.corp:80")
+    monkeypatch.delenv("BOXY_NO_PROXY_PROPAGATE", raising=False)   # opt back in
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "### Proxy   forwarding http://proxy.corp:80" in cap.out
+    assert "https_proxy=http://proxy.corp:80" in ssh["ssh_log"].read_text()
+
+
+def test_ssh_probes_myaccounts_on_the_cluster(ssh, capfd, monkeypatch):
+    # The laptop knows NOTHING (local account command disabled, no env), so the
+    # account is discovered by running `myaccounts` ON the cluster over the ssh
+    # master, then injected into the delegated command.
+    monkeypatch.setenv("BOXY_ACCOUNT_COMMAND", "")        # no laptop-side probe
+    monkeypatch.delenv("SBATCH_ACCOUNT", raising=False)
+    monkeypatch.delenv("SLURM_ACCOUNT", raising=False)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: account: ab110001 (via myaccounts on clustera" in cap.out
+    ssh_log = ssh["ssh_log"].read_text()
+    assert "--account ab110001" in ssh_log                # injected into the delegation
+    assert "#SBATCH --account=ab110001" in cap.out        # ...and into the remote script
+
+
+# ---- scheduler is abstracted: no --scheduler needed over --ssh --------------------
+
+
+def test_ssh_auto_detects_scheduler_when_flag_absent(ssh, capfd, monkeypatch):
+    # NO --scheduler at all: boxy probes the cluster (sbatch on PATH) over the ssh
+    # master and INJECTS --scheduler slurm, so even an OLD cluster boxy submits a
+    # batch job. A novice types only the model + the host.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--ssh", "user@clustera", "--dryrun"])   # no --scheduler
+    cap = capfd.readouterr()
+    assert rc == 0
+    # sinfo returns partitions on the fake cluster -> slurm's control plane is LIVE
+    sched_line = next(ln for ln in cap.out.splitlines() if "auto: scheduler:" in ln)
+    assert "slurm" in sched_line and "Slurm is live" in sched_line
+    ssh_log = ssh["ssh_log"].read_text()
+    assert "--scheduler slurm" in ssh_log                  # injected into the delegation
+    assert "#SBATCH --account=ab110003" in cap.out         # the remote boxy built a batch job
+
+
+def test_ssh_flux_system_with_slurm_shims_detects_flux(ssh, capfd, monkeypatch):
+    # The clusterb field case: a FLUX system whose slurm-compat layer is COMPLETE
+    # enough that `sinfo` answers too (both flux-live AND slurm-live fire) and its
+    # `sbatch` shim returns Flux job ids squeue can't track. A reachable Flux broker
+    # is authoritative: detection must pick FLUX and NOT be defeated by the working
+    # slurm shims. This is the misidentification fix.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    # flux present & live: `flux resource list` (and friends) exit 0; queue list
+    # feeds the partition probe; `flux jobs` reports nothing live (auto-unique).
+    _shim(ssh["bin"], "flux",
+          "#!/bin/bash\n"
+          'if [ "$1" = "--uri" ]; then shift 2; fi\n'   # a system flux answers on the system socket
+          'case "$1" in\n'
+          "  getattr) echo 0 ;;\n"                       # instance-level 0 == SYSTEM instance
+          "  resource|uptime) : ;;\n"
+          '  queue) echo "pbatch|true" ;;\n'
+          "  jobs) : ;;\n"
+          "  *) : ;;\n"
+          "esac\n"
+          "exit 0\n")
+    # NB: the fixture's `sinfo` STILL returns partitions (slurm-live also fires) —
+    # exactly like clusterb; flux must win anyway.
+    rc = main(["serve", MODEL, "--ssh", "user@clusterb", "--dryrun"])   # no --scheduler
+    cap = capfd.readouterr()
+    assert rc == 0
+    # the scheduler line names flux and explains the slurm shims are compat proxies.
+    sched_line = next(ln for ln in cap.out.splitlines() if "auto: scheduler:" in ln)
+    assert "flux" in sched_line and "Flux broker is live" in sched_line
+    assert "compat shims" in sched_line                    # the slurm shims are named, not chosen
+    ssh_log = ssh["ssh_log"].read_text()
+    assert "--scheduler flux" in ssh_log                   # flux injected, NOT slurm
+    assert "--scheduler slurm" not in ssh_log
+    assert "# flux: --bank=" in cap.out                    # a Flux batch script was built
+
+
+def test_ssh_scheduler_config_wins_over_detection(ssh, capfd, monkeypatch):
+    # config BOXY_SCHEDULER pins the scheduler without probing PATH — the decision
+    # line names the provenance so it's auditable.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("BOXY_SCHEDULER", "slurm")
+    rc = main(["serve", MODEL, "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: scheduler: slurm (via config site.scheduler on clustera)" in cap.out
+    assert "--scheduler slurm" in ssh["ssh_log"].read_text()
+
+
+def test_ssh_explicit_scheduler_not_re_injected(ssh, capfd, monkeypatch):
+    # power user pins --scheduler: no auto line, and it's not duplicated on the
+    # delegated argv.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    # no laptop-side injection line (the delegated boxy still prints its own
+    # "auto: scheduler: slurm (submitting a batch job …)" — that's not ours)
+    assert "auto: scheduler: slurm (via" not in cap.out
+    assert ssh["ssh_log"].read_text().count("--scheduler slurm") == 1
+
+
+def test_ssh_here_stays_a_direct_serve(ssh, capfd, monkeypatch):
+    # --here is an explicit "serve directly on that node": scheduler auto-detection
+    # must NOT turn it into a batch job even though sbatch is on the host.
+    # NOTE: the DELEGATED boxy may print its own "auto: scheduler: none (…)" line
+    # when its resolution succeeds (on CI podman works, and the accel ladder now
+    # reads the fake cluster's GRES) — only a slurm/flux verdict would mean a
+    # batch job, so that is what must be absent.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    main(["serve", MODEL, "--here", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert "auto: scheduler: slurm" not in cap.out
+    assert "auto: scheduler: flux" not in cap.out
+    assert "--scheduler" not in ssh["ssh_log"].read_text()
+
+
+# ---- default walltime (30 min) is abstracted too ----------------------------------
+
+
+def test_ssh_injects_default_walltime(ssh, capfd, monkeypatch):
+    # NO --time: the 30-min default rides the delegated command so the served job
+    # carries a walltime even against an OLD cluster boxy (whose default is
+    # laptop-side). The decision line warns the scheduler stops the job then.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: time: 1:00:00" in cap.out
+    assert "stops the job at this walltime" in cap.out
+    assert "--time 1:00:00" in ssh["ssh_log"].read_text()
+    assert "#SBATCH --time=1:00:00" in cap.out
+
+
+def test_ssh_explicit_time_wins(ssh, capfd, monkeypatch):
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--time", "2:00:00",
+               "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: time:" not in cap.out                    # not injected over an explicit flag
+    ssh_log = ssh["ssh_log"].read_text()
+    assert "--time 2:00:00" in ssh_log and "--time 1:00:00" not in ssh_log
+
+
+# ---- readiness timeout is raised so an OLD cluster boxy doesn't give up early ------
+
+
+def test_ssh_injects_ready_timeout(ssh, capfd, monkeypatch):
+    # NO --ready-timeout: boxy raises the delegated boxy's readiness wait (an old
+    # cluster boxy defaults to 180s and gives up on a still-loading model). The
+    # generous ceiling rides the delegated command; READY is still reported the
+    # instant the endpoint answers, so it never over-waits.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: ready-timeout: 20 min" in cap.out
+    assert "--ready-timeout 1200" in ssh["ssh_log"].read_text()
+
+
+def test_ssh_explicit_ready_timeout_wins(ssh, capfd, monkeypatch):
+    # a power user pinning --ready-timeout (incl. 0 = submit-and-detach) is respected.
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ready-timeout", "0",
+               "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: ready-timeout:" not in cap.out
+    assert "--ready-timeout 1200" not in ssh["ssh_log"].read_text()
+
+
+# ---- login node itself: scheduler auto-detected on PATH ---------------------------
+
+
+def test_login_node_scheduler_from_config(cluster, capfd, monkeypatch):
+    # On the login node itself, an explicit BOXY_SCHEDULER submits a batch job
+    # with NO --scheduler flag (the default 'auto' deliberately does NOT probe
+    # PATH locally — the login-node guard handles that with a clear message). The
+    # script on disk carries the myaccounts account and the 30-min default walltime.
+    monkeypatch.setenv("BOXY_SCHEDULER", "slurm")
+    rc = main(["serve", MODEL])                            # no --scheduler flag
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: scheduler: slurm (via config site.scheduler)" in cap.out
+    script = _the_script(cluster["jobs"])
+    assert "#SBATCH --account=ab110001" in script
+    assert "#SBATCH --time=1:00:00" in script
+
+
+# ---- --share is abstracted: a team URL is published automatically over --ssh ------
+
+
+def test_ssh_auto_share_derives_alias(ssh, capfd, monkeypatch):
+    # NO --share: a served model over --ssh auto-publishes a team URL whose alias is
+    # derived from the model's instance name (turnkey). The decision line is printed
+    # laptop-side; the delegated command is NOT changed (share is a laptop concern).
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("BOXY_AUTO_SHARE", "true")   # conftest turns it off for the suite
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    # dots are sanitized to dashes so the alias is a valid relay DNS label
+    assert "auto: share: llama-3-1-8b-instruct" in cap.out
+    assert "--share" not in ssh["ssh_log"].read_text()   # share is handled laptop-side, not delegated
+
+
+def test_ssh_no_auto_share_when_disabled(ssh, capfd, monkeypatch):
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("BOXY_AUTO_SHARE", "false")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: share:" not in cap.out
+
+
+# ---- fully agentless over --ssh: NOTHING installed on the HPC ----------------------
+
+
+def test_ssh_agentless_default_renders_self_contained_script(ssh, capfd, monkeypatch):
+    # THE turnkey promise: `boxy serve <hf model> --ssh host` with NO boxy on the
+    # cluster. The laptop renders a self-contained podman batch script (engine
+    # pulls the model), with the site directives resolved over SSH — no delegation.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")   # production default; conftest opts the suite out
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "Agentless (no boxy on the cluster)" in cap.out
+    # the engine pulls the bare repo id at container start (no RamaLama on the cluster)
+    assert "the engine downloads it at container start" in cap.out
+    assert "serve meta-llama/Llama-3.1-8B-Instruct" in cap.out
+    assert "podman run" in cap.out
+    # site directives resolved laptop-side over SSH and baked into the script
+    assert "#SBATCH --account=ab110003" in cap.out
+    assert "#SBATCH --partition=gpu,batch" in cap.out
+    assert "#SBATCH --time=1:00:00" in cap.out
+    assert "sbatch --parsable" in cap.out
+    # NOT the delegated path — the cluster's boxy is never invoked
+    assert "$ boxy serve" not in cap.out
+    assert "RUN user@clustera" not in ssh["ssh_log"].read_text() or "boxy serve" not in ssh["ssh_log"].read_text()
+
+
+def test_ssh_delegate_flag_forces_the_cluster_boxy(ssh, capfd, monkeypatch):
+    # --delegate opts out of agentless and runs the cluster's own boxy (the old
+    # path) — for --replicas/--box, or a cluster that has boxy.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--delegate", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "Agentless (no boxy on the cluster)" not in cap.out
+    assert "$ boxy serve" in cap.out                       # delegated to the cluster boxy
+    assert "--delegate" not in ssh["ssh_log"].read_text()  # laptop-only flag, not forwarded
+
+
+def test_ssh_agentless_multinode_ray(ssh, capfd, monkeypatch):
+    # `boxy serve MODEL --nodes 2 --gpus 4 --ssh clustera`: STILL agentless — the
+    # batch script itself runs the Ray head + vllm (TP=4 x PP=2) on the head
+    # node and sruns the worker container onto the other node. No cluster boxy.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--nodes", "2", "--gpus", "4",
+               "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "Agentless (no boxy on the cluster)" in cap.out
+    assert "auto: distributed vLLM across 2 nodes via Ray" in cap.out
+    assert "tensor-parallel=4" in cap.out and "pipeline-parallel=2" in cap.out
+    assert "#SBATCH --nodes=2" in cap.out and "#SBATCH --ntasks-per-node=1" in cap.out
+    assert "ray start --head" in cap.out
+    assert "srun --nodes=1 --ntasks=1 --ntasks-per-node=1" in cap.out
+    assert "ray start --address=${BOXY_RAY_HEAD}" in cap.out
+    assert "--tensor-parallel-size=4" in cap.out and "--pipeline-parallel-size=2" in cap.out
+    assert "$ boxy serve" not in cap.out                   # never the delegated path
+
+
+def test_ssh_agentless_flux_bank_and_engine_pull(ssh, capfd, monkeypatch):
+    # Flux system: the agentless script uses `# flux:` directives (--bank) and the
+    # single queue, still engine-pulling the model.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "flux", "--ssh", "user@clusterb", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "Agentless (no boxy on the cluster)" in cap.out
+    assert "# flux: --bank=ab110003" in cap.out
+    assert "serve meta-llama/Llama-3.1-8B-Instruct" in cap.out
+
+
+# ---- agentless: the Slurm GPU request FORM is auto-detected from sinfo GRES --------
+
+
+def test_ssh_agentless_default_gpu_request_is_gpus_per_node(ssh, capfd, monkeypatch):
+    # A WORKING cluster is NEVER changed pre-emptively: even though the fixture's
+    # sinfo advertises a GPU type, the default 'auto' emits the proven
+    # --gpus-per-node (what works on clustera/clusterb). The portable --gres form is
+    # only used REACTIVELY, if the site rejects this at submit (see the recovery
+    # tests). This is the fix for clustera flipping to --gres=gpu:h100:1 unexpectedly.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\ncat <<'EOF'\n"
+          "gpu|up|2/6/0/8|gpu:h100:8\n"
+          "batch|up|8/2/0/10|gpu:h100:4\n"
+          "EOF\n")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "#SBATCH --gpus-per-node=1" in cap.out           # unchanged working form
+    assert "--gres=gpu" not in cap.out                      # NOT pre-emptively switched
+    assert "auto: gpu request:" not in cap.out              # no proactive decision line
+
+
+def test_ssh_agentless_pinned_gpu_directive_forces_gres(ssh, capfd, monkeypatch):
+    # BOXY_GPU_DIRECTIVE pins the form explicitly (escape hatch): 'gres' emits
+    # --gres=gpu:N with no probing and no self-heal.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("BOXY_GPU_DIRECTIVE", "gres")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "#SBATCH --gres=gpu:1" in cap.out
+    assert "--gpus-per-node" not in cap.out
+
+
+# ---- interactive ACCOUNT_ID picker: the chosen account lands in the batch script ----------
+
+
+def test_login_node_picker_selects_account(cluster, capfd, monkeypatch):
+    # Several ACCOUNT_IDs from myaccounts + a TTY -> the numbered menu. A pick of '2' puts
+    # the SECOND account into the batch script the scheduler actually ran.
+    monkeypatch.setenv("BOXY_PICK_ACCOUNT", "always")       # suite default is 'never'
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "2")
+    rc = main(["serve", MODEL, "--scheduler", "slurm"])     # no --account, no --dryrun
+    out = capfd.readouterr().out
+    assert rc == 0
+    script = _the_script(cluster["jobs"])
+    assert "#SBATCH --account=ab110002" in script           # the 2nd ACCOUNT_ID, not the 1st
+    assert "#SBATCH --account=ab110001" not in script
+    assert "auto: account: ab110002 (you picked 2 of 3 from myaccounts)" in out
+    assert "### READY" in out
+
+
+def test_login_node_no_prompt_when_disabled(cluster, capfd, monkeypatch):
+    # Suite default (never): multi-account discovery keeps the silent first-pick
+    # and NEVER calls input() — proves batch/CI can't block on the menu.
+    def _boom(*a, **k):
+        raise AssertionError("input() must not be called when the picker is off")
+
+    monkeypatch.setattr("builtins.input", _boom)
+    rc = main(["serve", MODEL, "--scheduler", "slurm"])     # BOXY_PICK_ACCOUNT=never (conftest)
+    assert rc == 0
+    assert "#SBATCH --account=ab110001" in _the_script(cluster["jobs"])   # first, silently
+
+
+def test_ssh_agentless_picker_selects_account(ssh, capfd, monkeypatch):
+    # Over --ssh with NO boxy on the cluster: myaccounts is probed ON the cluster and
+    # the menu runs LAPTOP-side. Emptying the LOCAL account command emulates a
+    # laptop with no myaccounts, so resolution falls through to the remote probe.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_PICK_ACCOUNT", "always")
+    monkeypatch.setenv("BOXY_ACCOUNT_COMMAND", "")          # laptop has no myaccounts
+    monkeypatch.delenv("BOXY_ACCOUNT", raising=False)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "2")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "Agentless (no boxy on the cluster)" in cap.out
+    assert "#SBATCH --account=ab110002" in cap.out
+    assert "you picked 2 of 3 from myaccounts on clustera" in cap.out
+
+
+def test_ssh_agentless_forwards_proxy_to_the_compute_node_pull(ssh, capfd, monkeypatch):
+    # THE regression: the --ssh agentless script must forward the corporate proxy to
+    # the compute-node `podman pull`, or an isolated node 403s on Docker Hub (Zscaler).
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.delenv("BOXY_NO_PROXY_PROPAGATE", raising=False)     # opt in (suite opts out)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--proxy", "http://proxy.site:80",
+               "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    # the podman pull is prefixed with the proxy env, and boxy says so
+    assert "exec env " in cap.out and "proxy.site:80" in cap.out
+    assert "env " in cap.out.split("podman run")[0].rsplit("exec ", 1)[-1] or "proxy.site:80" in cap.out
+    assert "forwarding" in cap.out and "compute-node image pull" in cap.out
+
+
+def test_ssh_agentless_license_flag_lands_in_the_script(ssh, capfd, monkeypatch):
+    # --license adds #SBATCH --license=... in the agentless batch script (Slurm).
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--license", "sitescratch:1,pscratch:1",
+               "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "#SBATCH --license=sitescratch:1,pscratch:1" in cap.out
+    assert "auto: license: sitescratch:1,pscratch:1 (via --license)" in cap.out
+
+
+def test_ssh_agentless_ca_picked_on_the_node_at_runtime(ssh, capfd, monkeypatch, tmp_path):
+    # THE clustera CERTIFICATE_VERIFY_FAILED fix: the batch script picks a CA bundle ON
+    # THE COMPUTE NODE at job runtime — the boxy-staged laptop bundle first (when one
+    # exists), else the node's OWN system trust store, which provably trusts the
+    # site's TLS interceptor (host-side pulls work) — and splices the mount + TLS env
+    # into the podman argv via $_CAARGS. Never the laptop's SSL_CERT_FILE path
+    # (meaningless on the node; the old bug bind-mounted an empty file).
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    laptop_ca = tmp_path / "ca-merged.crt"
+    laptop_ca.write_text("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n")
+    monkeypatch.setenv("SSL_CERT_FILE", str(laptop_ca))
+    monkeypatch.delenv("BOXY_NO_CA_PROPAGATE", raising=False)     # opt in (suite opts out)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "would stage your merged site CA" in cap.out
+    # staged shared-FS bundle is the FIRST candidate, node system stores follow
+    assert "agentless/clustera/boxy-ca-merged.pem" in cap.out
+    assert "/etc/pki/tls/certs/ca-bundle.crt" in cap.out
+    # the pick is spliced into the container argv before the image ...
+    assert "${_CAARGS}" in cap.out
+    assert "-e SSL_CERT_FILE=/etc/ssl/certs/boxy-ca-merged.pem" in cap.out
+    # ... and the laptop path is NEVER mounted (the CERTIFICATE_VERIFY_FAILED bug)
+    assert f"{laptop_ca}:" not in cap.out
+
+
+def test_ssh_agentless_node_system_ca_without_laptop_bundle(ssh, capfd, monkeypatch):
+    # No merged bundle on the laptop: nothing is staged, but the script STILL
+    # carries the runtime CA pick over the node's own system stores — the fix must
+    # not depend on the laptop's TLS setup at all.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "stage your merged site CA" not in cap.out              # nothing staged
+    assert "agentless/clustera/boxy-ca-merged.pem" not in cap.out      # no staged candidate
+    assert "/etc/pki/tls/certs/ca-bundle.crt" in cap.out           # RHEL store
+    assert "/etc/ssl/certs/ca-certificates.crt" in cap.out         # Debian store
+    assert "${_CAARGS}" in cap.out
+
+
+def test_ssh_agentless_persistent_hf_cache_on_shared_fs(ssh, capfd, monkeypatch):
+    # engine-pull mounts a shared-FS HF cache into the container (download once,
+    # reused by every rerun) and the script creates the dir at job runtime.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: model cache:" in cap.out and "hfcache" in cap.out
+    assert "hfcache:/root/.cache/huggingface" in cap.out           # the bind mount
+    assert "HF_HOME=/root/.cache/huggingface" in cap.out           # engine writes there
+    assert "mkdir -p " in cap.out and "/hfcache" in cap.out        # bind source made at runtime
+    assert "auto: model store:" in cap.out                         # where it lives is a decision
+
+
+def test_ssh_agentless_model_store_discovers_scratch_fs(ssh, capfd, monkeypatch, tmp_path):
+    # FIELD: the HF cache under ~/.local/share/... exhausted the user's $HOME
+    # quota. Unpinned, boxy probes the login node's scratch ladder ($SCRATCH
+    # first) and puts the cache THERE — and remembers the pick per cluster so
+    # the location never wanders between runs.
+    scratch = tmp_path / "big-scratch"
+    scratch.mkdir()
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("BOXY_MODEL_DIR", "")                # opt back into discovery
+    monkeypatch.setenv("BOXY_MIN_FREE_GB", "0")             # any tmpfs passes in CI
+    monkeypatch.setenv("SCRATCH", str(scratch))             # fake ssh probes locally
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert f"auto: model store: clustera:{scratch}/boxy" in cap.out
+    assert "GB free" in cap.out
+    assert f"{scratch}/boxy/hfcache:/root/.cache/huggingface" in cap.out
+    assert f"mkdir -p {scratch}/boxy/hfcache" in cap.out    # bind source, not $HOME
+    # dryrun never persists the pick; a real submit writes the per-cluster sticky
+    from boxy import jobs
+    assert not (jobs._dir() / ".model-store-clustera").exists()
+
+
+def test_ssh_agentless_model_store_home_fallback_warns(ssh, capfd, monkeypatch):
+    # No scratch FS found (probe finds nothing): cache stays under $HOME — but
+    # LOUDLY, with the quota warning and the BOXY_MODEL_DIR escape hatch.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("BOXY_MODEL_DIR", "")
+    monkeypatch.delenv("SCRATCH", raising=False)
+    monkeypatch.setenv("BOXY_MIN_FREE_GB", "1000000")       # nothing can clear the bar…
+    from boxy import site
+    monkeypatch.setattr(site, "MODEL_STORE_LADDER", ('"$SCRATCH"',))  # …and no real /scratch
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "no shared scratch FS found" in cap.err
+    assert "BOXY_MODEL_DIR" in cap.err
+    assert ".local/share/boxy/agentless/clustera/hfcache:/root/.cache/huggingface" in cap.out
+
+
+def test_agentless_list_logs_stop_answer_from_laptop_records(ssh, capfd, monkeypatch, tmp_path):
+    # FIELD: `boxy list --ssh clustera` delegated to the cluster's boxy, whose
+    # login-node `podman ps` showed NOTHING while the container ran on the compute
+    # node. Agentless records live on THIS machine; list/logs/stop must answer
+    # from them over the master — never delegate.
+    from boxy import jobs
+
+    rdir = tmp_path / "agentless"
+    rdir.mkdir()
+    (rdir / "boxy-m-777.log").write_text("vllm says hello\nApplication startup complete\n")
+    ep = rdir / "boxy-m.endpoint.json"
+    ep.write_text('{"name": "boxy-m", "host": "clustera7", "port": 8000, "url": "http://clustera7:8000"}')
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "777",
+                                 "model": "hf://x", "submitted_from": "agentless-ssh",
+                                 "target": "user@clustera", "endpoint_remote": str(ep),
+                                 "log": str(rdir / "boxy-m-%j.log")})
+    _shim(ssh["bin"], "squeue", "#!/bin/bash\necho RUNNING\n")
+    _shim(ssh["bin"], "scancel", "#!/bin/bash\necho ok\n")
+
+    rc = main(["list", "--ssh", "user@clustera"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "agentless jobs" in cap.out
+    assert "boxy-m  slurm job 777 on user@clustera  RUNNING  http://clustera7:8000/v1" in cap.out
+    assert "### Remote" not in cap.out                     # no delegation to a cluster boxy
+    assert "podman ps" not in cap.out                      # no login-node container listing
+
+    rc = main(["logs", "boxy-m"])                          # fetched over the master
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "vllm says hello" in cap.out
+
+    rc = main(["stop", "boxy-m", "--ssh", "user@clustera"])    # canceled over the master
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "stopped slurm job 777 on user@clustera" in cap.out
+    assert jobs.read_record("boxy-m") is None              # record reaped
+
+
+def test_boxy_attach_rejoins_agentless_serve(ssh, capfd, monkeypatch, tmp_path):
+    # FIELD: the serve detached while vLLM was still loading and there was NO way
+    # back to the tunnel/READY. `boxy attach` re-joins: reads the endpoint from
+    # the shared FS over the master, opens the tunnel, waits (extending while the
+    # job is alive), prints READY.
+    from boxy import jobs, remote
+
+    rdir = tmp_path / "agentless"
+    rdir.mkdir()
+    (rdir / "boxy-m-777.log").write_text("Application startup complete.\n")
+    ep = rdir / "boxy-m.endpoint.json"
+    ep.write_text('{"name": "boxy-m", "host": "clustera11", "port": 8000, "url": "http://clustera11:8000"}')
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "777",
+                                 "model": "hf://x", "submitted_from": "agentless-ssh",
+                                 "target": "user@clustera", "endpoint_remote": str(ep),
+                                 "log": str(rdir / "boxy-m-%j.log")})
+    _shim(ssh["bin"], "squeue", "#!/bin/bash\necho RUNNING\n")
+    calls = {}
+
+    def fake_await(host, node, port, log_path, *a, **kw):
+        calls.update(host=host, node=node, port=port, log=log_path,
+                     alive=kw.get("still_alive"))
+        return True
+
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", fake_await)
+    rc = main(["attach", "boxy-m"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "attaching to boxy-m on clustera11" in cap.out
+    assert calls["host"] == "user@clustera" and calls["node"] == "clustera11" and calls["port"] == 8000
+    assert calls["log"].endswith("boxy-m-777.log")     # newest real per-job file, not the %j token
+    assert calls["alive"] is not None and calls["alive"]() is True   # squeue says RUNNING
+
+
+def test_await_ready_extends_while_job_alive(monkeypatch, tmp_path):
+    # THE detach fix: when the window expires but the scheduler says the job is
+    # alive, the wait EXTENDS; when the job is gone, it returns False.
+    import boxy.readiness as readiness
+    from boxy import remote
+
+    monkeypatch.setattr(remote, "_pick_local_port", lambda lp, rp: 0)
+    monkeypatch.setattr(remote, "add_forward", lambda *a: 1)   # no tunnel: log-grep only
+    monkeypatch.setattr(readiness, "probe_once", lambda *a, **k: None)
+    monkeypatch.setattr(remote, "ssh_capture", lambda *a, **k: (0, ""))  # log never ready
+    # fake clock: sleep(5) advances a minute so the 120s extensions elapse instantly
+    clock = {"t": 0.0}
+    monkeypatch.setattr("time.time", lambda: clock["t"])
+    monkeypatch.setattr("time.sleep", lambda s: clock.__setitem__("t", clock["t"] + 60.0))
+
+    lives = iter([True, True, False])                          # alive twice, then gone
+    rc = remote.await_ready_and_tunnel("u@h", "n1", 8000, "/log", None, "", "", "relay",
+                                       False, timeout_s=0.0, still_alive=lambda: next(lives))
+    assert rc is False                                          # detached only when the job died
+
+
+def test_ssh_agentless_autodetects_rocm_from_gres(ssh, capfd, monkeypatch):
+    # FIELD: an AMD cluster got the CUDA image and died with 'unresolvable CDI
+    # devices nvidia.com/gpu=all'. The SCHEDULER's GPU inventory is authoritative
+    # (it describes the COMPUTE nodes): mi300a GRES -> rocm, even when the login
+    # node exposes no GPU userland at all.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\ncat <<'EOF'\n"
+          "batch|up|2/6/0/8|gpu:mi300a:4\n"
+          "EOF\n")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clusterb", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: accelerator: rocm (via cluster probe: cluster GRES types)" in cap.out
+    assert "### clusterb: slurm" in cap.out and "1 probe" in cap.out   # the facts banner
+    assert "nvidia.com/gpu" not in cap.out                          # not the CUDA device flag
+    assert "--device /dev/kfd" in cap.out                           # the AMD device nodes
+    exec_line = [ln for ln in cap.out.splitlines() if "podman run" in ln][0]
+    assert "rocm" in exec_line                                      # the ROCm vLLM image
+
+
+def test_ssh_agentless_autodetects_rocm_from_userland(ssh, capfd, monkeypatch):
+    # No GRES signal (CPU-only sinfo answer, e.g. a Flux system without the
+    # slurm shim): the login node's ROCm userland (rocm-smi) still wins.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\necho 'batch|up|2/6/0/8|(null)'\n")
+    _shim(ssh["bin"], "rocm-smi", "#!/bin/bash\ntrue\n")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clusterb", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: accelerator: rocm (via cluster probe: ROCm userland/driver markers)" in cap.out
+    assert "--device /dev/kfd" in cap.out
+
+
+def test_ssh_agentless_explicit_accelerator_skips_probe(ssh, capfd, monkeypatch):
+    # --accelerator pins it; the probe never runs (rocm-smi on PATH is ignored).
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    _shim(ssh["bin"], "rocm-smi", "#!/bin/bash\ntrue\n")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--accelerator", "cuda",
+               "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: accelerator:" not in cap.out
+    assert "nvidia.com/gpu" in cap.out
+
+
+def test_ssh_serve_pre_submission_is_one_probe_roundtrip(ssh, capfd, monkeypatch):
+    # THE round-trip collapse: everything the pre-submission phase used to ask
+    # in ~5 separate ssh commands (scheduler, accel, partitions, account,
+    # store, $HOME) now rides ONE composite probe. No stray individual probe
+    # commands may appear in the ssh log.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    rc = main(["serve", MODEL, "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    log = ssh["ssh_log"].read_text()
+    composite = [ln for ln in log.splitlines() if "===BOXY:END===" in ln]
+    assert len(composite) == 1                                   # exactly one probe trip
+    # every probe tool invocation lives INSIDE that one composite line
+    for tool in ("sinfo", "myaccounts", "flux queue", 'printf "%s\\n" "$HOME"'):
+        stray = [ln for ln in log.splitlines() if tool in ln and "===BOXY:END===" not in ln]
+        assert stray == [], f"stray {tool!r} round-trip: {stray}"
+    assert "### clustera: slurm" in cap.out and "1 probe" in cap.out  # the facts banner
+
+
+def test_ssh_serve_falls_back_when_composite_probe_breaks(ssh, capfd, monkeypatch):
+    # A garbled composite report (no ===BOXY: markers) must never half-decide:
+    # boxy warns once and every consumer re-runs its INDIVIDUAL probe.
+    from boxy import site as _site
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setattr(_site, "cluster_probe",
+                        lambda partition="", store_saved="": "echo no-markers-here")
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\necho 'batch|up|2/6/0/8|gpu:mi300a:4'\n")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clusterb", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "falling back to individual probes" in cap.err
+    # the OLD probe path decided (its provenance string, not the probe's)
+    assert "auto: accelerator: rocm (via the GPU stack on clusterb's login node)" in cap.out
+
+
+def test_ssh_serve_writes_through_the_system_card(ssh, monkeypatch, capfd, tmp_path):
+    # Write-through: a REAL (non-dryrun) serve refreshes the generated system
+    # card from the probe's inventory; a hand-edited card is never clobbered.
+    from boxy import remote
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\n"
+          'case "$*" in *-N*) printf "n[001-004]|48|512000|gpu:mi300a:4\\n";; '
+          '*) echo "batch|up|2/6/0/8|gpu:mi300a:4";; esac\n')
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", lambda *a, **k: True)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clusterb"])
+    assert rc == 0
+    from boxy import cards
+
+    card = cards._user_systems_dir() / "clusterb.toml"
+    assert card.exists() and "gpus_per_node = 4" in card.read_text()
+    # hand-edited (no generated marker): the next serve leaves it alone
+    card.write_text('[location]\nname = "clusterb"\n[location.resources]\ngpus_per_node = 2\n')
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clusterb"])
+    capfd.readouterr()
+    assert rc == 0
+    assert "gpus_per_node = 2" in card.read_text()      # untouched
+
+
+def test_ssh_partition_scoped_accel_probe(ssh, capfd, monkeypatch):
+    # FIELD ask: "when I pick a partition, check its accelerators before
+    # deploying." A concrete --partition scopes the GRES probe to THAT
+    # partition (sinfo -p short) — its answer wins over the cluster-wide view.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\n"
+          'case "$*" in *"-p short"*) echo "gpu:mi300a:4";; *) echo "(null)";; esac\n')
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clusterb",
+               "--partition", "short", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: accelerator: rocm (via cluster probe: partition short GRES)" in cap.out
+    assert "--device /dev/kfd" in cap.out
+
+
+def test_ssh_partition_without_gpus_holds_deployment(ssh, capfd, monkeypatch):
+    # The chosen partition advertises NO GPU GRES: boxy HOLDS before any
+    # submission (a GPU job there would be rejected or queue forever) and says
+    # how to override.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\n"
+          'case "$*" in *"-p short"*) echo "(null)";; *) echo "gpu:h100:4";; esac\n')
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera",
+               "--partition", "short", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 2
+    assert "advertises no GPUs" in cap.err
+    assert "sinfo -s on clustera" in cap.err                   # actionable next step
+    assert "#SBATCH" not in cap.out                        # nothing was rendered
+
+
+def test_ssh_partition_nogpu_hold_overridden_by_explicit_accelerator(ssh, capfd, monkeypatch):
+    # An explicit --accelerator skips the probe entirely — the documented
+    # override for a site whose GRES config under-reports a GPU partition.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\n"
+          'case "$*" in *"-p short"*) echo "(null)";; *) echo "gpu:h100:4";; esac\n')
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera",
+               "--partition", "short", "--accelerator", "cuda", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "advertises no GPUs" not in cap.err
+
+
+def test_relay_apps_domain_discovery(monkeypatch):
+    # <service>.apps.<cluster>.<org>.<tld>: the apps domain comes from the
+    # cluster ingress config, else the api.->apps. transform of the oc server URL.
+    from boxy.exposers import relay
+
+    calls = {}
+
+    def fake_oc(args, **kw):
+        calls.setdefault("seq", []).append(args[0])
+        if args[0] == "get" and "ingresses.config.openshift.io" in args:
+            return 0, "apps.ocp.example.gov"
+        return 1, ""
+
+    monkeypatch.setattr(relay, "_oc", fake_oc)
+    dom, why = relay.discover_apps_domain()
+    assert dom == "apps.ocp.example.gov" and why == "cluster ingress config"
+
+    def fake_oc2(args, **kw):
+        if args[0] == "get":
+            return 1, "forbidden"                                  # no cluster-scope read
+        if args[0] == "whoami":
+            return 0, "https://api.ocp.example.gov:6443"
+        return 1, ""
+
+    monkeypatch.setattr(relay, "_oc", fake_oc2)
+    dom, why = relay.discover_apps_domain()
+    assert dom == "apps.ocp.example.gov" and "api. -> apps." in why
+
+    monkeypatch.setattr(relay, "_oc", lambda a, **k: (1, "not logged in"))
+    dom, why = relay.discover_apps_domain()
+    assert dom == "" and "oc login" in why
+
+
+def test_generate_relay_autodiscovers_host(capsys, monkeypatch):
+    # zero-flag relay: no --host -> the Route host derives from the logged-in
+    # cluster (boxy-relay.apps.<cluster>.<org>.<tld>); stdout stays pure YAML.
+    from boxy.exposers import relay
+
+    monkeypatch.setattr(relay, "discover_apps_domain",
+                        lambda: ("apps.ocp.example.gov", "cluster ingress config"))
+    rc = main(["generate", "relay", "--auth", "boxy:pw"])
+    cap = capsys.readouterr()
+    assert rc == 0
+    assert "auto: relay host: boxy-relay.apps.ocp.example.gov" in cap.err
+    assert "host: boxy-relay.apps.ocp.example.gov" in cap.out
+    assert "kind: Deployment" in cap.out
+
+
+def test_hf_arch_preflight_refuses_asr_model(ssh, capfd, monkeypatch):
+    # FIELD: nvidia's nemotron ASR (RNN-T decoder) burned a 400s clusterb GPU job
+    # before vLLM refused it. The laptop-side preflight reads the repo's declared
+    # architecture and refuses in seconds — before any submit.
+    from boxy import cardgen
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.delenv("BOXY_NO_PREFLIGHT", raising=False)      # opt in (suite opts out)
+    monkeypatch.setattr(cardgen, "hf_get_json",
+                        lambda *a, **k: {"architectures": ["Nemotron3_5AsrRNNTDecoder"]})
+    rc = main(["serve", "hf://nvidia/nemotron-3.5-asr-streaming-0.6b",
+               "--scheduler", "slurm", "--ssh", "user@clusterb", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 2
+    assert "not a text-generation model" in cap.err
+    assert "NeMo/Riva" in cap.err
+    assert "sbatch" not in cap.out                               # never reached a submit
+
+
+def test_hf_arch_preflight_passes_causal_lm_and_survives_fetch_failure(ssh, capfd, monkeypatch):
+    # A CausalLM arch proceeds; an uncheckable repo (gated/offline fetch error)
+    # NEVER blocks — the engine gets to try.
+    from boxy import cardgen
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.delenv("BOXY_NO_PREFLIGHT", raising=False)
+    monkeypatch.setattr(cardgen, "hf_get_json",
+                        lambda *a, **k: {"architectures": ["LlamaForCausalLM"]})
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    assert rc == 0
+    capfd.readouterr()
+
+    def boom(*a, **k):
+        raise cardgen.CardGenError("gated")
+
+    monkeypatch.setattr(cardgen, "hf_get_json", boom)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0                                               # uncheckable => proceed
+    assert "not a text-generation model" not in cap.err
+
+
+def test_ssh_agentless_autoconfigures_custom_code_vlm(ssh, capfd, monkeypatch):
+    # FIELD (Nemotron-Parse): a custom-code VISION model died at vLLM config
+    # validation for want of --trust-remote-code. For a model with NO packaged
+    # card, boxy reads config.json (auto_map => custom code; vision_config =>
+    # VLM) and folds --trust-remote-code + --limit-mm-per-prompt into the
+    # rendered vLLM command — turnkey, no flags. (Nemotron-Parse itself now
+    # ships a packaged card — covered below — so this uses a cardless id.)
+    from boxy import cardgen
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.delenv("BOXY_NO_PREFLIGHT", raising=False)       # opt in (suite opts out)
+    monkeypatch.setattr(cardgen, "hf_get_json", lambda *a, **k: {
+        "architectures": ["AcmeParseForConditionalGeneration"],
+        "auto_map": {"AutoModel": "modeling_acme_parse.AcmeParse"},
+        "vision_config": {"hidden_size": 1280}})
+    rc = main(["serve", "hf://acme/Custom-Parse-VLM-1B",
+               "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "trust-remote-code: enabled" in cap.out and "auto_map" in cap.out
+    assert "multimodal:" in cap.out
+    exec_line = [ln for ln in cap.out.splitlines() if "podman run" in ln][0]
+    assert "--trust-remote-code" in exec_line                    # the fix for the crash
+    assert "--limit-mm-per-prompt" in exec_line and '"image": 1' in exec_line
+
+
+def test_ssh_agentless_nemotron_parse_card_serves_first_try(ssh, capfd, monkeypatch):
+    # Nemotron-Parse itself: the PACKAGED model card bakes the serve spec in, so
+    # the flags land on the FIRST submit with no Hub probe at all (the field
+    # laptops cannot reach the Hub) — deterministic, no self-heal needed.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", "hf://nvidia/NVIDIA-Nemotron-Parse-v1.2",
+               "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "packaged card 'nvidia-nemotron-parse'" in cap.out
+    exec_line = [ln for ln in cap.out.splitlines() if "podman run" in ln][0]
+    assert "--trust-remote-code" in exec_line
+    assert "--limit-mm-per-prompt" in exec_line and '"image": 1' in exec_line
+    # the card's pip deps install at container START, before the engine execs
+    # (field: the C-RADIO encoder imports open_clip; the vLLM image lacks it)
+    assert "pip install --no-cache-dir --quiet open_clip_torch" in exec_line
+    assert "&& exec vllm serve" in exec_line
+
+
+def test_looks_like_proxy_failure_matches_the_field_error():
+    from boxy.cli import _looks_like_proxy_failure
+    assert _looks_like_proxy_failure(
+        'Error: initializing source docker://vllm/vllm-openai-rocm:latest: '
+        'proxyconnect tcp: dial tcp 185.46.212.90:80: i/o timeout')
+    assert not _looks_like_proxy_failure("CUDA out of memory")
+    assert not _looks_like_proxy_failure("")
+
+
+def test_proxy_self_heal_resubmits_without_proxy(ssh, capfd, monkeypatch):
+    # FIELD (clusterb): the compute node can't reach the FORWARDED site proxy
+    # (proxyconnect i/o timeout). boxy resubmits ONCE without the proxy — the
+    # cluster may reach the registry directly. Driven at the unit seam: a stubbed
+    # await returns False once (job died on the proxy) then True (clean rerun).
+    from boxy import cli, remote
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("BOXY_PROXY", "http://proxy.example.gov:80")
+    monkeypatch.delenv("BOXY_NO_PROXY_PROPAGATE", raising=False)      # opt in — forward the proxy
+    monkeypatch.setattr(cli, "_remote_log_tail",
+                        lambda *a, **k: "proxyconnect tcp: dial tcp 185.46.212.90:80: i/o timeout")
+
+    calls = {"n": 0}
+
+    def await_stub(host, node, port, *a, **k):
+        calls["n"] += 1
+        return calls["n"] > 1                                          # die once, then ready
+
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", await_stub)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "gpu", "--ssh", "user@clusterb"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "couldn't reach the forwarded proxy" in cap.err
+    assert "Resubmitted slurm job" in cap.out and "without the proxy" in cap.out
+    # the first script carried the proxy; the resubmit dropped it
+    assert ssh["sbatch_log"].read_text().count("--parsable") >= 2
+
+
+def test_trust_remote_code_self_heal_resubmits_with_flag(ssh, capfd, monkeypatch):
+    # FIELD (Nemotron-Parse, generalized): vLLM died at config validation —
+    # 'Please pass the argument `trust_remote_code=True`'. Works even when the
+    # laptop can't reach the Hub to pre-detect: the death path folds the flag in
+    # and resubmits once. Uses a CARDLESS custom-code id — Nemotron-Parse itself
+    # now ships a packaged card that sets the flag on the first submit, so the
+    # heal (correctly) never fires for it.
+    from boxy import cli, remote
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("HOME", str(ssh["tmp"] / "home"))
+    (ssh["tmp"] / "home").mkdir(exist_ok=True)
+    monkeypatch.setattr(cli, "_remote_log_tail", lambda *a, **k:
+                        "ValidationError: ... The repository contains custom code which must be "
+                        "executed ... Please pass the argument `trust_remote_code=True` to allow "
+                        "custom code to be run.")
+
+    calls = {"n": 0}
+
+    def await_stub(host, node, port, *a, **k):
+        calls["n"] += 1
+        return calls["n"] > 1                                      # die once, then ready
+
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", await_stub)
+    rc = main(["serve", "hf://acme/Custom-Code-VLM-1B", "--scheduler", "slurm",
+               "--partition", "gpu", "--ssh", "user@clusterb"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "custom loader code vLLM refused" in cap.err
+    assert "Resubmitted slurm job" in cap.out and "--trust-remote-code" in cap.out
+    assert ssh["sbatch_log"].read_text().count("--parsable") >= 2   # first + heal resubmit
+    # the healed script on the shared FS really carries the flag
+    script = (ssh["tmp"] / "home" / ".local" / "share" / "boxy" / "agentless" / "clusterb"
+              / "boxy-custom-code-vlm-1b.sh")
+    assert "--trust-remote-code" in script.read_text()
+
+
+def test_ssh_agentless_explicit_trust_remote_code(ssh, capfd, monkeypatch):
+    # --trust-remote-code forces it even when the probe can't see the config
+    # (gated/offline) — the flag still reaches the rendered vLLM command.
+    from boxy import cardgen
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.delenv("BOXY_NO_PREFLIGHT", raising=False)
+    monkeypatch.setattr(cardgen, "hf_get_json",
+                        lambda *a, **k: (_ for _ in ()).throw(cardgen.CardGenError("gated")))
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--trust-remote-code",
+               "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    exec_line = [ln for ln in cap.out.splitlines() if "podman run" in ln][0]
+    assert "--trust-remote-code" in exec_line
+
+
+def test_diagnose_not_a_text_generation_model():
+    from boxy import diagnostics
+
+    hint = diagnostics.diagnose(
+        "ValueError: Argument inputs_embeds not found in the forward method of "
+        "<class 'transformers...Nemotron3_5AsrRNNTDecoder'>")
+    assert hint and "NOT a text-generation LLM" in hint
+    # the benign fallback warning ALONE must not trigger it
+    assert diagnostics.diagnose(
+        "WARNING ... TransformersForCausalLM has no vLLM implementation, falling back") is None
+
+
+def test_config_default_proxy_is_unset(monkeypatch):
+    # pip-anywhere: network.proxy ships NO default — the ambient http(s)_proxy
+    # env applies; a site pins its proxy via BOXY_PROXY / [network].proxy.
+    from boxy import config
+
+    monkeypatch.delenv("BOXY_PROXY", raising=False)
+    config.reset()
+    assert config.get_str("network.proxy") == ""
+
+
+def test_ssh_agentless_prestage_dryrun_announces_plan(ssh, capfd, monkeypatch):
+    # agentless on an ISOLATED node: with prestaging on (auto), --dryrun ANNOUNCES it
+    # would pull the image + download the hf:// model on the login node and serve BY
+    # PATH — but performs nothing (dryrun must never touch the cluster).
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_AGENTLESS_PRESTAGE", "auto")        # suite default is 'never'
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "prestage: would stage model meta-llama/Llama-3.1-8B-Instruct" in cap.out
+    assert "then serve BY PATH" in cap.out
+    assert "not run under --dryrun" in cap.out
+
+
+def test_ssh_agentless_no_prestage_keeps_engine_pull(ssh, capfd, monkeypatch):
+    # --no-prestage (also the suite default 'never') keeps the engine-pull render and
+    # prints no prestage plan.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_AGENTLESS_PRESTAGE", "auto")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--no-prestage",
+               "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "prestage:" not in cap.out
+    assert "the engine downloads it at container start" in cap.out
+
+
+def test_prestage_agentless_model_stages_and_rewrites_to_path(monkeypatch, tmp_path):
+    # Unit: _prestage_agentless_model pulls the image, runs the in-container
+    # snapshot_download, and returns the shared-FS path (which the caller mounts).
+    import argparse
+
+    from boxy import cli
+    from boxy.box import Box
+
+    calls = []
+
+    def fake_capture(target, cmd, timeout=20):
+        calls.append(cmd)
+        return 0, ""
+
+    monkeypatch.setattr("boxy.remote.ssh_capture", fake_capture)
+    monkeypatch.setattr("boxy.remote.remote_proxy_env", lambda: {})
+    monkeypatch.setenv("HF_TOKEN", "hf_secret")
+    box = Box(name="m", image="", entrypoint="vllm", engine="vllm",
+              model="meta-llama/Llama-3.1-8B-Instruct")
+    args = argparse.Namespace()
+    staged = cli._prestage_agentless_model(
+        args, "user@clustera", "clustera", box, "vllm/vllm-openai:latest", "", "/home/u/.local/share/boxy/agentless/clustera", None)
+    assert staged == "/home/u/.local/share/boxy/agentless/clustera/models/meta-llama-llama-3.1-8b-instruct"
+    # the image was pulled on the login node ...
+    assert any("podman pull vllm/vllm-openai:latest" in c for c in calls)
+    # ... and the model downloaded IN-CONTAINER via huggingface_hub, with the token
+    dl = [c for c in calls if "snapshot_download" in c]
+    assert dl and "hf_secret" in dl[0] and "python3" in dl[0]
+    assert "meta-llama/Llama-3.1-8B-Instruct" in dl[0]
+
+
+def test_ssh_agentless_partition_picker_selects_one(ssh, capfd, monkeypatch):
+    # 2+ partitions + a TTY -> the partition menu; picking one puts it in the script
+    # instead of the soonest-start comma-list.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("BOXY_PICK_PARTITION", "always")     # suite default is 'never'
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "2")   # pick the 2nd partition
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    # the fixture's GPU partitions are gpu(6 idle) + batch(2 idle) -> menu [gpu, batch, all]
+    assert "#SBATCH --partition=batch" in cap.out
+    assert "#SBATCH --partition=gpu,batch" not in cap.out
+    assert "you picked batch of 2" in cap.out
+
+
+def test_ssh_agentless_partition_default_keeps_comma_list(ssh, capfd, monkeypatch):
+    # suite default (never): the soonest-start comma-list is kept, no prompt.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("partition menu shown when disabled")))
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "#SBATCH --partition=gpu,batch" in cap.out
+
+
+def test_account_id_env_bypasses_the_menu(cluster, capfd, monkeypatch):
+    # $ACCOUNT_ID is a scripted bypass: it wins with no prompt even under 'always'.
+    monkeypatch.setenv("BOXY_PICK_ACCOUNT", "always")
+    monkeypatch.setenv("ACCOUNT_ID", "ab110003")
+    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("menu shown despite $ACCOUNT_ID")))
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--dryrun"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "#SBATCH --account=ab110003" in out               # $ACCOUNT_ID, no menu
+
+
+# ---- GPU request auto-recovery: a site that rejects --gpus-per-node -----------------
+
+# a picky Slurm: rejects any script asking with --gpus-per-node ('Invalid generic
+# resource (gres) specification', field: clusterd), accepts the portable --gres form.
+GRES_PICKY_SBATCH = r"""#!/bin/bash
+echo "$@" >> "$SBATCH_LOG"
+script="${!#}"
+if grep -q -- '--gpus-per-node' "$script"; then
+  echo "sbatch: error: Invalid generic resource (gres) specification" >&2
+  exit 1
+fi
+ep="${script%.sh}.endpoint.json"
+host="$(hostname)"
+printf '{"name":"x","host":"%s","port":8000,"url":"http://%s:8000","job":"12345"}\n' \
+       "$host" "$host" > "$ep"
+echo "12345"
+"""
+
+
+def test_gres_fallback_forms_order(monkeypatch):
+    from boxy.cli import _gres_fallback_forms
+    # every sinfo-reported TYPE is tried as --gres=gpu:<type>:N (some sites
+    # REQUIRE the type — field: clusterd), then untyped --gres, then --gpus. The
+    # just-rejected default --gpus-per-node is NOT retried — unless a pinned
+    # BOXY_GPU_TYPE poisoned it, where dropping the type is the fix.
+    assert _gres_fallback_forms(["h200", "a100"]) == [
+        ("gres", "h200"), ("gres", "a100"), ("gres", ""), ("gpus", ""), ("none", "")]
+    assert _gres_fallback_forms([]) == [("gres", ""), ("gpus", ""), ("none", "")]
+    monkeypatch.setenv("BOXY_GPU_TYPE", "h200")               # the poisoned-pin case
+    assert _gres_fallback_forms([]) == [
+        ("gpus-per-node", ""), ("gres", ""), ("gpus", ""), ("none", "")]
+
+
+def test_login_node_auto_recovers_from_gres_rejection(cluster, capfd, monkeypatch):
+    # Same recovery when boxy submits ON the login node: the picky sbatch rejects
+    # --gpus-per-node; sinfo names a100 first, so the typed form is tried and
+    # accepted (some sites require the type; a site that doesn't still takes it).
+    _shim(cluster["bin"], "sbatch", GRES_PICKY_SBATCH)
+    rc = main(["serve", MODEL, "--scheduler", "slurm"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "retrying with --gres=gpu:a100:N" in cap.err
+    assert "GPU request accepted as --gres=gpu:a100:N (auto-recovered)" in cap.out
+    script = _the_script(cluster["jobs"])
+    assert "--gres=gpu:a100:1" in script and "--gpus-per-node" not in script
+
+
+def test_ssh_agentless_recovers_on_type_required_site(ssh, capfd, monkeypatch):
+    # THE clusterd failure: the site rejects EVERY untyped GPU spelling
+    # (--gpus-per-node, --gres=gpu:N, --gpus=N) and accepts only a TYPED
+    # --gres=gpu:<type>:N. The recovery must try each sinfo-reported type.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("HOME", str(ssh["tmp"] / "home"))
+    (ssh["tmp"] / "home").mkdir(exist_ok=True)
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\ncat <<'EOF'\n"
+          "hopper|up|2/6/0/8|gpu:h200:4\n"
+          "short|up|3/5/0/8|(null)\n"
+          "EOF\n")
+    _shim(ssh["bin"], "sbatch", r"""#!/bin/bash
+echo "$@" >> "$SBATCH_LOG"
+script="${!#}"
+if ! grep -Eq -- '--gres=gpu:[a-z0-9]+:[0-9]+' "$script"; then
+  echo "sbatch: error: Invalid generic resource (gres) specification" >&2
+  exit 1
+fi
+ep="${script%.sh}.endpoint.json"
+host="$(hostname)"
+printf '{"name":"x","host":"%s","port":8000,"url":"http://%s:8000","job":"12345"}\n' \
+       "$host" "$host" > "$ep"
+echo "12345"
+""")
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", lambda *a, **k: True)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "hopper",
+               "--ssh", "user@clusterd"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "retrying with --gres=gpu:h200:N" in cap.err
+    assert "GPU request accepted as --gres=gpu:h200:N (auto-recovered)" in cap.out
+
+
+def test_ssh_agentless_recovers_via_per_node_gres(ssh, capfd, monkeypatch):
+    # Some sites report (null) GRES at PARTITION level and only surface the GPU
+    # type per-NODE (`sinfo -N -o %G`). The recovery falls back to that probe
+    # before abandoning the typed form.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("HOME", str(ssh["tmp"] / "home"))
+    (ssh["tmp"] / "home").mkdir(exist_ok=True)
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\n"
+          'if [ "$1" = "-h" ] && [ "$2" = "-N" ]; then echo "gpu:h200:4(S:0-1)"; exit 0; fi\n'
+          "cat <<'EOF'\nhopper|up|2/6/0/8|(null)\nEOF\n")
+    _shim(ssh["bin"], "sbatch", r"""#!/bin/bash
+echo "$@" >> "$SBATCH_LOG"
+script="${!#}"
+if ! grep -Eq -- '--gres=gpu:[a-z0-9]+:[0-9]+' "$script"; then
+  echo "sbatch: error: Invalid generic resource (gres) specification" >&2
+  exit 1
+fi
+ep="${script%.sh}.endpoint.json"
+host="$(hostname)"
+printf '{"name":"x","host":"%s","port":8000,"url":"http://%s:8000","job":"12345"}\n' \
+       "$host" "$host" > "$ep"
+echo "12345"
+""")
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", lambda *a, **k: True)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "hopper",
+               "--ssh", "user@clusterd"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "GPU request accepted as --gres=gpu:h200:N (auto-recovered)" in cap.out
+
+
+def test_ssh_agentless_recovers_on_no_gres_site(ssh, capfd, monkeypatch):
+    # FIELD (clusterd): EVERY partition reports (null) GRES — the site has no GRES
+    # config at all, GPUs are implied by the PARTITION (hopper/grace/blackwell),
+    # and ANY --gres/--gpus/--gpus-per-node spelling errors. The last recovery
+    # rung drops the GPU directive entirely.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("HOME", str(ssh["tmp"] / "home"))
+    (ssh["tmp"] / "home").mkdir(exist_ok=True)
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\n"
+          'if [ "$1" = "-h" ] && [ "$2" = "-N" ]; then echo "(null)"; exit 0; fi\n'
+          "cat <<'EOF'\nhopper|up|1/1/2/4|(null)\nblackwell|up|2/0/0/2|(null)\nEOF\n")
+    _shim(ssh["bin"], "sbatch", r"""#!/bin/bash
+echo "$@" >> "$SBATCH_LOG"
+script="${!#}"
+if grep -Eq -- '--(gres|gpus|gpus-per-node)' "$script"; then
+  echo "sbatch: error: Invalid generic resource (gres) specification" >&2
+  exit 1
+fi
+ep="${script%.sh}.endpoint.json"
+host="$(hostname)"
+printf '{"name":"x","host":"%s","port":8000,"url":"http://%s:8000","job":"12345"}\n' \
+       "$host" "$host" > "$ep"
+echo "12345"
+""")
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", lambda *a, **k: True)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "hopper",
+               "--ssh", "user@clusterd"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "GPU request accepted as NO GPU directive" in cap.out
+
+
+def test_ssh_agentless_recovers_gres_then_license(ssh, capfd, monkeypatch):
+    # THE full clusterd sequence: no GRES config (every GPU spelling invalid) AND
+    # no sitescratch license. The GPU ladder must land on 'no directive', then the
+    # license self-heal drops --license and the submit succeeds.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("BOXY_LICENSE", "sitescratch:1")          # ship-default, opt back in
+    monkeypatch.setenv("HOME", str(ssh["tmp"] / "home"))
+    (ssh["tmp"] / "home").mkdir(exist_ok=True)
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\n"
+          'if [ "$1" = "-h" ] && [ "$2" = "-N" ]; then echo "(null)"; exit 0; fi\n'
+          "cat <<'EOF'\nhopper|up|1/1/2/4|(null)\nEOF\n")
+    _shim(ssh["bin"], "sbatch", r"""#!/bin/bash
+echo "$@" >> "$SBATCH_LOG"
+script="${!#}"
+if grep -Eq -- '--(gres|gpus|gpus-per-node)' "$script"; then
+  echo "sbatch: error: Invalid generic resource (gres) specification" >&2
+  exit 1
+fi
+if grep -q -- '--license' "$script"; then
+  echo "sbatch: error: Batch job submission failed: Invalid license specification" >&2
+  exit 1
+fi
+ep="${script%.sh}.endpoint.json"
+host="$(hostname)"
+printf '{"name":"x","host":"%s","port":8000,"url":"http://%s:8000","job":"12345"}\n' \
+       "$host" "$host" > "$ep"
+echo "12345"
+""")
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", lambda *a, **k: True)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "hopper",
+               "--ssh", "user@clusterd"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "retrying with NO GPU directive" in cap.err          # the GPU ladder's last rung
+    assert "the site rejected the license request" in cap.err   # then the license self-heal
+    assert "### license request dropped (auto-recovered)." in cap.out
+    assert "### Submitted slurm job 12345" in cap.out
+
+
+def test_ssh_agentless_auto_recovers_from_gres_rejection(ssh, capfd, monkeypatch):
+    # THE clusterd fix: sinfo shows no gpu GRES so the first script uses
+    # --gpus-per-node, which this site rejects. boxy must re-render with the
+    # portable --gres=gpu:N and RESUBMIT on its own — no env var, no rerun.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("HOME", str(ssh["tmp"] / "home"))     # keep pushed scripts in tmp
+    (ssh["tmp"] / "home").mkdir(exist_ok=True)
+    _shim(ssh["bin"], "sinfo", "#!/bin/bash\ncat <<'EOF'\ngpu|up|2/6/0/8|(null)\nEOF\n")
+    _shim(ssh["bin"], "sbatch", GRES_PICKY_SBATCH)
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", lambda *a, **k: True)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "gpu", "--ssh", "user@clustera"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "retrying with --gres=gpu:N" in cap.err
+    assert "GPU request accepted as --gres=gpu:N (auto-recovered)" in cap.out
+    # and the accepted submission really used the portable form
+    submits = ssh["sbatch_log"].read_text()
+    assert submits.count("--parsable") >= 2                   # first (rejected) + retry
+
+
+# ---- app cards over --ssh: agentless spack benchmark submission --------------------
+
+
+def test_ssh_agentless_app_submits_spack_benchmark(ssh, capfd, monkeypatch):
+    # The deployment-OS promise for CLASSIC HPC apps: `boxy app osu-benchmarks
+    # --ssh cluster` resolves the site exactly like serve (account via myaccounts on
+    # the cluster, walltime from the card), renders a self-contained spack batch
+    # script, pushes it to the shared FS, and submits — nothing boxy-side on the
+    # cluster. --detach returns right after the submit with a laptop record.
+    home = ssh["tmp"] / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))                 # pushed scripts stay in tmp
+    rc = main(["app", "osu-benchmarks", "--ssh", "user@clustera", "--detach"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: account: ab110001 (via myaccounts" in cap.out    # probed ON the cluster
+    assert "### Submitted slurm job 12345" in cap.out
+    script = (home / ".local/share/boxy/agentless/clustera/app-osu-benchmarks.sh").read_text()
+    assert "#SBATCH --account=ab110001" in script
+    assert "#SBATCH --nodes=2" in script
+    assert "#SBATCH --time=30:00" in script                    # the card's walltime
+    assert "spack install --reuse -y osu-micro-benchmarks" in script
+    assert "srun -N 2 -n 2 " in script
+    assert "--parsable" in ssh["sbatch_log"].read_text()       # really submitted
+    rec = json.loads((ssh["jobs"] / "app-osu-benchmarks.json").read_text())
+    assert rec["app"] == "osu-benchmarks" and rec["job"] == "12345"
+
+
+def test_ssh_agentless_app_rerun_stages_blocked_source(ssh, capfd, monkeypatch):
+    # FIELD (clustera): the app job died on a Zscaler-blocked spack fetch while boxy
+    # wasn't following (detached) — so a plain RERUN of the same command must
+    # heal: read the previous run's log, download the archive laptop-side, land
+    # it in the file:// mirror BEFORE submitting. Exercised on a card WITHOUT
+    # source provenance (stream) — provenance-carrying cards prestage instead.
+    import hashlib
+
+    from boxy import cli
+
+    home = ssh["tmp"] / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    tarball = b"fake-stream-tarball-bytes"
+    digest = hashlib.sha256(tarball).hexdigest()
+    prev_log = home / ".local/share/boxy/agentless/clustera/app-stream-111.log"
+    prev_log.parent.mkdir(parents=True, exist_ok=True)
+    prev_log.write_text(
+        "spack.error.FetchError: All fetchers failed for "
+        "spack-stage-stream-5.10-frmvtwk7ojga4y4kl5nfrc5bamxwrrz5\n"
+        f"    https://mirror.spack.io/_source-cache/archive/{digest[:2]}/{digest}.tar.gz: "
+        "DetailedHTTPError: GET http://block-message.ca.example.gov/block-page.html?url=x "
+        "returned 403: Forbidden\n")
+    monkeypatch.setattr(cli, "_download_bytes", lambda u, timeout=600: tarball)
+    rc = main(["app", "stream", "--ssh", "user@clustera", "--detach"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "previous run died on a blocked source fetch" in cap.err
+    staged = (home / ".local/share/boxy/agentless/clustera/spack-mirror/_source-cache/archive"
+              / digest[:2] / f"{digest}.tar.gz")
+    assert staged.read_bytes() == tarball                     # in the mirror BEFORE submit
+    assert "### Submitted slurm job 12345" in cap.out
+    # and the submitted script registers that mirror
+    script = (home / ".local/share/boxy/agentless/clustera/app-stream.sh").read_text()
+    assert "spack mirror add boxy-local" in script
+
+
+def test_ssh_agentless_app_prestages_card_sources_first_try(ssh, capfd, monkeypatch, tmp_path):
+    # TURNKEY on a filtered site: a card that names its sources + sha256 gets the
+    # archive staged into the mirror BEFORE the first submit — no failed job
+    # needed, no flags. The login-node fetch fails here (invalid host), so the
+    # laptop download rung stages it; and the proxy is exported into the script.
+    import hashlib
+
+    from boxy import cli
+
+    home = ssh["tmp"] / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("BOXY_PROXY", "http://proxy.example.gov:80")
+    tarball = b"demo-source-bytes"
+    digest = hashlib.sha256(tarball).hexdigest()
+    cards_dir = tmp_path / "cfg" / "boxy" / "cards" / "apps"
+    cards_dir.mkdir(parents=True)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    (cards_dir / "demo.toml").write_text(
+        '[app]\nname = "demo"\nkind = "spack"\nspec = "demo@1.0"\n'
+        'sources = ["https://demo.invalid/demo-1.0.tar.gz"]\n'
+        f'sha256 = "{digest}"\nrun = ["demo_bin"]\n')
+    monkeypatch.setattr(cli, "_download_bytes", lambda u, timeout=600: tarball)
+    rc = main(["app", "demo", "--ssh", "user@clustera", "--detach"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "staged demo-1.0.tar.gz from this machine" in cap.out
+    staged = (home / ".local/share/boxy/agentless/clustera/spack-mirror/_source-cache/archive"
+              / digest[:2] / f"{digest}.tar.gz")
+    assert staged.read_bytes() == tarball
+    script = (home / ".local/share/boxy/agentless/clustera/app-demo.sh").read_text()
+    assert "export https_proxy=http://proxy.example.gov:80" in script   # spack rides the proxy
+    assert "spack mirror add boxy-local" in script
+    assert "### Submitted slurm job 12345" in cap.out
+
+
+def test_ssh_agentless_adhoc_image_submits(ssh, capfd, monkeypatch):
+    # `boxy app --image REF --ssh cluster` — no card at all: the image is an
+    # ad-hoc container app pushed through the same agentless pipeline, with the
+    # proxy exported into the job for the compute-node podman pull.
+    home = ssh["tmp"] / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("BOXY_PROXY", "http://proxy.example.gov:80")
+    rc = main(["app", "--image", "quay.io/podman/hello:latest", "--ssh", "user@clustera",
+               "--detach"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "### Submitted slurm job 12345" in cap.out
+    script = (home / ".local/share/boxy/agentless/clustera/app-hello.sh").read_text()
+    assert "srun -N 1 -n 1" in script and "podman run --rm quay.io/podman/hello:latest" in script
+    assert "export https_proxy=http://proxy.example.gov:80" in script
+    assert "spack" not in script
+    rec = json.loads((ssh["jobs"] / "app-hello.json").read_text())
+    assert rec["app"] == "hello" and rec["job"] == "12345"
+
+
+def test_ssh_agentless_app_rerun_heals_ucx_mpi_pin(ssh, capfd, monkeypatch):
+    # FIELD (clusterc): the build succeeded but MPI_Init died — the site pins
+    # OMPI_MCA_pml=ucx and the spack OpenMPI has no ucx. A plain rerun must fold
+    # the portable ob1/tcp transport into the script (with a loud perf caveat).
+    home = ssh["tmp"] / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    prev_log = home / ".local/share/boxy/agentless/clustera/app-stream-222.log"
+    prev_log.parent.mkdir(parents=True, exist_ok=True)
+    prev_log.write_text(
+        "Framework: pml\nComponent: ucx\n"
+        "  mca_base_framework_open on ompi_pml failed\n"
+        "*** An error occurred in MPI_Init\n")
+    rc = main(["app", "stream", "--ssh", "user@clustera", "--detach"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "ob1/tcp" in cap.err and "not the high-speed fabric" in cap.err
+    script = (home / ".local/share/boxy/agentless/clustera/app-stream.sh").read_text()
+    assert "export OMPI_MCA_pml=ob1" in script
+    assert "export OMPI_MCA_btl=self,vader,tcp" in script
+    assert "### Submitted slurm job 12345" in cap.out
+
+
+def test_ssh_agentless_serve_from_bundle_is_fully_offline(ssh, capfd, monkeypatch):
+    # AIR-GAP: --bundle serves entirely from a `boxy bundle` directory on the
+    # cluster — image podman-load'ed from its oci-archive, model + custom code
+    # from its HF cache (HF_HUB_OFFLINE), wheels installed --no-index — and NO
+    # proxy appears anywhere even when one is configured.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("BOXY_PROXY", "http://proxy.example.gov:80")   # must be ignored
+    rc = main(["serve", "hf://nvidia/NVIDIA-Nemotron-Parse-v1.2", "--scheduler", "slurm",
+               "--accelerator", "cuda", "--ssh", "user@clustera",
+               "--bundle", "/projects/me/nemotron-bundle", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "AIR-GAPPED" in cap.out
+    script = cap.out[cap.out.index("### Batch script"):]
+    assert "podman load -i /projects/me/nemotron-bundle/image.oci.tar" in script
+    assert "/projects/me/nemotron-bundle/hfcache:/root/.cache/huggingface" in script
+    assert "HF_HUB_OFFLINE=1" in script and "TRANSFORMERS_OFFLINE=1" in script
+    assert "pip install --no-cache-dir --quiet --no-index --find-links /opt/boxy-wheels" in script
+    assert "/projects/me/nemotron-bundle/wheels:/opt/boxy-wheels" in script
+    assert "--trust-remote-code" in script                     # card args still ride
+    assert "proxy.example.gov" not in script                    # zero egress config
+
+
+def test_ssh_geometry_from_system_card_zero_flags(ssh, capfd, monkeypatch, tmp_path):
+    # THE abstraction: `boxy serve MODEL --ssh clustera` with a system card declaring
+    # clustera's node hardware — the geometry is SOLVED from cards alone. A 70B on
+    # 4x140GB parts gets 2 GPUs (not the 80GB-class 4), no flags typed.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    d = tmp_path / "xdg" / "boxy" / "cards" / "systems"
+    d.mkdir(parents=True)
+    (d / "clustera.toml").write_text(
+        '[location]\nname = "clustera"\nscheduler = "slurm"\n'
+        '[location.resources]\ngpus_per_node = 4\ngpu_vram_gb = 140\n')
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    rc = main(["serve", "hf://meta-llama/Llama-3.3-70B-Instruct",
+               "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: gpus: 2 per node" in cap.out
+    assert "system card 'clustera' for clustera" in cap.out
+    assert "#SBATCH --gpus-per-node=2" in cap.out
+    assert "ray start" not in cap.out                     # fits one node -> no Ray
+
+
+def test_ssh_model_bigger_than_a_node_goes_multinode_zero_flags(ssh, capfd, monkeypatch, tmp_path):
+    # A model whose card says it CANNOT fit one node: same bare command, and the
+    # solver turns it into an N-node Ray instance end to end (batch script fans
+    # the workers out). Nothing typed beyond the model name and the host.
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    d = tmp_path / "xdg" / "boxy" / "cards" / "models"
+    d.mkdir(parents=True)
+    (d / "acme-mega.toml").write_text(
+        '[model]\nmatch = "acme/Mega-405B*"\nengine = "vllm"\nmin_vram_gb = 810\n'
+        '[model.args]\nmax_model_len = 8192\n')
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    rc = main(["serve", "acme/Mega-405B-Instruct", "--scheduler", "slurm",
+               "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: gpus: 4 per node" in cap.out
+    assert "auto: nodes: 4" in cap.out and "Ray" in cap.out
+    assert "#SBATCH --nodes=4" in cap.out and "#SBATCH --ntasks-per-node=1" in cap.out
+    assert "ray start --head" in cap.out                  # the multinode agentless script
+    assert "--tensor-parallel-size=4" in cap.out and "--pipeline-parallel-size=4" in cap.out
+
+
+def test_ssh_uncarded_model_autogenerates_card_deterministically(ssh, capfd, monkeypatch, tmp_path):
+    # Full turnkey determinism: an UNCARDED model over --ssh generates its card
+    # from HF metadata (fixture Hub here), the GEOMETRY comes from that card's
+    # real byte count (the name would have guessed 8 GPUs for "450B" — the index
+    # says ~18GB -> 1), and the card lands on disk for every later serve.
+    from boxy import cardgen
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("BOXY_CARD_AUTOGEN", "true")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    fixture = {"config": {"architectures": ["LlamaForCausalLM"], "torch_dtype": "bfloat16",
+                          "max_position_embeddings": 131072},
+               "index": {"metadata": {"total_size": 18_000_000_000}}, "generation": None}
+    monkeypatch.setattr(cardgen, "fetch_model", lambda repo, token="", **kw: fixture)
+    rc = main(["serve", "acme/Custom-Dense-450B", "--scheduler", "slurm",
+               "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "generated deterministically from HuggingFace metadata" in cap.out
+    assert "auto: gpus: 1 per node" in cap.out            # bytes, not the 450B name
+    assert "#SBATCH --gpus-per-node=1" in cap.out
+    assert (tmp_path / "xdg" / "boxy" / "cards" / "models" / "acme-custom-dense-450b.toml").exists()

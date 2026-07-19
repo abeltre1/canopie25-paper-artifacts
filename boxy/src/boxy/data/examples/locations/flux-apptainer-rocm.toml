@@ -1,0 +1,23 @@
+# Flux/ROCm example cluster (paper): AMD MI300a nodes, Flux, Apptainer.
+[location]
+name = "flux-apptainer-rocm"
+scheduler = "flux"
+accelerator = "rocm"
+runtime = "apptainer"
+offline = true
+
+[location.resources]
+nodes = 2
+gpus_per_node = 4
+gpu_vram_gb = 128    # MI300A-class parts; the model-card geometry solver sizes against this
+
+[location.modules]
+load = ["rocm/6.4.0"]
+
+[location.staging]
+models_dir = "./models"
+
+[location.tuning.vllm]
+# MI300a HBM is shared with the host CPU: leave memory for the OS
+# (paper finding; default 0.9 OOMs the node).
+gpu_memory_utilization = 0.7

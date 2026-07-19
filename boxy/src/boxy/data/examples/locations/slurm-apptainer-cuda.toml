@@ -1,0 +1,13 @@
+# Slurm cluster using Apptainer + NVIDIA GPUs (common DOE configuration).
+[location]
+name = "slurm-apptainer-cuda"
+scheduler = "slurm"
+accelerator = "cuda"
+runtime = "apptainer"
+offline = true
+[location.resources]
+nodes = 1
+gpus_per_node = 4
+gpu_vram_gb = 80    # A100/H100-class parts; the model-card geometry solver sizes against this
+[location.staging]
+models_dir = "./models"

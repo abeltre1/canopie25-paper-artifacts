@@ -1,0 +1,11 @@
+# Slurm + CUDA using CharlieCloud (ch-run) — fully unprivileged, no daemon;
+# common on security-conscious HPC sites. EXPERIMENTAL runtime.
+[location]
+name = "slurm-charliecloud"
+scheduler = "slurm"
+accelerator = "cuda"
+runtime = "charliecloud"
+offline = true
+[location.resources]
+gpus_per_node = 4
+gpu_vram_gb = 80    # A100/H100-class parts; the model-card geometry solver sizes against this

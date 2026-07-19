@@ -1,0 +1,11 @@
+# meta-llama/Llama-3.1-8B-Instruct — the workhorse 8B, single 80GB-class GPU.
+[model]
+match = "meta-llama/Llama-3.1-8B-Instruct*"
+engine = "vllm"
+gpus = 1
+min_vram_gb = 24
+[model.args]
+# Llama-3.1 defaults to a 128K context; vLLM profiles KV cache for the FULL
+# window at startup and OOMs on a 24-40GB GPU. Cap it so the turnkey serve fits;
+# override with `-- --max-model-len N` for more context on a bigger GPU.
+max_model_len = 8192

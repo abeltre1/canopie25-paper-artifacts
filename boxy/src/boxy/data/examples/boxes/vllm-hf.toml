@@ -1,0 +1,15 @@
+# vLLM box whose model is pulled by transport URI (requires boxy[ramalama]).
+# On connected systems: boxy pull --box vllm-hf.toml
+# NOTE: this image is linux/amd64 + CUDA and ~20 GB — pull/serve it on a GPU
+# cluster, not a laptop. For laptop testing use qwen-gguf.toml (llama.cpp, multi-arch).
+# No `workdir`: the pulled model is bind-mounted at an absolute /mnt/models
+# path, and Podman refuses workdirs that don't exist in the image.
+[box]
+name = "vllm-hf"
+image = "vllm/vllm-openai:v0.24.0"
+entrypoint = "vllm"
+model = "hf://Qwen/Qwen2.5-0.5B-Instruct"
+ports = [8000]
+
+[box.args]
+seed = 12345

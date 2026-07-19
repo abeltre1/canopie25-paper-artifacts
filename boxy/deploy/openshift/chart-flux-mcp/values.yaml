@@ -1,0 +1,23 @@
+# chart-flux-mcp — the Flux MCP server as a persistent OpenShift service.
+#   helm install flux-mcp ./chart-flux-mcp --set host=flux-mcp.apps.<cluster>
+# `boxy generate flux-mcp --host flux-mcp.apps.<cluster> | oc apply -f -` is the
+# equivalent no-Helm path.
+
+image: ghcr.io/converged-computing/flux-mcp:latest
+port: 8089                     # FastMCP HTTP/SSE transport
+
+# REQUIRED: the OpenShift Route hostname to expose the MCP endpoint on.
+host: ""
+
+# Optional: reach a remote Flux instance (flux-mcp needs Flux; OpenShift has none
+# of its own). Left empty, the server starts but tools that call Flux will fail
+# until a Flux endpoint is reachable.
+fluxUri: ""
+
+route:
+  enabled: true
+  termination: edge
+  timeout: 3600s
+
+securityContext:
+  runAsNonRoot: true

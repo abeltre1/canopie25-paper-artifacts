@@ -1,0 +1,39 @@
+# OpenShift-ready chisel relay image for boxy `--share`.
+#
+# WHY: OpenShift's restricted-v2 SCC runs pods as an arbitrary non-root UID and
+# forbids images that REQUIRE root. Upstream docker.io/jpillora/chisel is FROM
+# scratch and declares no USER (defaults to root:0). Re-basing it with a numeric
+# non-root USER makes it satisfy `runAsNonRoot: true` on ANY platform (plain
+# Kubernetes included), while OpenShift still overrides the UID from the
+# namespace range. The static chisel binary is UID-agnostic, binds an
+# unprivileged port, and keeps its host key in memory, so it runs cleanly under
+# a read-only rootfs with all capabilities dropped.
+#
+# BUILD + PUSH to YOUR registry (this is the <registry>/user/chisel:1.10.1 image
+# you point boxy at), then it works air-gapped and behind a Docker-Hub block:
+#
+#   podman build -t <registry>/user/chisel:1.10.1 \
+#       -f deploy/openshift/chart-relay/Containerfile deploy/openshift/chart-relay
+#   podman push  <registry>/user/chisel:1.10.1
+#
+# DEPLOY the relay server on OpenShift with that image (one setting feeds BOTH
+# the server manifest and the zero-install client container):
+#
+#   export BOXY_RELAY_IMAGE=<registry>/user/chisel:1.10.1
+#   boxy generate relay --host relay-boxy.apps.<cluster> \
+#        --auth "boxy:$(openssl rand -hex 16)" | oc apply -f -
+#   # (or Helm:  helm install boxy-relay ./chart-relay --set image=<registry>/user/chisel:1.10.1 ...)
+#
+# If Docker Hub is blocked at BUILD time too, first mirror the base once from a
+# host that can reach it (podman pull … && podman push … to your registry) and
+# change the FROM below to that mirrored base.
+
+FROM docker.io/jpillora/chisel:1.10
+
+# 65532 = the conventional "nonroot" UID (distroless). Numeric UID:GID so the
+# kubelet can verify non-root WITHOUT a /etc/passwd lookup — required by
+# runAsNonRoot. OpenShift's SCC still assigns its own UID on top of this.
+USER 65532:65532
+
+# The image's ENTRYPOINT (/app/chisel) is inherited from the base; boxy/Helm pass
+# `server --reverse --port … --key $(KEY_SEED) --keepalive 25s` as the args.

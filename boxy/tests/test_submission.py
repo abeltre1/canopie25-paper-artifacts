@@ -1,0 +1,603 @@
+"""The seamless scheduler path: submit -> track -> rendezvous -> READY.
+Drives the full login-side state machine against a fake scheduler; the same
+flow runs live against real Slurm in the E2E environment (see RUNBOOK §0)."""
+
+import json
+import os
+
+import pytest
+
+from boxy import jobs
+from boxy.cli import main
+from boxy.location import Location
+
+
+@pytest.fixture
+def jobs_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    return tmp_path / "jobs"
+
+
+@pytest.fixture
+def gguf(tmp_path):
+    model = tmp_path / "m.q4.gguf"
+    model.write_bytes(b"GGUF")
+    return model
+
+
+def test_jobs_record_and_endpoint_roundtrip(jobs_dir):
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "42"})
+    assert jobs.read_record("boxy-m")["job"] == "42"
+    jobs.write_endpoint("boxy-m", 8090, job_id="42")
+    endpoint = jobs.read_endpoint("boxy-m")
+    assert endpoint["port"] == 8090 and endpoint["url"].startswith("http://")
+    assert [r["name"] for r in jobs.list_records()] == ["boxy-m"]
+    jobs.remove("boxy-m")
+    assert jobs.read_record("boxy-m") is None and jobs.read_endpoint("boxy-m") is None
+
+
+def test_location_profile_carries_scheduler_args(tmp_path):
+    profile = tmp_path / "site.toml"
+    profile.write_text(
+        '[location]\nname = "clustera"\nscheduler = "slurm"\naccelerator = "cuda"\n'
+        'scheduler_args = ["--partition=short", "--license=sitescratch:1"]\n'
+        "[location.resources]\nnodes = 1\ngpus_per_node = 2\n"
+    )
+    loc = Location.from_toml(profile)
+    assert loc.scheduler_args == ["--partition=short", "--license=sitescratch:1"]
+
+
+def test_model_plus_location_profile_submits_with_site_args(gguf, tmp_path, jobs_dir, capsys):
+    profile = tmp_path / "site.toml"
+    profile.write_text(
+        '[location]\nname = "clustera"\nscheduler = "slurm"\naccelerator = "cuda"\n'
+        'scheduler_args = ["--partition=short", "--account=ab110003"]\n'
+        "[location.resources]\nnodes = 1\ngpus_per_node = 2\n"
+    )
+    rc = main(["serve", str(gguf), "--location", str(profile), "--dryrun"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "#SBATCH --partition=short" in out and "#SBATCH --account=ab110003" in out
+    assert "#SBATCH --gpus-per-node=2" in out
+    assert "sbatch --parsable" in out
+
+
+class _FakeSlurm:
+    """subprocess.run stand-in: scripted sbatch/squeue/scancel behavior.
+    When the fake job reaches RUNNING it publishes the endpoint file, exactly
+    like the real compute-node boxy does."""
+
+    def __init__(self, monkeypatch, states, submit_stdout="77\n", submit_rc=0,
+                 publish_on_running=None):
+        import boxy.cli as cli
+
+        self.states = list(states)
+        self.calls = []
+        self.publish_on_running = publish_on_running
+
+        def fake_run(cmd, **kwargs):
+            self.calls.append(list(cmd))
+            out = ""
+            rc = 0
+            if cmd[0] == "sbatch":
+                out, rc = submit_stdout, submit_rc
+            elif cmd[0] == "squeue":
+                out = self.states.pop(0) if len(self.states) > 1 else self.states[0]
+                if "RUNNING" in out and self.publish_on_running:
+                    name, port = self.publish_on_running
+                    if not jobs.read_endpoint(name):
+                        jobs.write_endpoint(name, port, job_id="77")
+            return type("R", (), {"returncode": rc, "stdout": out, "stderr": ""})()
+
+        monkeypatch.setattr(cli.subprocess, "run", fake_run)
+        monkeypatch.setattr("time.sleep", lambda s: None)
+        # CI runners have no real sbatch on PATH; make the scheduler binary appear
+        # present so the pre-submit guard doesn't short-circuit the fake.
+        real_which = cli.shutil.which
+        monkeypatch.setattr(cli.shutil, "which",
+                            lambda b: "/usr/bin/sbatch" if b in ("sbatch", "squeue", "scancel")
+                            else real_which(b))
+
+
+def test_submission_reaches_ready(gguf, jobs_dir, monkeypatch, capsys):
+    fake = _FakeSlurm(monkeypatch, states=["PENDING\n", "RUNNING\n"],
+                      publish_on_running=("boxy-m", 9291))
+    monkeypatch.setattr("boxy.readiness.wait_ready",
+                        lambda url, **kw: "the-model" if jobs.read_endpoint("boxy-m") else None)
+
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--name", "boxy-m"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "### Submitted slurm job 77" in out
+    assert "### READY" in out and ":9291/v1" in out and "slurm job 77" in out
+    assert "ssh -L 9291" in out and "boxy stop boxy-m" in out
+    assert jobs.read_record("boxy-m")["job"] == "77"
+    assert any(c[0] == "sbatch" for c in fake.calls)
+    # the submitted script exists and re-invokes boxy with rendezvous flags
+    script = jobs.script_path("boxy-m").read_text()
+    assert "--foreground --here" in script and "--endpoint-file" in script
+
+
+def test_submission_job_dies_dumps_log(gguf, jobs_dir, monkeypatch, capsys):
+    _FakeSlurm(monkeypatch, states=["PENDING\n", "\n"])  # PENDING then gone from queue
+    monkeypatch.setattr("boxy.readiness.wait_ready", lambda url, **kw: None)
+    jobs._dir()
+    jobs.log_path("boxy-m").write_text("srun: error: GPU allocation failed\n")
+
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--name", "boxy-m"])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "ended before the server became ready" in err
+    assert "GPU allocation failed" in err          # the actual job log, surfaced
+    assert jobs.read_record("boxy-m") is None      # record reaped
+
+
+def test_submission_is_idempotent_per_name(gguf, jobs_dir, monkeypatch, capsys):
+    _FakeSlurm(monkeypatch, states=["RUNNING\n"])
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "55"})
+    jobs.write_endpoint("boxy-m", 9291, job_id="55")
+    monkeypatch.setattr("boxy.readiness.wait_ready", lambda url, **kw: "m")
+
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--name", "boxy-m"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "ALREADY SERVING" in out and "slurm job 55" in out
+    assert "sbatch" not in out  # nothing was resubmitted
+
+
+def test_stop_cancels_scheduler_job(jobs_dir, monkeypatch, capsys):
+    import boxy.cli as cli
+
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "88"})
+    calls = []
+    monkeypatch.setattr(cli.subprocess, "run",
+                        lambda cmd, **kw: calls.append(list(cmd)) or
+                        type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+    rc = main(["stop", "boxy-m"])
+    assert rc == 0
+    assert ["scancel", "88"] in calls
+    assert jobs.read_record("boxy-m") is None
+
+
+def test_list_shows_scheduler_jobs(jobs_dir, monkeypatch, capsys):
+    import boxy.cli as cli
+
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "99"})
+    jobs.write_endpoint("boxy-m", 9291, job_id="99")
+    monkeypatch.setattr(cli, "_scheduler_reachable", lambda s: True)  # CI runners have no squeue
+    monkeypatch.setattr(cli, "_job_state", lambda s, j: "RUNNING")
+    monkeypatch.setattr(cli, "_container_runtime", lambda loc: (_ for _ in ()).throw(RuntimeError("none")))
+    rc = main(["list"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "boxy-m" in out and "slurm job 99" in out and "RUNNING" in out and ":9291/v1" in out
+
+
+def test_list_swallows_rootless_podman_noise_on_login_node(jobs_dir, monkeypatch, capsys):
+    """Field report: on an HPC login node `podman ps` fails with 'Failed to get
+    rootless runtime dir' / 'creating events dirs: permission denied' because
+    there is no /run/user/$UID. With scheduler jobs already listed, boxy must NOT
+    dump that noise — the instances live on the compute nodes."""
+    import boxy.cli as cli
+
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "flux", "job": "f2aowVYm"})
+    jobs.write_endpoint("boxy-m", 8090, job_id="f2aowVYm")
+    monkeypatch.setattr(cli, "_scheduler_reachable", lambda s: True)
+    monkeypatch.setattr(cli, "_job_state", lambda s, j: "RUNNING")
+    monkeypatch.setattr(cli, "_container_runtime", lambda loc: "podman")
+
+    def fake_run(cmd, **kw):
+        if cmd[1:3] == ["ps", "--filter"]:               # the local `podman ps`
+            return type("R", (), {"returncode": 125, "stdout": "",
+                                  "stderr": 'Error: creating events dirs: mkdir '
+                                            '/run/user/140425: permission denied\n'})()
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()   # ps -a: no exited
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    rc = main(["list"])
+    cap = capsys.readouterr()
+    assert rc == 0
+    assert "boxy-m" in cap.out and "RUNNING" in cap.out           # jobs still shown
+    assert "creating events dirs" not in cap.out                 # podman noise suppressed
+    assert "creating events dirs" not in cap.err                 # ...and not leaked to stderr
+    assert "no local podman containers" in cap.out               # honest one-liner instead
+
+
+def test_list_reveals_exited_containers_with_oom_note(monkeypatch, capsys):
+    """Field report: `--unique` instances kept 'disappearing'. Plain `ps` hides
+    EXITED containers, so a server killed seconds after READY vanished from view.
+    `boxy list` must surface them with exit code + an OOM note when exit==137."""
+    import boxy.cli as cli
+
+    def fake_run(cmd, **kw):
+        out = ""
+        if cmd[1:3] == ["ps", "-a"]:
+            out = "boxy-a-0707\tExited (137) 2 minutes ago\nboxy-b-0707\tExited (0) 1 minute ago\n"
+        elif cmd[1] == "inspect":
+            out = "137 true" if "boxy-a-0707" in cmd else "0 false"
+        return type("R", (), {"returncode": 0, "stdout": out, "stderr": ""})()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    cli._report_exited_containers("podman")
+    out = capsys.readouterr().out
+    assert "boxy-a-0707" in out and "exit 137" in out and "OOM/SIGKILL" in out
+    assert "boxy-b-0707" in out and "exit 0" in out
+    assert "podman machine set --memory" in out          # OOM fix shown (137 present)
+    assert "podman logs <name>" in out
+
+
+def test_proxy_flag_injected_into_batch_job(gguf, jobs_dir, monkeypatch, capsys):
+    """--proxy carries the corporate proxy into the COMPUTE-NODE command so its
+    host-side `podman pull` egresses through it (the ghcr.io-403 fix)."""
+    for v in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.delenv(v, raising=False)
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--gpus", "1", "--dryrun",
+               "--proxy", "http://proxy.example.gov:80"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "exec env " in out                                        # env-prefixed inner command
+    assert "https_proxy=http://proxy.example.gov:80" in out
+    assert "HTTPS_PROXY=http://proxy.example.gov:80" in out           # both cases for host tools
+
+
+def test_no_proxy_configured_means_no_env_prefix(gguf, jobs_dir, monkeypatch, capsys):
+    for v in ("http_proxy", "https_proxy", "all_proxy", "no_proxy",
+              "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(v, raising=False)
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--gpus", "1", "--dryrun"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "exec env " not in out                        # no proxy -> plain exec
+
+
+def test_apply_proxy_env_exports_into_process(monkeypatch):
+    """`_apply_proxy_env` exports --proxy into THIS process so the IN-PROCESS model
+    pull (local/baremetal serve + standalone `boxy pull`) egresses through the
+    corporate proxy — the slurm/flux compute-node pull is already covered by the
+    _proxy_prefix env wrapper (test_proxy_flag_injected_into_batch_job)."""
+    from types import SimpleNamespace
+
+    from boxy import cli
+    for v in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1,.example.gov")
+    cli._apply_proxy_env(SimpleNamespace(proxy="http://proxy.example.gov:80"))
+    assert os.environ["HTTPS_PROXY"] == os.environ["https_proxy"] == "http://proxy.example.gov:80"
+    assert os.environ["HTTP_PROXY"] == "http://proxy.example.gov:80"
+    assert os.environ["NO_PROXY"] == "localhost,127.0.0.1,.example.gov"   # preserved
+    # no --proxy -> no mutation
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    cli._apply_proxy_env(SimpleNamespace(proxy=None))
+    assert "HTTPS_PROXY" not in os.environ
+
+
+def test_pull_proxy_applies_before_download(monkeypatch, tmp_path):
+    import boxy.ramalama_shim as rs
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path))
+    for v in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+        monkeypatch.delenv(v, raising=False)
+    seen = {}
+    monkeypatch.setattr(rs, "pull_model",
+                        lambda uri, **kw: seen.update(p=os.environ.get("HTTPS_PROXY")) or "/store/m.gguf")
+    rc = main(["pull", "hf://org/model.gguf", "--proxy", "http://proxy.example.gov:80"])
+    assert rc == 0 and seen.get("p") == "http://proxy.example.gov:80"
+
+
+def test_serve_scheduler_without_binary_guides_to_ssh(gguf, jobs_dir, monkeypatch, capsys):
+    """--scheduler slurm on a host with no sbatch (e.g. a laptop, no --ssh) must
+    give a clear 'add --ssh / drop --scheduler', not a bare Errno 2 (field report)."""
+    import boxy.cli as cli
+
+    real_which = cli.shutil.which
+    monkeypatch.setattr(cli.shutil, "which",
+                        lambda b: None if b in ("sbatch", "flux") else real_which(b))
+    ran = []
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: ran.append(a))
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--gpus", "1"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "not on this host" in err and "--ssh user@login" in err and "drop --scheduler" in err
+    assert ran == []                                          # never tried to exec sbatch
+
+
+def test_dynamic_scheduler_flags_flow_into_the_script(gguf, jobs_dir, capsys):
+    """User request: pass ANY scheduler flag without boxy needing to know it.
+    --slurm-FLAG[=VALUE] / --flux-FLAG[=VALUE] translate 1:1 into directives."""
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--dryrun",
+               "--slurm-qos=long", "--slurm-exclusive", "--slurm-C=gpu_h100",
+               "--flux-queue=pbatch"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "#SBATCH --qos=long" in captured.out
+    assert "#SBATCH --exclusive" in captured.out          # value-less flag
+    assert "#SBATCH -C gpu_h100" in captured.out          # single-char flag
+    assert "ignoring --flux-queue" in captured.err        # other scheduler's flag: loud, not silent
+
+
+def test_sched_neutral_flags_follow_the_active_scheduler(gguf, jobs_dir, capsys):
+    """--sched-FLAG[=VALUE] is scheduler-NEUTRAL: the SAME command renders under
+    whichever --scheduler is active (the scheduler flag dictates what to do)."""
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--dryrun",
+               "--sched-license=sitescratch:1", "--sched-exclusive"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "#SBATCH --license=sitescratch:1" in out and "#SBATCH --exclusive" in out
+
+    rc = main(["serve", str(gguf), "--scheduler", "flux", "--dryrun",
+               "--sched-license=sitescratch:1", "--sched-exclusive"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "# flux: --license=sitescratch:1" in captured.out and "# flux: --exclusive" in captured.out
+    assert "ignoring" not in captured.err                  # neutral flags are never dropped
+
+
+def test_dynamic_flags_apply_to_attached_srun_too(gguf, capsys):
+    rc = main(["serve", str(gguf), "--runtime", "podman", "--scheduler", "slurm",
+               "--accelerator", "cuda", "--gpus", "1", "--foreground", "--dryrun",
+               "--slurm-partition=short", "--slurm-C=gpu_h100"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "srun" in out and "--partition=short" in out and "-C gpu_h100" in out
+
+
+def test_submission_hint_for_account_partition_rejection():
+    from boxy.cli import _submission_hint
+
+    hint = _submission_hint("sbatch: error: Batch job submission failed: "
+                            "Invalid account or account/partition combination specified")
+    assert "sacctmgr show assoc" in hint and "sinfo -s" in hint
+    assert "single partition" in hint
+    assert _submission_hint("some other failure") == ""
+
+
+def test_bare_flags_pass_to_the_active_scheduler(gguf, jobs_dir, capsys):
+    """The user's spelling: NO prefix — any flag boxy doesn't own goes to the
+    active scheduler verbatim; the portable trio is translated internally."""
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--dryrun",
+               "--account=ab110003", "--partition=short,batch", "--license=sitescratch:1",
+               "--time", "30:00", "--qos=long"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    for d in ("--partition=short,batch", "--account=ab110003", "--time=30:00",
+              "--license=sitescratch:1", "--qos=long"):
+        assert f"#SBATCH {d}" in out
+
+    rc = main(["serve", str(gguf), "--scheduler", "flux", "--dryrun",
+               "--account=ab110003", "--partition=short,batch", "--license=sitescratch:1"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    # SAME command; flux spellings chosen internally. Flux's --queue takes ONE
+    # queue, so the Slurm-style comma list `short,batch` is trimmed to `short`
+    # (field failure: `--partition=short,batch` was rejected on Flux).
+    assert "# flux: --queue=short" in out and "# flux: --queue=short,batch" not in out
+    assert "# flux: --bank=ab110003" in out
+    assert "# flux: --license=sitescratch:1" in out
+
+
+def test_typo_of_a_boxy_flag_errors_with_suggestion(gguf, capsys):
+    # a near-miss of a real boxy flag must NEVER silently become a scheduler flag
+    assert main(["serve", str(gguf), "--scheduler", "slurm", "--dryrun", "--replcias=3"]) == 2
+    err = capsys.readouterr().err
+    assert "did you mean --replicas?" in err
+
+
+def test_unknown_flag_without_scheduler_warns_loudly(gguf, capsys):
+    rc = main(["serve", str(gguf), "--here", "--runtime", "docker",
+               "--accelerator", "none", "--dryrun", "--not-a-flag"])
+    assert rc == 0
+    assert "ignoring --not-a-flag" in capsys.readouterr().err  # loud, never silent
+
+
+def test_endpoint_file_written_by_serving_side(gguf, jobs_dir, monkeypatch, tmp_path, capsys):
+    """The inner (compute-node) serve publishes its endpoint before launching."""
+    import boxy.deploy as deploy
+
+    monkeypatch.setattr("boxy.ramalama_shim.detect_accel", lambda: "none")
+    monkeypatch.setattr(deploy, "execute", lambda d: 0)
+    endpoint_file = tmp_path / "ep.json"
+    rc = main(["serve", str(gguf), "--runtime", "docker", "--image", "i:1",
+               "--foreground", "--here", "--endpoint-file", str(endpoint_file), "--port", "9391"])
+    assert rc == 0
+    data = json.loads(endpoint_file.read_text())
+    assert data["port"] == 9391 and data["url"].endswith(":9391")
+
+
+# ---- round 2: submission auditor ----
+
+def test_r2_unreachable_scheduler_is_unknown_not_done(monkeypatch):
+    """r2-S1 (major, reproduced live): squeue's connect-failure signature
+    (rc!=0, empty stdout) was read as DONE — live jobs got reaped, duplicated,
+    and boxy stop cancelled the wrong job."""
+    import boxy.cli as cli
+    from boxy.schedulers import get_scheduler
+
+    def fake_run(cmd, **kw):
+        return type("R", (), {"returncode": 1, "stdout": "",
+                              "stderr": "slurm_load_jobs error: Unable to contact slurm controller"})()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    assert cli._job_state(get_scheduler("slurm"), "11") == "UNKNOWN"
+
+    def fake_run2(cmd, **kw):
+        return type("R", (), {"returncode": 1, "stdout": "",
+                              "stderr": "slurm_load_jobs error: Invalid job id specified"})()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run2)
+    assert cli._job_state(get_scheduler("slurm"), "11") == "DONE"
+
+
+def test_r2_unknown_state_never_resubmits(gguf, jobs_dir, monkeypatch, capsys):
+    import boxy.cli as cli
+
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "11"})
+    monkeypatch.setattr(cli, "_job_state", lambda s, j: "UNKNOWN")
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--name", "boxy-m"])
+    err = capsys.readouterr()
+    assert rc == 1
+    assert "Not resubmitting" in err.err
+    assert jobs.read_record("boxy-m") is not None        # record NOT reaped
+    assert "sbatch" not in err.out                       # no duplicate job
+
+
+def test_r2_wait_loop_bails_after_unknown_streak(gguf, jobs_dir, monkeypatch, capsys):
+    """r2-S2 (major, reproduced): the wait loop spun forever, silently."""
+    _FakeSlurm(monkeypatch, states=["SUSPENDEDX\n"])  # unmapped -> UNKNOWN forever
+    monkeypatch.setattr("boxy.readiness.wait_ready", lambda url, **kw: None)
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--name", "boxy-m"])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "cannot determine job" in err and "boxy stop boxy-m" in err
+
+
+def test_r2_suspended_is_alive_not_unknown():
+    from boxy.schedulers import get_scheduler
+
+    slurm = get_scheduler("slurm")
+    for state in ("SUSPENDED", "REQUEUED", "RESIZING"):
+        assert slurm.interpret_state(state) == "PENDING"
+
+
+def test_r2_junk_endpoint_json_is_not_published(jobs_dir):
+    jobs.endpoint_path("boxy-m").parent.mkdir(parents=True, exist_ok=True)
+    jobs.endpoint_path("boxy-m").write_text('{"name": "boxy-m", "host": "vm", "port": 1}')  # no url
+    assert jobs.read_endpoint("boxy-m") is None          # was: KeyError downstream
+    jobs.endpoint_path("boxy-m").write_text('"just a string"')
+    assert jobs.read_endpoint("boxy-m") is None
+    jobs.write_endpoint("boxy-m", 8090, job_id="1")      # the real writer round-trips
+    assert jobs.read_endpoint("boxy-m")["url"].endswith(":8090")
+
+
+def test_r2_directive_values_with_spaces_are_quoted(gguf, jobs_dir, capsys):
+    rc = main(["serve", str(gguf), "--scheduler", "slurm",
+               "--scheduler-arg=--comment=hello world", "--dryrun"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert '#SBATCH --comment="hello world"' in out      # was: 'Invalid directive: world'
+
+
+def test_r2_dryrun_does_not_reap_job_state(gguf, jobs_dir, monkeypatch, capsys):
+    """r2-S6: --dryrun deleted stale records and endpoint files."""
+    import boxy.cli as cli
+
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "24"})
+    jobs.write_endpoint("boxy-m", 8090)
+    monkeypatch.setattr(cli, "_job_state", lambda s, j: "DONE")
+    rc = main(["serve", str(gguf), "--scheduler", "slurm", "--name", "boxy-m", "--dryrun"])
+    assert rc == 0
+    assert jobs.read_record("boxy-m") is not None        # untouched by dryrun
+    rc = main(["list", "--dryrun", "--runtime", "docker"])
+    assert jobs.read_record("boxy-m") is not None
+
+
+def test_list_labels_foreign_cluster_records(jobs_dir, monkeypatch, capsys):
+    """Shared $HOME: another cluster's record (a scheduler this host can't even
+    speak) must list as FOREIGN(origin), not UNKNOWN — and must not be probed.
+    Field report: an clusterb flux job listed on clustera as UNKNOWN."""
+    from boxy import cli, jobs
+
+    jobs.write_record("boxy-cbnode", {"name": "boxy-cbnode", "scheduler": "flux",
+                                    "job": "f2agHnM4psaw", "submitted_from": "clusterb-login2"})
+    jobs.write_record("boxy-here", {"name": "boxy-here", "scheduler": "slurm", "job": "77",
+                                    "submitted_from": "clustera-login1"})
+    probed = []
+    # cluster identity decides (deterministic on any host, incl. CI runners):
+    # this host "is" clustera, so the clusterb-submitted record is the foreign one
+    monkeypatch.setenv("BOXY_CLUSTER", "clustera")
+    monkeypatch.setattr(cli, "_job_state", lambda s, j: probed.append(j) or "RUNNING")
+    rc = main(["list", "--runtime", "docker", "--dryrun"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "FOREIGN(clusterb-login2)" in out          # labeled with its origin
+    assert "boxy-here" in out and "RUNNING" in out    # local record still probed
+    assert probed == ["77"]                           # the foreign job was NOT probed
+    assert "another cluster" in out                   # the explainer footnote
+    assert jobs.read_record("boxy-cbnode") is not None  # never reaped
+
+
+def test_jobs_dir_partitions_by_cluster(tmp_path, monkeypatch):
+    """Shared $HOME: the jobs dir is partitioned per cluster by default, so clustera
+    and clusterb never write into a common directory (field report: `boxy logs`
+    on clustera surfaced an clusterb log)."""
+    from boxy import jobs
+
+    monkeypatch.delenv("BOXY_JOBS_DIR", raising=False)          # exact-dir override OFF
+    monkeypatch.setenv("BOXY_JOBS_ROOT", str(tmp_path))
+    monkeypatch.setenv("BOXY_CLUSTER", "clustera")
+    d_clustera = jobs._dir()
+    assert d_clustera == tmp_path / "clustera"
+    monkeypatch.setenv("BOXY_CLUSTER", "clusterb")
+    d_cbnode = jobs._dir()
+    assert d_cbnode == tmp_path / "clusterb" and d_cbnode != d_clustera
+    # a record written on clusterb is invisible from clustera (separate dirs)
+    jobs.write_record("boxy-e", {"name": "boxy-e", "scheduler": "flux", "job": "1"})
+    monkeypatch.setenv("BOXY_CLUSTER", "clustera")
+    assert jobs.read_record("boxy-e") is None
+    assert [r["name"] for r in jobs.list_records()] == []
+
+
+def test_jobs_dir_exact_override_is_flat(tmp_path, monkeypatch):
+    # BOXY_JOBS_DIR pins an EXACT dir (no per-cluster nesting) — the escape hatch.
+    from boxy import jobs
+
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "flat"))
+    monkeypatch.setenv("BOXY_CLUSTER", "clustera")
+    assert jobs._dir() == tmp_path / "flat"
+
+
+def test_cluster_identity_and_fallback(monkeypatch):
+    """FOREIGN classification keys on WHERE the record was submitted, not on
+    which scheduler binaries happen to be on PATH (field report: clustera ships
+    `flux` too, so an clusterb flux record passed the binary check and boxy
+    curl chased cbnode1025). Legacy records keep the binary fallback."""
+    from boxy import cli
+
+    assert cli._cluster_id("clusterb-login2") == "clusterb"
+    assert cli._cluster_id("clusterb-login1.example.gov") == "clusterb"
+    assert cli._cluster_id("clustera12") == "clustera"
+    assert cli._cluster_id("CLUSTERA-LOGIN5") == "clustera"
+    assert cli._cluster_id("laptop") == "laptop"   # a laptop asset tag must NOT collapse to 's'
+    monkeypatch.setenv("BOXY_CLUSTER", "clustera")   # this host "is" clustera
+    foreign, origin = cli._record_is_foreign({"scheduler": "flux", "submitted_from": "clusterb-login2"})
+    assert foreign and origin == "clusterb-login2"
+    foreign, _ = cli._record_is_foreign({"scheduler": "slurm", "submitted_from": "clustera-login1"})
+    assert not foreign
+    # legacy record without an origin: binary-presence fallback still applies
+    monkeypatch.setattr(cli, "_scheduler_reachable", lambda s: False)
+    foreign, origin = cli._record_is_foreign({"scheduler": "slurm"})
+    assert foreign and origin == "another cluster"
+
+
+def test_boxy_logs_newest_named_and_diagnosed(jobs_dir, monkeypatch, capsys):
+    """boxy logs: newest log by default, NAME-prefix filter, crash diagnosis
+    appended — and it works after the record was reaped (files outlive jobs)."""
+    import time
+
+    from boxy import jobs
+
+    d = jobs._dir()
+    (d / "boxy-old-1.log").write_text("old noise\n")
+    time.sleep(0.01)
+    (d / "boxy-tiny-99.log").write_text(
+        "loading model\nRuntimeError: HIP error: no kernel image is available for execution\n")
+    rc = main(["logs"])                      # no name -> newest
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "boxy-tiny-99.log" in out and "HIP error" in out
+    assert "boxy diagnosis:" in out and "gfx" in out    # diagnosis appended
+    rc = main(["logs", "boxy-old"])          # prefix filter
+    out = capsys.readouterr().out
+    assert rc == 0 and "old noise" in out
+    rc = main(["logs", "nope"])              # helpful error
+    assert rc == 2
+    assert "boxy-tiny-99.log" in capsys.readouterr().err
+
+
+def test_last_log_line_shows_progress(tmp_path):
+    from boxy import cli
+    log = tmp_path / "job.log"
+    log.write_text("Starting vLLM…\n\nLoading safetensors checkpoint shards: 40% 2/5\n\n")
+    assert cli._last_log_line(log) == "Loading safetensors checkpoint shards: 40% 2/5"
+    assert cli._last_log_line(tmp_path / "missing.log") == ""
+    long = "x" * 500
+    (tmp_path / "long.log").write_text(long + "\n")
+    assert cli._last_log_line(tmp_path / "long.log").endswith("…") and len(cli._last_log_line(tmp_path / "long.log")) <= 140

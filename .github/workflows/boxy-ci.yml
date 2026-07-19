@@ -1,0 +1,83 @@
+name: boxy-ci
+
+on:
+  push:
+    # TODO: drop the feature branches once this work merges to the default branch.
+    branches: ["claude/boxy-cli-hpc-spec-ojevsl", "claude/boxy-turnkey", "main", "master"]
+    paths: ["boxy/**", ".github/workflows/boxy-ci.yml"]
+  pull_request:
+    paths: ["boxy/**", ".github/workflows/boxy-ci.yml"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+        # NOTE: no macOS leg. GitHub's hosted macOS runners ship no container
+        # runtime (podman/docker/apptainer), so boxy's dryrun tests can't resolve
+        # one, and one backend test is deliberately Linux-specific (the darwin
+        # network path publishes ports instead of --network=host). macOS is a
+        # best-effort target, verified locally; adding a green macOS leg would
+        # need a runtime install + Linux-only test markers (tracked for 0.2).
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install boxy (+ramalama, test deps)
+        run: python -m pip install -e 'boxy[ramalama,s3,test]' ruff
+      - name: Lint (ruff)
+        run: ruff check boxy/src boxy/tests
+      - name: Unit + golden tests
+        # degraded_and_live needs ramalama ABSENT / a live container runtime — CI
+        # covers the deterministic suite (dryrun/golden/e2e-with-fakes).
+        working-directory: boxy
+        run: python -m pytest -q --ignore=tests/test_degraded_and_live.py
+
+  package:
+    # Prove the distribution actually builds, passes twine metadata checks, and
+    # installs cleanly — the same artifact the release workflow will publish.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install build twine
+          python -m build boxy
+      - name: Metadata check
+        run: python -m twine check boxy/dist/*
+      - name: Install the wheel and smoke-test the entry points
+        run: |
+          python -m pip install boxy/dist/*.whl
+          boxy --version
+          python -m boxy --version
+          boxy config >/dev/null
+          boxy examples >/dev/null
+      - name: Upload the installable wheel (per-commit artifact)
+        # Every push's Actions run carries the built wheel + sdist: download it
+        # from the run page (or `gh run download`) and `pip install` anywhere —
+        # no local build needed.
+        uses: actions/upload-artifact@v4
+        with:
+          name: boxy-wheel-${{ github.sha }}
+          path: |
+            boxy/dist/*.whl
+            boxy/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+      - name: Build the boxy container image (from the same wheel)
+        # Containerized boxy: the CLI + OpenSSH client in one image, runnable
+        # anywhere. CI proves the image builds and the entrypoint answers on
+        # every push; the release workflow pushes the tagged image to GHCR.
+        run: docker build -t boxy:ci -f boxy/Containerfile boxy/
+      - name: Smoke-test the container
+        run: |
+          docker run --rm boxy:ci --version
+          docker run --rm --entrypoint sh boxy:ci -c 'command -v ssh'

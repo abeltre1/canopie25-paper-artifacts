@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: boxy-relay
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: boxy-relay
+type: Opaque
+stringData:
+  auth: {{ required "auth is required (user:pass)" .Values.auth | quote }}
+  key-seed: {{ .Values.keySeed | default "boxy-relay" | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: boxy-relay
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: boxy-relay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: boxy-relay
+  template:
+    metadata:
+      labels:
+        app: boxy-relay
+    spec:
+      # OpenShift restricted-v2 SCC / Pod Security Admission (4.11+): no runAsUser
+      # (the SCC assigns a non-root UID), drop all caps, no privilege escalation,
+      # RuntimeDefault seccomp, read-only rootfs. chisel is a static binary that
+      # holds its key in memory and binds an unprivileged port — needs none of them.
+      securityContext:
+        runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+        seccompProfile:
+          type: {{ .Values.securityContext.seccompProfile | default "RuntimeDefault" }}
+      containers:
+        - name: chisel
+          image: {{ .Values.image }}
+          args: ["server", "--reverse", "--port", "{{ .Values.port }}", "--key", "$(KEY_SEED)", "--keepalive", "25s"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: {{ .Values.securityContext.seccompProfile | default "RuntimeDefault" }}
+          env:
+            - name: AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: boxy-relay
+                  key: auth
+            - name: KEY_SEED
+              valueFrom:
+                secretKeyRef:
+                  name: boxy-relay
+                  key: key-seed
+          ports:
+            - containerPort: {{ .Values.port }}
+              name: http
+          resources:
+            requests:
+              cpu: {{ .Values.resources.requests.cpu | default "10m" | quote }}
+              memory: {{ .Values.resources.requests.memory | default "32Mi" | quote }}
+            limits:
+              memory: {{ .Values.resources.limits.memory | default "128Mi" | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: boxy-relay
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: boxy-relay
+spec:
+  selector:
+    app: boxy-relay
+  ports:
+    - name: http
+      port: {{ .Values.port }}
+      targetPort: {{ .Values.port }}
+{{- if .Values.route.enabled }}
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: boxy-relay
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: boxy-relay
+  annotations:
+    haproxy.router.openshift.io/timeout: {{ .Values.route.timeout | quote }}
+    haproxy.router.openshift.io/timeout-tunnel: {{ .Values.route.timeoutTunnel | quote }}
+spec:
+  host: {{ required "host is required (relay-boxy.apps.<cluster>)" .Values.host }}
+  to:
+    kind: Service
+    name: boxy-relay
+  port:
+    targetPort: http
+  tls:
+    termination: {{ .Values.route.termination }}
+{{- end }}

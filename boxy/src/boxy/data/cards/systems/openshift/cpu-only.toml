@@ -1,0 +1,6 @@
+# OpenShift CPU-only (llama.cpp GGUF serving; no GPU operator needed).
+[location]
+name = "openshift-cpu"
+scheduler = "none"
+accelerator = "none"
+offline = true

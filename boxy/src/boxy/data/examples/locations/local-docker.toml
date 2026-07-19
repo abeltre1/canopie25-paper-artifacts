@@ -1,0 +1,11 @@
+# Dev box / CI: Docker, no scheduler, no GPU, fully offline.
+# Relative models_dir is absolutized against your CWD at plan time.
+[location]
+name = "local-docker"
+scheduler = "none"
+accelerator = "none"
+runtime = "docker"
+offline = true
+
+[location.staging]
+models_dir = "./models"

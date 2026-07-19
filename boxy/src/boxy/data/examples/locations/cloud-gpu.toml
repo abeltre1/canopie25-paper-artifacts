@@ -1,0 +1,14 @@
+# Generic cloud GPU location: boxy delegates provisioning to SkyPilot here.
+#   boxy generate sky --box ... --location cloud-gpu.toml --serve -o task.yaml
+#   sky serve up task.yaml
+[location]
+name = "cloud-gpu"
+scheduler = "none"
+accelerator = "cuda"
+runtime = "docker"
+
+[location.resources]
+nodes = 1
+gpus_per_node = 4
+gpu_vram_gb = 80    # A100/H100-class parts; the model-card geometry solver sizes against this
+accelerator_type = "H100"

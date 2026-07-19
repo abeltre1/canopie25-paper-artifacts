@@ -1,0 +1,14 @@
+# meta-llama/Llama-4-Scout-17B-16E-Instruct — 109B params, MoE (16 experts)
+# (~218GB weights bf16): 4 80GB-class GPUs; tensor-parallel from the GPU count.
+# Generated from the captured HF config (`boxy generate card` shape) and shipped
+# packaged so filtered-egress laptops don't need the Hub to serve it.
+[model]
+match = "meta-llama/Llama-4-Scout-17B-16E-Instruct*"
+engine = "vllm"
+gpus = 4
+min_vram_gb = 228
+[model.args]
+# Llama-4-Scout has a 10,485,760-token native context; vLLM profiles KV cache
+# for the FULL window at startup and can OOM. Cap it so the turnkey serve fits;
+# raise with `-- --max-model-len N`.
+max_model_len = 8192

@@ -1,0 +1,8 @@
+apiVersion: v2
+name: chart-flux-mcp
+description: flux-mcp (MCP server for the Flux Framework) as a persistent OpenShift service.
+type: application
+version: 0.0.1
+appVersion: "latest"
+maintainers:
+  - name: boxy

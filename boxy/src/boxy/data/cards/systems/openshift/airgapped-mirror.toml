@@ -1,0 +1,8 @@
+# Air-gapped OpenShift: EVERY image routed to the internal registry mirror
+# (one place to pre-mirror). Pair with `boxy pull`/`oc image mirror`.
+[location]
+name = "openshift-airgapped"
+scheduler = "none"
+accelerator = "cuda"
+offline = true
+registry = "image-registry.openshift-image-registry.svc:5000/boxy"

@@ -1,0 +1,7 @@
+# Laptop / cloud VM / dev box: no scheduler, autodetect accelerator+runtime.
+[location]
+name = "local"
+scheduler = "none"
+
+[location.staging]
+models_dir = "./models"

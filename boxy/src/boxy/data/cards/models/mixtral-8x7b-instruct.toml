@@ -1,0 +1,8 @@
+# mistralai/Mixtral-8x7B-Instruct — MoE, ~90GB weights: 2x80GB-class GPUs.
+[model]
+match = "mistralai/Mixtral-8x7B-Instruct*"
+engine = "vllm"
+gpus = 2
+min_vram_gb = 100
+[model.args]
+max_model_len = 16384

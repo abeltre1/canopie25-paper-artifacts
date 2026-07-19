@@ -1,0 +1,7 @@
+# Qwen/Qwen2.5-7B-Instruct-GGUF — the GGUF build runs on llama.cpp (CPU or one
+# GPU). Longest-match beats the safetensors card for the same family.
+[model]
+match = "Qwen/Qwen2.5-7B-Instruct-GGUF*"
+engine = "llama.cpp"
+gpus = 1
+min_vram_gb = 6
