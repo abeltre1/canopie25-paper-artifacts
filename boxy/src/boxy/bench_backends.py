@@ -373,7 +373,12 @@ class VllmContainer(BenchBackend):
     def render_command(self, spec: BenchSpec) -> list[str]:
         flags = " ".join(_serve_flags(spec))
         inner = (
-            "if vllm bench serve --help >/dev/null 2>&1; then "
+            # newest images route the CLI through the module entrypoint (the
+            # wrapper's own migration hint, field: vllm-openai-rocm), then the
+            # classic `vllm` script, then the bundled benchmark_serving.py.
+            "if python3 -m vllm.entrypoints.cli.main bench serve --help >/dev/null 2>&1; then "
+            f"python3 -m vllm.entrypoints.cli.main bench serve {flags} \"$@\"; "
+            "elif vllm bench serve --help >/dev/null 2>&1; then "
             f"vllm bench serve {flags} \"$@\"; "
             "elif [ -f /app/vllm/benchmarks/benchmark_serving.py ]; then "
             f"python3 /app/vllm/benchmarks/benchmark_serving.py {flags} \"$@\"; "
@@ -435,6 +440,55 @@ class VllmContainerRemote(VllmContainer):
         tail = out.strip().splitlines()[-3:]
         return {"max_concurrency": spec.concurrency, "status": "error",
                 "error": f"remote exit {rc}: " + " | ".join(tail)}
+
+
+REMOTE_BIN = "$HOME/.local/share/boxy/store/bin/vllm-bench"
+
+
+class VllmBenchRemote(BenchBackend):
+    """The vllm-bench static binary ON the cluster login node, run over boxy's
+    ssh master — the fastest agentless path once `boxy bench --fetch-backend
+    --ssh <cluster>` has installed it there. No container, no image pull; the
+    save-result JSON is echoed back behind a marker and parsed laptop-side."""
+    name = "vllm-bench"
+
+    def __init__(self, target: str):
+        self.target = target
+
+    def available(self) -> tuple[bool, str]:
+        from boxy import remote
+
+        rc, _ = remote.ssh_capture(self.target, f"test -x {REMOTE_BIN}", timeout=15)
+        if rc != 0:
+            return False, (f"no vllm-bench on {self.target} — install it once with "
+                           f"`boxy bench --fetch-backend --ssh {self.target}`")
+        return True, f"vllm-bench binary on {self.target} (installed via --fetch-backend)"
+
+    def run_level(self, spec: BenchSpec) -> dict:
+        import shlex
+
+        from boxy import remote
+
+        host = re.sub(r"^https?://", "", spec.url).split("/")[0].split(":")[0]
+        flags = shlex.join(_serve_flags(spec))
+        cmd = (f"d=$(mktemp -d); no_proxy={shlex.quote(host)} NO_PROXY={shlex.quote(host)} "
+               f"{REMOTE_BIN} {flags} --save-result --result-dir \"$d\" "
+               f"--result-filename r.json; rc=$?; "
+               f"echo BOXY_RESULT_JSON; cat \"$d/r.json\" 2>/dev/null; rm -rf \"$d\"; exit $rc")
+        rc, out = remote.ssh_capture(self.target, cmd, timeout=3600)
+        head, _, tail = out.partition("BOXY_RESULT_JSON")
+        tail = tail.strip()
+        if tail.startswith("{"):
+            try:
+                return _normalize_saved(json.loads(tail), spec.concurrency)
+            except ValueError:
+                pass
+        parsed = parse_stdout_block(head, spec.concurrency)
+        if parsed:
+            return parsed
+        lines = head.strip().splitlines()[-3:]
+        return {"max_concurrency": spec.concurrency, "status": "error",
+                "error": f"remote exit {rc}: " + " | ".join(lines)}
 
 
 def pick_backend(requested: str, *, image: str = "", runtime: str = "",

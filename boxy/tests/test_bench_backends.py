@@ -399,10 +399,12 @@ def agentless_setup(tmp_path, monkeypatch):
     _shim(tmp_path, monkeypatch, "ssh", f'''
         echo "$@" >> {log}
         case "$*" in
+          *"test -x"*)     exit 1 ;;
           *cat*endpoint*)  printf '{{"name": "boxy-llama", "host": "cbnode7", "port": 8000,
                                      "url": "http://cbnode7:8000", "ready": true,
                                      "model": "org/llama-x"}}\\n' ;;
           *"command -v podman"*) echo /usr/bin/podman ;;
+          *"image exists"*) echo PRESENT ;;
           *podman*run*)    printf "%b" "{block}\\n" ;;
           *)               exit 0 ;;
         esac
@@ -485,3 +487,61 @@ def test_fetch_backend_over_ssh_is_agentless(tmp_path, monkeypatch, capfd):
     calls = log.read_text()
     assert "curl" in calls and "chmod +x" in calls
     assert "boxy bench" not in calls                        # no delegation involved
+
+
+def test_agentless_bench_prefers_cluster_binary(agentless_setup, tmp_path, monkeypatch, capfd):
+    """When vllm-bench is installed on the cluster (--fetch-backend --ssh),
+    the agentless bench uses it — no container, no image pull. The shim
+    emits the save-result JSON behind the marker."""
+    from boxy.cli import main
+
+    _, log = agentless_setup
+    d = tmp_path / "shims"
+    (d / "ssh").write_text(f"""#!/bin/sh
+echo "$@" >> {log}
+case "$*" in
+  *"test -x"*)    exit 0 ;;
+  *cat*endpoint*) printf '{{"name": "boxy-llama", "host": "cbnode7", "port": 8000,
+                           "url": "http://cbnode7:8000", "ready": true,
+                           "model": "org/llama-x"}}\\n' ;;
+  *vllm-bench*)   echo BOXY_RESULT_JSON
+                  printf '{{"max_concurrency": 4, "completed": 32, "failed": 0,
+                           "duration": 2.0, "request_throughput": 16.0,
+                           "output_throughput": 640.5, "median_ttft_ms": 12.0,
+                           "p99_ttft_ms": 20.0, "median_e2el_ms": 80.0}}\\n' ;;
+  *)              exit 0 ;;
+esac
+""")
+    rc = main(["bench", "boxy-llama", "--batch-sizes", "4", "--max-tokens", "8"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "auto: bench backend: vllm-bench" in out and "--fetch-backend" in out
+    assert "640.5 tok/s" in out
+    calls = log.read_text()
+    assert "store/bin/vllm-bench" in calls and "no_proxy=cbnode7" in calls
+    assert "podman" not in calls                            # no container involved
+
+
+def test_agentless_container_prepull_when_image_absent(agentless_setup, tmp_path, capfd):
+    """Login-node podman without the image: the bench announces a proxied
+    pre-pull before level 1 (field: silent multi-minute hang)."""
+    from boxy.cli import main
+
+    _, log = agentless_setup
+    d = tmp_path / "shims"
+    script = (d / "ssh").read_text().replace("echo PRESENT", "echo ABSENT")
+    (d / "ssh").write_text(script)
+    rc = main(["bench", "boxy-llama", "--batch-sizes", "1", "--max-tokens", "8"])
+    out = capfd.readouterr().out
+    assert rc == 0 and "### Pulling docker.io/rocm/vllm:6.4 on clustera-login" in out
+    assert "podman pull" in log.read_text()
+
+
+def test_container_probe_chain_tries_module_entrypoint():
+    """Newest images: the vllm wrapper redirects to the module entrypoint —
+    the probe chain must try it FIRST (field: vllm-openai-rocm exit 1)."""
+    backend = bb.VllmContainer(image="docker.io/vllm/vllm-openai-rocm", runtime="podman")
+    spec = bb.BenchSpec(url="http://n:8000", model="m", concurrency=1,
+                        num_prompts=32, max_tokens=8)
+    inner = " ".join(backend.render_command(spec))
+    assert inner.index("vllm.entrypoints.cli.main bench serve") < inner.index("vllm bench serve --help")

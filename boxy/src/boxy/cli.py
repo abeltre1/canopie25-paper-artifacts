@@ -5987,18 +5987,14 @@ def _bench_agentless(args, rec: dict) -> int:
         raise UsageError(f"--batch-sizes must be a comma-separated list of integers, "
                          f"got {args.batch_sizes!r}") from None
     image = getattr(args, "image", None) or rec.get("image", "")
-    if not image:
-        raise UsageError(
-            f"{rec['name']}: the serve record carries no image (served by an older boxy) — "
-            f"pass --image <the serving image> once, or re-serve with the current boxy")
     if args.dataset and args.dataset not in ("random",):
         raise UsageError("the agentless bench supports --dataset random for now (the corpus "
                          "would have to be staged on the cluster) — omit --dataset, or bench "
                          "via a tunnel with --url for file datasets")
     if args.dryrun:
-        print(f"### Agentless bench plan: {rec['name']} on {host} — benchmark inside "
-              f"{image} on the login node, levels {batch_sizes}, endpoint from "
-              f"{rec['endpoint_remote']}")
+        print(f"### Agentless bench plan: {rec['name']} on {host} — cluster vllm-bench binary "
+              f"if installed, else benchmark inside {image or '<image from --image>'} on the "
+              f"login node; levels {batch_sizes}, endpoint from {rec['endpoint_remote']}")
         return 0
     if remote.ensure_master(target) != 0:
         print(f"boxy: could not open an SSH session to {target}", file=sys.stderr)
@@ -6014,16 +6010,56 @@ def _bench_agentless(args, rec: dict) -> int:
     if not (ep and ep.get("url")):
         raise UsageError(f"{rec['name']}: no endpoint on {host} yet — the job may still be "
                          f"pending (see boxy list)")
-    rc2, rt = remote.ssh_capture(target, "command -v podman || command -v docker", timeout=15)
-    runtime = os.path.basename(rt.strip().splitlines()[0]) if rc2 == 0 and rt.strip() else ""
-    if not runtime:
-        raise UsageError(f"no container runtime on {host}'s login node — the agentless bench "
-                         f"runs the benchmark inside the serving image there. Alternatives: "
-                         f"`boxy bench --fetch-backend` on the login node, or bench through a "
-                         f"tunnel with --url")
-    backend = bench_backends.VllmContainerRemote(image, runtime, target)
-    why = f"benchmark inside the serving image {image} via {runtime} on {host} (agentless)"
-    print(f"  auto: bench backend: vllm-container ({why})")
+    requested = getattr(args, "backend", None) or config.get("bench.backend")
+    backend = None
+    why = ""
+    runtime = ""
+    if requested in ("auto", "vllm-bench"):
+        cand = bench_backends.VllmBenchRemote(target)
+        ok, note = cand.available()
+        if ok:
+            backend, why = cand, note
+        elif requested == "vllm-bench":
+            raise UsageError(note)
+    if backend is None:
+        if requested == "synthetic":
+            raise UsageError("the synthetic backend runs where boxy runs — this laptop can't "
+                             "reach the compute node directly. Use --backend auto (cluster-side "
+                             "vllm-bench binary or the serving image), or bench through a tunnel "
+                             "with --url")
+        if not image:
+            raise UsageError(
+                f"{rec['name']}: the serve record carries no image (served by an older boxy) — "
+                f"pass --image <the serving image> once, install the binary with "
+                f"`boxy bench --fetch-backend --ssh {target}`, or re-serve with the current boxy")
+        rc2, rt = remote.ssh_capture(target, "command -v podman || command -v docker", timeout=15)
+        runtime = os.path.basename(rt.strip().splitlines()[0]) if rc2 == 0 and rt.strip() else ""
+        if not runtime:
+            raise UsageError(f"no container runtime on {host}'s login node — the agentless bench "
+                             f"runs the benchmark inside the serving image there. Alternatives: "
+                             f"`boxy bench --fetch-backend --ssh {target}` (static binary), or "
+                             f"bench through a tunnel with --url")
+        backend = bench_backends.VllmContainerRemote(image, runtime, target)
+        why = f"benchmark inside the serving image {image} via {runtime} on {host} (agentless)"
+    print(f"  auto: bench backend: {backend.name} ({why})")
+    if backend.name == "vllm-container":
+        # the serve pulled the image on the COMPUTE node; the login node's podman
+        # storage is separate, so the first bench may need its own (proxied) pull
+        # — announced, or level 1 looks hung for minutes (field report).
+        pfx = config.get("network.proxy")
+        env = (f"https_proxy={shlex.quote(pfx)} http_proxy={shlex.quote(pfx)} " if pfx else "")
+        rc3, pout = remote.ssh_capture(
+            target, f"{backend.runtime} image exists {shlex.quote(image)} 2>/dev/null "
+                    f"&& echo PRESENT || echo ABSENT", timeout=30)
+        if "PRESENT" not in pout:
+            print(f"### Pulling {image} on {host} (first bench only — this can take minutes) ...")
+            rc4, plog = remote.ssh_capture(
+                target, f"{env}{backend.runtime} pull {shlex.quote(image)}", timeout=1800)
+            if rc4 != 0:
+                tail = plog.strip().splitlines()[-2:]
+                raise RuntimeError(f"image pull failed on {host}: {' | '.join(tail)} — "
+                                   f"check network.proxy, or use the binary backend "
+                                   f"(`boxy bench --fetch-backend --ssh {target}`)")
     model = rec.get("model", "") or ep.get("model", "")
     base = bench_backends.BenchSpec(
         url=ep["url"], model=model, concurrency=0,
