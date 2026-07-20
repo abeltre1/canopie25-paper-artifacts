@@ -38,6 +38,7 @@ dependencies = ["certifi"]
 ramalama = ["ramalama==0.23.*"]
 cloud = ["skypilot>=0.12"]
 s3 = ["boto3"]
+plot = ["matplotlib"]
 test = ["pytest"]
 
 [project.urls]

@@ -29,7 +29,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install boxy (+ramalama, test deps)
-        run: python -m pip install -e 'boxy[ramalama,s3,test]' ruff
+        run: python -m pip install -e 'boxy[ramalama,s3,plot,test]' ruff
       - name: Lint (ruff)
         run: ruff check boxy/src boxy/tests
       - name: Unit + golden tests

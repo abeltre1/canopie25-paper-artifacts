@@ -15,6 +15,7 @@ Numbered in the order you'd test boxy end to end; reference material follows.
 | 09 | [Architecture](09-architecture.md) | the layered design: cards → resolver → scheduler/runtime ABCs, with diagrams |
 | 10 | [Specification](10-spec.md) | the full design spec: goals, landscape, reuse map, CLI surface, roadmap (§8), known issues (§8b), agentless design (§8c) |
 | 11 | [Colocation (design draft)](11-colocation-design.md) | NOT implemented — bin-packing services onto shared nodes; open questions |
+| 12 | [Benchmark + plot](12-benchmark-and-plot.md) | real vLLM benchmarking of any served model (vllm-bench/container/CLI ladder), the results store, and `boxy plot` figures + gnuplot pipeline |
 
 Start at [01](01-serve-gpu-model.md). The package front door is
 [../README.md](../README.md).

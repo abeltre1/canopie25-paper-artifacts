@@ -405,6 +405,33 @@ def remote_checks(run) -> list[Result]:
     return out
 
 
+def _check_bench_backend() -> Result:
+    """Which benchmark load generator `boxy bench` would use (the auto ladder)."""
+    from boxy import bench_backends
+
+    try:
+        backend, why = bench_backends.pick_backend("auto")
+    except RuntimeError as e:  # defensive: pick_backend("auto") shouldn't raise
+        return Result("bench backend", WARN, str(e))
+    if backend.name == "synthetic":
+        return Result("bench backend", WARN,
+                      "synthetic only — the official vLLM benchmark isn't available here; "
+                      "`boxy bench --fetch-backend` downloads the static vllm-bench binary "
+                      "(air-gap: mirror via config urls.vllm_bench)")
+    return Result("bench backend", OK, f"{backend.name} ({why})")
+
+
+def _check_plotting() -> Result:
+    try:
+        import matplotlib  # noqa: F401
+
+        return Result("plotting", OK, "matplotlib present — `boxy plot` renders figures")
+    except ImportError:
+        return Result("plotting", WARN,
+                      "no matplotlib — `pip install 'boxy-hpc[plot]'` for figures; "
+                      "`boxy plot --emit gnuplot` works without it")
+
+
 def run_checks(net: bool = False) -> list[Result]:
     """Every check, in a sensible reading order. `net` adds the (slower)
     outbound registry probes."""
@@ -418,6 +445,8 @@ def run_checks(net: bool = False) -> list[Result]:
         _check_cluster_state(),
         _check_exited_containers(),
         _check_relay(),
+        _check_bench_backend(),
+        _check_plotting(),
     ]
     machine = _check_podman_machine()
     if machine is not None:

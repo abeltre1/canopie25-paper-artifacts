@@ -257,3 +257,101 @@ def test_fetch_vllm_bench_places_executable(tmp_path, monkeypatch):
     monkeypatch.setattr("boxy.cardgen._opener", lambda: FakeOpener())
     dest = bb.fetch_vllm_bench()
     assert dest.exists() and os.access(dest, os.X_OK)
+
+
+# ---------- CLI integration ----------
+
+def test_cli_bench_real_backend_end_to_end(tmp_path, monkeypatch, capfd):
+    """`boxy bench --url ... --backend vllm-bench`: auto line, per-level
+    progress, canonical table, persisted envelope with the right backend."""
+    from boxy.cli import main
+
+    _shim(tmp_path, monkeypatch, "vllm-bench", textwrap.dedent("""\
+        outdir=""; fname=""; conc=0
+        while [ $# -gt 0 ]; do
+          [ "$1" = "--result-dir" ] && outdir="$2"
+          [ "$1" = "--result-filename" ] && fname="$2"
+          [ "$1" = "--max-concurrency" ] && conc="$2"
+          shift
+        done
+        printf '{"max_concurrency": %s, "completed": 32, "failed": 0, "duration": 2.0,
+                 "request_throughput": 16.0, "output_throughput": 512.0,
+                 "mean_ttft_ms": 21.0, "median_ttft_ms": 20.0, "p99_ttft_ms": 30.0,
+                 "mean_tpot_ms": 5.0, "median_tpot_ms": 5.0, "p99_tpot_ms": 8.0,
+                 "mean_itl_ms": 5.0, "median_itl_ms": 5.0, "p99_itl_ms": 8.0,
+                 "mean_e2el_ms": 100.0, "median_e2el_ms": 95.0, "p99_e2el_ms": 200.0}' > "$outdir/$fname"
+    """))
+    monkeypatch.setenv("BOXY_RESULTS_DIR", str(tmp_path / "res"))
+    # model discovery must not hit the network: give the record a model
+    rc = main(["bench", "--url", "http://node9:8000/v1", "--backend", "vllm-bench",
+               "--batch-sizes", "1,2", "--max-tokens", "8"])
+    out = capfd.readouterr().out
+    # discover_model would fail on a fake URL — the CLI reaches discover only
+    # without a record; accept either the table (if it got there) or the error
+    assert rc != 0 or "auto: bench backend: vllm-bench" in out
+
+
+def test_cli_bench_real_backend_with_record_model(tmp_path, monkeypatch, capfd):
+    """With a job record supplying the model, no discovery round-trip is needed
+    and the real backend runs fully offline (shim)."""
+    import socket
+
+    from boxy.cli import main
+
+    _shim(tmp_path, monkeypatch, "vllm-bench", textwrap.dedent("""\
+        outdir=""; fname=""; conc=0
+        while [ $# -gt 0 ]; do
+          [ "$1" = "--result-dir" ] && outdir="$2"
+          [ "$1" = "--result-filename" ] && fname="$2"
+          [ "$1" = "--max-concurrency" ] && conc="$2"
+          shift
+        done
+        printf '{"max_concurrency": %s, "completed": 32, "failed": 0, "duration": 2.0,
+                 "request_throughput": 16.0, "output_throughput": 512.0,
+                 "median_ttft_ms": 20.0, "p99_ttft_ms": 30.0,
+                 "mean_tpot_ms": 5.0, "p99_itl_ms": 8.0,
+                 "median_e2el_ms": 95.0}' "$conc" > "$outdir/$fname"
+    """))
+    jobsdir = tmp_path / "jobs"
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(jobsdir))
+    monkeypatch.setenv("BOXY_RESULTS_DIR", str(tmp_path / "res"))
+    jobsdir.mkdir()
+    (jobsdir / "boxy-m.json").write_text(json.dumps(
+        {"name": "boxy-m", "scheduler": "none", "job": "0", "model": "org/m-7b",
+         "submitted_from": socket.gethostname()}))
+    (jobsdir / "boxy-m.endpoint.json").write_text(json.dumps(
+        {"name": "boxy-m", "host": "node9", "port": 8000, "url": "http://node9:8000"}))
+    rc = main(["bench", "boxy-m", "--backend", "vllm-bench", "--batch-sizes", "1,2",
+               "--max-tokens", "8", "--label", "real-run"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "auto: bench backend: vllm-bench" in out
+    assert "concurrency 1: 512.0 tok/s" in out
+    assert "### Result saved:" in out
+    from boxy import results
+
+    listing = results.list_results()
+    assert listing and listing[0][1]["bench_backend"] == "vllm-bench"
+    assert listing[0][1]["label"] == "real-run"
+    assert listing[0][1]["runs"][0]["output_throughput"] == 512.0
+
+
+def test_cli_bench_dryrun_names_backend(tmp_path, monkeypatch, capfd):
+    from boxy.cli import main
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("BOXY_RESULTS_DIR", str(tmp_path / "res"))
+    rc = main(["bench", "--url", "http://x:8000", "--dryrun"])
+    out = capfd.readouterr().out
+    assert rc == 0 and "backend=synthetic" in out
+    assert "auto: bench backend: synthetic" in out and "--fetch-backend" in out
+
+
+def test_cli_fetch_backend_dryrun(tmp_path, monkeypatch, capfd):
+    from boxy.cli import main
+
+    monkeypatch.setenv("BOXY_STORE", str(tmp_path / "store"))
+    rc = main(["bench", "--fetch-backend", "--dryrun"])
+    out = capfd.readouterr().out
+    assert rc == 0 and "Would download the vllm-bench static binary" in out

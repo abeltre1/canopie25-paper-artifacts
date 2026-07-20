@@ -118,3 +118,62 @@ def test_emit_gnuplot_paper_format(tmp_path):
     sh = tmp_path / "run-gnuplot.sh"
     assert sh.exists() and "gnuplot compare.gp" in sh.read_text()
     assert set(files) == {tmp_path / "results.dat", tmp_path / "compare.gp", sh}
+
+
+# ---------- CLI ----------
+
+@pytest.fixture()
+def _store_with_result(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOXY_RESULTS_DIR", str(tmp_path / "res"))
+    p1 = results.write_result(TWO[0])
+    p2 = results.write_result(TWO[1])
+    return tmp_path, p1, p2
+
+
+def test_cli_plot_newest_default(_store_with_result, capfd):
+    pytest.importorskip("matplotlib")
+    from boxy.cli import main
+
+    rc = main(["plot"])
+    out = capfd.readouterr().out
+    assert rc == 0 and "### Plot:" in out
+    path = out.split("### Plot:", 1)[1].strip()
+    assert path.endswith("-throughput.png")
+
+
+def test_cli_plot_overlay_compare(_store_with_result, tmp_path, capfd):
+    pytest.importorskip("matplotlib")
+    from boxy.cli import main
+
+    rc = main(["plot", "1", "2", "-o", str(tmp_path / "cmp.png")])
+    out = capfd.readouterr().out
+    assert rc == 0 and "cmp.png" in out
+
+
+def test_cli_plot_emit_gnuplot(_store_with_result, tmp_path, capfd):
+    from boxy.cli import main
+
+    rc = main(["plot", "1", "2", "--emit", "gnuplot", "-o", str(tmp_path / "gp")])
+    out = capfd.readouterr().out
+    assert rc == 0 and "results.dat" in out
+    assert (tmp_path / "gp" / "results.dat").exists()
+
+
+def test_cli_plot_no_results_is_clean_error(tmp_path, monkeypatch, capfd):
+    from boxy.cli import main
+
+    monkeypatch.setenv("BOXY_RESULTS_DIR", str(tmp_path / "empty"))
+    rc = main(["plot"])
+    err = capfd.readouterr().err
+    assert rc != 0 and "no bench results" in err
+
+
+def test_cli_plot_kind_all(_store_with_result, tmp_path, capfd):
+    pytest.importorskip("matplotlib")
+    from boxy.cli import main
+
+    rc = main(["plot", "--kind", "all", "-o", str(tmp_path)])
+    out = capfd.readouterr().out
+    assert rc == 0
+    for kind in ("throughput", "latency", "frontier"):
+        assert f"-{kind}.png" in out

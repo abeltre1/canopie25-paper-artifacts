@@ -5768,7 +5768,17 @@ def cmd_bench(args: argparse.Namespace) -> int:
     if rc is not None:
         return rc
 
-    from boxy import bench, engines
+    from boxy import bench, bench_backends, engines
+
+    if getattr(args, "fetch_backend", False):
+        if args.dryrun:
+            print(f"### Would download the vllm-bench static binary to "
+                  f"{bench_backends._store_bin_dir() / 'vllm-bench'} "
+                  f"(from config urls.vllm_bench)")
+            return 0
+        dest = bench_backends.fetch_vllm_bench()
+        print(f"### vllm-bench installed: {dest}  (auto backend now prefers it)")
+        return 0
 
     instance = ""
     if args.url:
@@ -5793,19 +5803,42 @@ def cmd_bench(args: argparse.Namespace) -> int:
     except ValueError:
         raise UsageError(f"--batch-sizes must be a comma-separated list of integers, "
                          f"got {args.batch_sizes!r}") from None
+
+    from boxy import jobs
+
+    record = (jobs.read_record(instance) or {}) if instance else {}
+    image = getattr(args, "image", None) or record.get("image", "")
+    runtime = getattr(args, "runtime", None) or record.get("runtime", "")
+    try:
+        backend, why = bench_backends.pick_backend(
+            getattr(args, "backend", None) or config.get("bench.backend"),
+            image=image, runtime=runtime)
+    except RuntimeError as e:
+        raise UsageError(str(e)) from None
+    print(f"  auto: bench backend: {backend.name} ({why})")
+    try:
+        dkind, dpath, dwhy = bench_backends.resolve_dataset(args.dataset, backend.name)
+    except RuntimeError as e:
+        raise UsageError(str(e)) from None
+    if args.dataset or backend.name != "synthetic":
+        print(f"  auto: dataset: {dkind} ({dwhy})")
+
     if args.dryrun:
         from boxy import results
 
-        print(f"### Bench plan: url={url} batch_sizes={batch_sizes} max_tokens={args.max_tokens} "
-              f"dataset={args.dataset or 'synthetic'}"
+        print(f"### Bench plan: url={url} backend={backend.name} batch_sizes={batch_sizes} "
+              f"max_tokens={args.max_tokens} dataset={dkind}"
               + (" auth=bearer" if api_key else ""))
         if not getattr(args, "no_save", False):
             print(f"### Result would be saved under {results._dir()} (skip with --no-save)")
         return 0
     import urllib.error
 
+    if backend.name != "synthetic":
+        return _bench_real(args, backend, why, url, batch_sizes, instance, record,
+                           dkind, dpath, api_key)
     try:
-        report = bench.run_bench(url, batch_sizes, max_tokens=args.max_tokens, dataset=args.dataset)
+        report = bench.run_bench(url, batch_sizes, max_tokens=args.max_tokens, dataset=dpath)
     except (urllib.error.URLError, OSError, ConnectionError) as e:
         raise RuntimeError(
             f"cannot reach {url} ({getattr(e, 'reason', e)}) — is the box serving? "
@@ -5829,19 +5862,76 @@ def cmd_bench(args: argparse.Namespace) -> int:
             f.write(report.to_csv())
         print(f"wrote {args.output}")
     if not getattr(args, "no_save", False):
-        from boxy import jobs, results
+        from boxy import results
 
-        record = jobs.read_record(instance) if instance else None
-        geometry = {k: record[k] for k in ("nodes", "gpus") if record and record.get(k)} if record else {}
         envelope = results.make_envelope(
             url=report.url, model=report.model, backend="synthetic",
             backend_detail="built-in stdlib load generator (bench.py)",
             runs=[bench.to_canonical(r) for r in report.results],
             instance=instance, label=getattr(args, "label", "") or "",
-            dataset=args.dataset or "synthetic", seed=0, max_tokens=args.max_tokens,
-            geometry=geometry)
+            dataset=dkind, seed=0, max_tokens=args.max_tokens,
+            geometry={k: record[k] for k in ("nodes", "gpus") if record.get(k)})
         path = results.write_result(envelope)
         print(f"### Result saved: {path}   (list: boxy results; plot: boxy plot)")
+        if getattr(args, "plot", False):
+            _plot_after_bench(envelope, path)
+    return 0
+
+
+def _plot_after_bench(envelope: dict, result_path) -> None:
+    """The --plot hook: render the default throughput figure next to the
+    result file. Best-effort — a missing matplotlib names the fix but never
+    fails the bench that just ran."""
+    from boxy import plotting
+
+    out = result_path.with_suffix(".png")
+    try:
+        plotting.render("throughput", plotting.throughput_series([envelope]), out,
+                        title=envelope.get("label", ""))
+        print(f"### Plot: {out}")
+    except RuntimeError as e:
+        print(f"### Plot skipped: {e}", file=sys.stderr)
+
+
+def _bench_real(args, backend, why, url: str, batch_sizes: list[int], instance: str,
+                record: dict, dkind: str, dpath: str | None, api_key: str) -> int:
+    """The real-backend bench flow: official vLLM load generator, one
+    invocation per concurrency level, canonical records throughout."""
+    from boxy import bench, bench_backends, results
+
+    try:
+        model = record.get("model") or bench.discover_model(url)
+    except OSError as e:
+        raise RuntimeError(f"cannot reach {url} ({e}) — is the box serving? (boxy list)") from e
+    base = bench_backends.BenchSpec(
+        url=url, model=model, concurrency=0,
+        num_prompts=getattr(args, "num_prompts", 0) or 0,
+        max_tokens=args.max_tokens, dataset_kind=dkind, dataset_path=dpath,
+        seed=getattr(args, "seed", None) or config.get("bench.seed"),
+        api_key=api_key, image=backend.image if hasattr(backend, "image") else "",
+        runtime=getattr(backend, "runtime", ""))
+    print(f"### Benchmarking {model} at {url} — {len(batch_sizes)} concurrency levels")
+    runs = bench_backends.run_series(backend, base, batch_sizes)
+    envelope = results.make_envelope(
+        url=url, model=model, backend=backend.name, backend_detail=why, runs=runs,
+        instance=instance, label=getattr(args, "label", "") or "",
+        dataset=dkind, seed=base.seed, max_tokens=args.max_tokens,
+        geometry={k: record[k] for k in ("nodes", "gpus") if record.get(k)})
+    if args.json:
+        import json as _json
+
+        print(_json.dumps(envelope, indent=1))
+    else:
+        _print_bench_table(envelope)
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(results.to_csv(envelope))
+        print(f"wrote {args.output}")
+    if not getattr(args, "no_save", False):
+        path = results.write_result(envelope)
+        print(f"### Result saved: {path}   (list: boxy results; plot: boxy plot)")
+        if getattr(args, "plot", False):
+            _plot_after_bench(envelope, path)
     return 0
 
 
@@ -5897,6 +5987,62 @@ def cmd_results(args: argparse.Namespace) -> int:
         print(f"{i:>3} {data.get('created', '?'):>20} {data.get('bench_backend', '?'):>12} "
               f"{len(ok_runs):>6} {peak:>10.1f}  {data.get('label', data.get('model', '?'))}")
     print(f"# store: {results._dir()}   (details: boxy results show N; plot: boxy plot N)")
+    return 0
+
+
+def cmd_plot(args: argparse.Namespace) -> int:
+    """Plot persisted bench results: the paper's throughput-vs-concurrency
+    figure by default, latency percentiles, or the latency/throughput
+    frontier. Several results overlay as one comparison figure (the automated
+    version of the paper's multi-column results.dat); --emit gnuplot writes
+    the plots/-style dat+gp pipeline instead of a PNG."""
+    from pathlib import Path
+
+    from boxy import plotting, results
+
+    try:
+        paths = results.select(args.result)
+    except ValueError as e:
+        raise UsageError(str(e)) from None
+    envelopes = []
+    for p in paths:
+        data = results.read_result(p)
+        if data is None:
+            raise UsageError(f"{p}: not a readable bench result")
+        envelopes.append(data)
+    kinds = list(plotting.KINDS) if args.kind == "all" else [args.kind]
+    outputs = []
+    base = Path(args.output) if args.output else Path(paths[0]).parent
+    stem = Path(paths[0]).name.removesuffix(".bench.json")
+    if len(paths) > 1:
+        stem = f"compare-{len(paths)}"
+    for kind in kinds:
+        if kind == "throughput":
+            series = plotting.throughput_series(envelopes)
+        elif kind == "latency":
+            try:
+                series = plotting.latency_series(envelopes, args.metric, args.stat)
+            except ValueError as e:
+                raise UsageError(str(e)) from None
+        else:
+            series = plotting.frontier_series(envelopes)
+        if args.emit == "gnuplot":
+            outdir = base if base.is_dir() or not base.suffix else base.parent
+            files = plotting.emit_gnuplot(series, outdir, f"{stem}-{kind}")
+            outputs.extend(files)
+            continue
+        if base.is_dir() or not base.suffix:
+            out = Path(base) / f"{stem}-{kind}.{args.format}"
+        else:
+            out = base if len(kinds) == 1 else base.with_name(f"{base.stem}-{kind}{base.suffix}")
+        try:
+            plotting.render(kind, series, out, fmt=args.format,
+                            title=args.title or "", logx2=not args.no_logx)
+        except RuntimeError as e:
+            raise UsageError(str(e)) from None
+        outputs.append(out)
+    for o in outputs:
+        print(f"### Plot: {o}")
     return 0
 
 
@@ -5992,6 +6138,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
     axis, values = _sweep_axis(args)
     scheduler_name = args.scheduler
+    rung_envelopes: list[dict] = []
     profile = Location.from_toml(args.location) if args.location else None
     if scheduler_name is None and profile and profile.scheduler in ("slurm", "flux"):
         scheduler_name = profile.scheduler
@@ -6039,6 +6186,19 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         report.points.append(pt)
         print(f"##   {axis}={v}: peak {pt.tokens_per_s:.1f} tok/s @ batch {pt.peak_batch} "
               f"(p50 {pt.latency_p50_ms:.0f} ms) across {len(urls)} endpoint(s)")
+        if not getattr(args, "no_save", False):
+            from boxy import results
+
+            envelope = results.make_envelope(
+                url=rep.url, model=rep.model, backend="synthetic",
+                backend_detail=f"sweep rung {axis}={v} — synthetic pools true fleet "
+                               f"percentiles across {len(urls)} endpoint(s)",
+                runs=[bench.to_canonical(r) for r in rep.results],
+                label=f"{axis}={v}", dataset=args.dataset or "synthetic",
+                seed=0, max_tokens=args.max_tokens,
+                geometry={axis: v, "endpoints": len(urls)})
+            rung_envelopes.append(envelope)
+            print(f"##   result saved: {results.write_result(envelope)}")
         if not args.keep:
             for n in names:
                 _sweep_teardown(n)
@@ -6055,6 +6215,16 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         print(f"wrote {args.output}")
     if args.json:
         print(report.to_json())
+    if getattr(args, "plot", False) and rung_envelopes:
+        from boxy import plotting, results
+
+        out = results._dir() / f"sweep-{axis}-{'-'.join(str(v) for v in values)}.png"
+        try:
+            plotting.render("throughput", plotting.throughput_series(rung_envelopes), out,
+                            title=f"{report.model} — {axis} sweep")
+            print(f"### Plot: {out}")
+        except RuntimeError as e:
+            print(f"### Plot skipped: {e}", file=sys.stderr)
     return 0
 
 
@@ -6488,7 +6658,29 @@ def build_parser() -> argparse.ArgumentParser:
                    help="comma list of concurrency levels, default 1,2,4,...,1024 "
                         "(--max-concurrency is the vLLM-bench spelling)")
     p.add_argument("--max-tokens", type=int, default=32)
-    p.add_argument("--dataset", default=None, help="JSON list of prompts or ShareGPT JSON")
+    p.add_argument("--backend", default=None,
+                   choices=["auto", "synthetic", "vllm-bench", "vllm-cli", "vllm-container"],
+                   help="load generator: auto prefers the official vLLM tools "
+                        "(vllm-bench binary > serving-image > vllm CLI) and falls back "
+                        "to the built-in synthetic one (config bench.backend)")
+    p.add_argument("--num-prompts", type=int, default=0,
+                   help="requests per concurrency level for real backends "
+                        "(default 0 = auto: 10x the level, clamped to 32..1000)")
+    p.add_argument("--seed", type=int, default=None,
+                   help="dataset sampling seed for real backends (default config "
+                        "bench.seed = 12345, the paper's)")
+    p.add_argument("--fetch-backend", action="store_true",
+                   help="download the static vllm-bench binary into boxy's store, then exit")
+    p.add_argument("--image", default=None,
+                   help="serving image for the vllm-container backend (default: the "
+                        "benched instance's job record)")
+    p.add_argument("--runtime", default=None,
+                   help="container runtime for the vllm-container backend (podman|docker)")
+    p.add_argument("--plot", action="store_true",
+                   help="render the throughput figure next to the saved result")
+    p.add_argument("--dataset", default=None,
+                   help="'random' (real-backend default), 'sharegpt' (auto-downloaded + "
+                        "cached), or a file: JSON list of prompts / ShareGPT JSON")
     p.add_argument("--api-key", default=None,
                    help="Bearer token for a secured endpoint (k8s/OpenShift ingress); "
                         "also BOXY_BENCH_API_KEY / config bench.api_key")
@@ -6511,6 +6703,31 @@ def build_parser() -> argparse.ArgumentParser:
                    help="for show: an index from `boxy results` (1=newest), a path, or a "
                         "name fragment")
     p.set_defaults(func=cmd_results)
+
+    p = sub.add_parser("plot", help="plot persisted bench results (throughput vs "
+                                    "concurrency by default); several results overlay "
+                                    "as one comparison figure")
+    p.add_argument("result", nargs="*", default=[],
+                   help="results to plot: default the newest; indices from `boxy results` "
+                        "(1=newest), paths, or name fragments — 2+ overlay for comparison")
+    p.add_argument("--kind", default="throughput",
+                   choices=["throughput", "latency", "frontier", "all"],
+                   help="throughput = output tok/s vs concurrency (the paper figure); "
+                        "latency = a latency percentile vs concurrency; frontier = "
+                        "latency vs throughput")
+    p.add_argument("--metric", default="ttft", choices=["ttft", "tpot", "itl", "e2e"],
+                   help="latency kind: which metric (default ttft)")
+    p.add_argument("--stat", default="p99", choices=["mean", "median", "p99"],
+                   help="latency kind: which statistic (default p99)")
+    p.add_argument("-o", "--output", default=None,
+                   help="output file or directory (default: next to the first result)")
+    p.add_argument("--format", default="png", choices=["png", "pdf"])
+    p.add_argument("--emit", default="matplotlib", choices=["matplotlib", "gnuplot"],
+                   help="gnuplot writes the paper-pipeline results.dat + .gp + runner "
+                        "instead of rendering (no python deps needed)")
+    p.add_argument("--title", default=None)
+    p.add_argument("--no-logx", action="store_true", help="linear x axis (default log2)")
+    p.set_defaults(func=cmd_plot)
 
     p = sub.add_parser("logs", help="show a job's log + boxy's crash diagnosis (newest first)")
     p.add_argument("name", nargs="?", default=None,
@@ -6599,6 +6816,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", default=None, help="write the scaling table as CSV here")
     p.add_argument("--json", action="store_true", help="print the scaling report as JSON too")
     p.add_argument("--dryrun", action="store_true", help="print the sweep plan without submitting")
+    p.add_argument("--plot", action="store_true",
+                   help="render the rung-overlay throughput figure into the results store")
+    p.add_argument("--no-save", action="store_true",
+                   help="don't persist per-rung results to the results store")
     p.set_defaults(func=cmd_sweep, name=None, models_dir=None)
 
     p = sub.add_parser("launch", help="launch the box on cloud via SkyPilot (delegated)")
