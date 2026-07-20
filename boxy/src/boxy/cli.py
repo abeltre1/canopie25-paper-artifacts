@@ -6060,7 +6060,10 @@ def _bench_agentless(args, rec: dict) -> int:
                 raise RuntimeError(f"image pull failed on {host}: {' | '.join(tail)} — "
                                    f"check network.proxy, or use the binary backend "
                                    f"(`boxy bench --fetch-backend --ssh {target}`)")
-    model = rec.get("model", "") or ep.get("model", "")
+    # the benchmark must name the model the SERVER serves: prefer the endpoint
+    # file's served id, else strip boxy's transport scheme from the record
+    # (field: vllm-bench choked on the literal 'hf://…' tokenizer lookup)
+    model = ep.get("model") or bench_backends.served_model_id(rec.get("model", ""))
     base = bench_backends.BenchSpec(
         url=ep["url"], model=model, concurrency=0,
         num_prompts=getattr(args, "num_prompts", 0) or 0,
@@ -6114,7 +6117,8 @@ def _bench_real(args, backend, why, url: str, batch_sizes: list[int], instance: 
     from boxy import bench, bench_backends, results
 
     try:
-        model = record.get("model") or bench.discover_model(url)
+        model = (bench_backends.served_model_id(record.get("model", ""))
+                 or bench.discover_model(url))
     except OSError as e:
         raise RuntimeError(f"cannot reach {url} ({e}) — is the box serving? (boxy list)") from e
     base = bench_backends.BenchSpec(

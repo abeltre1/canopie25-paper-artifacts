@@ -57,6 +57,14 @@ class BenchSpec:
     endpoints: list[tuple[str, str]] = field(default_factory=list)  # synthetic fleet mode
 
 
+def served_model_id(model: str) -> str:
+    """boxy records carry the TRANSPORT URI (hf://org/name); the server serves
+    the plain id — and the benchmark's tokenizer/model args must match the
+    server (field: vllm-bench 'No tokenizer.json for hf://…', then server-side
+    tokenization 404s on the mismatched name)."""
+    return re.sub(r"^[a-z0-9+._-]+://", "", model or "")
+
+
 def _no_proxy_env(url: str) -> dict[str, str]:
     """Child env for subprocess backends: the bench target must be reached
     DIRECTLY (the corporate proxy can't see compute nodes / localhost tunnels)

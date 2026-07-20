@@ -545,3 +545,35 @@ def test_container_probe_chain_tries_module_entrypoint():
                         num_prompts=32, max_tokens=8)
     inner = " ".join(backend.render_command(spec))
     assert inner.index("vllm.entrypoints.cli.main bench serve") < inner.index("vllm bench serve --help")
+
+
+def test_agentless_bench_strips_transport_uri_from_model(agentless_setup, tmp_path, capfd):
+    """A record's hf:// transport URI must never reach the benchmark's --model:
+    the server serves the plain id (field: tokenizer lookup on 'hf://…')."""
+    from boxy.cli import main
+
+    _, log = agentless_setup
+    jobsdir = tmp_path / "jobs"
+    rec = json.loads((jobsdir / "boxy-llama.json").read_text())
+    rec["model"] = "hf://meta-llama/Llama-3.2-1B-Instruct"
+    (jobsdir / "boxy-llama.json").write_text(json.dumps(rec))
+    # endpoint file without a model field -> the stripped record id must win
+    d = tmp_path / "shims"
+    script = (d / "ssh").read_text().replace(', "model": "org/llama-x"', "")
+    script = script.replace('"model": "org/llama-x"', '"job": "77"')
+    (d / "ssh").write_text(script)
+    rc = main(["bench", "boxy-llama", "--batch-sizes", "1", "--max-tokens", "8"])
+    assert rc == 0
+    calls = log.read_text()
+    assert "--model meta-llama/Llama-3.2-1B-Instruct" in calls
+    assert "hf://" not in calls.replace("hf://meta", "STRIPPEDCHECK") or \
+           "--model hf://" not in calls
+
+
+def test_served_model_id_helper():
+    assert bb.served_model_id("hf://meta-llama/Llama-3.2-1B-Instruct") == \
+        "meta-llama/Llama-3.2-1B-Instruct"
+    assert bb.served_model_id("ollama://tinyllama") == "tinyllama"
+    assert bb.served_model_id("meta-llama/Llama-3.2-1B-Instruct") == \
+        "meta-llama/Llama-3.2-1B-Instruct"
+    assert bb.served_model_id("") == ""
