@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-KINDS = ("throughput", "latency", "frontier")
+KINDS = ("throughput", "latency", "cache", "frontier")
 
 # one metric family per --metric choice; stat prefixes follow the canonical keys
 _METRIC_KEY = {"ttft": "ttft_ms", "tpot": "tpot_ms", "itl": "itl_ms", "e2e": "e2el_ms"}
@@ -79,6 +79,12 @@ def latency_series(envelopes: list[dict], metric: str = "ttft", stat: str = "p99
     return _series(envelopes, _metric_key(metric, stat))
 
 
+def cache_series(envelopes: list[dict]) -> list[Series]:
+    """Server-side prefix-cache hit rate (%) per concurrency level, sampled
+    from vLLM's /metrics around each level; levels without the metric gap."""
+    return _series(envelopes, "prefix_cache_hit_rate")
+
+
 def frontier_series(envelopes: list[dict]) -> list[Series]:
     """Latency-throughput frontier: one point per level — x = output tok/s,
     y = median E2E latency. (xs carry throughputs here, not concurrency.)"""
@@ -99,6 +105,8 @@ def frontier_series(envelopes: list[dict]) -> list[Series]:
 def _axis_labels(kind: str, metric: str, stat: str) -> tuple[str, str]:
     if kind == "throughput":
         return "Maximum Request Concurrency", "Output Token Throughput (tokens/s)"
+    if kind == "cache":
+        return "Maximum Request Concurrency", "Prefix Cache Hit Rate (%)"
     if kind == "latency":
         return "Maximum Request Concurrency", f"{stat} {metric.upper()} (ms)"
     return "Output Token Throughput (tokens/s)", "Median E2E Latency (ms)"
@@ -164,7 +172,8 @@ def render(kind: str, series: list[Series], out: Path, fmt: str = "png",
     if title:
         ax.set_title(title)
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend()
     fig.tight_layout()
     out = Path(out)
     fig.savefig(out, format=fmt, dpi=dpi)

@@ -6080,7 +6080,14 @@ def _bench_agentless(args, rec: dict) -> int:
         image=image, runtime=runtime)
     print(f"### Benchmarking {model or rec['name']} at {ep['url']} — "
           f"{len(batch_sizes)} concurrency levels (on {host})")
-    runs = bench_backends.run_series(backend, base, batch_sizes)
+
+    def _metrics_sampler():
+        rc_m, out_m = remote.ssh_capture(
+            target, f"curl -s --max-time 10 {shlex.quote(ep['url'] + '/metrics')}", timeout=20)
+        return bench_backends.parse_cache_metrics(out_m) if rc_m == 0 else None
+
+    runs = bench_backends.run_series(backend, base, batch_sizes,
+                                     metrics_sampler=_metrics_sampler)
     accel = rec.get("accelerator", "") or bench_backends.accel_from_image(image)
     gtype = rec.get("gpu_type", "")
     prefix = gtype or accel
@@ -6144,7 +6151,15 @@ def _bench_real(args, backend, why, url: str, batch_sizes: list[int], instance: 
         api_key=api_key, image=backend.image if hasattr(backend, "image") else "",
         runtime=getattr(backend, "runtime", ""))
     print(f"### Benchmarking {model} at {url} — {len(batch_sizes)} concurrency levels")
-    runs = bench_backends.run_series(backend, base, batch_sizes)
+
+    def _metrics_sampler():
+        try:
+            return bench_backends.parse_cache_metrics(bench.fetch_text(f"{url}/metrics"))
+        except OSError:
+            return None
+
+    runs = bench_backends.run_series(backend, base, batch_sizes,
+                                     metrics_sampler=_metrics_sampler)
     envelope = results.make_envelope(
         url=url, model=model, backend=backend.name, backend_detail=why, runs=runs,
         instance=instance, label=getattr(args, "label", "") or "",
@@ -6252,6 +6267,8 @@ def cmd_plot(args: argparse.Namespace) -> int:
     for kind in kinds:
         if kind == "throughput":
             series = plotting.throughput_series(envelopes)
+        elif kind == "cache":
+            series = plotting.cache_series(envelopes)
         elif kind == "latency":
             try:
                 series = plotting.latency_series(envelopes, args.metric, args.stat)
@@ -6945,7 +6962,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="results to plot: default the newest; indices from `boxy results` "
                         "(1=newest), paths, or name fragments — 2+ overlay for comparison")
     p.add_argument("--kind", default="throughput",
-                   choices=["throughput", "latency", "frontier", "all"],
+                   choices=["throughput", "latency", "cache", "frontier", "all"],
                    help="throughput = output tok/s vs concurrency (the paper figure); "
                         "latency = a latency percentile vs concurrency; frontier = "
                         "latency vs throughput")

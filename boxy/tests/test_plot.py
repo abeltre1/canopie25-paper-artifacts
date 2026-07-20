@@ -243,3 +243,16 @@ def test_legend_enriches_old_results_with_accelerator():
     plain["accelerator"] = ""
     plain["backend_detail"] = "vllm-bench binary on somewhere"
     assert ":" not in results.display_label(plain).split("/")[0]
+
+
+def test_cache_kind_plots_hit_rate(tmp_path):
+    env = dict(TWO[1])
+    env["runs"] = [dict(r, prefix_cache_hit_rate=10.0 * i)
+                   for i, r in enumerate(env["runs"], 1)]
+    s = plotting.cache_series([env])
+    assert s[0].ys == [10.0, 20.0, 30.0, 40.0]
+    old = dict(TWO[0])                                       # runs without the metric gap out
+    assert all(y is None for y in plotting.cache_series([old])[0].ys)
+    pytest.importorskip("matplotlib")
+    out = plotting.render("cache", s, tmp_path / "c.png")
+    assert out.exists()

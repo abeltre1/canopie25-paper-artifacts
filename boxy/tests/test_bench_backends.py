@@ -593,3 +593,50 @@ def test_envelope_label_carries_accelerator():
     env2 = results.make_envelope(url="http://n:1", model="m/x", backend="synthetic",
                                  runs=[], instance="boxy-m")
     assert ":" not in env2["label"].split("/")[0]
+
+
+# ---------- prefix-cache hit rate ----------
+
+METRICS_TEXT = """\
+# HELP vllm:gpu_prefix_cache_queries_total ...
+vllm:gpu_prefix_cache_queries_total{model_name="m/x"} 1000
+vllm:gpu_prefix_cache_hits_total{model_name="m/x"} 250
+vllm:gpu_cache_usage_perc{model_name="m/x"} 0.42
+"""
+
+
+def test_parse_cache_metrics_counters_and_gauge():
+    m = bb.parse_cache_metrics(METRICS_TEXT)
+    assert m == {"hits": 250.0, "queries": 1000.0, "gauge": None}
+    g = bb.parse_cache_metrics('vllm:gpu_prefix_cache_hit_rate{m="x"} 0.37\n')
+    assert g["gauge"] == 0.37
+    assert bb.parse_cache_metrics("no vllm metrics here") is None
+
+
+def test_cache_rate_delta_semantics():
+    b = {"hits": 100.0, "queries": 400.0, "gauge": None}
+    a = {"hits": 350.0, "queries": 900.0, "gauge": None}
+    assert bb.cache_rate_delta(b, a) == pytest.approx(50.0)   # 250/500
+    assert bb.cache_rate_delta(None, {"hits": 0, "queries": 0, "gauge": 0.8}) == pytest.approx(80.0)
+    assert bb.cache_rate_delta(b, b) is None                  # no queries this level
+    assert bb.cache_rate_delta(b, None) is None
+
+
+def test_run_series_attaches_cache_hit_rate():
+    class Fixed(bb.BenchBackend):
+        name = "fixed"
+
+        def run_level(self, spec):
+            return {"max_concurrency": spec.concurrency, "status": "ok",
+                    "output_throughput": 1.0, "completed": 4, "num_prompts": 4}
+
+    samples = iter([
+        {"hits": 0.0, "queries": 0.0, "gauge": None},
+        {"hits": 30.0, "queries": 100.0, "gauge": None},      # level 1: 30%
+        {"hits": 110.0, "queries": 200.0, "gauge": None},     # level 2: 80%
+    ])
+    base = bb.BenchSpec(url="http://x:1", model="m", concurrency=0, num_prompts=4, max_tokens=4)
+    recs = bb.run_series(Fixed(), base, [1, 2], progress=lambda *_: None,
+                         metrics_sampler=lambda: next(samples))
+    assert recs[0]["prefix_cache_hit_rate"] == pytest.approx(30.0)
+    assert recs[1]["prefix_cache_hit_rate"] == pytest.approx(80.0)

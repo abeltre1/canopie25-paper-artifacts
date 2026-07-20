@@ -144,6 +144,13 @@ def _http_json(url: str, payload: dict | None = None, timeout: float = 120.0) ->
         return json.load(resp)
 
 
+def fetch_text(url: str, timeout: float = 10.0) -> str:
+    """Raw GET through the no-proxy opener (the /metrics sampler)."""
+    req = urllib.request.Request(url, headers=dict(_extra_headers))
+    with _opener.open(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
 def discover_model(url: str) -> str:
     """The served model id from GET /v1/models (vLLM requires it in requests)."""
     data = _http_json(f"{url}/v1/models")

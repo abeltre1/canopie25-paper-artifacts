@@ -547,16 +547,69 @@ def pick_backend(requested: str, *, image: str = "", runtime: str = "",
                                      "benchmark run `boxy bench --fetch-backend` once")
 
 
+_CACHE_LINE = re.compile(
+    r"^vllm:(?:gpu_)?prefix_cache_(hits|queries)(?:_total)?(?:\{[^}]*\})?\s+([0-9.eE+-]+)")
+_CACHE_GAUGE = re.compile(
+    r"^vllm:(?:gpu_)?prefix_cache_hit_rate(?:\{[^}]*\})?\s+([0-9.eE+-]+)")
+
+
+def parse_cache_metrics(text: str) -> dict | None:
+    """vLLM's Prometheus /metrics -> {'hits': float, 'queries': float,
+    'gauge': float|None}. Counters are summed across label sets; the old
+    hit-rate gauge is the fallback for engines that don't export counters.
+    None when the text carries no prefix-cache metrics at all."""
+    hits = queries = 0.0
+    gauge = None
+    seen = False
+    for line in (text or "").splitlines():
+        m = _CACHE_LINE.match(line.strip())
+        if m:
+            seen = True
+            if m.group(1) == "hits":
+                hits += float(m.group(2))
+            else:
+                queries += float(m.group(2))
+            continue
+        g = _CACHE_GAUGE.match(line.strip())
+        if g:
+            seen = True
+            gauge = float(g.group(1))
+    return {"hits": hits, "queries": queries, "gauge": gauge} if seen else None
+
+
+def cache_rate_delta(before: dict | None, after: dict | None) -> float | None:
+    """Per-level prefix-cache hit rate in PERCENT from two /metrics samples;
+    None when it can't be known (no metrics, no queries this level)."""
+    if not after:
+        return None
+    if before and after["queries"] > before["queries"]:
+        dq = after["queries"] - before["queries"]
+        dh = after["hits"] - before["hits"]
+        return max(0.0, min(100.0, 100.0 * dh / dq))
+    if after.get("gauge") is not None:
+        return max(0.0, min(100.0, 100.0 * after["gauge"]))
+    return None
+
+
 def run_series(backend: BenchBackend, base: BenchSpec, concurrencies: list[int],
-               progress=print) -> list[dict]:
+               progress=print, metrics_sampler=None) -> list[dict]:
     """The concurrency sweep: one canonical record per level; an errored level
     is kept (plots show a gap) and the series continues — a 1024-level crash
-    must not discard the 1..512 measurements (the paper's 405B run)."""
+    must not discard the 1..512 measurements (the paper's 405B run).
+    metrics_sampler (optional, () -> parse_cache_metrics dict) is called
+    around each level to attach the server-side prefix-cache hit rate."""
     records = []
+    before = metrics_sampler() if metrics_sampler else None
     for conc in concurrencies:
         spec = BenchSpec(**{**base.__dict__, "concurrency": conc,
                             "num_prompts": base.num_prompts or min(max(10 * conc, 32), 1000)})
         rec = backend.run_level(spec)
+        if metrics_sampler:
+            after = metrics_sampler()
+            rate = cache_rate_delta(before, after)
+            if rate is not None:
+                rec["prefix_cache_hit_rate"] = rate
+            before = after
         records.append(rec)
         if rec.get("status") == "ok":
             progress(f"###   concurrency {conc}: {rec.get('output_throughput', 0.0):.1f} tok/s "
