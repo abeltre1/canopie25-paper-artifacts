@@ -177,3 +177,51 @@ def test_cli_plot_kind_all(_store_with_result, tmp_path, capfd):
     assert rc == 0
     for kind in ("throughput", "latency", "frontier"):
         assert f"-{kind}.png" in out
+
+
+def test_default_ticks_are_explicit_values(tmp_path):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    captured = {}
+    orig = plt.subplots
+
+    def spy(*a, **k):
+        fig, ax = orig(*a, **k)
+        captured["ax"] = ax
+        return fig, ax
+
+    plt.subplots = spy
+    try:
+        plotting.render("throughput", plotting.throughput_series(TWO), tmp_path / "v.png")
+    finally:
+        plt.subplots = orig
+    ax = captured["ax"]
+    assert list(ax.get_xticks()) == [1, 2, 4, 1024]         # the series' levels, verbatim
+    labels = [ax.xaxis.get_major_formatter()(v, None) for v in ax.get_xticks()]
+    assert labels == ["1", "2", "4", "1024"]                # plain values, not 2^n
+
+
+def test_pow2_ticks_option_keeps_log_formatter(tmp_path):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    captured = {}
+    orig = plt.subplots
+
+    def spy(*a, **k):
+        fig, ax = orig(*a, **k)
+        captured["ax"] = ax
+        return fig, ax
+
+    plt.subplots = spy
+    try:
+        plotting.render("throughput", plotting.throughput_series(TWO), tmp_path / "p.png",
+                        ticks="pow2")
+    finally:
+        plt.subplots = orig
+    from matplotlib.ticker import FixedLocator
+
+    assert not isinstance(captured["ax"].xaxis.get_major_locator(), FixedLocator)

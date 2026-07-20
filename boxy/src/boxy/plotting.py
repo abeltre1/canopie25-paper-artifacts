@@ -101,7 +101,7 @@ def _axis_labels(kind: str, metric: str, stat: str) -> tuple[str, str]:
 
 
 def render(kind: str, series: list[Series], out: Path, fmt: str = "png",
-           title: str = "", logx2: bool = True) -> Path:
+           title: str = "", logx2: bool = True, ticks: str = "values") -> Path:
     """Render one figure with matplotlib (Agg). Raises RuntimeError with the
     install hint when matplotlib is absent — `--emit gnuplot` never needs it."""
     try:
@@ -142,6 +142,17 @@ def render(kind: str, series: list[Series], out: Path, fmt: str = "png",
     ax.set_ylabel(ylabel)
     if logx2 and kind != "frontier":
         ax.set_xscale("log", base=2)
+        if ticks == "values":
+            # explicit concurrency values (1, 2, 4, ... 1024) beat exponent
+            # notation for reading a specific level off the figure; --ticks
+            # pow2 restores matplotlib's 2^n labels.
+            from matplotlib.ticker import FixedLocator, FuncFormatter
+
+            levels = sorted({x for s in series for x in s.xs if x})
+            if levels:
+                ax.xaxis.set_major_locator(FixedLocator(levels))
+                ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{int(v):d}"))
+                ax.xaxis.set_minor_locator(FixedLocator([]))
     if title:
         ax.set_title(title)
     ax.grid(True, alpha=0.3)

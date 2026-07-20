@@ -6255,7 +6255,8 @@ def cmd_plot(args: argparse.Namespace) -> int:
             out = base if len(kinds) == 1 else base.with_name(f"{base.stem}-{kind}{base.suffix}")
         try:
             plotting.render(kind, series, out, fmt=args.format,
-                            title=args.title or "", logx2=not args.no_logx)
+                            title=args.title or "", logx2=not args.no_logx,
+                            ticks=args.ticks)
         except RuntimeError as e:
             raise UsageError(str(e)) from None
         outputs.append(out)
@@ -6945,6 +6946,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "instead of rendering (no python deps needed)")
     p.add_argument("--title", default=None)
     p.add_argument("--no-logx", action="store_true", help="linear x axis (default log2)")
+    p.add_argument("--ticks", default="values", choices=["values", "pow2"],
+                   help="x-axis labels: explicit concurrency values 1,2,4,...,1024 "
+                        "(default) or 2^n exponent notation")
     p.set_defaults(func=cmd_plot)
 
     p = sub.add_parser("logs", help="show a job's log + boxy's crash diagnosis (newest first)")
