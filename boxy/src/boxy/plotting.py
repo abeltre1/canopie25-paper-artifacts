@@ -57,9 +57,11 @@ def _metric_key(metric: str, stat: str) -> str:
 
 
 def _series(envelopes: list[dict], value_key: str) -> list[Series]:
+    from boxy import results as _results
+
     out = []
     for env in envelopes:
-        s = Series(label=env.get("label") or env.get("model", "run"))
+        s = Series(label=_results.display_label(env))
         for run in env.get("runs", []):
             s.xs.append(int(run.get("max_concurrency", 0)))
             s.ys.append(float(run[value_key]) if run.get("status") == "ok"
@@ -80,9 +82,11 @@ def latency_series(envelopes: list[dict], metric: str = "ttft", stat: str = "p99
 def frontier_series(envelopes: list[dict]) -> list[Series]:
     """Latency-throughput frontier: one point per level — x = output tok/s,
     y = median E2E latency. (xs carry throughputs here, not concurrency.)"""
+    from boxy import results as _results
+
     out = []
     for env in envelopes:
-        s = Series(label=env.get("label") or env.get("model", "run"))
+        s = Series(label=_results.display_label(env))
         for run in env.get("runs", []):
             if run.get("status") != "ok":
                 continue
@@ -100,8 +104,13 @@ def _axis_labels(kind: str, metric: str, stat: str) -> tuple[str, str]:
     return "Output Token Throughput (tokens/s)", "Median E2E Latency (ms)"
 
 
+# vivid primaries for print-quality figures (the paper's gnuplot order)
+MPL_COLORS = ["#d62728", "#ff7f0e", "#2ca02c", "#1f77b4", "#9467bd", "#7f7f7f", "#000000"]
+
+
 def render(kind: str, series: list[Series], out: Path, fmt: str = "png",
-           title: str = "", logx2: bool = True, ticks: str = "values") -> Path:
+           title: str = "", logx2: bool = True, ticks: str = "values",
+           dpi: int = 300) -> Path:
     """Render one figure with matplotlib (Agg). Raises RuntimeError with the
     install hint when matplotlib is absent — `--emit gnuplot` never needs it."""
     try:
@@ -112,10 +121,11 @@ def render(kind: str, series: list[Series], out: Path, fmt: str = "png",
     except ImportError:
         raise RuntimeError("plotting needs matplotlib: pip install 'boxy-hpc[plot]' — "
                            "or use `boxy plot --emit gnuplot` (no python deps)") from None
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for s in series:
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for idx, s in enumerate(series):
+        series_color = MPL_COLORS[idx % len(MPL_COLORS)]
         if kind == "frontier":
-            ax.plot(s.xs, s.ys, marker="o", linewidth=2, label=s.label)
+            ax.plot(s.xs, s.ys, marker="o", linewidth=2.5, color=series_color, label=s.label)
             continue
         # split at None gaps so crashed levels break the line (paper's X cells)
         xs, ys = [], []
@@ -130,11 +140,9 @@ def render(kind: str, series: list[Series], out: Path, fmt: str = "png",
                 ys.append(y)
         if xs:
             segments.append((xs, ys))
-        color = None
         for i, (sx, sy) in enumerate(segments):
-            line, = ax.plot(sx, sy, marker="o", linewidth=2, color=color,
-                            label=s.label if i == 0 else None)
-            color = line.get_color()
+            ax.plot(sx, sy, marker="o", linewidth=2.5, color=series_color,
+                    label=s.label if i == 0 else None)
     xlabel, ylabel = _axis_labels(kind, "", "")
     if kind == "latency":
         ylabel = "Latency (ms)"
@@ -159,7 +167,7 @@ def render(kind: str, series: list[Series], out: Path, fmt: str = "png",
     ax.legend()
     fig.tight_layout()
     out = Path(out)
-    fig.savefig(out, format=fmt, dpi=150)
+    fig.savefig(out, format=fmt, dpi=dpi)
     plt.close(fig)
     return out
 

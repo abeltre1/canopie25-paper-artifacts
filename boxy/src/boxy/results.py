@@ -71,7 +71,7 @@ def make_envelope(*, url: str, model: str, backend: str, runs: list[dict],
     cluster = jobs.local_cluster()
     if not label:
         base = f"{cluster}/{instance}" if instance else f"{cluster}/{_slug(model)}"
-        label = f"{accelerator} - {base}" if accelerator else base
+        label = f"{accelerator}: {base}" if accelerator else base
     return {
         "schema": SCHEMA,
         "boxy_version": version_string(),
@@ -178,3 +178,35 @@ def to_csv(envelope: dict) -> str:
 def peak_output_throughput(envelope: dict) -> float:
     vals = [r.get("output_throughput", 0.0) for r in envelope.get("runs", []) if r.get("status") == "ok"]
     return max(vals, default=0.0)
+
+
+def display_label(envelope: dict) -> str:
+    """The label as shown in legends/listings: `<accelerator>: cluster/name`.
+    Older envelopes predate the accelerator field — enrich at display time
+    from the stored field, else infer it from the serving image recorded in
+    backend_detail, so existing results get the full legend without a re-run."""
+    label = envelope.get("label") or envelope.get("model", "run")
+    accel = envelope.get("gpu_type", "") or envelope.get("accelerator", "")
+    if not accel:
+        from boxy.bench_backends import accel_from_image
+
+        accel = accel_from_image(envelope.get("backend_detail", ""))
+    if envelope.get("instance"):
+        # the serve record for this instance (still on this machine) may know
+        # MORE than the stored envelope: the GPU MODEL (mi300a/h100) outranks
+        # the accelerator family, and old envelopes may lack both
+        from boxy import jobs
+
+        rec = jobs.read_record(envelope["instance"]) or {}
+        better = rec.get("gpu_type", "")
+        if better:
+            accel = better
+        elif not accel:
+            accel = rec.get("accelerator", "") or accel_from_image(rec.get("image", ""))
+    if not accel:
+        return label
+    if label.startswith(f"{accel} - "):          # the short-lived dash format
+        return f"{accel}: " + label[len(accel) + 3:]
+    if label.lower().startswith(f"{accel}:"):
+        return label
+    return f"{accel}: {label}"

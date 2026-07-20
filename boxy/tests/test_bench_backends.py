@@ -432,7 +432,7 @@ def test_agentless_bench_end_to_end(agentless_setup, capfd):
 
     listing = results.list_results()
     assert listing and listing[0][1]["bench_backend"] == "vllm-container"
-    assert listing[0][1]["label"] == "rocm - clustera/boxy-llama"
+    assert listing[0][1]["label"] == "rocm: clustera/boxy-llama"
     assert listing[0][1]["instance"] == "boxy-llama"
 
 
@@ -589,7 +589,7 @@ def test_accel_from_image_heuristic():
 def test_envelope_label_carries_accelerator():
     env = results.make_envelope(url="http://n:1", model="m/x", backend="synthetic",
                                 runs=[], instance="boxy-m", accelerator="rocm")
-    assert env["label"].startswith("rocm - ") and env["label"].endswith("/boxy-m")
+    assert env["label"].startswith("rocm: ") and env["label"].endswith("/boxy-m")
     env2 = results.make_envelope(url="http://n:1", model="m/x", backend="synthetic",
                                  runs=[], instance="boxy-m")
-    assert " - " not in env2["label"]
+    assert ":" not in env2["label"].split("/")[0]

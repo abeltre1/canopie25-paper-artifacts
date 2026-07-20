@@ -225,3 +225,21 @@ def test_pow2_ticks_option_keeps_log_formatter(tmp_path):
     from matplotlib.ticker import FixedLocator
 
     assert not isinstance(captured["ax"].xaxis.get_major_locator(), FixedLocator)
+
+
+def test_legend_enriches_old_results_with_accelerator():
+    """Envelopes stored before the accelerator field existed still legend as
+    '<accel>: cluster/name' — inferred from the serving image recorded in
+    backend_detail. Unknown images stay untouched."""
+    old = dict(TWO[0])
+    old["label"] = "eldorado/boxy-llama-3.2-1b-instruct"
+    old["accelerator"] = ""
+    old["backend_detail"] = ("benchmark inside the serving image "
+                             "docker.io/vllm/vllm-openai-rocm via podman on eldorado (agentless)")
+    assert results.display_label(old) == "rocm: eldorado/boxy-llama-3.2-1b-instruct"
+    s = plotting.throughput_series([old])
+    assert s[0].label == "rocm: eldorado/boxy-llama-3.2-1b-instruct"
+    plain = dict(TWO[0])
+    plain["accelerator"] = ""
+    plain["backend_detail"] = "vllm-bench binary on somewhere"
+    assert ":" not in results.display_label(plain).split("/")[0]

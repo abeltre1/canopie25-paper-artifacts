@@ -3156,11 +3156,18 @@ def _serve_agentless_ssh(args, target: str) -> int:
     # benchmark inside that same image on the cluster — agentless, no installs
     record_image = box.image or ramalama_shim.default_image(
         box.engine, getattr(args, "accelerator", "") or "")
+    record_gpu_type = ""
+    if cfacts is not None:
+        record_gpu_type = cfacts.gpu_hw()[0]
+        if not record_gpu_type:
+            gres_types = site.gpu_types_from_gres(cfacts.sections.get("GRESALL", ""))
+            record_gpu_type = gres_types[0] if gres_types else ""
     jobs.write_record(name, {"name": name, "scheduler": scheduler_name, "job": job_id,
                              "model": args.model, "submitted_from": "agentless-ssh",
                              "target": target, "endpoint_remote": ep_remote, "log": log_remote,
                              "image": record_image, "engine": box.engine,
-                             "accelerator": getattr(args, "accelerator", "") or ""})
+                             "accelerator": getattr(args, "accelerator", "") or "",
+                             "gpu_type": record_gpu_type})
 
     # 9) poll the shared-FS endpoint file over the master; the moment it names the
     #    compute node, hand off to the tunnel + localhost/health readiness.
@@ -6075,15 +6082,17 @@ def _bench_agentless(args, rec: dict) -> int:
           f"{len(batch_sizes)} concurrency levels (on {host})")
     runs = bench_backends.run_series(backend, base, batch_sizes)
     accel = rec.get("accelerator", "") or bench_backends.accel_from_image(image)
+    gtype = rec.get("gpu_type", "")
+    prefix = gtype or accel
     ccluster = jobs.cluster_id(host)
-    default_label = (f"{accel} - {ccluster}/{rec['name']}" if accel
+    default_label = (f"{prefix}: {ccluster}/{rec['name']}" if prefix
                      else f"{ccluster}/{rec['name']}")
     envelope = results.make_envelope(
         url=ep["url"], model=model, backend=backend.name, backend_detail=why, runs=runs,
         instance=rec["name"],
         label=getattr(args, "label", "") or default_label,
         dataset="random", seed=base.seed, max_tokens=args.max_tokens,
-        accelerator=accel,
+        accelerator=accel, gpu_type=gtype,
         geometry={k: rec[k] for k in ("nodes", "gpus") if rec.get(k)})
     if args.json:
         print(_json.dumps(envelope, indent=1))
@@ -6209,7 +6218,7 @@ def cmd_results(args: argparse.Namespace) -> int:
         ok_runs = [r for r in data.get("runs", []) if r.get("status") == "ok"]
         peak = results.peak_output_throughput(data)
         print(f"{i:>3} {data.get('created', '?'):>20} {data.get('bench_backend', '?'):>12} "
-              f"{len(ok_runs):>6} {peak:>10.1f}  {data.get('label', data.get('model', '?'))}")
+              f"{len(ok_runs):>6} {peak:>10.1f}  {results.display_label(data)}")
     print(f"# store: {results._dir()}   (details: boxy results show N; plot: boxy plot N)")
     return 0
 
@@ -6262,7 +6271,7 @@ def cmd_plot(args: argparse.Namespace) -> int:
         try:
             plotting.render(kind, series, out, fmt=args.format,
                             title=args.title or "", logx2=not args.no_logx,
-                            ticks=args.ticks)
+                            ticks=args.ticks, dpi=args.dpi)
         except RuntimeError as e:
             raise UsageError(str(e)) from None
         outputs.append(out)
@@ -6952,6 +6961,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "instead of rendering (no python deps needed)")
     p.add_argument("--title", default=None)
     p.add_argument("--no-logx", action="store_true", help="linear x axis (default log2)")
+    p.add_argument("--dpi", type=int, default=300,
+                   help="raster resolution (default 300 — print quality; use "
+                        "--format pdf for vector output)")
     p.add_argument("--ticks", default="values", choices=["values", "pow2"],
                    help="x-axis labels: explicit concurrency values 1,2,4,...,1024 "
                         "(default) or 2^n exponent notation")
