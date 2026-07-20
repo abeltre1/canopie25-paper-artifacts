@@ -72,9 +72,20 @@ binary at `<store>/bin/vllm-bench` by hand, or carry it with
   NODE stages it itself (proxied, ~650 MB once, cached in the cluster-side
   boxy store) — nothing rides the laptop link. Air-gapped: pre-stage the
   JSON at the path the error message shows (laptop or cluster).
+- **`--dataset hf:<repo-id>`** — any HuggingFace-hub bench dataset, e.g.
+  `hf:lmarena-ai/VisionArena-Chat` for **multimodal** models. The benchmark
+  downloads it itself (public datasets; rides your proxy), so it needs the
+  vLLM datasets loader — the serving-image and vllm-cli backends have it,
+  the static vllm-bench binary doesn't. Agentless `--ssh` benches cache the
+  download in the cluster-side boxy store so only level 1 pays for it.
 - **`--dataset path/to/prompts.json`** — your own JSON list of prompts or a
   ShareGPT-format file (local benches and `--url` tunnels; not staged to
   clusters automatically).
+
+If a cluster's login node can't reach the corpus URL (site filters commonly
+403 huggingface.co), the sharegpt stage self-heals: boxy downloads on YOUR
+machine — whose proxy/CA config is known-good — and streams the file up the
+existing ssh session automatically.
 
 ---
 

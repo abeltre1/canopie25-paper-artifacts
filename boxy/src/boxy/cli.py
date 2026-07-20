@@ -5996,10 +5996,11 @@ def _bench_agentless(args, rec: dict) -> int:
                          f"got {args.batch_sizes!r}") from None
     image = getattr(args, "image", None) or rec.get("image", "")
     dkind = args.dataset or "random"
-    if dkind not in ("random", "sharegpt"):
-        raise UsageError("the agentless bench supports --dataset random|sharegpt (sharegpt "
-                         "auto-stages on the cluster) — for a local FILE dataset bench "
-                         "through a tunnel with --url")
+    if dkind not in ("random", "sharegpt") and not dkind.startswith("hf:"):
+        raise UsageError("the agentless bench supports --dataset random|sharegpt|hf:<repo> "
+                         "(sharegpt auto-stages on the cluster; hf downloads in the bench "
+                         "container) — for a local FILE dataset bench through a tunnel "
+                         "with --url")
     if args.dryrun:
         print(f"### Agentless bench plan: {rec['name']} on {host} — cluster vllm-bench binary "
               f"if installed, else benchmark inside {image or '<image from --image>'} on the "
@@ -6011,12 +6012,30 @@ def _bench_agentless(args, rec: dict) -> int:
         print(f"boxy: could not open an SSH session to {target}", file=sys.stderr)
         return 1
     dpath = None
+    skind = dkind
+    hf_cache = ""
     if dkind == "sharegpt":
         try:
             dpath = bench_backends.ensure_sharegpt_remote(target)
         except RuntimeError as e:
             raise UsageError(str(e)) from None
         print(f"  auto: dataset: sharegpt (on {host}: {dpath})")
+    elif dkind.startswith("hf:"):
+        skind, dpath = "hf", dkind[3:].strip("/")
+        if not dpath:
+            raise UsageError("--dataset hf:<repo-id> needs a HuggingFace dataset id, "
+                             "e.g. hf:lmarena-ai/VisionArena-Chat")
+        if (getattr(args, "backend", None) or config.get("bench.backend")) == "vllm-bench":
+            raise UsageError("HF-hub datasets need the vLLM datasets loader — the static "
+                             "vllm-bench binary can't provide it; use --backend auto "
+                             "(the serving image runs the benchmark)")
+        try:
+            hf_cache = f"{bench_backends._remote_home(target)}/.local/share/boxy/store/hf-cache"
+        except RuntimeError as e:
+            raise UsageError(str(e)) from None
+        remote.ssh_capture(target, f"mkdir -p {shlex.quote(hf_cache)}", timeout=15)
+        print(f"  auto: dataset: hf ({dpath} — the bench container downloads it on {host}; "
+              f"cached at {hf_cache})")
     rc, epj = remote.ssh_capture(
         target, f"cat {shlex.quote(rec['endpoint_remote'])} 2>/dev/null || true", timeout=15)
     ep = None
@@ -6032,7 +6051,11 @@ def _bench_agentless(args, rec: dict) -> int:
     backend = None
     why = ""
     runtime = ""
-    if requested in ("auto", "vllm-bench"):
+    if skind == "hf" and requested == "vllm-bench":
+        raise UsageError("HF-hub datasets need the vLLM datasets loader — the static "
+                         "vllm-bench binary can't provide it; use --backend auto "
+                         "(the serving image runs the benchmark)")
+    if requested in ("auto", "vllm-bench") and skind != "hf":
         cand = bench_backends.VllmBenchRemote(target)
         ok, note = cand.available()
         if ok:
@@ -6085,8 +6108,9 @@ def _bench_agentless(args, rec: dict) -> int:
     base = bench_backends.BenchSpec(
         url=ep["url"], model=model, concurrency=0,
         num_prompts=getattr(args, "num_prompts", 0) or 0,
-        max_tokens=args.max_tokens, dataset_kind=dkind, dataset_path=dpath,
+        max_tokens=args.max_tokens, dataset_kind=skind, dataset_path=dpath,
         random_prefix_len=getattr(args, "random_prefix_len", 0) or 0,
+        hf_cache_dir=hf_cache,
         seed=getattr(args, "seed", None) or config.get("bench.seed"),
         image=image, runtime=runtime)
     print(f"### Benchmarking {model or rec['name']} at {ep['url']} — "
@@ -6166,11 +6190,16 @@ def _bench_real(args, backend, why, url: str, batch_sizes: list[int], instance: 
                  or bench.discover_model(url))
     except OSError as e:
         raise RuntimeError(f"cannot reach {url} ({e}) — is the box serving? (boxy list)") from e
+    hf_cache = ""
+    if dkind == "hf":
+        hf_cache = str(bench_backends.dataset_cache_dir() / "hf-cache")
+        os.makedirs(hf_cache, exist_ok=True)
     base = bench_backends.BenchSpec(
         url=url, model=model, concurrency=0,
         num_prompts=getattr(args, "num_prompts", 0) or 0,
         max_tokens=args.max_tokens, dataset_kind=dkind, dataset_path=dpath,
         random_prefix_len=getattr(args, "random_prefix_len", 0) or 0,
+        hf_cache_dir=hf_cache,
         seed=getattr(args, "seed", None) or config.get("bench.seed"),
         api_key=api_key, image=backend.image if hasattr(backend, "image") else "",
         runtime=getattr(backend, "runtime", ""))
@@ -6187,7 +6216,8 @@ def _bench_real(args, backend, why, url: str, batch_sizes: list[int], instance: 
     envelope = results.make_envelope(
         url=url, model=model, backend=backend.name, backend_detail=why, runs=runs,
         instance=instance, label=getattr(args, "label", "") or "",
-        dataset=dkind, seed=base.seed, max_tokens=args.max_tokens,
+        dataset=(f"hf:{dpath}" if dkind == "hf" else dkind),
+        seed=base.seed, max_tokens=args.max_tokens,
         accelerator=record.get("accelerator", ""),
         gpu_type=getattr(args, "gpu_type", None) or record.get("gpu_type", ""),
         geometry={k: record[k] for k in ("nodes", "gpus") if record.get(k)})
@@ -6990,8 +7020,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="render the throughput figure next to the saved result")
     p.add_argument("--dataset", default=None,
                    help="'random' (real-backend default), 'sharegpt' (auto-downloaded + "
-                        "cached; auto-staged on the cluster for agentless --ssh), or a "
-                        "file: JSON list of prompts / ShareGPT JSON")
+                        "cached; auto-staged on the cluster for agentless --ssh), "
+                        "'hf:<repo>' (HuggingFace hub, e.g. hf:lmarena-ai/VisionArena-Chat "
+                        "for multimodal — the benchmark downloads it), or a file: JSON "
+                        "list of prompts / ShareGPT JSON")
     p.add_argument("--random-prefix-len", type=int, default=0,
                    help="random dataset only: shared-prefix tokens across all prompts — "
                         "produces real prefix-cache hits with no corpus staged")

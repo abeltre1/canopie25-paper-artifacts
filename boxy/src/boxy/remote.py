@@ -332,6 +332,23 @@ def add_forward(host: str, local_port: int, remote_host: str, remote_port: int) 
                           capture_output=True, text=True).returncode
 
 
+def push_path(host: str, remote_path: str, local_path) -> int:
+    """Stream a LARGE local file to `remote_path` over the live master — stdin
+    comes straight from the open file, so nothing is buffered in memory (the
+    ShareGPT corpus is ~650 MB). Same quoting contract as push_file: pass a
+    boxy-controlled remote path, never user free-text. No timeout: big uploads
+    take as long as they take."""
+    with open(local_path, "rb") as f:
+        proc = subprocess.run(
+            [ssh_bin(), "-o", f"ControlPath={control_path()}", host,
+             f'mkdir -p "$(dirname {remote_path})" && cat > {remote_path}'],
+            stdin=f, capture_output=True)
+    if proc.returncode != 0:
+        print(f"warning: could not write {remote_path} on {host}: "
+              f"{(proc.stderr or b'').decode(errors='replace')[:200]}", file=sys.stderr)
+    return proc.returncode
+
+
 def push_file(host: str, remote_path: str, content: str | bytes) -> int:
     """Write `content` (text or raw bytes — e.g. a staged source tarball) to
     `remote_path` on host over the LIVE master (cat >, no re-auth), creating the

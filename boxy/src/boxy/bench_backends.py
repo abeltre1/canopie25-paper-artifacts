@@ -48,9 +48,10 @@ class BenchSpec:
     concurrency: int
     num_prompts: int
     max_tokens: int
-    dataset_kind: str = "random"        # random | sharegpt | synthetic | file
-    dataset_path: str | None = None
+    dataset_kind: str = "random"        # random | sharegpt | hf | synthetic | file
+    dataset_path: str | None = None     # file path, or the HF repo id for kind "hf"
     random_prefix_len: int = 0          # random only: shared-prefix tokens (cache hits)
+    hf_cache_dir: str = ""              # hf only: persistent HF_HOME for the bench container
     seed: int = 12345
     api_key: str = ""
     image: str = ""                     # vllm-container only
@@ -206,6 +207,19 @@ def ensure_sharegpt() -> Path:
     return dest
 
 
+def _remote_home(target: str) -> str:
+    """The cluster account's ABSOLUTE home dir — remote paths that end up in
+    podman argv (mounts, HF_HOME) must be literal: a quoted $HOME never
+    expands there."""
+    from boxy import remote
+
+    rc, home = remote.ssh_capture(target, "echo $HOME", timeout=15)
+    home = home.strip().splitlines()[-1] if rc == 0 and home.strip() else ""
+    if not home.startswith("/"):
+        raise RuntimeError(f"cannot resolve $HOME on {target} — is the ssh session live?")
+    return home
+
+
 def ensure_sharegpt_remote(target: str, progress=print) -> str:
     """ShareGPT staged ON the cluster for the agentless bench: cached in the
     cluster-side boxy store, downloaded once by the login node itself through
@@ -216,10 +230,7 @@ def ensure_sharegpt_remote(target: str, progress=print) -> str:
 
     from boxy import config, remote
 
-    rc, home = remote.ssh_capture(target, "echo $HOME", timeout=15)
-    home = home.strip().splitlines()[-1] if rc == 0 and home.strip() else ""
-    if not home.startswith("/"):
-        raise RuntimeError(f"cannot resolve $HOME on {target} — is the ssh session live?")
+    home = _remote_home(target)
     dest = f"{home}/.local/share/boxy/store/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
     q = shlex.quote(dest)
     rc, _ = remote.ssh_capture(target, f"test -s {q}", timeout=15)
@@ -237,12 +248,25 @@ def ensure_sharegpt_remote(target: str, progress=print) -> str:
     if rc != 0 or "BOXY_STAGED" not in out:
         remote.ssh_capture(target, f"rm -f {q}.part", timeout=15)
         tail = " | ".join(out.strip().splitlines()[-3:]) or "no output"
-        raise RuntimeError(
-            f"could not stage ShareGPT on {target} ({tail}) — the cluster may need "
-            f"its own proxy (set network.proxy) or a datasets.sharegpt_url mirror; "
-            f"or pre-stage it by hand: `scp {dataset_cache_dir()}/"
-            f"ShareGPT_V3_unfiltered_cleaned_split.json {target}:{dest}` "
-            f"(the laptop copy comes from any local `boxy bench --dataset sharegpt`)")
+        # SELF-HEAL (field: the site filter 403s huggingface.co on login nodes,
+        # same as the spack-source blocks): download on THIS machine — whose
+        # proxy/CA config is known-good — and stream it up the live master.
+        progress(f"### the cluster could not fetch the corpus itself ({tail}) — "
+                 f"downloading here and uploading over the ssh session instead ...")
+        try:
+            local = ensure_sharegpt()
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"could not stage ShareGPT on {target} ({tail}), and the laptop-side "
+                f"fallback failed too: {e}") from e
+        if remote.push_path(target, f"{dest}.part", local) != 0 or \
+                remote.ssh_capture(target, f"mv {q}.part {q}", timeout=60)[0] != 0:
+            remote.ssh_capture(target, f"rm -f {q}.part", timeout=15)
+            raise RuntimeError(
+                f"could not upload the ShareGPT corpus to {target} — set network.proxy / "
+                f"a datasets.sharegpt_url mirror the cluster can reach, or pre-stage it "
+                f"by hand: `scp {local} {target}:{dest}`")
+        progress(f"### staged from this machine: {target}:{dest}")
     return dest
 
 
@@ -258,6 +282,16 @@ def resolve_dataset(arg: str | None, backend_name: str) -> tuple[str, str | None
     if arg == "sharegpt":
         path = ensure_sharegpt()
         return "sharegpt", str(path), f"cached at {path}"
+    if arg.startswith("hf:"):
+        repo = arg[3:].strip("/")
+        if not repo:
+            raise RuntimeError("--dataset hf:<repo-id> needs a HuggingFace dataset id, "
+                               "e.g. hf:lmarena-ai/VisionArena-Chat")
+        if backend_name in ("vllm-bench", "synthetic"):
+            raise RuntimeError(
+                f"HF-hub datasets need the vLLM datasets loader — the {backend_name} "
+                f"backend can't provide it; use --backend vllm-container (or vllm-cli)")
+        return "hf", repo, "HuggingFace hub — downloaded by the benchmark itself (public datasets)"
     path = os.path.expanduser(arg)
     if not os.path.exists(path):
         raise RuntimeError(f"--dataset {arg!r}: not a known name (random|sharegpt) and no such file")
@@ -394,6 +428,10 @@ def _serve_flags(spec: BenchSpec) -> list[str]:
             flags += ["--random-prefix-len", str(spec.random_prefix_len)]
     elif spec.dataset_kind == "sharegpt":
         flags += ["--dataset-name", "sharegpt", "--dataset-path", spec.dataset_path or ""]
+    elif spec.dataset_kind == "hf":
+        # --dataset-path is the HF REPO ID; the benchmark downloads it via the
+        # datasets library (VisionArena & friends for multimodal models)
+        flags += ["--dataset-name", "hf", "--dataset-path", spec.dataset_path or ""]
     else:
         flags += ["--dataset-name", "custom", "--dataset-path", spec.dataset_path or ""]
     return flags
@@ -473,7 +511,16 @@ class VllmContainer(BenchBackend):
         cmd += ["--env", f"no_proxy={host}", "--env", f"NO_PROXY={host}"]
         if spec.api_key:
             cmd += ["--env", "OPENAI_API_KEY"]
-        if spec.dataset_path:
+        if spec.dataset_kind == "hf":
+            # the loader downloads the repo INSIDE the container: pass the
+            # proxies through (values stay out of argv) and persist the HF
+            # cache across levels so only level 1 pays the download
+            cmd += ["--env", "https_proxy", "--env", "http_proxy",
+                    "--env", "HTTPS_PROXY", "--env", "HTTP_PROXY"]
+            if spec.hf_cache_dir:
+                cmd += ["--env", f"HF_HOME={spec.hf_cache_dir}",
+                        "-v", f"{spec.hf_cache_dir}:{spec.hf_cache_dir}"]
+        elif spec.dataset_path:
             d = os.path.dirname(os.path.abspath(spec.dataset_path))
             cmd += ["-v", f"{d}:{d}:ro"]
         cmd += ["--entrypoint", "/bin/bash", self.image, "-c", inner, "bench"]
@@ -513,10 +560,18 @@ class VllmContainerRemote(VllmContainer):
     def run_level(self, spec: BenchSpec) -> dict:
         import shlex
 
-        from boxy import remote
+        from boxy import config, remote
 
         cmd = self.render_command(spec)
-        rc, out = remote.ssh_capture(self.target, shlex.join(cmd), timeout=3600)
+        line = shlex.join(cmd)
+        if spec.dataset_kind == "hf":
+            # the in-container HF download rides the site proxy — export it on
+            # the remote command so podman's --env passthrough has a value
+            pfx = config.get("network.proxy")
+            if pfx:
+                line = (f"https_proxy={shlex.quote(pfx)} http_proxy={shlex.quote(pfx)} "
+                        f"HTTPS_PROXY={shlex.quote(pfx)} HTTP_PROXY={shlex.quote(pfx)} {line}")
+        rc, out = remote.ssh_capture(self.target, line, timeout=3600)
         parsed = parse_stdout_block(out, spec.concurrency)
         if parsed:
             return parsed

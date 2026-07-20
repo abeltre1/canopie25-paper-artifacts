@@ -580,6 +580,7 @@ def _sharegpt_shim(tmp_path, monkeypatch, log, *, staged: str, curl: str):
           *"echo \\$HOME"*) echo /rhome ;;
           *"test -s"*)     {staged} ;;
           *curl*ShareGPT*) {curl} ;;
+          *"cat >"*)       cat > /dev/null ;;
           *"test -x"*)     exit 1 ;;
           *cat*endpoint*)  printf '{{"name": "boxy-llama", "host": "cbnode7", "port": 8000,
                                     "url": "http://cbnode7:8000", "ready": true,
@@ -629,16 +630,43 @@ def test_agentless_sharegpt_cached_skips_staging(agentless_setup, tmp_path, monk
     assert "--dataset-name sharegpt" in calls
 
 
-def test_agentless_sharegpt_staging_failure_names_the_fixes(agentless_setup, tmp_path,
-                                                            monkeypatch, capfd):
+def test_agentless_sharegpt_403_self_heals_via_laptop_upload(agentless_setup, tmp_path,
+                                                             monkeypatch, capfd):
+    """Field: the site filter 403s huggingface.co on the login node. The stage
+    then downloads on the LAPTOP (proxy/CA known-good) and streams the corpus
+    up the live ssh master — the bench proceeds without manual scp."""
     from boxy.cli import main
 
+    corpus = tmp_path / "sharegpt.json"
+    corpus.write_text("[]")
+    monkeypatch.setattr(bb, "ensure_sharegpt", lambda: corpus)
+    log = tmp_path / "ssh-calls.log"
+    _sharegpt_shim(tmp_path, monkeypatch, log, staged="exit 1", curl="exit 22")
+    rc = main(["bench", "--dataset", "sharegpt", "--batch-sizes", "1", "--max-tokens", "8"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "uploading over the ssh session" in out and "staged from this machine" in out
+    calls = log.read_text()
+    assert f"cat > {SHAREGPT_REMOTE}.part" in calls        # streamed, then moved into place
+    assert f"mv {SHAREGPT_REMOTE}.part" in calls
+    assert "--dataset-name sharegpt" in calls
+
+
+def test_agentless_sharegpt_both_paths_failing_names_the_fixes(agentless_setup, tmp_path,
+                                                               monkeypatch, capfd):
+    from boxy.cli import main
+
+    def boom():
+        raise RuntimeError("cannot download the ShareGPT dataset (proxy down) — "
+                           "point datasets.sharegpt_url at a mirror")
+
+    monkeypatch.setattr(bb, "ensure_sharegpt", boom)
     log = tmp_path / "ssh-calls.log"
     _sharegpt_shim(tmp_path, monkeypatch, log, staged="exit 1", curl="exit 22")
     rc = main(["bench", "--dataset", "sharegpt", "--batch-sizes", "1", "--max-tokens", "8"])
     err = capfd.readouterr().err
     assert rc != 0
-    assert "network.proxy" in err and "scp" in err          # mirror + manual pre-stage
+    assert "laptop-side fallback failed" in err and "sharegpt_url" in err
 
 
 def test_agentless_bench_still_refuses_file_datasets(agentless_setup, capfd):
@@ -690,6 +718,74 @@ def test_agentless_bench_names_gpu_model_from_node(agentless_setup, tmp_path, mo
     assert listing[0][1]["gpu_type"] == "mi300a"
     assert listing[0][1]["label"] == "mi300a: clustera/boxy-llama"
     assert res.display_label(listing[0][1]) == "mi300a: clustera/boxy-llama"
+
+
+def test_resolve_dataset_hf_repo():
+    kind, path, why = bb.resolve_dataset("hf:lmarena-ai/VisionArena-Chat", "vllm-container")
+    assert (kind, path) == ("hf", "lmarena-ai/VisionArena-Chat") and "hub" in why
+    with pytest.raises(RuntimeError, match="vllm-container"):
+        bb.resolve_dataset("hf:org/data", "vllm-bench")       # Rust binary: no datasets lib
+    with pytest.raises(RuntimeError, match="hf:<repo-id>"):
+        bb.resolve_dataset("hf:", "vllm-container")
+
+
+def test_serve_flags_and_container_render_for_hf():
+    spec = bb.BenchSpec(url="http://n7:8000", model="m", concurrency=2, num_prompts=8,
+                        max_tokens=16, dataset_kind="hf", dataset_path="org/data",
+                        hf_cache_dir="/rhome/.local/share/boxy/store/hf-cache")
+    flags = bb._serve_flags(spec)
+    i = flags.index("--dataset-name")
+    assert flags[i + 1] == "hf" and "org/data" in flags
+    cmd = bb.VllmContainer("img", "podman").render_command(spec)
+    assert "--env" in cmd and "https_proxy" in cmd            # hub download rides the proxy
+    assert "HF_HOME=/rhome/.local/share/boxy/store/hf-cache" in cmd
+    assert "-v" in cmd
+    assert f"{spec.hf_cache_dir}:{spec.hf_cache_dir}" in cmd  # cache persists across levels
+    assert not any(str(c).endswith(":ro") for c in cmd)       # repo id is not a file mount
+
+
+def test_agentless_bench_hf_dataset_skips_binary_and_mounts_cache(agentless_setup, tmp_path,
+                                                                  monkeypatch, capfd):
+    """--dataset hf:<repo> agentlessly: the cluster vllm-bench binary (present!)
+    is skipped — only the serving image has the datasets loader — and the bench
+    container gets a persistent HF cache."""
+    from boxy.cli import main
+
+    log = tmp_path / "ssh-calls.log"
+    block = STDOUT_BLOCK.replace("\n", "\\n").replace('"', '\\"')
+    _shim(tmp_path, monkeypatch, "ssh", f'''
+        echo "$@" >> {log}
+        case "$*" in
+          *"echo \\$HOME"*) echo /rhome ;;
+          *"test -x"*)     exit 0 ;;
+          *cat*endpoint*)  printf '{{"name": "boxy-llama", "host": "cbnode7", "port": 8000,
+                                     "url": "http://cbnode7:8000", "ready": true,
+                                     "model": "org/llama-x"}}\\n' ;;
+          *"command -v podman"*) echo /usr/bin/podman ;;
+          *"image exists"*) echo PRESENT ;;
+          *podman*run*)    printf "%b" "{block}\\n" ;;
+          *)               exit 0 ;;
+        esac
+    ''')
+    rc = main(["bench", "--dataset", "hf:org/data", "--batch-sizes", "1", "--max-tokens", "8"])
+    out = capfd.readouterr().out
+    assert rc == 0 and "vllm-container" in out
+    calls = log.read_text()
+    assert "--dataset-name hf" in calls and "org/data" in calls
+    assert "mkdir -p /rhome/.local/share/boxy/store/hf-cache" in calls
+    assert "HF_HOME=/rhome/.local/share/boxy/store/hf-cache" in calls
+    from boxy import results as res
+
+    assert res.list_results()[0][1]["dataset"] == "hf:org/data"
+
+
+def test_agentless_bench_hf_with_explicit_binary_backend_refuses(agentless_setup, capfd):
+    from boxy.cli import main
+
+    rc = main(["bench", "--dataset", "hf:org/data", "--backend", "vllm-bench",
+               "--batch-sizes", "1"])
+    err = capfd.readouterr().err
+    assert rc != 0 and "vllm-bench binary" in err
 
 
 def test_agentless_bench_gpu_type_flag_overrides_detection(agentless_setup, tmp_path,
