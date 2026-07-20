@@ -65,6 +65,23 @@ def served_model_id(model: str) -> str:
     return re.sub(r"^[a-z0-9+._-]+://", "", model or "")
 
 
+# GPU model tokens, longest-first so mi300a never matches as mi300 etc.
+_GPU_TOKENS = ["mi325x", "mi300a", "mi300x", "mi250x", "mi250", "mi210", "mi100",
+               "gh200", "h200", "h100", "b200", "b100", "a100", "l40s", "l40",
+               "a40", "a30", "v100", "p100", "a6000", "rtx6000", "l4", "t4"]
+
+
+def gpu_name_from_text(text: str) -> str:
+    """The GPU MODEL (mi300a, h100, ...) from any scheduler/hardware text —
+    typed GRES lines, node Features, rocm-smi/nvidia-smi output, a system
+    card. '' when no known model token appears (never guess)."""
+    low = (text or "").lower()
+    for tok in _GPU_TOKENS:
+        if re.search(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", low):
+            return tok
+    return ""
+
+
 def accel_from_image(image: str) -> str:
     """Best-effort accelerator from a serving-image name — the label fallback
     for records that predate accelerator recording ('vllm-openai-rocm' -> rocm,
@@ -591,6 +608,15 @@ def cache_rate_delta(before: dict | None, after: dict | None) -> float | None:
     return None
 
 
+def auto_num_prompts(conc: int) -> int:
+    """Prompt-pool size for a sweep level: ~10x the concurrency, floored at 32,
+    capped at 1000 — but the cap itself must scale past 256, otherwise a
+    1024-level "sweep" issues only 1000 prompts and can never actually hold
+    1024 requests in flight (field: the top rung looked like a scaling wall
+    when it was a drained queue)."""
+    return min(max(10 * conc, 32), max(1000, 3 * conc))
+
+
 def run_series(backend: BenchBackend, base: BenchSpec, concurrencies: list[int],
                progress=print, metrics_sampler=None) -> list[dict]:
     """The concurrency sweep: one canonical record per level; an errored level
@@ -602,7 +628,7 @@ def run_series(backend: BenchBackend, base: BenchSpec, concurrencies: list[int],
     before = metrics_sampler() if metrics_sampler else None
     for conc in concurrencies:
         spec = BenchSpec(**{**base.__dict__, "concurrency": conc,
-                            "num_prompts": base.num_prompts or min(max(10 * conc, 32), 1000)})
+                            "num_prompts": base.num_prompts or auto_num_prompts(conc)})
         rec = backend.run_level(spec)
         if metrics_sampler:
             after = metrics_sampler()
@@ -616,4 +642,8 @@ def run_series(backend: BenchBackend, base: BenchSpec, concurrencies: list[int],
                      f"({rec.get('completed', 0)}/{rec.get('num_prompts', '?')} ok)")
         else:
             progress(f"###   concurrency {conc}: FAILED ({rec.get('error', '?')}) — continuing")
+    if metrics_sampler and not any("prefix_cache_hit_rate" in r for r in records):
+        progress("###   cache metrics: the server exported no prefix-cache series — "
+                 "enable it at serve time (`boxy serve ... -- --enable-prefix-caching`; "
+                 "vLLM V1 engines have it on by default)")
     return records

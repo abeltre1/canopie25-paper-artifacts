@@ -123,6 +123,21 @@ Levels that crash the server record as failed **and the sweep continues** —
 the surviving levels still save and plot (the 405B lesson: a 1024-concurrency
 crash must not discard the 1..512 measurements).
 
+**Scaling past 256 concurrency.** Two ceilings flatten the top of a sweep:
+
+- *Prompt pool*: boxy sizes it automatically (~10× the level, and always at
+  least 3× at the top rungs — 3072 prompts at concurrency 1024), so the
+  requested concurrency can genuinely be held in flight. Expect the 512/1024
+  levels to take proportionally longer; `--num-prompts` overrides.
+- *The server's scheduler*: vLLM only batches `--max-num-seqs` requests at a
+  time (256 by default on V0 engines) and **queues the rest** — the plot goes
+  flat past that value no matter what the client sends. To measure real
+  1024-way scaling, raise it at serve time:
+
+```console
+$ boxy serve meta-llama/Llama-3.1-8B-Instruct --ssh clustera -- --max-num-seqs 1024
+```
+
 ---
 
 ## 4. Results persist — `boxy results`
@@ -152,13 +167,25 @@ $ boxy plot                        # newest result → throughput-vs-concurrency
 $ boxy plot 1 2                    # OVERLAY two runs — compare clusters/configs
 $ boxy plot --kind latency --metric ttft --stat p99
 $ boxy plot --kind frontier        # latency vs throughput, one point per level
-$ boxy plot --kind all -o ./figs/  # all three figures
+$ boxy plot --kind cache           # prefix-cache hit rate (%) per level
+$ boxy plot --kind all -o ./figs/  # every figure the results support
 ```
 
 - The default figure is the paper's: **output tokens/s vs max request
   concurrency, log₂ x-axis**; crashed levels appear as gaps.
 - Overlaying N results reproduces the paper's multi-column comparison
   (ClusterA vs ClusterB vs OpenShift) without hand-editing a `.dat`.
+- Legends read `<gpu model or accel family>: cluster/name` (mi300a, h100, …)
+  — the GPU model comes from the serve record, the node's GRES/Features, or
+  the cluster's system card; pin `gpu_type = "mi300a"` in
+  `~/.config/boxy/cards/systems/<cluster>.toml` on sites whose scheduler
+  doesn't label GPU types.
+- **Cache-hit figures need two things**: the server must export prefix-cache
+  metrics (`boxy serve ... -- --enable-prefix-caching`; vLLM V1 engines have
+  it on by default), and the workload must actually reuse prefixes — bench
+  with `--dataset sharegpt`; the `random` dataset shows ~0% by design.
+  Rates are sampled from vLLM's `/metrics` around each level, so no extra
+  flags at bench time.
 - Rendering needs matplotlib: `pip install 'boxy-hpc[plot]'`.
 - **No matplotlib? No problem** — emit the paper's exact gnuplot pipeline:
 

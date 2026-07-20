@@ -2,6 +2,8 @@
 rendering (Agg, figure introspection), gap handling for crashed levels, and
 the gnuplot emitter's paper-format artifacts (results.dat with X cells)."""
 
+import json
+
 import pytest
 
 from boxy import plotting, results
@@ -232,17 +234,66 @@ def test_legend_enriches_old_results_with_accelerator():
     '<accel>: cluster/name' — inferred from the serving image recorded in
     backend_detail. Unknown images stay untouched."""
     old = dict(TWO[0])
-    old["label"] = "eldorado/boxy-llama-3.2-1b-instruct"
+    old["label"] = "clusterb/boxy-llama-3.2-1b-instruct"
     old["accelerator"] = ""
     old["backend_detail"] = ("benchmark inside the serving image "
-                             "docker.io/vllm/vllm-openai-rocm via podman on eldorado (agentless)")
-    assert results.display_label(old) == "rocm: eldorado/boxy-llama-3.2-1b-instruct"
+                             "docker.io/vllm/vllm-openai-rocm via podman on clusterb (agentless)")
+    assert results.display_label(old) == "rocm: clusterb/boxy-llama-3.2-1b-instruct"
     s = plotting.throughput_series([old])
-    assert s[0].label == "rocm: eldorado/boxy-llama-3.2-1b-instruct"
+    assert s[0].label == "rocm: clusterb/boxy-llama-3.2-1b-instruct"
     plain = dict(TWO[0])
     plain["accelerator"] = ""
     plain["backend_detail"] = "vllm-bench binary on somewhere"
     assert ":" not in results.display_label(plain).split("/")[0]
+
+
+def test_legend_never_guesses_across_clusters(tmp_path, monkeypatch):
+    """Field regression: the SAME instance name served later on another cluster
+    overwrote the laptop-side record, and the clusterb (ROCm) result relabeled
+    itself 'cuda' from clusterc's record. A serve record may only inform the
+    label when its target sits on the cluster the result was measured on."""
+    jobsdir = tmp_path / "jobs"
+    jobsdir.mkdir()
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(jobsdir))
+    (jobsdir / "boxy-llama.json").write_text(json.dumps({
+        "name": "boxy-llama", "target": "user1@clusterc-login",
+        "image": "docker.io/vllm/vllm-openai:v0.9.1", "accelerator": "cuda",
+        "gpu_type": "h100"}))
+    env = dict(TWO[0])
+    env.update(label="clusterb/boxy-llama", instance="boxy-llama",
+               accelerator="", gpu_type="", backend_detail="")
+    lbl = results.display_label(env)
+    assert "cuda" not in lbl and "h100" not in lbl
+    # the result's OWN cluster's record is authoritative — and the GPU model
+    # (mi300a) outranks the family (rocm)
+    (jobsdir / "boxy-llama.json").write_text(json.dumps({
+        "name": "boxy-llama", "target": "user1@clusterb-login",
+        "image": "docker.io/vllm/vllm-openai-rocm", "accelerator": "rocm",
+        "gpu_type": "mi300a"}))
+    assert results.display_label(env) == "mi300a: clusterb/boxy-llama"
+
+
+def test_legend_reads_gpu_model_from_system_card(tmp_path, monkeypatch):
+    """Sites whose scheduler doesn't label GPU types can pin gpu_type in the
+    cluster's system card (~/.config/boxy/cards/systems/) — the legend reads
+    it when neither the envelope nor a same-cluster record names the model."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    sysdir = tmp_path / "cfg" / "boxy" / "cards" / "systems"
+    sysdir.mkdir(parents=True)
+    (sysdir / "clusterb.toml").write_text(
+        '[location]\nname = "clusterb"\n\n[location.resources]\n'
+        'gpus_per_node = 4\ngpu_type = "AMD Instinct MI300A APU"\n')
+    env = dict(TWO[0])
+    env.update(label="clusterb/boxy-llama", instance="",
+               accelerator="", gpu_type="", backend_detail="")
+    assert results.display_label(env) == "mi300a: clusterb/boxy-llama"
+
+
+def test_legend_prefers_envelope_gpu_type():
+    env = dict(TWO[0])
+    env.update(label="clusterb/boxy-llama", instance="",
+               accelerator="rocm", gpu_type="mi300a", backend_detail="")
+    assert results.display_label(env) == "mi300a: clusterb/boxy-llama"
 
 
 def test_cache_kind_plots_hit_rate(tmp_path):

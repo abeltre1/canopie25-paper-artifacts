@@ -6090,6 +6090,18 @@ def _bench_agentless(args, rec: dict) -> int:
                                      metrics_sampler=_metrics_sampler)
     accel = rec.get("accelerator", "") or bench_backends.accel_from_image(image)
     gtype = rec.get("gpu_type", "")
+    if not gtype:
+        # ask the scheduler about the SERVING node itself — typed GRES or node
+        # Features name the model (mi300a/h100) at sites that label them
+        node = ep.get("host", "")
+        if node:
+            rc_g, gout = remote.ssh_capture(
+                target, f"scontrol show node {shlex.quote(node)} 2>/dev/null | "
+                        f"grep -iE 'gres|features'; "
+                        f"sinfo -N -n {shlex.quote(node)} -h -o '%G %f' 2>/dev/null",
+                timeout=20)
+            if rc_g == 0:
+                gtype = bench_backends.gpu_name_from_text(gout)
     prefix = gtype or accel
     ccluster = jobs.cluster_id(host)
     default_label = (f"{prefix}: {ccluster}/{rec['name']}" if prefix
@@ -6269,6 +6281,16 @@ def cmd_plot(args: argparse.Namespace) -> int:
             series = plotting.throughput_series(envelopes)
         elif kind == "cache":
             series = plotting.cache_series(envelopes)
+            if all(y is None for srs in series for y in srs.ys):
+                msg = ("no cache metrics in the selected result(s) — either the bench "
+                       "predates cache sampling (re-run `boxy bench` after updating), or "
+                       "the server exports no prefix-cache series: enable it at serve "
+                       "time with `boxy serve ... -- --enable-prefix-caching` (vLLM V1 "
+                       "engines have it on by default), then bench again")
+                if args.kind == "cache":
+                    raise UsageError(msg)
+                print(f"### cache figure skipped: {msg}")
+                continue
         elif kind == "latency":
             try:
                 series = plotting.latency_series(envelopes, args.metric, args.stat)

@@ -570,6 +570,39 @@ def test_agentless_bench_strips_transport_uri_from_model(agentless_setup, tmp_pa
            "--model hf://" not in calls
 
 
+def test_agentless_bench_names_gpu_model_from_node(agentless_setup, tmp_path, monkeypatch, capfd):
+    """The serving node's typed GRES / Features (scontrol over the ssh master)
+    name the GPU MODEL — the stored envelope and label carry mi300a, not just
+    the rocm family (field: 'cuda' on an MI300A cluster was unacceptable)."""
+    from boxy.cli import main
+
+    block = STDOUT_BLOCK.replace("\n", "\\n").replace('"', '\\"')
+    log = tmp_path / "ssh-calls.log"
+    _shim(tmp_path, monkeypatch, "ssh", f'''
+        echo "$@" >> {log}
+        case "$*" in
+          *"test -x"*)     exit 1 ;;
+          *scontrol*)      echo "   Gres=gpu:mi300a:4  AvailableFeatures=amd,apu" ;;
+          *cat*endpoint*)  printf '{{"name": "boxy-llama", "host": "cbnode7", "port": 8000,
+                                     "url": "http://cbnode7:8000", "ready": true,
+                                     "model": "org/llama-x"}}\\n' ;;
+          *"command -v podman"*) echo /usr/bin/podman ;;
+          *"image exists"*) echo PRESENT ;;
+          *podman*run*)    printf "%b" "{block}\\n" ;;
+          *)               exit 0 ;;
+        esac
+    ''')
+    rc = main(["bench", "--batch-sizes", "1", "--max-tokens", "8"])
+    assert rc == 0
+    assert "1059.3 tok/s" in capfd.readouterr().out
+    from boxy import results as res
+
+    listing = res.list_results()
+    assert listing[0][1]["gpu_type"] == "mi300a"
+    assert listing[0][1]["label"] == "mi300a: clustera/boxy-llama"
+    assert res.display_label(listing[0][1]) == "mi300a: clustera/boxy-llama"
+
+
 def test_served_model_id_helper():
     assert bb.served_model_id("hf://meta-llama/Llama-3.2-1B-Instruct") == \
         "meta-llama/Llama-3.2-1B-Instruct"
@@ -577,6 +610,46 @@ def test_served_model_id_helper():
     assert bb.served_model_id("meta-llama/Llama-3.2-1B-Instruct") == \
         "meta-llama/Llama-3.2-1B-Instruct"
     assert bb.served_model_id("") == ""
+
+
+def test_gpu_name_from_text_tokens():
+    assert bb.gpu_name_from_text("Gres=gpu:mi300a:4") == "mi300a"
+    assert bb.gpu_name_from_text("NodeName=n7 AvailableFeatures=amd,MI300A,apu") == "mi300a"
+    assert bb.gpu_name_from_text("gpu:h100:8(S:0-1)") == "h100"
+    assert bb.gpu_name_from_text("NVIDIA H100 80GB HBM3") == "h100"
+    assert bb.gpu_name_from_text("sha100x") == ""          # boundaries: no substring hits
+    assert bb.gpu_name_from_text("plain cuda node, no model") == ""
+    assert bb.gpu_name_from_text("") == ""
+
+
+def test_auto_num_prompts_scales_with_concurrency():
+    """Field: the 1000-prompt cap starved the 1024-concurrency level (fewer
+    prompts than requested in-flight requests) and read as a scaling wall."""
+    assert bb.auto_num_prompts(1) == 32
+    assert bb.auto_num_prompts(64) == 640
+    assert bb.auto_num_prompts(256) == 1000                # legacy cap unchanged
+    assert bb.auto_num_prompts(512) == 1536                # cap scales: 3x the level
+    assert bb.auto_num_prompts(1024) == 3072
+
+
+def test_run_series_prompt_pool_holds_top_concurrency():
+    seen = []
+
+    class Cap(bb.BenchBackend):
+        name = "cap"
+
+        def run_level(self, spec):
+            seen.append((spec.concurrency, spec.num_prompts))
+            return {"max_concurrency": spec.concurrency, "status": "ok"}
+
+    base = bb.BenchSpec(url="http://x:1", model="m", concurrency=0, num_prompts=0, max_tokens=4)
+    bb.run_series(Cap(), base, [256, 1024], progress=lambda *_: None)
+    assert seen == [(256, 1000), (1024, 3072)]             # pool always >= the level
+    seen.clear()
+    explicit = bb.BenchSpec(url="http://x:1", model="m", concurrency=0,
+                            num_prompts=64, max_tokens=4)
+    bb.run_series(Cap(), explicit, [1024], progress=lambda *_: None)
+    assert seen == [(1024, 64)]                            # --num-prompts always wins
 
 
 def test_accel_from_image_heuristic():
@@ -640,3 +713,28 @@ def test_run_series_attaches_cache_hit_rate():
                          metrics_sampler=lambda: next(samples))
     assert recs[0]["prefix_cache_hit_rate"] == pytest.approx(30.0)
     assert recs[1]["prefix_cache_hit_rate"] == pytest.approx(80.0)
+
+
+def test_run_series_notes_missing_cache_series():
+    """A server with prefix caching disabled exports NO cache series; the sweep
+    must say so (with the serve-time fix) instead of silently attaching
+    nothing — field: an empty cache figure with zero explanation."""
+
+    class Fixed(bb.BenchBackend):
+        name = "fixed"
+
+        def run_level(self, spec):
+            return {"max_concurrency": spec.concurrency, "status": "ok",
+                    "output_throughput": 1.0, "completed": 4, "num_prompts": 4}
+
+    lines = []
+    base = bb.BenchSpec(url="http://x:1", model="m", concurrency=0, num_prompts=4, max_tokens=4)
+    bb.run_series(Fixed(), base, [1, 2], progress=lines.append,
+                  metrics_sampler=lambda: None)            # server exports nothing
+    assert any("--enable-prefix-caching" in ln for ln in lines)
+    lines.clear()
+    samples = iter([{"hits": 0.0, "queries": 0.0, "gauge": None},
+                    {"hits": 30.0, "queries": 100.0, "gauge": None}])
+    bb.run_series(Fixed(), base, [1], progress=lines.append,
+                  metrics_sampler=lambda: next(samples))   # rates present: no note
+    assert not any("--enable-prefix-caching" in ln for ln in lines)

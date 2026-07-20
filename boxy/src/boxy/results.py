@@ -181,32 +181,49 @@ def peak_output_throughput(envelope: dict) -> float:
 
 
 def display_label(envelope: dict) -> str:
-    """The label as shown in legends/listings: `<accelerator>: cluster/name`.
-    Older envelopes predate the accelerator field — enrich at display time
-    from the stored field, else infer it from the serving image recorded in
-    backend_detail, so existing results get the full legend without a re-run."""
-    label = envelope.get("label") or envelope.get("model", "run")
-    accel = envelope.get("gpu_type", "") or envelope.get("accelerator", "")
-    if not accel:
-        from boxy.bench_backends import accel_from_image
+    """The legend/listing label: `<gpu model or accel family>: cluster/name`.
+    Sources, most- to least-authoritative — and NEVER a cross-cluster guess
+    (field: a same-named serve on another cluster overwrote the record and
+    relabeled a ROCm result 'cuda'):
 
-        accel = accel_from_image(envelope.get("backend_detail", ""))
-    if envelope.get("instance"):
-        # the serve record for this instance (still on this machine) may know
-        # MORE than the stored envelope: the GPU MODEL (mi300a/h100) outranks
-        # the accelerator family, and old envelopes may lack both
+    1. the envelope's own gpu_type / accelerator,
+    2. the instance's serve record — only when its target matches the cluster
+       this result was measured on,
+    3. the cluster's SYSTEM CARD (generate once with `boxy generate system
+       --ssh <cluster>`, or hand-pin `gpu_type` there),
+    4. the serving image name (family only: rocm/cuda).
+    A GPU MODEL (mi300a/h100) always outranks a family (rocm/cuda)."""
+    from boxy.bench_backends import accel_from_image, gpu_name_from_text
+
+    label = envelope.get("label") or envelope.get("model", "run")
+    base = label.split(": ", 1)[-1]
+    label_cluster = base.split("/", 1)[0] if "/" in base else ""
+    model_name = envelope.get("gpu_type", "")
+    family = envelope.get("accelerator", "")
+    if envelope.get("instance") and not model_name:
         from boxy import jobs
 
         rec = jobs.read_record(envelope["instance"]) or {}
-        better = rec.get("gpu_type", "")
-        if better:
-            accel = better
-        elif not accel:
-            accel = rec.get("accelerator", "") or accel_from_image(rec.get("image", ""))
-    if not accel:
-        return label
-    if label.startswith(f"{accel} - "):          # the short-lived dash format
-        return f"{accel}: " + label[len(accel) + 3:]
-    if label.lower().startswith(f"{accel}:"):
-        return label
-    return f"{accel}: {label}"
+        rec_cluster = (jobs.cluster_id(rec.get("target", "").split("@")[-1])
+                       if rec.get("target") else "")
+        if rec and label_cluster and rec_cluster == label_cluster:
+            model_name = rec.get("gpu_type", "")
+            family = family or rec.get("accelerator", "") or accel_from_image(rec.get("image", ""))
+    if not model_name and label_cluster:
+        try:
+            from boxy import cards
+
+            match = cards._match_system_card(label_cluster)
+            if match:
+                card_text = match[0]
+                m = re.search(r'gpu_type\s*=\s*"([^"]+)"', card_text)
+                model_name = (gpu_name_from_text(m.group(1)) if m
+                              else gpu_name_from_text(card_text))
+        except Exception:  # noqa: BLE001 — a broken card must never break a listing
+            model_name = ""
+    if not family:
+        family = accel_from_image(envelope.get("backend_detail", ""))
+    prefix = model_name or family
+    if not prefix:
+        return base if base != label else label
+    return f"{prefix}: {base}"
