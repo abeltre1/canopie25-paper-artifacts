@@ -162,7 +162,7 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
                  "downloads it."),
     Setting("urls.vllm_bench",
             "BOXY_VLLM_BENCH_URL",
-            "https://github.com/vllm-project/vllm-bench/releases/latest/download/vllm-bench-{arch}-unknown-linux-musl",
+            "https://github.com/vllm-project/vllm-bench/releases/latest/download/vllm-bench-{arch}-linux-musl",
             help="download URL for the static vllm-bench binary ({arch} = x86_64|aarch64); "
                  "point at an internal mirror on air-gapped sites."),
     Setting("datasets.sharegpt_url",
