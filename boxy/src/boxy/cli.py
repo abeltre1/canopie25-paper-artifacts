@@ -3152,9 +3152,14 @@ def _serve_agentless_ssh(args, target: str) -> int:
         return 1
     job_id = scheduler.parse_job_id(out)
     print(f"### Submitted {scheduler_name} job {job_id}  ({name})")
+    # the record carries the SERVING IMAGE so `boxy bench` can later run the
+    # benchmark inside that same image on the cluster — agentless, no installs
+    record_image = box.image or ramalama_shim.default_image(
+        box.engine, getattr(args, "accelerator", "") or "")
     jobs.write_record(name, {"name": name, "scheduler": scheduler_name, "job": job_id,
                              "model": args.model, "submitted_from": "agentless-ssh",
-                             "target": target, "endpoint_remote": ep_remote, "log": log_remote})
+                             "target": target, "endpoint_remote": ep_remote, "log": log_remote,
+                             "image": record_image, "engine": box.engine})
 
     # 9) poll the shared-FS endpoint file over the master; the moment it names the
     #    compute node, hand off to the tunnel + localhost/health readiness.
@@ -5764,13 +5769,14 @@ def cmd_bench(args: argparse.Namespace) -> int:
     the newest live instance's endpoint from the job records; NAME picks one;
     --ssh runs the bench ON the cluster (where compute-node hostnames resolve);
     --url / legacy --box pin the endpoint explicitly."""
-    rc = _delegate_remote(args)
-    if rc is not None:
-        return rc
-
     from boxy import bench, bench_backends, engines
 
     if getattr(args, "fetch_backend", False):
+        from boxy import remote as _remote
+
+        target = _remote.resolve_target(args)
+        if target and not os.environ.get(_remote.ENV_ACTIVE):
+            return _fetch_backend_remote(args, target)
         if args.dryrun:
             print(f"### Would download the vllm-bench static binary to "
                   f"{bench_backends._store_bin_dir() / 'vllm-bench'} "
@@ -5779,6 +5785,23 @@ def cmd_bench(args: argparse.Namespace) -> int:
         dest = bench_backends.fetch_vllm_bench()
         print(f"### vllm-bench installed: {dest}  (auto backend now prefers it)")
         return 0
+
+    # Agentless-served instances (the --ssh serve default) have NO record on the
+    # cluster — delegation can't find them, and the laptop has no local endpoint.
+    # Bench them AGENTLESSLY too, BEFORE delegation: the benchmark runs inside
+    # the serving image on the login node over the same ssh master (nothing
+    # installed on the HPC), results land in the laptop's store.
+    if not args.url and not args.box and not os.environ.get("BOXY_REMOTE_ACTIVE"):
+        from boxy import remote
+
+        arec = _agentless_bench_candidate(getattr(args, "name", None),
+                                          remote.resolve_target(args))
+        if arec is not None:
+            return _bench_agentless(args, arec)
+
+    rc = _delegate_remote(args)
+    if rc is not None:
+        return rc
 
     instance = ""
     if args.url:
@@ -5871,6 +5894,161 @@ def cmd_bench(args: argparse.Namespace) -> int:
             instance=instance, label=getattr(args, "label", "") or "",
             dataset=dkind, seed=0, max_tokens=args.max_tokens,
             geometry={k: record[k] for k in ("nodes", "gpus") if record.get(k)})
+        path = results.write_result(envelope)
+        print(f"### Result saved: {path}   (list: boxy results; plot: boxy plot)")
+        if getattr(args, "plot", False):
+            _plot_after_bench(envelope, path)
+    return 0
+
+
+def _fetch_backend_remote(args, target: str) -> int:
+    """`boxy bench --fetch-backend --ssh <cluster>`: install the vllm-bench
+    static Linux binary ON the cluster, agentlessly — a curl over the live ssh
+    master into the cluster-side boxy store. No cluster boxy involved (the
+    delegated form died on clusters whose checkout predates the flag)."""
+    from boxy import remote
+
+    if remote.ensure_master(target) != 0:
+        print(f"boxy: could not open an SSH session to {target}", file=sys.stderr)
+        return 1
+    rc, arch_out = remote.ssh_capture(target, "uname -m", timeout=15)
+    arch = {"x86_64": "x86_64", "amd64": "x86_64",
+            "aarch64": "aarch64", "arm64": "aarch64"}.get(arch_out.strip().lower(), "x86_64")
+    url = config.get("urls.vllm_bench").format(arch=arch)
+    dest = "$HOME/.local/share/boxy/store/bin/vllm-bench"
+    pfx = config.get("network.proxy")
+    env = f"https_proxy={shlex.quote(pfx)} http_proxy={shlex.quote(pfx)} " if pfx else ""
+    cmd = (f"mkdir -p $HOME/.local/share/boxy/store/bin && "
+           f"({env}curl -fsSL {shlex.quote(url)} -o {dest} || "
+           f"{env}wget -q {shlex.quote(url)} -O {dest}) && chmod +x {dest} && echo FETCHED")
+    if args.dryrun:
+        print(f"### Would install vllm-bench on {target} ({arch}): {cmd}")
+        return 0
+    print(f"### Fetching vllm-bench on {target} ({arch}) ...")
+    rc, out = remote.ssh_capture(target, cmd, timeout=600)
+    if rc != 0 or "FETCHED" not in out:
+        tail = out.strip().splitlines()[-3:]
+        print(f"boxy: fetch failed on {target}: {' | '.join(tail) or 'no output'} — "
+              f"the cluster may need its own proxy (set network.proxy), or mirror "
+              f"urls.vllm_bench and re-run; you can also place the binary at "
+              f"~/.local/share/boxy/store/bin/vllm-bench there by hand.", file=sys.stderr)
+        return 1
+    print(f"### vllm-bench installed on {target}: ~/.local/share/boxy/store/bin/vllm-bench")
+    return 0
+
+
+def _agentless_bench_candidate(name: str | None, target: str | None) -> dict | None:
+    """The agentless-ssh record to bench, if that's what this invocation means.
+    Named: that record if it is agentless (else None — the normal path errors
+    with its usual messages). Unnamed: agentless records for the --ssh target
+    (or any, when no target) — but only when nothing is serving LOCALLY, so a
+    laptop with a live local serve keeps today's behavior. Ambiguity names the
+    choices."""
+    from boxy import jobs
+
+    ags = [r for r in jobs.list_records()
+           if r.get("submitted_from") == "agentless-ssh" and r.get("target")
+           and r.get("endpoint_remote")]
+    if name:
+        ags = [r for r in ags if r.get("name") == name]
+        return ags[0] if ags else None
+    if target:
+        thost = target.split("@")[-1]
+        ags = [r for r in ags if r["target"].split("@")[-1] == thost]
+        if not ags:
+            return None                      # delegated-serve case: fall through
+    else:
+        local_live = any(jobs.read_endpoint(n)
+                         for r in jobs.list_records()
+                         for n in [r.get("name", ""), *r.get("replicas", [])] if n)
+        if local_live or not ags:
+            return None
+    if len(ags) > 1:
+        raise UsageError("several agentless instances — pick one: boxy bench "
+                         + " | ".join(sorted(r["name"] for r in ags)))
+    return ags[0]
+
+
+def _bench_agentless(args, rec: dict) -> int:
+    """Benchmark an agentless-served model with NOTHING installed on the HPC:
+    the benchmark runs inside the SERVING IMAGE on the login node (over the
+    live ssh master), against the compute-node endpoint directly — no tunnel,
+    no cluster boxy. The parsed result lands in the laptop's results store."""
+    import json as _json
+
+    from boxy import bench, bench_backends, jobs, remote, results
+
+    target = rec["target"]
+    host = target.split("@")[-1]
+    try:
+        batch_sizes = ([int(b) for b in args.batch_sizes.split(",")]
+                       if args.batch_sizes else bench.DEFAULT_BATCH_SIZES)
+    except ValueError:
+        raise UsageError(f"--batch-sizes must be a comma-separated list of integers, "
+                         f"got {args.batch_sizes!r}") from None
+    image = getattr(args, "image", None) or rec.get("image", "")
+    if not image:
+        raise UsageError(
+            f"{rec['name']}: the serve record carries no image (served by an older boxy) — "
+            f"pass --image <the serving image> once, or re-serve with the current boxy")
+    if args.dataset and args.dataset not in ("random",):
+        raise UsageError("the agentless bench supports --dataset random for now (the corpus "
+                         "would have to be staged on the cluster) — omit --dataset, or bench "
+                         "via a tunnel with --url for file datasets")
+    if args.dryrun:
+        print(f"### Agentless bench plan: {rec['name']} on {host} — benchmark inside "
+              f"{image} on the login node, levels {batch_sizes}, endpoint from "
+              f"{rec['endpoint_remote']}")
+        return 0
+    if remote.ensure_master(target) != 0:
+        print(f"boxy: could not open an SSH session to {target}", file=sys.stderr)
+        return 1
+    rc, epj = remote.ssh_capture(
+        target, f"cat {shlex.quote(rec['endpoint_remote'])} 2>/dev/null || true", timeout=15)
+    ep = None
+    if rc == 0 and epj.strip():
+        try:
+            ep = _json.loads(epj)
+        except ValueError:
+            ep = None
+    if not (ep and ep.get("url")):
+        raise UsageError(f"{rec['name']}: no endpoint on {host} yet — the job may still be "
+                         f"pending (see boxy list)")
+    rc2, rt = remote.ssh_capture(target, "command -v podman || command -v docker", timeout=15)
+    runtime = os.path.basename(rt.strip().splitlines()[0]) if rc2 == 0 and rt.strip() else ""
+    if not runtime:
+        raise UsageError(f"no container runtime on {host}'s login node — the agentless bench "
+                         f"runs the benchmark inside the serving image there. Alternatives: "
+                         f"`boxy bench --fetch-backend` on the login node, or bench through a "
+                         f"tunnel with --url")
+    backend = bench_backends.VllmContainerRemote(image, runtime, target)
+    why = f"benchmark inside the serving image {image} via {runtime} on {host} (agentless)"
+    print(f"  auto: bench backend: vllm-container ({why})")
+    model = rec.get("model", "") or ep.get("model", "")
+    base = bench_backends.BenchSpec(
+        url=ep["url"], model=model, concurrency=0,
+        num_prompts=getattr(args, "num_prompts", 0) or 0,
+        max_tokens=args.max_tokens, dataset_kind="random", dataset_path=None,
+        seed=getattr(args, "seed", None) or config.get("bench.seed"),
+        image=image, runtime=runtime)
+    print(f"### Benchmarking {model or rec['name']} at {ep['url']} — "
+          f"{len(batch_sizes)} concurrency levels (on {host})")
+    runs = bench_backends.run_series(backend, base, batch_sizes)
+    envelope = results.make_envelope(
+        url=ep["url"], model=model, backend="vllm-container", backend_detail=why, runs=runs,
+        instance=rec["name"],
+        label=getattr(args, "label", "") or f"{jobs.cluster_id(host)}/{rec['name']}",
+        dataset="random", seed=base.seed, max_tokens=args.max_tokens,
+        geometry={k: rec[k] for k in ("nodes", "gpus") if rec.get(k)})
+    if args.json:
+        print(_json.dumps(envelope, indent=1))
+    else:
+        _print_bench_table(envelope)
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(results.to_csv(envelope))
+        print(f"wrote {args.output}")
+    if not getattr(args, "no_save", False):
         path = results.write_result(envelope)
         print(f"### Result saved: {path}   (list: boxy results; plot: boxy plot)")
         if getattr(args, "plot", False):

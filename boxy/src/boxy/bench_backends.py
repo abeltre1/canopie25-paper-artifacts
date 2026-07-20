@@ -410,6 +410,33 @@ class VllmContainer(BenchBackend):
                 "error": f"exit {proc.returncode}: " + " | ".join(tail)}
 
 
+class VllmContainerRemote(VllmContainer):
+    """The container backend executed on a REMOTE login node over boxy's live
+    ssh master — the fully AGENTLESS bench: nothing installed on the HPC, the
+    already-pulled serving image provides the benchmark, and the stdout result
+    block is parsed laptop-side. The login node reaches the compute-node
+    endpoint directly, so no tunnel is involved."""
+    name = "vllm-container"
+
+    def __init__(self, image: str, runtime: str, target: str):
+        super().__init__(image, runtime)
+        self.target = target
+
+    def run_level(self, spec: BenchSpec) -> dict:
+        import shlex
+
+        from boxy import remote
+
+        cmd = self.render_command(spec)
+        rc, out = remote.ssh_capture(self.target, shlex.join(cmd), timeout=3600)
+        parsed = parse_stdout_block(out, spec.concurrency)
+        if parsed:
+            return parsed
+        tail = out.strip().splitlines()[-3:]
+        return {"max_concurrency": spec.concurrency, "status": "error",
+                "error": f"remote exit {rc}: " + " | ".join(tail)}
+
+
 def pick_backend(requested: str, *, image: str = "", runtime: str = "",
                  fleet: bool = False) -> tuple[BenchBackend, str]:
     """Resolve --backend/config bench.backend to a working backend + the

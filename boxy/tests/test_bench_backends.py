@@ -374,3 +374,114 @@ def test_fetch_download_failure_names_proxy(monkeypatch, tmp_path):
     monkeypatch.setattr("boxy.cardgen._opener", lambda: FailOpener())
     with pytest.raises(RuntimeError, match="network.proxy"):
         bb.fetch_vllm_bench()
+
+
+# ---------- the agentless bench (cluster-side zero install) ----------
+
+@pytest.fixture()
+def agentless_setup(tmp_path, monkeypatch):
+    """A laptop-side agentless serve record + a fake ssh that answers the
+    endpoint cat and runs the 'podman' benchmark, emitting the real stdout
+    block — the exact cluster-side zero-install flow."""
+    import socket
+
+    jobsdir = tmp_path / "jobs"
+    jobsdir.mkdir()
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(jobsdir))
+    monkeypatch.setenv("BOXY_RESULTS_DIR", str(tmp_path / "res"))
+    (jobsdir / "boxy-llama.json").write_text(json.dumps({
+        "name": "boxy-llama", "scheduler": "slurm", "job": "77", "model": "org/llama-x",
+        "submitted_from": "agentless-ssh", "target": "user1@clustera-login",
+        "endpoint_remote": "/rhome/.boxy/boxy-llama.endpoint.json",
+        "image": "docker.io/rocm/vllm:6.4", "engine": "vllm"}))
+    block = STDOUT_BLOCK.replace("\n", "\\n").replace('"', '\\"')
+    log = tmp_path / "ssh-calls.log"
+    _shim(tmp_path, monkeypatch, "ssh", f'''
+        echo "$@" >> {log}
+        case "$*" in
+          *cat*endpoint*)  printf '{{"name": "boxy-llama", "host": "cbnode7", "port": 8000,
+                                     "url": "http://cbnode7:8000", "ready": true,
+                                     "model": "org/llama-x"}}\\n' ;;
+          *"command -v podman"*) echo /usr/bin/podman ;;
+          *podman*run*)    printf "%b" "{block}\\n" ;;
+          *)               exit 0 ;;
+        esac
+    ''')
+    monkeypatch.setattr(socket, "gethostname", lambda: "laptop-mac")
+    return tmp_path, log
+
+
+def test_agentless_bench_end_to_end(agentless_setup, capfd):
+    """`boxy bench` with only an agentless record: container backend runs on
+    the login node over ssh, block parsed, result stored laptop-side."""
+    from boxy.cli import main
+
+    tmp_path, log = agentless_setup
+    rc = main(["bench", "--batch-sizes", "1,2", "--max-tokens", "8"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "auto: bench backend: vllm-container" in out and "agentless" in out
+    assert "1059.3 tok/s" in out                             # parsed from the block
+    assert "### Result saved:" in out
+    calls = log.read_text()
+    assert "podman" in calls and "rocm/vllm:6.4" in calls
+    assert "--network=host" in calls and "no_proxy=cbnode7" in calls
+    from boxy import results
+
+    listing = results.list_results()
+    assert listing and listing[0][1]["bench_backend"] == "vllm-container"
+    assert listing[0][1]["label"] == "clustera/boxy-llama"
+    assert listing[0][1]["instance"] == "boxy-llama"
+
+
+def test_agentless_bench_with_matching_ssh_flag(agentless_setup, capfd):
+    """--ssh to the same cluster prefers the agentless path over delegation
+    (the cluster has no record of an agentless serve)."""
+    from boxy.cli import main
+
+    rc = main(["bench", "--ssh", "user1@clustera-login", "--batch-sizes", "1",
+               "--max-tokens", "8"])
+    out = capfd.readouterr().out
+    assert rc == 0 and "auto: bench backend: vllm-container" in out
+
+
+def test_agentless_bench_dryrun(agentless_setup, capfd):
+    from boxy.cli import main
+
+    rc = main(["bench", "--dryrun"])
+    out = capfd.readouterr().out
+    assert rc == 0 and "Agentless bench plan" in out and "rocm/vllm:6.4" in out
+
+
+def test_agentless_bench_old_record_without_image(agentless_setup, tmp_path, capfd):
+    from boxy.cli import main
+
+    jobsdir = tmp_path / "jobs"
+    rec = json.loads((jobsdir / "boxy-llama.json").read_text())
+    del rec["image"]
+    (jobsdir / "boxy-llama.json").write_text(json.dumps(rec))
+    rc = main(["bench", "boxy-llama"])
+    err = capfd.readouterr().err
+    assert rc != 0 and "--image" in err and "older boxy" in err
+
+
+def test_fetch_backend_over_ssh_is_agentless(tmp_path, monkeypatch, capfd):
+    """--fetch-backend --ssh installs the binary ON the cluster via curl over
+    the master — never by delegating to a (possibly ancient) cluster boxy."""
+    from boxy.cli import main
+
+    log = tmp_path / "ssh-calls.log"
+    _shim(tmp_path, monkeypatch, "ssh", f'''
+        echo "$@" >> {log}
+        case "$*" in
+          *"uname -m"*) echo x86_64 ;;
+          *curl*)       echo FETCHED ;;
+          *)            exit 0 ;;
+        esac
+    ''')
+    rc = main(["bench", "--fetch-backend", "--ssh", "user1@clustera-login"])
+    out = capfd.readouterr().out
+    assert rc == 0 and "vllm-bench installed on user1@clustera-login" in out
+    calls = log.read_text()
+    assert "curl" in calls and "chmod +x" in calls
+    assert "boxy bench" not in calls                        # no delegation involved

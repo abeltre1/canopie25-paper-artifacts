@@ -74,12 +74,33 @@ binary at `<store>/bin/vllm-bench` by hand, or carry it with
 
 ## 3. Benchmarks from anywhere
 
-**On the cluster over SSH** (the bench runs cluster-side, where compute-node
-hostnames resolve):
+**An agentless-served model** (the `--ssh` serve default) — the bench is
+agentless too. boxy finds the serve record on your laptop, runs the benchmark
+**inside the serving image on the login node** over the same SSH session, and
+stores the parsed result laptop-side. No boxy, binary, or anything else on the
+cluster:
 
 ```console
-$ boxy bench --ssh user1@clustera
+$ boxy bench                      # or: boxy bench --ssh user1@clustera / boxy bench NAME
+  auto: bench backend: vllm-container (benchmark inside the serving image
+        docker.io/rocm/vllm:… via podman on clustera — agentless)
+###   concurrency 1: 76.5 tok/s (32/32 ok)
+    …
+### Result saved: ~/.local/share/boxy/results/…   (list: boxy results; plot: boxy plot)
 ```
+
+(Models served by an older boxy have no image in their record — pass
+`--image <the serving image>` once; new serves record it automatically.)
+
+**Install the vllm-bench binary ON a cluster** — also agentless (a curl over
+the SSH master; never delegated to the cluster's own boxy):
+
+```console
+$ boxy bench --fetch-backend --ssh user1@clustera
+```
+
+**A delegated-serve instance** (`--delegate`): `boxy bench --ssh user1@clustera`
+runs the bench via the cluster's boxy — keep that checkout current.
 
 **A secured k8s/OpenShift ingress** (vLLM behind `--api-key` — this scripts
 what the paper did by hand for its OpenShift columns):
