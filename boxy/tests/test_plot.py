@@ -307,3 +307,51 @@ def test_cache_kind_plots_hit_rate(tmp_path):
     pytest.importorskip("matplotlib")
     out = plotting.render("cache", s, tmp_path / "c.png")
     assert out.exists()
+
+
+def test_cache_kind_renders_grouped_bars(tmp_path):
+    """Hit rates cluster near 100% and overlapping lines were unreadable
+    (field) — the cache figure draws grouped BARS on a full 0..100 axis; a
+    level without the metric has no bar."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    env = dict(TWO[1])
+    env["runs"] = [dict(r, prefix_cache_hit_rate=50.0) for r in env["runs"]]
+    partial = dict(TWO[1])                     # one level lacks the metric
+    partial["runs"] = ([dict(r, prefix_cache_hit_rate=99.0) for r in env["runs"][:3]]
+                       + [dict(env["runs"][3])])
+    partial["runs"][3].pop("prefix_cache_hit_rate", None)
+    captured = {}
+    orig = plt.subplots
+
+    def spy(*a, **k):
+        fig, ax = orig(*a, **k)
+        captured["ax"] = ax
+        return fig, ax
+
+    plt.subplots = spy
+    try:
+        plotting.render("cache", plotting.cache_series([env, partial]), tmp_path / "c.png")
+    finally:
+        plt.subplots = orig
+    ax = captured["ax"]
+    assert len(ax.patches) == 7                # 4 bars + 3 bars (missing level gaps)
+    assert ax.get_ylim() == (0.0, 105.0)
+    assert [t.get_text() for t in ax.get_xticklabels()] == ["1", "2", "4", "1024"]
+
+
+def test_duplicate_overlay_labels_get_run_stamps():
+    """Overlaying two results of the SAME instance must not draw two identical
+    legend entries (field: twin 'h200: ...' lines nobody could tell apart)."""
+    a = _env("clusterc/run1", {1: 70.0})
+    b = _env("clusterc/run1", {1: 75.0})
+    a["created"] = "2026-07-19T09:00:00Z"
+    b["created"] = "2026-07-20T14:10:02Z"
+    s = plotting.throughput_series([a, b])
+    assert s[0].label != s[1].label
+    assert s[0].label.endswith("[2026-07-19 09:00:00]")
+    assert s[1].label.endswith("[2026-07-20 14:10:02]")
+    lone = plotting.throughput_series([a])     # no duplicate -> no stamp
+    assert lone[0].label == "clusterc/run1"

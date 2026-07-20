@@ -56,12 +56,30 @@ def _metric_key(metric: str, stat: str) -> str:
                          f"{'|'.join(_METRIC_KEY)}, stat one of {'|'.join(_STAT_PREFIX)}") from None
 
 
-def _series(envelopes: list[dict], value_key: str) -> list[Series]:
+def _display_labels(envelopes: list[dict]) -> list[str]:
+    """Legend labels, disambiguated: overlaying two results of the SAME
+    instance (a before/after rerun) must not draw two identical legend entries
+    nobody can tell apart (field: twin 'h200: ...' lines) — repeats get the
+    run's creation stamp appended."""
     from boxy import results as _results
 
+    labels = [_results.display_label(e) for e in envelopes]
+    dup = {lbl for lbl in labels if labels.count(lbl) > 1}
+    out, nth = [], {}
+    for lbl, env in zip(labels, envelopes):
+        if lbl in dup:
+            nth[lbl] = nth.get(lbl, 0) + 1
+            stamp = (env.get("created") or "").replace("T", " ").removesuffix("Z")
+            out.append(f"{lbl} [{stamp or f'run {nth[lbl]}'}]")
+        else:
+            out.append(lbl)
+    return out
+
+
+def _series(envelopes: list[dict], value_key: str) -> list[Series]:
     out = []
-    for env in envelopes:
-        s = Series(label=_results.display_label(env))
+    for env, label in zip(envelopes, _display_labels(envelopes)):
+        s = Series(label=label)
         for run in env.get("runs", []):
             s.xs.append(int(run.get("max_concurrency", 0)))
             s.ys.append(float(run[value_key]) if run.get("status") == "ok"
@@ -88,11 +106,9 @@ def cache_series(envelopes: list[dict]) -> list[Series]:
 def frontier_series(envelopes: list[dict]) -> list[Series]:
     """Latency-throughput frontier: one point per level — x = output tok/s,
     y = median E2E latency. (xs carry throughputs here, not concurrency.)"""
-    from boxy import results as _results
-
     out = []
-    for env in envelopes:
-        s = Series(label=_results.display_label(env))
+    for env, label in zip(envelopes, _display_labels(envelopes)):
+        s = Series(label=label)
         for run in env.get("runs", []):
             if run.get("status") != "ok":
                 continue
@@ -130,7 +146,23 @@ def render(kind: str, series: list[Series], out: Path, fmt: str = "png",
         raise RuntimeError("plotting needs matplotlib: pip install 'boxy-hpc[plot]' — "
                            "or use `boxy plot --emit gnuplot` (no python deps)") from None
     fig, ax = plt.subplots(figsize=(10, 6))
-    for idx, s in enumerate(series):
+    if kind == "cache":
+        # hit rates cluster near 100% — lines overlap into one unreadable band
+        # (field). Grouped bars on a full 0..100 axis show each level's rate
+        # per series; a level without the metric simply has no bar.
+        levels = sorted({x for s in series for x in s.xs})
+        pos = {x: i for i, x in enumerate(levels)}
+        width = 0.8 / max(1, len(series))
+        for idx, s in enumerate(series):
+            xs = [pos[x] + (idx - (len(series) - 1) / 2) * width
+                  for x, y in zip(s.xs, s.ys) if y is not None]
+            ys = [y for y in s.ys if y is not None]
+            ax.bar(xs, ys, width=width * 0.92, color=MPL_COLORS[idx % len(MPL_COLORS)],
+                   label=s.label)
+        ax.set_xticks(range(len(levels)), [str(x) for x in levels])
+        ax.set_ylim(0, 105)
+        logx2 = False                              # categorical positions, not values
+    for idx, s in enumerate(series if kind != "cache" else []):
         series_color = MPL_COLORS[idx % len(MPL_COLORS)]
         if kind == "frontier":
             ax.plot(s.xs, s.ys, marker="o", linewidth=2.5, color=series_color, label=s.label)
@@ -171,7 +203,7 @@ def render(kind: str, series: list[Series], out: Path, fmt: str = "png",
                 ax.xaxis.set_minor_locator(FixedLocator([]))
     if title:
         ax.set_title(title)
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.3, axis="y" if kind == "cache" else "both")
     if ax.get_legend_handles_labels()[0]:
         ax.legend()
     fig.tight_layout()

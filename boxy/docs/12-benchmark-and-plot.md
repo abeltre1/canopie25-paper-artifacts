@@ -167,7 +167,7 @@ $ boxy plot                        # newest result → throughput-vs-concurrency
 $ boxy plot 1 2                    # OVERLAY two runs — compare clusters/configs
 $ boxy plot --kind latency --metric ttft --stat p99
 $ boxy plot --kind frontier        # latency vs throughput, one point per level
-$ boxy plot --kind cache           # prefix-cache hit rate (%) per level
+$ boxy plot --kind cache           # prefix-cache hit rate: grouped bars, 0-100%
 $ boxy plot --kind all -o ./figs/  # every figure the results support
 ```
 
