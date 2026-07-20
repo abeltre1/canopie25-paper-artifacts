@@ -50,6 +50,7 @@ class BenchSpec:
     max_tokens: int
     dataset_kind: str = "random"        # random | sharegpt | synthetic | file
     dataset_path: str | None = None
+    random_prefix_len: int = 0          # random only: shared-prefix tokens (cache hits)
     seed: int = 12345
     api_key: str = ""
     image: str = ""                     # vllm-container only
@@ -205,6 +206,46 @@ def ensure_sharegpt() -> Path:
     return dest
 
 
+def ensure_sharegpt_remote(target: str, progress=print) -> str:
+    """ShareGPT staged ON the cluster for the agentless bench: cached in the
+    cluster-side boxy store, downloaded once by the login node itself through
+    the site proxy (the --fetch-backend pattern — nothing rides the laptop
+    link). Returns the ABSOLUTE remote path: the container backend mounts its
+    dirname into podman, where a literal $HOME would never expand."""
+    import shlex
+
+    from boxy import config, remote
+
+    rc, home = remote.ssh_capture(target, "echo $HOME", timeout=15)
+    home = home.strip().splitlines()[-1] if rc == 0 and home.strip() else ""
+    if not home.startswith("/"):
+        raise RuntimeError(f"cannot resolve $HOME on {target} — is the ssh session live?")
+    dest = f"{home}/.local/share/boxy/store/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+    q = shlex.quote(dest)
+    rc, _ = remote.ssh_capture(target, f"test -s {q}", timeout=15)
+    if rc == 0:
+        return dest
+    url = config.get("datasets.sharegpt_url")
+    pfx = config.get("network.proxy")
+    env = f"https_proxy={shlex.quote(pfx)} http_proxy={shlex.quote(pfx)} " if pfx else ""
+    progress(f"### staging the ShareGPT corpus on {target} (~650 MB, cached after this once) ...")
+    cmd = (f"mkdir -p $(dirname {q}) && "
+           f"({env}curl -fsSL {shlex.quote(url)} -o {q}.part || "
+           f"{env}wget -q {shlex.quote(url)} -O {q}.part) && "
+           f"mv {q}.part {q} && echo BOXY_STAGED")
+    rc, out = remote.ssh_capture(target, cmd, timeout=3600)
+    if rc != 0 or "BOXY_STAGED" not in out:
+        remote.ssh_capture(target, f"rm -f {q}.part", timeout=15)
+        tail = " | ".join(out.strip().splitlines()[-3:]) or "no output"
+        raise RuntimeError(
+            f"could not stage ShareGPT on {target} ({tail}) — the cluster may need "
+            f"its own proxy (set network.proxy) or a datasets.sharegpt_url mirror; "
+            f"or pre-stage it by hand: `scp {dataset_cache_dir()}/"
+            f"ShareGPT_V3_unfiltered_cleaned_split.json {target}:{dest}` "
+            f"(the laptop copy comes from any local `boxy bench --dataset sharegpt`)")
+    return dest
+
+
 def resolve_dataset(arg: str | None, backend_name: str) -> tuple[str, str | None, str]:
     """(kind, path, provenance). Default keeps zero-flag turnkey: `random` for
     real backends (no download), the built-in prompts for synthetic."""
@@ -347,6 +388,10 @@ def _serve_flags(spec: BenchSpec) -> list[str]:
     if spec.dataset_kind in ("random", "synthetic"):
         flags += ["--dataset-name", "random",
                   "--random-output-len", str(spec.max_tokens)]
+        if spec.random_prefix_len > 0:
+            # shared prefix across all generated prompts: real prefix-cache
+            # hits with NO corpus staged — the quick cache test on clusters
+            flags += ["--random-prefix-len", str(spec.random_prefix_len)]
     elif spec.dataset_kind == "sharegpt":
         flags += ["--dataset-name", "sharegpt", "--dataset-path", spec.dataset_path or ""]
     else:

@@ -570,6 +570,95 @@ def test_agentless_bench_strips_transport_uri_from_model(agentless_setup, tmp_pa
            "--model hf://" not in calls
 
 
+def _sharegpt_shim(tmp_path, monkeypatch, log, *, staged: str, curl: str):
+    """The agentless fake ssh, extended with the ShareGPT staging answers:
+    staged/curl are shell snippets for the `test -s` and curl cases."""
+    block = STDOUT_BLOCK.replace("\n", "\\n").replace('"', '\\"')
+    _shim(tmp_path, monkeypatch, "ssh", f'''
+        echo "$@" >> {log}
+        case "$*" in
+          *"echo \\$HOME"*) echo /rhome ;;
+          *"test -s"*)     {staged} ;;
+          *curl*ShareGPT*) {curl} ;;
+          *"test -x"*)     exit 1 ;;
+          *cat*endpoint*)  printf '{{"name": "boxy-llama", "host": "cbnode7", "port": 8000,
+                                    "url": "http://cbnode7:8000", "ready": true,
+                                    "model": "org/llama-x"}}\\n' ;;
+          *"command -v podman"*) echo /usr/bin/podman ;;
+          *"image exists"*) echo PRESENT ;;
+          *podman*run*)    printf "%b" "{block}\\n" ;;
+          *)               exit 0 ;;
+        esac
+    ''')
+
+
+SHAREGPT_REMOTE = "/rhome/.local/share/boxy/store/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+
+
+def test_agentless_bench_stages_sharegpt(agentless_setup, tmp_path, monkeypatch, capfd):
+    """--dataset sharegpt on the agentless path: the login node downloads the
+    corpus itself (proxied curl, cached in the cluster-side store) and the
+    container mounts it — no more 'random only' refusal (field: clusterc)."""
+    from boxy.cli import main
+
+    log = tmp_path / "ssh-calls.log"
+    _sharegpt_shim(tmp_path, monkeypatch, log, staged="exit 1", curl="echo BOXY_STAGED")
+    rc = main(["bench", "--dataset", "sharegpt", "--batch-sizes", "1", "--max-tokens", "8"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "staging the ShareGPT corpus" in out
+    calls = log.read_text()
+    assert "--dataset-name sharegpt" in calls and SHAREGPT_REMOTE in calls
+    d = SHAREGPT_REMOTE.rsplit("/", 1)[0]
+    assert f"-v {d}:{d}:ro" in calls                        # mounted into the bench container
+    from boxy import results as res
+
+    assert res.list_results()[0][1]["dataset"] == "sharegpt"
+
+
+def test_agentless_sharegpt_cached_skips_staging(agentless_setup, tmp_path, monkeypatch, capfd):
+    from boxy.cli import main
+
+    log = tmp_path / "ssh-calls.log"
+    _sharegpt_shim(tmp_path, monkeypatch, log, staged="exit 0", curl="echo BOXY_STAGED")
+    rc = main(["bench", "--dataset", "sharegpt", "--batch-sizes", "1", "--max-tokens", "8"])
+    out = capfd.readouterr().out
+    assert rc == 0 and "staging the ShareGPT corpus" not in out
+    calls = log.read_text()
+    assert ".part" not in calls                       # no download ran (metrics curl is fine)
+    assert "--dataset-name sharegpt" in calls
+
+
+def test_agentless_sharegpt_staging_failure_names_the_fixes(agentless_setup, tmp_path,
+                                                            monkeypatch, capfd):
+    from boxy.cli import main
+
+    log = tmp_path / "ssh-calls.log"
+    _sharegpt_shim(tmp_path, monkeypatch, log, staged="exit 1", curl="exit 22")
+    rc = main(["bench", "--dataset", "sharegpt", "--batch-sizes", "1", "--max-tokens", "8"])
+    err = capfd.readouterr().err
+    assert rc != 0
+    assert "network.proxy" in err and "scp" in err          # mirror + manual pre-stage
+
+
+def test_agentless_bench_still_refuses_file_datasets(agentless_setup, capfd):
+    from boxy.cli import main
+
+    rc = main(["bench", "--dataset", "/tmp/prompts.json", "--batch-sizes", "1"])
+    err = capfd.readouterr().err
+    assert rc != 0 and "random|sharegpt" in err
+
+
+def test_serve_flags_random_prefix_len():
+    spec = bb.BenchSpec(url="http://x:1", model="m", concurrency=4, num_prompts=8,
+                        max_tokens=16, random_prefix_len=256)
+    flags = bb._serve_flags(spec)
+    i = flags.index("--random-prefix-len")
+    assert flags[i + 1] == "256"
+    bare = bb.BenchSpec(url="http://x:1", model="m", concurrency=4, num_prompts=8, max_tokens=16)
+    assert "--random-prefix-len" not in bb._serve_flags(bare)
+
+
 def test_agentless_bench_names_gpu_model_from_node(agentless_setup, tmp_path, monkeypatch, capfd):
     """The serving node's typed GRES / Features (scontrol over the ssh master)
     name the GPU MODEL — the stored envelope and label carry mi300a, not just
@@ -601,6 +690,56 @@ def test_agentless_bench_names_gpu_model_from_node(agentless_setup, tmp_path, mo
     assert listing[0][1]["gpu_type"] == "mi300a"
     assert listing[0][1]["label"] == "mi300a: clustera/boxy-llama"
     assert res.display_label(listing[0][1]) == "mi300a: clustera/boxy-llama"
+
+
+def test_agentless_bench_gpu_type_flag_overrides_detection(agentless_setup, tmp_path,
+                                                           monkeypatch, capfd):
+    """--gpu-type pins the legend prefix and skips node interrogation — the
+    escape hatch when the scheduler's GRES/Features text names the wrong
+    model (field: 'h200' on a cluster the user knows better)."""
+    from boxy.cli import main
+
+    log = tmp_path / "ssh-calls.log"
+    block = STDOUT_BLOCK.replace("\n", "\\n").replace('"', '\\"')
+    _shim(tmp_path, monkeypatch, "ssh", f'''
+        echo "$@" >> {log}
+        case "$*" in
+          *"test -x"*)     exit 1 ;;
+          *scontrol*)      echo "Gres=gpu:mi300a:4" ;;
+          *cat*endpoint*)  printf '{{"name": "boxy-llama", "host": "cbnode7", "port": 8000,
+                                     "url": "http://cbnode7:8000", "ready": true,
+                                     "model": "org/llama-x"}}\\n' ;;
+          *"command -v podman"*) echo /usr/bin/podman ;;
+          *"image exists"*) echo PRESENT ;;
+          *podman*run*)    printf "%b" "{block}\\n" ;;
+          *)               exit 0 ;;
+        esac
+    ''')
+    rc = main(["bench", "--gpu-type", "h100", "--batch-sizes", "1", "--max-tokens", "8"])
+    assert rc == 0
+    capfd.readouterr()
+    assert "scontrol" not in log.read_text()               # detection skipped entirely
+    listing = results.list_results()
+    assert listing[0][1]["gpu_type"] == "h100"
+    assert listing[0][1]["label"] == "h100: clustera/boxy-llama"
+
+
+def test_results_relabel_fixes_stored_gpu_type(tmp_path, monkeypatch, capfd):
+    from boxy.cli import main
+
+    monkeypatch.setenv("BOXY_RESULTS_DIR", str(tmp_path / "res"))
+    env = results.make_envelope(url="http://n:1", model="m/x", backend="vllm-bench",
+                                runs=[], instance="boxy-m", accelerator="cuda",
+                                gpu_type="h200", label="h200: clusterc/boxy-m")
+    results.write_result(env)
+    rc = main(["results", "relabel", "1", "--gpu-type", "h100"])
+    out = capfd.readouterr().out
+    assert rc == 0 and "h100: clusterc/boxy-m" in out
+    path, data = results.list_results()[0]
+    assert data["gpu_type"] == "h100" and data["label"] == "h100: clusterc/boxy-m"
+    assert results.display_label(data) == "h100: clusterc/boxy-m"
+    rc = main(["results", "relabel", "1"])                 # missing --gpu-type
+    assert rc != 0 and "--gpu-type" in capfd.readouterr().err
 
 
 def test_served_model_id_helper():

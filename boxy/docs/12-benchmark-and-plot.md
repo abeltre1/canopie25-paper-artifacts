@@ -63,12 +63,18 @@ binary at `<store>/bin/vllm-bench` by hand, or carry it with
 ## 2. Datasets
 
 - **`random`** (real-backend default) — synthetic token streams, no download,
-  reproducible via `--seed` (default 12345, the paper's).
+  reproducible via `--seed` (default 12345, the paper's). Add
+  `--random-prefix-len N` to share an N-token prefix across all prompts —
+  real prefix-cache hits for the cache figure with **no corpus at all**.
 - **`--dataset sharegpt`** — the ShareGPT corpus the paper benched with;
   downloaded once through your proxy/CA config and cached under
-  `~/.local/share/boxy/datasets/`. Air-gapped: pre-stage the JSON there.
+  `~/.local/share/boxy/datasets/`. On the agentless `--ssh` path the LOGIN
+  NODE stages it itself (proxied, ~650 MB once, cached in the cluster-side
+  boxy store) — nothing rides the laptop link. Air-gapped: pre-stage the
+  JSON at the path the error message shows (laptop or cluster).
 - **`--dataset path/to/prompts.json`** — your own JSON list of prompts or a
-  ShareGPT-format file.
+  ShareGPT-format file (local benches and `--url` tunnels; not staged to
+  clusters automatically).
 
 ---
 
@@ -158,6 +164,15 @@ $ boxy results path          # where the store lives
 `--no-save` skips persistence; `-o results.csv` still writes the plot-ready
 CSV wherever you point it.
 
+Wrong GPU model in a label (a scheduler whose GRES/Features text misnames
+the hardware)? Pin it at bench time with `boxy bench ... --gpu-type h100`,
+and fix already-stored results in place:
+
+```console
+$ boxy results relabel 1 2 3 --gpu-type h100
+### relabeled 20260720-...bench.json: h100: clusterc/boxy-llama
+```
+
 ---
 
 ## 5. Plot — `boxy plot`
@@ -183,9 +198,10 @@ $ boxy plot --kind all -o ./figs/  # every figure the results support
 - **Cache-hit figures need two things**: the server must export prefix-cache
   metrics (`boxy serve ... -- --enable-prefix-caching`; vLLM V1 engines have
   it on by default), and the workload must actually reuse prefixes — bench
-  with `--dataset sharegpt`; the `random` dataset shows ~0% by design.
-  Rates are sampled from vLLM's `/metrics` around each level, so no extra
-  flags at bench time.
+  with `--dataset sharegpt`, or stay on `random` and add
+  `--random-prefix-len 256` (shared prefix, zero staging); plain `random`
+  shows ~0% by design. Rates are sampled from vLLM's `/metrics` around each
+  level, so no extra flags at bench time.
 - Rendering needs matplotlib: `pip install 'boxy-hpc[plot]'`.
 - **No matplotlib? No problem** — emit the paper's exact gnuplot pipeline:
 

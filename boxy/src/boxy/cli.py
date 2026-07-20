@@ -5995,18 +5995,28 @@ def _bench_agentless(args, rec: dict) -> int:
         raise UsageError(f"--batch-sizes must be a comma-separated list of integers, "
                          f"got {args.batch_sizes!r}") from None
     image = getattr(args, "image", None) or rec.get("image", "")
-    if args.dataset and args.dataset not in ("random",):
-        raise UsageError("the agentless bench supports --dataset random for now (the corpus "
-                         "would have to be staged on the cluster) — omit --dataset, or bench "
-                         "via a tunnel with --url for file datasets")
+    dkind = args.dataset or "random"
+    if dkind not in ("random", "sharegpt"):
+        raise UsageError("the agentless bench supports --dataset random|sharegpt (sharegpt "
+                         "auto-stages on the cluster) — for a local FILE dataset bench "
+                         "through a tunnel with --url")
     if args.dryrun:
         print(f"### Agentless bench plan: {rec['name']} on {host} — cluster vllm-bench binary "
               f"if installed, else benchmark inside {image or '<image from --image>'} on the "
-              f"login node; levels {batch_sizes}, endpoint from {rec['endpoint_remote']}")
+              f"login node; levels {batch_sizes}, dataset {dkind}"
+              + (" (staged in the cluster-side boxy store)" if dkind == "sharegpt" else "")
+              + f", endpoint from {rec['endpoint_remote']}")
         return 0
     if remote.ensure_master(target) != 0:
         print(f"boxy: could not open an SSH session to {target}", file=sys.stderr)
         return 1
+    dpath = None
+    if dkind == "sharegpt":
+        try:
+            dpath = bench_backends.ensure_sharegpt_remote(target)
+        except RuntimeError as e:
+            raise UsageError(str(e)) from None
+        print(f"  auto: dataset: sharegpt (on {host}: {dpath})")
     rc, epj = remote.ssh_capture(
         target, f"cat {shlex.quote(rec['endpoint_remote'])} 2>/dev/null || true", timeout=15)
     ep = None
@@ -6075,7 +6085,8 @@ def _bench_agentless(args, rec: dict) -> int:
     base = bench_backends.BenchSpec(
         url=ep["url"], model=model, concurrency=0,
         num_prompts=getattr(args, "num_prompts", 0) or 0,
-        max_tokens=args.max_tokens, dataset_kind="random", dataset_path=None,
+        max_tokens=args.max_tokens, dataset_kind=dkind, dataset_path=dpath,
+        random_prefix_len=getattr(args, "random_prefix_len", 0) or 0,
         seed=getattr(args, "seed", None) or config.get("bench.seed"),
         image=image, runtime=runtime)
     print(f"### Benchmarking {model or rec['name']} at {ep['url']} — "
@@ -6089,7 +6100,7 @@ def _bench_agentless(args, rec: dict) -> int:
     runs = bench_backends.run_series(backend, base, batch_sizes,
                                      metrics_sampler=_metrics_sampler)
     accel = rec.get("accelerator", "") or bench_backends.accel_from_image(image)
-    gtype = rec.get("gpu_type", "")
+    gtype = getattr(args, "gpu_type", None) or rec.get("gpu_type", "")
     if not gtype:
         # ask the scheduler about the SERVING node itself — typed GRES or node
         # Features name the model (mi300a/h100) at sites that label them
@@ -6110,7 +6121,7 @@ def _bench_agentless(args, rec: dict) -> int:
         url=ep["url"], model=model, backend=backend.name, backend_detail=why, runs=runs,
         instance=rec["name"],
         label=getattr(args, "label", "") or default_label,
-        dataset="random", seed=base.seed, max_tokens=args.max_tokens,
+        dataset=dkind, seed=base.seed, max_tokens=args.max_tokens,
         accelerator=accel, gpu_type=gtype,
         geometry={k: rec[k] for k in ("nodes", "gpus") if rec.get(k)})
     if args.json:
@@ -6159,6 +6170,7 @@ def _bench_real(args, backend, why, url: str, batch_sizes: list[int], instance: 
         url=url, model=model, concurrency=0,
         num_prompts=getattr(args, "num_prompts", 0) or 0,
         max_tokens=args.max_tokens, dataset_kind=dkind, dataset_path=dpath,
+        random_prefix_len=getattr(args, "random_prefix_len", 0) or 0,
         seed=getattr(args, "seed", None) or config.get("bench.seed"),
         api_key=api_key, image=backend.image if hasattr(backend, "image") else "",
         runtime=getattr(backend, "runtime", ""))
@@ -6176,6 +6188,8 @@ def _bench_real(args, backend, why, url: str, batch_sizes: list[int], instance: 
         url=url, model=model, backend=backend.name, backend_detail=why, runs=runs,
         instance=instance, label=getattr(args, "label", "") or "",
         dataset=dkind, seed=base.seed, max_tokens=args.max_tokens,
+        accelerator=record.get("accelerator", ""),
+        gpu_type=getattr(args, "gpu_type", None) or record.get("gpu_type", ""),
         geometry={k: record[k] for k in ("nodes", "gpus") if record.get(k)})
     if args.json:
         import json as _json
@@ -6215,12 +6229,35 @@ def _print_bench_table(envelope: dict) -> None:
 
 def cmd_results(args: argparse.Namespace) -> int:
     """The persisted bench results on THIS cluster: list them, re-print one's
-    table, or show where they live. The store replaces the paper's hand-
-    transcribed results.dat as the source plots are built from."""
+    table, fix a wrong GPU label in place, or show where they live. The store
+    replaces the paper's hand-transcribed results.dat as the plot source."""
+    import json as _json
+    from pathlib import Path
+
     from boxy import results
 
     if args.action == "path":
         print(results._dir())
+        return 0
+    if args.action == "relabel":
+        gt = (getattr(args, "gpu_type", None) or "").strip().lower()
+        if not gt:
+            raise UsageError("results relabel needs --gpu-type <model> "
+                             "(e.g. boxy results relabel 1 2 3 --gpu-type h100)")
+        try:
+            paths = results.select(args.which)
+        except ValueError as e:
+            raise UsageError(str(e)) from None
+        for p in paths:
+            data = results.read_result(p)
+            if data is None:
+                print(f"### {p}: unreadable/not a bench result — skipped", file=sys.stderr)
+                continue
+            base = (data.get("label") or "").split(": ", 1)[-1]
+            data["gpu_type"] = gt
+            data["label"] = f"{gt}: {base}" if base else data.get("label", "")
+            Path(p).write_text(_json.dumps(data, indent=1) + "\n")
+            print(f"### relabeled {Path(p).name}: {data['label']}")
         return 0
     if args.action == "show":
         try:
@@ -6953,7 +6990,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="render the throughput figure next to the saved result")
     p.add_argument("--dataset", default=None,
                    help="'random' (real-backend default), 'sharegpt' (auto-downloaded + "
-                        "cached), or a file: JSON list of prompts / ShareGPT JSON")
+                        "cached; auto-staged on the cluster for agentless --ssh), or a "
+                        "file: JSON list of prompts / ShareGPT JSON")
+    p.add_argument("--random-prefix-len", type=int, default=0,
+                   help="random dataset only: shared-prefix tokens across all prompts — "
+                        "produces real prefix-cache hits with no corpus staged")
+    p.add_argument("--gpu-type", default=None,
+                   help="pin the GPU model for the legend (h100, mi300a, ...) — overrides "
+                        "record/node/system-card detection; fix stored results with "
+                        "`boxy results relabel N --gpu-type ...`")
     p.add_argument("--api-key", default=None,
                    help="Bearer token for a secured endpoint (k8s/OpenShift ingress); "
                         "also BOXY_BENCH_API_KEY / config bench.api_key")
@@ -6969,9 +7014,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("results", help="list/inspect persisted bench results "
                                        "(`boxy results`, `boxy results show [N|PATH]`, "
+                                       "`boxy results relabel N --gpu-type h100`, "
                                        "`boxy results path`)")
-    p.add_argument("action", nargs="?", default="list", choices=["list", "show", "path"],
-                   help="list (default) | show a stored result's table | print the store dir")
+    p.add_argument("action", nargs="?", default="list",
+                   choices=["list", "show", "relabel", "path"],
+                   help="list (default) | show a stored result's table | relabel: fix the "
+                        "GPU model on stored results (--gpu-type) | print the store dir")
+    p.add_argument("--gpu-type", default=None,
+                   help="for relabel: the correct GPU model (h100, mi300a, ...)")
     p.add_argument("which", nargs="*", default=[],
                    help="for show: an index from `boxy results` (1=newest), a path, or a "
                         "name fragment")
