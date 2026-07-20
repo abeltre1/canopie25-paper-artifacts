@@ -211,9 +211,19 @@ def find_vllm_bench() -> str:
 def fetch_vllm_bench() -> Path:
     """Download the static vllm-bench binary into <store>/bin (proxy/CA-aware).
     Air-gapped sites point urls.vllm_bench at an internal mirror."""
+    import sys
+
     from boxy import config
     from boxy.cardgen import _opener
 
+    if sys.platform == "darwin":
+        raise RuntimeError(
+            "vllm-bench ships static LINUX binaries only — this Mac can't run them. "
+            "Either build natively (`cargo install --git "
+            "https://github.com/vllm-project/vllm-bench vllm-bench`), or fetch on the "
+            "cluster instead: over --ssh the bench runs cluster-side anyway, where the "
+            "serving image can also provide the benchmark with no install at all "
+            "(the vllm-container backend).")
     arch = {"x86_64": "x86_64", "amd64": "x86_64",
             "aarch64": "aarch64", "arm64": "aarch64"}.get(platform.machine().lower(), "x86_64")
     url = config.get("urls.vllm_bench").format(arch=arch)
@@ -224,8 +234,10 @@ def fetch_vllm_bench() -> Path:
             shutil.copyfileobj(resp, f)
     except OSError as e:
         part.unlink(missing_ok=True)
-        raise RuntimeError(f"cannot download vllm-bench from {url} ({e}) — set urls.vllm_bench "
-                           f"to a mirror, or drop a binary at {dest}") from e
+        raise RuntimeError(
+            f"cannot download vllm-bench from {url} ({e}) — if your site needs a proxy "
+            f"for outbound HTTPS, set network.proxy (BOXY_PROXY) first; otherwise set "
+            f"urls.vllm_bench to a mirror, or drop a binary at {dest}") from e
     os.replace(part, dest)
     dest.chmod(0o755)
     return dest

@@ -355,3 +355,22 @@ def test_cli_fetch_backend_dryrun(tmp_path, monkeypatch, capfd):
     rc = main(["bench", "--fetch-backend", "--dryrun"])
     out = capfd.readouterr().out
     assert rc == 0 and "Would download the vllm-bench static binary" in out
+
+
+def test_fetch_on_macos_refuses_with_guidance(monkeypatch, tmp_path):
+    monkeypatch.setenv("BOXY_STORE", str(tmp_path / "store"))
+    monkeypatch.setattr("sys.platform", "darwin")
+    with pytest.raises(RuntimeError, match="LINUX binaries only.*cargo install"):
+        bb.fetch_vllm_bench()
+
+
+def test_fetch_download_failure_names_proxy(monkeypatch, tmp_path):
+    monkeypatch.setenv("BOXY_STORE", str(tmp_path / "store"))
+
+    class FailOpener:
+        def open(self, url, timeout=0):
+            raise OSError("nodename nor servname provided")
+
+    monkeypatch.setattr("boxy.cardgen._opener", lambda: FailOpener())
+    with pytest.raises(RuntimeError, match="network.proxy"):
+        bb.fetch_vllm_bench()
