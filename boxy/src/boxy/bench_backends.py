@@ -65,6 +65,19 @@ def served_model_id(model: str) -> str:
     return re.sub(r"^[a-z0-9+._-]+://", "", model or "")
 
 
+def accel_from_image(image: str) -> str:
+    """Best-effort accelerator from a serving-image name — the label fallback
+    for records that predate accelerator recording ('vllm-openai-rocm' -> rocm,
+    plain vllm-openai / cuda images -> cuda)."""
+    low = (image or "").lower()
+    for accel in ("rocm", "cuda", "intel", "vulkan", "musa", "cann"):
+        if accel in low:
+            return accel
+    if "vllm-openai" in low or "ramalama/ramalama" in low:
+        return "cuda"
+    return ""
+
+
 def _no_proxy_env(url: str) -> dict[str, str]:
     """Child env for subprocess backends: the bench target must be reached
     DIRECTLY (the corporate proxy can't see compute nodes / localhost tunnels)

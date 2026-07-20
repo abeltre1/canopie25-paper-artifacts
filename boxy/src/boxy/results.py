@@ -69,13 +69,16 @@ def make_envelope(*, url: str, model: str, backend: str, runs: list[dict],
     from boxy import jobs, version_string
 
     cluster = jobs.local_cluster()
+    if not label:
+        base = f"{cluster}/{instance}" if instance else f"{cluster}/{_slug(model)}"
+        label = f"{accelerator} - {base}" if accelerator else base
     return {
         "schema": SCHEMA,
         "boxy_version": version_string(),
         "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "cluster": cluster,
         "instance": instance or None,
-        "label": label or (f"{cluster}/{instance}" if instance else f"{cluster}/{_slug(model)}"),
+        "label": label,
         "url": url,
         "endpoints": endpoints or [url],
         "model": model,

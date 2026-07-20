@@ -3159,7 +3159,8 @@ def _serve_agentless_ssh(args, target: str) -> int:
     jobs.write_record(name, {"name": name, "scheduler": scheduler_name, "job": job_id,
                              "model": args.model, "submitted_from": "agentless-ssh",
                              "target": target, "endpoint_remote": ep_remote, "log": log_remote,
-                             "image": record_image, "engine": box.engine})
+                             "image": record_image, "engine": box.engine,
+                             "accelerator": getattr(args, "accelerator", "") or ""})
 
     # 9) poll the shared-FS endpoint file over the master; the moment it names the
     #    compute node, hand off to the tunnel + localhost/health readiness.
@@ -6073,11 +6074,16 @@ def _bench_agentless(args, rec: dict) -> int:
     print(f"### Benchmarking {model or rec['name']} at {ep['url']} — "
           f"{len(batch_sizes)} concurrency levels (on {host})")
     runs = bench_backends.run_series(backend, base, batch_sizes)
+    accel = rec.get("accelerator", "") or bench_backends.accel_from_image(image)
+    ccluster = jobs.cluster_id(host)
+    default_label = (f"{accel} - {ccluster}/{rec['name']}" if accel
+                     else f"{ccluster}/{rec['name']}")
     envelope = results.make_envelope(
-        url=ep["url"], model=model, backend="vllm-container", backend_detail=why, runs=runs,
+        url=ep["url"], model=model, backend=backend.name, backend_detail=why, runs=runs,
         instance=rec["name"],
-        label=getattr(args, "label", "") or f"{jobs.cluster_id(host)}/{rec['name']}",
+        label=getattr(args, "label", "") or default_label,
         dataset="random", seed=base.seed, max_tokens=args.max_tokens,
+        accelerator=accel,
         geometry={k: rec[k] for k in ("nodes", "gpus") if rec.get(k)})
     if args.json:
         print(_json.dumps(envelope, indent=1))
