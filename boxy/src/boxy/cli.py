@@ -5770,6 +5770,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
     from boxy import bench, engines
 
+    instance = ""
     if args.url:
         url = args.url.rstrip("/").removesuffix("/v1")
     elif args.box:
@@ -5781,8 +5782,11 @@ def cmd_bench(args: argparse.Namespace) -> int:
                    else box.ports[0] if box.ports else engines.default_port(box.engine))
         url = f"http://127.0.0.1:{default}"
     else:
-        _name, ep = _select_endpoint(getattr(args, "name", None), "bench")
+        instance, ep = _select_endpoint(getattr(args, "name", None), "bench")
         url = ep["url"]
+    api_key = getattr(args, "api_key", None) or config.get("bench.api_key")
+    if api_key:
+        bench.set_api_key(api_key)
     try:
         batch_sizes = ([int(b) for b in args.batch_sizes.split(",")]
                        if args.batch_sizes else bench.DEFAULT_BATCH_SIZES)
@@ -5790,8 +5794,13 @@ def cmd_bench(args: argparse.Namespace) -> int:
         raise UsageError(f"--batch-sizes must be a comma-separated list of integers, "
                          f"got {args.batch_sizes!r}") from None
     if args.dryrun:
+        from boxy import results
+
         print(f"### Bench plan: url={url} batch_sizes={batch_sizes} max_tokens={args.max_tokens} "
-              f"dataset={args.dataset or 'synthetic'}")
+              f"dataset={args.dataset or 'synthetic'}"
+              + (" auth=bearer" if api_key else ""))
+        if not getattr(args, "no_save", False):
+            print(f"### Result would be saved under {results._dir()} (skip with --no-save)")
         return 0
     import urllib.error
 
@@ -5819,6 +5828,75 @@ def cmd_bench(args: argparse.Namespace) -> int:
         with open(args.output, "w") as f:
             f.write(report.to_csv())
         print(f"wrote {args.output}")
+    if not getattr(args, "no_save", False):
+        from boxy import jobs, results
+
+        record = jobs.read_record(instance) if instance else None
+        geometry = {k: record[k] for k in ("nodes", "gpus") if record and record.get(k)} if record else {}
+        envelope = results.make_envelope(
+            url=report.url, model=report.model, backend="synthetic",
+            backend_detail="built-in stdlib load generator (bench.py)",
+            runs=[bench.to_canonical(r) for r in report.results],
+            instance=instance, label=getattr(args, "label", "") or "",
+            dataset=args.dataset or "synthetic", seed=0, max_tokens=args.max_tokens,
+            geometry=geometry)
+        path = results.write_result(envelope)
+        print(f"### Result saved: {path}   (list: boxy results; plot: boxy plot)")
+    return 0
+
+
+def _print_bench_table(envelope: dict) -> None:
+    """The bench table, rendered from a canonical result (same columns whether
+    it just ran or was read back from the store)."""
+    print(f"# model={envelope['model']} url={envelope.get('url', '')} "
+          f"backend={envelope.get('bench_backend', '?')} label={envelope.get('label', '')}")
+    print(f"{'conc':>6} {'ok':>4} {'err':>4} {'req/s':>8} {'tok/s':>9} "
+          f"{'TTFT p50':>9} {'TTFT p99':>9} {'TPOT':>7} {'ITL p99':>8} {'E2E p50':>9} {'E2E p95':>9}")
+    for r in envelope.get("runs", []):
+        if r.get("status") != "ok":
+            print(f"{r.get('max_concurrency', '?'):>6}    X    - {r.get('error', 'failed')}")
+            continue
+        print(f"{r['max_concurrency']:>6} {r.get('completed', 0):>4} {r.get('failed', 0):>4} "
+              f"{r.get('request_throughput', 0.0):>8.2f} {r.get('output_throughput', 0.0):>9.1f} "
+              f"{r.get('median_ttft_ms', 0.0):>9.1f} {r.get('p99_ttft_ms', 0.0):>9.1f} "
+              f"{r.get('mean_tpot_ms', 0.0):>7.1f} {r.get('p99_itl_ms', 0.0):>8.1f} "
+              f"{r.get('median_e2el_ms', 0.0):>9.1f} {r.get('p95_e2el_ms', 0.0):>9.1f}")
+
+
+def cmd_results(args: argparse.Namespace) -> int:
+    """The persisted bench results on THIS cluster: list them, re-print one's
+    table, or show where they live. The store replaces the paper's hand-
+    transcribed results.dat as the source plots are built from."""
+    from boxy import results
+
+    if args.action == "path":
+        print(results._dir())
+        return 0
+    if args.action == "show":
+        try:
+            paths = results.select(args.which)
+        except ValueError as e:
+            raise UsageError(str(e)) from None
+        for p in paths:
+            data = results.read_result(p)
+            if data is None:
+                print(f"### {p}: unreadable/not a bench result", file=sys.stderr)
+                continue
+            print(f"### {p}")
+            _print_bench_table(data)
+        return 0
+    listing = results.list_results()
+    if not listing:
+        print(f"no bench results yet in {results._dir()} — run `boxy bench` "
+              f"(results persist there automatically)")
+        return 0
+    print(f"{'#':>3} {'created':>20} {'backend':>12} {'levels':>6} {'peak tok/s':>10}  model / label")
+    for i, (path, data) in enumerate(listing, 1):
+        ok_runs = [r for r in data.get("runs", []) if r.get("status") == "ok"]
+        peak = results.peak_output_throughput(data)
+        print(f"{i:>3} {data.get('created', '?'):>20} {data.get('bench_backend', '?'):>12} "
+              f"{len(ok_runs):>6} {peak:>10.1f}  {data.get('label', data.get('model', '?'))}")
+    print(f"# store: {results._dir()}   (details: boxy results show N; plot: boxy plot N)")
     return 0
 
 
@@ -6406,13 +6484,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ssh", default=None, metavar="USER@HOST",
                    help="run the bench ON that cluster (compute-node hostnames resolve there)")
     p.add_argument("--url", default=None, help="endpoint (default: the instance's recorded endpoint)")
-    p.add_argument("--batch-sizes", default=None, help="comma list, default 1,2,4,...,1024")
+    p.add_argument("--batch-sizes", "--max-concurrency", dest="batch_sizes", default=None,
+                   help="comma list of concurrency levels, default 1,2,4,...,1024 "
+                        "(--max-concurrency is the vLLM-bench spelling)")
     p.add_argument("--max-tokens", type=int, default=32)
     p.add_argument("--dataset", default=None, help="JSON list of prompts or ShareGPT JSON")
+    p.add_argument("--api-key", default=None,
+                   help="Bearer token for a secured endpoint (k8s/OpenShift ingress); "
+                        "also BOXY_BENCH_API_KEY / config bench.api_key")
+    p.add_argument("--label", default=None,
+                   help="series label stored with the result (default cluster/instance) — "
+                        "what `boxy plot` shows in the legend")
+    p.add_argument("--no-save", action="store_true",
+                   help="don't persist the result to the results store")
     p.add_argument("-o", "--output", default=None, help="write plot-ready CSV here")
     p.add_argument("--json", action="store_true", help="print JSON instead of a table")
     p.add_argument("--dryrun", action="store_true")
     p.set_defaults(func=cmd_bench)
+
+    p = sub.add_parser("results", help="list/inspect persisted bench results "
+                                       "(`boxy results`, `boxy results show [N|PATH]`, "
+                                       "`boxy results path`)")
+    p.add_argument("action", nargs="?", default="list", choices=["list", "show", "path"],
+                   help="list (default) | show a stored result's table | print the store dir")
+    p.add_argument("which", nargs="*", default=[],
+                   help="for show: an index from `boxy results` (1=newest), a path, or a "
+                        "name fragment")
+    p.set_defaults(func=cmd_results)
 
     p = sub.add_parser("logs", help="show a job's log + boxy's crash diagnosis (newest first)")
     p.add_argument("name", nargs="?", default=None,

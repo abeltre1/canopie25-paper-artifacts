@@ -22,6 +22,21 @@ from dataclasses import asdict, dataclass, field
 
 DEFAULT_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 
+# Bench traffic must NEVER ride the corporate proxy: boxy propagates
+# http(s)_proxy for image/model pulls, but the endpoints benched here are
+# internal compute nodes / localhost tunnels the proxy can't reach (same
+# rationale as readiness._no_proxy_opener). A single module-level opener.
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+# Optional Bearer token for secured endpoints (a k8s/OpenShift ingress fronting
+# vLLM's --api-key). Set once by the CLI; never logged, never persisted.
+_extra_headers: dict[str, str] = {}
+
+
+def set_api_key(key: str) -> None:
+    if key:
+        _extra_headers["Authorization"] = f"Bearer {key}"
+
 SYNTHETIC_PROMPTS = [
     "Explain what a batch scheduler does on an HPC system.",
     "Summarize the difference between Podman and Apptainer in two sentences.",
@@ -69,6 +84,11 @@ class BenchResult:
     tpot_mean_ms: float = 0.0
     itl_p50_ms: float = 0.0
     itl_p99_ms: float = 0.0
+    # parity with vLLM --save-result (median/p99 across the board)
+    latency_p99_ms: float = 0.0
+    tpot_p50_ms: float = 0.0
+    tpot_p99_ms: float = 0.0
+    itl_mean_ms: float = 0.0
 
 
 @dataclass
@@ -114,12 +134,13 @@ def load_prompts(path: str | None) -> list[str]:
 
 def _http_json(url: str, payload: dict | None = None, timeout: float = 120.0) -> dict:
     if payload is None:
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(url, headers=dict(_extra_headers))
     else:
         req = urllib.request.Request(
-            url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}
+            url, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", **_extra_headers},
         )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _opener.open(req, timeout=timeout) as resp:
         return json.load(resp)
 
 
@@ -151,7 +172,7 @@ def _one_stream_request(url: str, model: str, prompt: str, max_tokens: int) -> d
         data=json.dumps({"model": model, "prompt": prompt, "max_tokens": max_tokens,
                          "stream": True,
                          "stream_options": {"include_usage": True}}).encode(),
-        headers={"Content-Type": "application/json"})
+        headers={"Content-Type": "application/json", **_extra_headers})
     start = time.perf_counter()
     ttft = 0.0
     itls: list[float] = []
@@ -160,7 +181,7 @@ def _one_stream_request(url: str, model: str, prompt: str, max_tokens: int) -> d
     last = start
     body_lines: list[str] = []
     try:
-        with urllib.request.urlopen(req, timeout=300.0) as resp:
+        with _opener.open(req, timeout=300.0) as resp:
             for raw in resp:
                 line = raw.decode("utf-8", "replace").strip()
                 if not line.startswith("data:"):
@@ -252,7 +273,37 @@ def run_level_endpoints(endpoints: list[tuple[str, str]], prompts: list[str],
         tpot_mean_ms=statistics.mean(tpots) * 1000 if tpots else 0.0,
         itl_p50_ms=percentile_ms(itls, 0.50),
         itl_p99_ms=percentile_ms(itls, 0.99),
+        latency_p99_ms=pct(0.99),
+        tpot_p50_ms=percentile_ms(tpots, 0.50),
+        tpot_p99_ms=percentile_ms(tpots, 0.99),
+        itl_mean_ms=statistics.mean(itls) * 1000 if itls else 0.0,
     )
+
+
+def to_canonical(r: BenchResult) -> dict:
+    """One BenchResult as a canonical `boxy-bench/1` run record — the vLLM
+    --save-result key names (results.RUN_KEYS), so synthetic results are
+    indistinguishable in shape from real `vllm bench serve` / vllm-bench ones
+    and plotting is backend-agnostic."""
+    return {
+        "max_concurrency": r.batch_size,
+        "status": "ok" if r.ok else "error",
+        "num_prompts": r.requests,
+        "completed": r.ok,
+        "failed": r.errors,
+        "duration": r.elapsed_s,
+        "total_input_tokens": r.prompt_tokens,
+        "total_output_tokens": r.completion_tokens,
+        "request_throughput": r.requests_per_s,
+        "output_throughput": r.tokens_per_s,
+        "total_token_throughput": (r.prompt_tokens + r.completion_tokens) / r.elapsed_s
+                                  if r.elapsed_s else 0.0,
+        "mean_ttft_ms": r.ttft_mean_ms, "median_ttft_ms": r.ttft_p50_ms, "p99_ttft_ms": r.ttft_p99_ms,
+        "mean_tpot_ms": r.tpot_mean_ms, "median_tpot_ms": r.tpot_p50_ms, "p99_tpot_ms": r.tpot_p99_ms,
+        "mean_itl_ms": r.itl_mean_ms, "median_itl_ms": r.itl_p50_ms, "p99_itl_ms": r.itl_p99_ms,
+        "mean_e2el_ms": r.latency_mean_ms, "median_e2el_ms": r.latency_p50_ms,
+        "p95_e2el_ms": r.latency_p95_ms, "p99_e2el_ms": r.latency_p99_ms,
+    }
 
 
 def run_bench(

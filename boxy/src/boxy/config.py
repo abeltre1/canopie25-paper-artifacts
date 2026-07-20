@@ -139,6 +139,38 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
             help="boxy's own store dir (merged CA bundle, staged models)."),
     Setting("paths.models_dir", "BOXY_MODELS_DIR", "./models",
             help="default destination for staged models."),
+    Setting("paths.results_root", "BOXY_RESULTS_ROOT", "~/.local/share/boxy/results",
+            help="base dir for persisted bench results (partitioned per cluster; "
+                 "BOXY_RESULTS_DIR pins an exact dir)."),
+    Setting("paths.datasets", "BOXY_DATASETS_DIR", "~/.local/share/boxy/datasets",
+            help="cache for downloaded bench datasets (ShareGPT)."),
+
+    # -- bench -----------------------------------------------------------------
+    Setting("bench.backend", "BOXY_BENCH_BACKEND", "auto",
+            help="benchmark load generator: auto (vllm-bench binary > vllm CLI > "
+                 "container > synthetic), or pin one of synthetic|vllm-bench|"
+                 "vllm-cli|vllm-container."),
+    Setting("bench.seed", "BOXY_BENCH_SEED", 12345, int,
+            help="dataset sampling seed for real backends (the paper's seed) — "
+                 "same seed = same request mix, comparable runs."),
+    Setting("bench.api_key", "BOXY_BENCH_API_KEY", "",
+            help="Bearer token for benching a secured endpoint (e.g. a k8s/OpenShift "
+                 "ingress fronting vLLM --api-key). Never written to results."),
+    Setting("binaries.vllm_bench", "BOXY_VLLM_BENCH", "vllm-bench",
+            help="the vllm-bench load-generator binary (name on PATH or full path); "
+                 "boxy also looks in <paths.store>/bin. `boxy bench --fetch-backend` "
+                 "downloads it."),
+    Setting("urls.vllm_bench",
+            "BOXY_VLLM_BENCH_URL",
+            "https://github.com/vllm-project/vllm-bench/releases/latest/download/vllm-bench-{arch}-unknown-linux-musl",
+            help="download URL for the static vllm-bench binary ({arch} = x86_64|aarch64); "
+                 "point at an internal mirror on air-gapped sites."),
+    Setting("datasets.sharegpt_url",
+            "BOXY_SHAREGPT_URL",
+            "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered"
+            "/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json",
+            help="where `--dataset sharegpt` downloads the ShareGPT corpus from "
+                 "(cached in paths.datasets; pre-stage the file there when air-gapped)."),
 
     # -- mounts ----------------------------------------------------------------
     Setting("mounts.selinux_relabel", "BOXY_SELINUX_RELABEL", "auto",
