@@ -272,7 +272,7 @@ def auto_location(
     return location, decisions
 
 
-def _classify_model(model: str, require_exists: bool) -> tuple[str, str]:
+def _classify_model(model: str, require_exists: bool, remote_target: str = "") -> tuple[str, str]:
     """Syntax decides: a transport scheme means remote; anything else is a local
     path, full stop. Bare names are never guessed into registries — same
     command, same meaning, on every machine. Returns (resolved, decision)."""
@@ -304,6 +304,24 @@ def _classify_model(model: str, require_exists: bool) -> tuple[str, str]:
         )
     resolved = os.path.abspath(model)
     if not os.path.exists(resolved):
+        # an ABSOLUTE path in an --ssh invocation is a CLUSTER path — check it
+        # there over the live master, not on the laptop (field: a shared-FS
+        # model dir failed the local exists() and got a misleading hint)
+        if remote_target and model.startswith("/"):
+            import shlex
+
+            from boxy import remote
+
+            if remote.ensure_master(remote_target) == 0:
+                rc, _ = remote.ssh_capture(remote_target,
+                                           f"test -e {shlex.quote(model)}", timeout=15)
+                if rc == 0:
+                    host = remote_target.split("@")[-1]
+                    return model, f"model: {model} (path on {host}, verified over ssh)"
+            if require_exists:
+                raise RuntimeError(
+                    f"no such model path on {remote_target}: {model!r} (checked over the "
+                    f"ssh master) — is it on a filesystem the cluster mounts?")
         base = model.rsplit("/", 1)[-1]
         hint = (f"no such model file: {model!r}. MODEL is a local path or a transport URI — "
                 f"did you mean ollama://{base} or hf://<org>/{base}?")
@@ -318,13 +336,14 @@ def resolve_submission(
     scheduler: str,
     name: str | None = None,
     require_exists: bool = True,
+    remote_target: str = "",
 ) -> tuple[str, str, list[str]]:
     """Login-side resolution for a batch submission: classify the model and
     name the job. Hardware truths (accelerator/engine/image/port/runtime) are
     deliberately NOT resolved here — the inner `boxy serve` re-resolves them
     ON the compute node, where they are actually true (the design review's
     'wrong locus' fix). Returns (resolved_model, name, decisions)."""
-    resolved_model, model_decision = _classify_model(model, require_exists)
+    resolved_model, model_decision = _classify_model(model, require_exists, remote_target)
     decisions = [
         model_decision,
         f"scheduler: {scheduler} (submitting a batch job — detaches once READY)",
@@ -348,9 +367,10 @@ def resolve(
     require_exists: bool = True,
     sources: dict | None = None,
     distributed: bool | None = None,
+    remote_target: str = "",
 ) -> Resolution:
     decisions: list[str] = []
-    resolved_model, model_decision = _classify_model(model, require_exists)
+    resolved_model, model_decision = _classify_model(model, require_exists, remote_target)
     decisions.append(model_decision)
 
     location, loc_decisions = auto_location(

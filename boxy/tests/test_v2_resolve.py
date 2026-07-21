@@ -179,3 +179,29 @@ def test_slug_generation():
     assert resolve._slug("hf://Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf") \
         == "boxy-qwen2.5-0.5b-instruct-q4_k_m"
     assert resolve._slug("weird name!!.gguf").startswith("boxy-weird-name")
+
+
+def test_absolute_path_verified_on_the_remote_target(monkeypatch):
+    """Field: `boxy serve /shared-fs/model --ssh cluster` failed the LAPTOP
+    exists() check for a path that only exists on the cluster. With a remote
+    target, an absolute path is verified over the ssh master instead."""
+    from boxy import remote, resolve
+
+    monkeypatch.setattr(remote, "ensure_master", lambda t: 0)
+    monkeypatch.setattr(remote, "ssh_capture",
+                        lambda t, cmd, timeout=15: (0, "") if "test -e" in cmd else (1, ""))
+    model, note = resolve._classify_model("/shared/models/llama-x", True,
+                                          remote_target="user1@clustera-login")
+    assert model == "/shared/models/llama-x" and "verified over ssh" in note
+
+    monkeypatch.setattr(remote, "ssh_capture", lambda t, cmd, timeout=15: (1, ""))
+    with pytest.raises(RuntimeError, match="no such model path on user1@clustera-login"):
+        resolve._classify_model("/shared/models/llama-x", True,
+                                remote_target="user1@clustera-login")
+
+
+def test_local_path_check_unchanged_without_remote_target():
+    from boxy import resolve
+
+    with pytest.raises(RuntimeError, match="no such model file"):
+        resolve._classify_model("/definitely/not/here", True)

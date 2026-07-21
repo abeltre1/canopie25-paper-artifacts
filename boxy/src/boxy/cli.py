@@ -333,7 +333,7 @@ def _resolve_or_load(args: argparse.Namespace):
     (Sweep findings 11/12/13/39/46.)"""
     from dataclasses import replace as dc_replace
 
-    from boxy import resolve
+    from boxy import remote, resolve
 
     if args.box and args.model:
         raise UsageError(
@@ -410,6 +410,7 @@ def _resolve_or_load(args: argparse.Namespace):
         require_exists=not args.dryrun,
         sources=sources,
         distributed=getattr(args, "distributed", None),
+        remote_target=remote.resolve_target(args) or "",
     )
     if profile is not None:
         # keep the profile's site details (modules/tuning/offline/staging/
