@@ -302,3 +302,27 @@ def test_autogen_disabled_by_offline_env(autogen_on, monkeypatch):
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     card = cards.resolve_model_card("acme/Custom-Dense-450B")
     assert card is not None and card.source == "heuristic"     # straight to the guess
+
+
+def test_opener_falls_back_to_config_proxy(monkeypatch):
+    """No http(s)_proxy in the env + network.proxy configured -> the opener
+    carries a ProxyHandler for it (field: `generate card` died on bare DNS
+    from a shell without the proxy env, though boxy knew the proxy). An
+    ambient env proxy still wins."""
+    import urllib.request
+
+    from boxy import config
+
+    for var in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(config, "get",
+                        lambda k: "http://proxy.example.gov:80" if k == "network.proxy" else "")
+    op = cardgen._opener()
+    assert any(getattr(h, "proxies", {}).get("https") == "http://proxy.example.gov:80"
+               for h in op.handlers)
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://env-proxy:80")
+    op = cardgen._opener()
+    proxies = [getattr(h, "proxies", {}) for h in op.handlers
+               if isinstance(h, urllib.request.ProxyHandler)]
+    assert proxies and proxies[0].get("https") == "http://env-proxy:80"

@@ -70,7 +70,11 @@ def resolve_token(explicit: str | None = None) -> str:
 
 
 def _opener() -> urllib.request.OpenerDirector:
-    """An opener that trusts the site/proxy CA bundle and honors the env proxy."""
+    """An opener that trusts the site/proxy CA bundle and rides the configured
+    proxy: the ambient http(s)_proxy env wins, else config network.proxy —
+    a laptop shell WITHOUT the proxy env otherwise dies on bare DNS
+    ('nodename nor servname provided') even though boxy knows the proxy
+    (field: generate card)."""
     ctx = ssl.create_default_context()
     ca = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
     if not ca:
@@ -79,13 +83,19 @@ def _opener() -> urllib.request.OpenerDirector:
             ca = certifi.where()
         except Exception:
             ca = ""
-    for extra in (ca, "/root/.ccr/ca-bundle.crt"):
-        try:
-            if extra and os.path.exists(extra):
-                ctx.load_verify_locations(extra)
-        except (OSError, ssl.SSLError):
-            pass
-    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+    try:
+        if ca and os.path.exists(ca):
+            ctx.load_verify_locations(ca)
+    except (OSError, ssl.SSLError):
+        pass
+    handlers: list = [urllib.request.HTTPSHandler(context=ctx)]
+    if not (os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")):
+        from boxy import config
+
+        pfx = config.get("network.proxy")
+        if pfx:
+            handlers.append(urllib.request.ProxyHandler({"http": pfx, "https": pfx}))
+    return urllib.request.build_opener(*handlers)
 
 
 def hf_get_json(repo: str, path: str, token: str = "", *, required: bool = True,
@@ -121,8 +131,10 @@ def hf_get_json(repo: str, path: str, token: str = "", *, required: bool = True,
         raise CardGenError(f"{repo!r}: HuggingFace returned HTTP {e.code} for {path}.") from None
     except urllib.error.URLError as e:
         raise CardGenError(
-            f"{repo!r}: cannot reach HuggingFace ({e.reason}). Check your network/proxy "
-            f"(HTTPS_PROXY) and the CA bundle.") from None
+            f"{repo!r}: cannot reach HuggingFace ({e.reason}). A DNS failure here usually "
+            f"means the request skipped the site proxy — set it once with "
+            f"`boxy config network.proxy http://proxy.example.gov:80` (or export "
+            f"HTTPS_PROXY); TLS failures need the CA bundle (SSL_CERT_FILE / boxy trust).") from None
     except (ValueError, TimeoutError) as e:
         raise CardGenError(f"{repo!r}: bad/again response fetching {path}: {e}") from None
 
