@@ -134,3 +134,80 @@ def test_build_bundle_bake_builds_derived_image(tmp_path, monkeypatch):
     assert "pip install --no-cache-dir open_clip_torch" in cf
     assert any("save --format oci-archive" in c and ":baked" in c for c in calls)
     assert 'image = "localhost/boxy-nvidia-nemotron-parse-v1.2:baked"' in (dest / "manifest.toml").read_text()
+
+
+# ---------- boxy wheels: the turnkey offline wheelhouse ----------
+
+def _capture_run(monkeypatch):
+    calls = []
+    monkeypatch.setattr(airgap, "_run", lambda cmd, env=None, what="": calls.append(cmd))
+    return calls
+
+
+def test_build_wheelhouse_runs_platform_correct_container(tmp_path, monkeypatch):
+    """The build + verify both run inside python:<ver> pinned to --platform —
+    the field lesson: an Apple-Silicon laptop silently produced an aarch64 set
+    no x86_64 cluster could install."""
+    from boxy import ramalama_shim
+
+    calls = _capture_run(monkeypatch)
+    monkeypatch.setattr("shutil.which", lambda n: f"/usr/bin/{n}")
+    monkeypatch.setattr(ramalama_shim, "DEFAULT_STORE", str(tmp_path / "no-store"))
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    out = airgap.build_wheelhouse(str(tmp_path / "w"), platform="linux/amd64", python="3.12")
+    assert out.is_dir() and len(calls) == 2
+    build, verify = calls
+    assert build[:4] == ["/usr/bin/podman", "run", "--rm", "--platform"]
+    assert "linux/amd64" in build and "docker.io/library/python:3.12" in build
+    joined = " ".join(build)
+    assert "pip -q download '/tmp/b[ramalama,plot]'" in joined
+    assert "pip -q wheel /tmp/b --no-deps" in joined          # boxy's own wheel, always
+    assert "rm -rf /tmp/b/src/*.egg-info" in joined           # stale editable metadata
+    assert ":/src:ro" in joined                               # checkout stays untouched
+    assert "--network=none" in verify
+    assert "--no-index --find-links /wheels 'boxy-hpc[ramalama,plot]'" in " ".join(verify)
+
+
+def test_build_wheelhouse_mounts_the_site_ca(tmp_path, monkeypatch):
+    """CA resolution: --ca wins, else the user's own SSL_CERT_FILE (field:
+    the site bundle lives outside boxy), else boxy's ca-merged.crt."""
+    ca = tmp_path / "site.crt"
+    ca.write_text("CERT")
+    calls = _capture_run(monkeypatch)
+    monkeypatch.setattr("shutil.which", lambda n: f"/usr/bin/{n}")
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca))
+    airgap.build_wheelhouse(str(tmp_path / "w"), verify=False)
+    joined = " ".join(calls[0])
+    assert f"{ca}:/ca.crt:ro" in joined and "PIP_CERT=/ca.crt" in joined
+    explicit = tmp_path / "explicit.crt"
+    explicit.write_text("CERT2")
+    calls.clear()
+    airgap.build_wheelhouse(str(tmp_path / "w"), ca_file=str(explicit), verify=False)
+    assert f"{explicit}:/ca.crt:ro" in " ".join(calls[0])
+
+
+def test_build_wheelhouse_needs_container_runtime(tmp_path, monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda n: None)
+    with pytest.raises(airgap.BundleError, match="podman or docker"):
+        airgap.build_wheelhouse(str(tmp_path / "w"))
+
+
+def test_cmd_wheels_prints_carry_recipe(tmp_path, monkeypatch, capfd):
+    from pathlib import Path
+
+    monkeypatch.setattr(airgap, "build_wheelhouse",
+                        lambda out, **k: Path(out))
+    rc = main(["wheels", "-o", str(tmp_path / "wh")])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "Wheel set ready" in out and "linux/amd64" in out
+    assert "--no-index --find-links wh/ 'boxy-hpc[ramalama,plot]'" in out
+
+
+def test_cmd_wheels_surfaces_build_errors(tmp_path, monkeypatch, capfd):
+    def boom(out, **k):
+        raise airgap.BundleError("podman or docker missing")
+
+    monkeypatch.setattr(airgap, "build_wheelhouse", boom)
+    rc = main(["wheels", "-o", str(tmp_path / "wh")])
+    assert rc == 1 and "podman or docker" in capfd.readouterr().err

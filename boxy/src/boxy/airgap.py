@@ -42,6 +42,66 @@ def _run(cmd: list[str], env: dict | None = None, what: str = "") -> None:
         raise BundleError(f"{what or cmd[0]} failed:\n{(proc.stderr or proc.stdout).strip()[-1200:]}")
 
 
+def build_wheelhouse(out: str, *, platform: str = "linux/amd64", python: str = "3.12",
+                     extras: str = "ramalama,plot", runtime: str = "",
+                     ca_file: str = "", verify: bool = True) -> Path:
+    """TURNKEY offline wheel set: boxy's own wheel plus the full dependency
+    closure of the requested extras, built INSIDE a python:<ver> container so
+    every compiled wheel matches the TARGET (--platform), not this machine —
+    the field lesson: an Apple-Silicon laptop's podman VM silently produced an
+    aarch64 set that no x86_64 cluster could install. The site CA (boxy's
+    ca-merged.crt) and network.proxy ride along; a --network=none install
+    verifies the set is complete before anyone carries it across a gap."""
+    import boxy
+    from boxy import config, ramalama_shim
+
+    src = Path(boxy.__file__).resolve().parents[2]
+    if not (src / "pyproject.toml").is_file():
+        raise BundleError(
+            f"`boxy wheels` builds boxy's wheel from its git checkout, but this boxy is a "
+            f"frozen wheel install ({Path(boxy.__file__).parent}) — run it where boxy is "
+            f"installed editable from the repo (`pip install -e ./boxy`)")
+    rt = shutil.which(runtime) if runtime else (shutil.which("podman") or shutil.which("docker"))
+    if not rt:
+        raise BundleError("building a platform-correct wheel set needs podman or docker — "
+                          "the wheels must match the TARGET system, not this machine")
+    d = Path(os.path.expanduser(out))
+    d.mkdir(parents=True, exist_ok=True)
+    req = f"boxy-hpc[{extras}]" if extras else "boxy-hpc"
+    image = f"docker.io/library/python:{python}"
+    opts = ["-v", f"{src}:/src:ro", "-v", f"{d}:/wheels"]
+    # the container must trust the site's TLS interceptor: --ca wins, then the
+    # same SSL_CERT_FILE the user's other tools use, then boxy's merged bundle
+    ca = next((p for p in (ca_file, os.environ.get("SSL_CERT_FILE", ""),
+                           str(Path(ramalama_shim.DEFAULT_STORE) / "ca-merged.crt"))
+               if p and Path(os.path.expanduser(p)).is_file()), "")
+    if ca:
+        ca = os.path.expanduser(ca)
+        print(f"### wheels: site CA into the container: {ca}")
+        opts += ["-v", f"{ca}:/ca.crt:ro", "-e", "PIP_CERT=/ca.crt",
+                 "-e", "SSL_CERT_FILE=/ca.crt", "-e", "REQUESTS_CA_BUNDLE=/ca.crt"]
+    pfx = config.get("network.proxy")
+    if pfx:
+        opts += ["-e", f"https_proxy={pfx}", "-e", f"http_proxy={pfx}"]
+    spec = f"/tmp/b[{extras}]" if extras else "/tmp/b"
+    # the checkout mounts read-only; the build runs on a copy so a stale
+    # *.egg-info from an old editable install can't fail it (field)
+    script = ("cp -r /src /tmp/b && rm -rf /tmp/b/src/*.egg-info && "
+              f"pip -q download '{spec}' -d /wheels && "
+              "pip -q wheel /tmp/b --no-deps -w /wheels")
+    print(f"### wheels: building the {platform} py{python} set into {d}/ (inside {image}) ...")
+    _run([rt, "run", "--rm", "--platform", platform, *opts, image, "bash", "-c", script],
+         what="wheelhouse build")
+    if verify:
+        print("### wheels: verifying a fully OFFLINE install (--network=none) ...")
+        _run([rt, "run", "--rm", "--platform", platform, "--network=none",
+              "-v", f"{d}:/wheels:ro", image, "bash", "-c",
+              f"pip -q install --no-index --find-links /wheels '{req}'"],
+             what="offline verification")
+        print("### wheels: offline install verified — the set is complete")
+    return d
+
+
 def _hf_download(repo: str, hf_home: str, token: str = "") -> None:
     """Populate the bundle's HF cache with a full repo snapshot. Prefers the
     huggingface_hub Python API (ships with vLLM/ramalama installs); falls back

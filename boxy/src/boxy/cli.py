@@ -1248,6 +1248,29 @@ def cmd_clean(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_wheels(args: argparse.Namespace) -> int:
+    """One-command offline wheel set for installing boxy on air-gapped/other
+    systems: builds inside a python container so the wheels match the TARGET
+    platform, verifies with a no-network install, prints the carry recipe."""
+    from boxy import airgap
+
+    _print_provenance()
+    try:
+        out = airgap.build_wheelhouse(
+            args.output, platform=args.platform, python=args.python_version,
+            extras=args.extras, runtime=args.runtime or "",
+            ca_file=args.ca or "", verify=not args.no_verify)
+    except airgap.BundleError as e:
+        print(f"boxy wheels: {e}", file=sys.stderr)
+        return 1
+    spec = f"boxy-hpc[{args.extras}]" if args.extras else "boxy-hpc"
+    print(f"### Wheel set ready: {out}/  ({args.platform}, python {args.python_version})")
+    print("### Carry the directory across, then on the target:")
+    print(f"###   python{args.python_version} -m venv boxy-env && . boxy-env/bin/activate")
+    print(f"###   pip install --no-index --find-links {out.name}/ '{spec}'")
+    return 0
+
+
 def cmd_bundle(args: argparse.Namespace) -> int:
     """Build an AIR-GAP bundle for MODEL on a CONNECTED machine: the HF cache
     (model + the card's aux repos — custom code fetches them dynamically), the
@@ -6659,6 +6682,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true",
                    help="add without the interactive confirmation (non-TTY shells)")
     p.set_defaults(func=cmd_trust, location=None, box=None)
+
+    p = sub.add_parser("wheels", help="build a VERIFIED offline wheel set for installing "
+                                      "boxy (+extras) on air-gapped or other systems — "
+                                      "platform-correct via a python container")
+    p.add_argument("-o", "--output", default="boxy-wheels",
+                   help="wheel directory to produce (default boxy-wheels/)")
+    p.add_argument("--platform", default="linux/amd64",
+                   help="TARGET container platform (default linux/amd64; linux/arm64 for "
+                        "Grace/ARM systems) — never silently this machine's")
+    p.add_argument("--python", dest="python_version", default="3.12",
+                   help="TARGET python minor version (default 3.12) — compiled wheels pin to it")
+    p.add_argument("--extras", default="ramalama,plot",
+                   help="extras whose dependency closure to include (default ramalama,plot)")
+    p.add_argument("--runtime", choices=["podman", "docker"], default=None)
+    p.add_argument("--ca", default=None,
+                   help="site CA bundle for the in-container pip (default: $SSL_CERT_FILE, "
+                        "else boxy's ca-merged.crt)")
+    p.add_argument("--no-verify", action="store_true",
+                   help="skip the --network=none install verification")
+    p.set_defaults(func=cmd_wheels)
 
     p = sub.add_parser("bundle", help="build an AIR-GAP bundle for MODEL (HF cache incl. "
                                      "aux custom-code repos, engine image oci-archive, pip "

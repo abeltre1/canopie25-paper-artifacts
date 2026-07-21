@@ -27,6 +27,35 @@ boxy bundle nvidia/NVIDIA-Nemotron-Parse-v1.2 -o nemotron-bundle/ --bake
   `boxy serve MODEL --bundle /path/nemotron-bundle --ssh <connected-cluster>`.
   If it reaches `### READY` there, the same directory works inside.
 
+## Installing boxy itself across the gap — `boxy wheels`
+
+The bundle carries the MODEL; when the inside system also needs the boxy CLI
+(anyone driving serves/benches from in there), carry a wheel set:
+
+```bash
+boxy wheels -o boxy-wheels/                 # linux/amd64 + python 3.12 by default
+#   builds inside python:3.12 (podman --platform linux/amd64): boxy's own wheel
+#   from your checkout + the FULL dependency closure of [ramalama,plot], then
+#   verifies with a --network=none install before you carry anything
+```
+
+Then on the target:
+
+```bash
+python3.12 -m venv boxy-env && . boxy-env/bin/activate
+pip install --no-index --find-links boxy-wheels/ 'boxy-hpc[ramalama,plot]'
+```
+
+- **The set is platform+python pinned** — that is the point. `--platform
+  linux/arm64` for Grace/ARM systems, `--python 3.11` for older site pythons;
+  one directory per target flavor. (Field: a laptop-native download silently
+  produced aarch64 wheels no x86_64 cluster could install.)
+- The in-container pip rides your site CA (`--ca`, else `$SSL_CERT_FILE`,
+  else boxy's `ca-merged.crt`) and `network.proxy` automatically.
+- Remember the agentless design first: driving `boxy serve/bench --ssh` from
+  OUTSIDE needs **no boxy on the cluster at all** — install inside only when
+  someone must run boxy from in there.
+
 ## The checklist nobody remembers
 
 **Software that must live inside:**
