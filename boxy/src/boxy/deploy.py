@@ -7,6 +7,7 @@ Pipeline:  resolve accel/runtime -> env merge -> model & mounts ->
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 from dataclasses import dataclass, field, replace
@@ -208,6 +209,15 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
     the plain foreground `podman run` (no srun); the REAL scheduler supplies
     only the batch directives."""
     if box.model_is_s3 or (box.model_is_transport_uri and not engine_pulls_model):
+        # field: `s3://huggingface.co/org/name` — HF is not an S3 bucket; the
+        # user wanted the hf:// transport, which agentless serves directly
+        if box.model_is_s3 and "huggingface" in box.model.lower():
+            repo = re.sub(r"^s3://[^/]+/", "", box.model)
+            raise AgentlessError(
+                f"{box.model!r}: huggingface.co is not an S3 bucket — the s3:// transport is "
+                f"for SITE buckets fed by `boxy push`. For HuggingFace use "
+                f"`boxy serve hf://{repo} ...` — the agentless serve stages it onto the "
+                f"cluster's shared FS automatically, no S3 involved.")
         raise AgentlessError(
             f"agentless needs a PRE-STAGED model on the shared filesystem, not {box.model!r} — "
             "a transport-URI/s3 pull requires RamaLama on the cluster. Stage it first "

@@ -233,3 +233,13 @@ def test_render_from_mac_still_targets_linux(staged_gguf, tmp_path, monkeypatch)
 
     args = PodmanBackend().network_args(_box(staged_gguf), ["llama-server", "--port", "8090"])
     assert args == ["-p", "8090:8090"]
+
+
+def test_render_hf_via_s3_uri_names_the_hf_transport(tmp_path):
+    """Field: `s3://huggingface.co/org/name` — HF is not an S3 bucket; the
+    error must point at the hf:// transport the user actually wanted."""
+    with pytest.raises(deploy.AgentlessError,
+                       match=r"hf://meta-llama/Llama-3.1-8B-Instruct"):
+        deploy.render_agentless_script(
+            _box("s3://huggingface.co/meta-llama/Llama-3.1-8B-Instruct"), _loc(),
+            "slurm", "x", str(tmp_path / "x.json"), str(tmp_path / "x.log"), [])
