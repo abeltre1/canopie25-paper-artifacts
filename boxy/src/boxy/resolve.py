@@ -380,8 +380,13 @@ def resolve(
     decisions += loc_decisions
 
     if engine is None:
+        # a path verified on the --ssh cluster (_classify_model's note) is REAL:
+        # infer the engine from it like any existing path — the 'assume
+        # llama.cpp' fallback sent a shared-FS HF DIRECTORY into the llama.cpp
+        # image, which died on 'failed to read magic' (field)
+        exists_remote = "verified over ssh" in model_decision
         if (not resolved_model.startswith(TRANSPORT_SCHEMES) and not resolved_model.startswith("s3://")
-                and not os.path.exists(resolved_model)):
+                and not os.path.exists(resolved_model) and not exists_remote):
             # dryrun with a missing path: don't assert facts about a file that
             # doesn't exist (finding 22) — plan as llama.cpp and say so
             engine = "llama.cpp"

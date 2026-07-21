@@ -205,3 +205,24 @@ def test_local_path_check_unchanged_without_remote_target():
 
     with pytest.raises(RuntimeError, match="no such model file"):
         resolve._classify_model("/definitely/not/here", True)
+
+
+def test_remote_verified_path_infers_real_engine(monkeypatch):
+    """Field: a shared-FS HF DIRECTORY served over --ssh got 'engine:
+    llama.cpp (assumed — model file not present)' because the assumption
+    checked the LAPTOP filesystem — the job died on GGUF 'failed to read
+    magic'. A remote-verified path infers like any existing path: dir ->
+    vLLM, *.gguf -> llama.cpp."""
+    from boxy import remote, resolve
+
+    monkeypatch.setattr(remote, "ensure_master", lambda t: 0)
+    monkeypatch.setattr(remote, "ssh_capture", lambda t, cmd, timeout=15: (0, ""))
+    r = resolve.resolve("/shared/models/Llama-4-Maverick", scheduler="slurm",
+                        gpus=4, accelerator="rocm", runtime="podman",
+                        remote_target="user1@clustera-login")
+    assert r.box.engine == "vllm"
+    assert not any("assumed" in d for d in r.decisions)
+    r2 = resolve.resolve("/shared/models/llama.gguf", scheduler="slurm",
+                         gpus=1, accelerator="rocm", runtime="podman",
+                         remote_target="user1@clustera-login")
+    assert r2.box.engine == "llama.cpp"
