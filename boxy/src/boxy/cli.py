@@ -4328,6 +4328,13 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
 
 def cmd_serve(args: argparse.Namespace) -> int:
     _print_provenance()
+    # `--nodes-per-replica M` with a SINGLE instance IS `--nodes M` — honor the
+    # intent instead of silently ignoring it (field: a 2-node Maverick plan ran
+    # on one node and died; the flag only differed from --nodes for --replicas).
+    npr = getattr(args, "nodes_per_replica", 1) or 1
+    if npr > 1 and (getattr(args, "replicas", 1) or 1) == 1 and (getattr(args, "nodes", 1) or 1) <= 1:
+        args.nodes = npr
+        print(f"  auto: nodes: {npr} (--nodes-per-replica with a single instance = --nodes)")
     # A --system card is a built-in deployment profile: materialize it to a TOML
     # and feed it through the SAME --location machinery (explicit flags still win
     # via the overlay). --location wins if both are given.

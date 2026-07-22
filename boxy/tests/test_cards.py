@@ -588,3 +588,33 @@ def test_nemotron3_family_per_accelerator_serving():
     # variant-specific cards beat the generic Nano match
     assert cards.find_card("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8").min_vram_gb == 30
     assert cards.find_card("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4").min_vram_gb == 18
+
+
+def test_cards_match_filesystem_paths(tmp_path, monkeypatch):
+    """A shared-FS checkout served BY PATH must hit the same card as the
+    hf:// id (field: a by-path Maverick serve missed its card's geometry and
+    context cap, ran single-node, and OOMed)."""
+    from boxy import cards
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    d = tmp_path / "cfg" / "boxy" / "cards" / "models"
+    d.mkdir(parents=True)
+    (d / "acme-big-moe.toml").write_text(
+        '[model]\nmatch = "acme/Big-MoE-400B*"\nengine = "vllm"\n'
+        'gpus = 16\nmin_vram_gb = 814\n[model.args]\nmax_model_len = 8192\n')
+    card = cards.find_card("/pscratch/team/models/acme/Big-MoE-400B-Instruct")
+    assert card is not None and card.gpus == 16
+    args, _ = cards.layered_args("/pscratch/team/models/acme/Big-MoE-400B-Instruct")
+    assert args.get("max_model_len") == 8192
+    assert cards.find_card("acme/Big-MoE-400B-Instruct").gpus == 16   # plain id unchanged
+    assert cards.find_card("acme/Other-Model") is None                # no false hits
+
+
+def test_match_keys_shapes():
+    from boxy import cards
+
+    assert cards.match_keys("meta-llama/X") == ["meta-llama/X"]
+    assert cards.match_keys("hf://meta-llama/X") == ["meta-llama/X"]
+    keys = cards.match_keys("/fs/models/meta-llama/X")
+    assert keys[0] == "/fs/models/meta-llama/X"
+    assert "meta-llama/X" in keys and "X" in keys

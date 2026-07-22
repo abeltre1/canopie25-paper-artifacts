@@ -105,6 +105,29 @@ def model_key(model: str) -> str:
     return m
 
 
+def match_keys(model: str) -> list[str]:
+    """Every key a card pattern may match for `model`. A plain id yields just
+    itself; a filesystem PATH also yields its trailing `org/name` pair and
+    basename, so a shared-FS checkout of meta-llama/X hits the same card as
+    hf://meta-llama/X (field: a by-path Maverick serve missed its card's
+    geometry + context cap and OOMed)."""
+    key = model_key(model)
+    keys = [key]
+    trimmed = key.rstrip("/")
+    if "/" in trimmed and (os.path.isabs(os.path.expanduser(trimmed))
+                           or trimmed.startswith((".", "~"))):
+        parts = [p for p in trimmed.split("/") if p]
+        if len(parts) >= 2:
+            keys.append(f"{parts[-2]}/{parts[-1]}")
+        if parts:
+            keys.append(parts[-1])
+    return keys
+
+
+def _hit(keys: list[str], pattern: str) -> bool:
+    return any(fnmatch.fnmatchcase(k, pattern) or k == pattern for k in keys)
+
+
 def _user_dir() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
     return Path(xdg) / "boxy" / "cards" / "models"
@@ -169,10 +192,10 @@ def find_card(model: str) -> ModelCard | None:
     """Best card for `model`: user beats packaged; within a source the LONGEST
     match pattern wins (most specific — 'Qwen2.5-7B-Instruct-GGUF*' beats
     'Qwen2.5-7B-Instruct*')."""
-    key = model_key(model)
+    keys = match_keys(model)
     best: ModelCard | None = None
     for card in load_cards():
-        if not (fnmatch.fnmatchcase(key, card.match) or key == card.match):
+        if not _hit(keys, card.match):
             continue
         if best is None:
             best = card
@@ -193,10 +216,10 @@ def layered_args(model: str) -> tuple[dict, str]:
     before cardgen knew about trust_remote_code) shadowed the packaged
     Nemotron-Parse card entirely, silently dropping --trust-remote-code and
     killing every serve at vLLM config validation. Returns (args, provenance)."""
-    key = model_key(model)
+    keys = match_keys(model)
     best: dict[str, ModelCard] = {}
     for card in load_cards():
-        if not (fnmatch.fnmatchcase(key, card.match) or key == card.match):
+        if not _hit(keys, card.match):
             continue
         cur = best.get(card.source)
         if cur is None or len(card.match) > len(cur.match):
@@ -220,10 +243,10 @@ def layered_pip(model: str) -> list:
     """Extra pip packages for the model, UNION of the best-matching packaged and
     user cards (same layering rationale as layered_args: a user card must never
     silently drop a packaged card's required runtime deps)."""
-    key = model_key(model)
+    keys = match_keys(model)
     best: dict[str, ModelCard] = {}
     for card in load_cards():
-        if not (fnmatch.fnmatchcase(key, card.match) or key == card.match):
+        if not _hit(keys, card.match):
             continue
         cur = best.get(card.source)
         if cur is None or len(card.match) > len(cur.match):
@@ -240,10 +263,10 @@ def layered_env(model: str) -> dict:
     """[model.env] with the same packaged-base / user-overlay layering as
     layered_args: engine env vars the model needs (kernel selectors like
     VLLM_USE_FLASHINFER_MOE_FP4). User box.env still wins at merge time."""
-    key = model_key(model)
+    keys = match_keys(model)
     best: dict[str, ModelCard] = {}
     for card in load_cards():
-        if not (fnmatch.fnmatchcase(key, card.match) or key == card.match):
+        if not _hit(keys, card.match):
             continue
         cur = best.get(card.source)
         if cur is None or len(card.match) > len(cur.match):
@@ -259,10 +282,10 @@ def layered_aux_repos(model: str) -> list:
     """Auxiliary HF repos (dynamically fetched by the model's custom code) from
     the best packaged + user cards — `boxy bundle` pre-caches every one so an
     air-gapped serve never reaches for the network mid-import."""
-    key = model_key(model)
+    keys = match_keys(model)
     best: dict[str, ModelCard] = {}
     for card in load_cards():
-        if not (fnmatch.fnmatchcase(key, card.match) or key == card.match):
+        if not _hit(keys, card.match):
             continue
         cur = best.get(card.source)
         if cur is None or len(card.match) > len(cur.match):

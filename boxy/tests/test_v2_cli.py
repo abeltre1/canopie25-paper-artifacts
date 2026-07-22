@@ -248,3 +248,17 @@ def test_pull_local_path_is_noop(capsys):
     rc = main(["pull", "/shared/models/m.gguf"])
     assert rc == 0
     assert "nothing to pull" in capsys.readouterr().out
+
+
+def test_nodes_per_replica_maps_to_nodes_for_single_instance(tmp_path, monkeypatch, capfd):
+    """Field: `--nodes-per-replica 2` without --replicas was silently ignored —
+    a 2-node Maverick plan ran single-node and OOMed. With one instance the
+    flag now means --nodes 2 (announced), so the Ray plan engages."""
+    from boxy.cli import main
+
+    rc = main(["serve", "hf://org/repo", "--nodes-per-replica", "2", "--gpus", "4",
+               "--scheduler", "slurm", "--runtime", "podman", "--accelerator", "cuda",
+               "--dryrun"])
+    out = capfd.readouterr().out
+    assert rc == 0
+    assert "auto: nodes: 2 (--nodes-per-replica with a single instance = --nodes)" in out
