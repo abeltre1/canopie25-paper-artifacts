@@ -602,9 +602,9 @@ def test_cards_match_filesystem_paths(tmp_path, monkeypatch):
     (d / "acme-big-moe.toml").write_text(
         '[model]\nmatch = "acme/Big-MoE-400B*"\nengine = "vllm"\n'
         'gpus = 16\nmin_vram_gb = 814\n[model.args]\nmax_model_len = 8192\n')
-    card = cards.find_card("/pscratch/team/models/acme/Big-MoE-400B-Instruct")
+    card = cards.find_card("/scratch/team/models/acme/Big-MoE-400B-Instruct")
     assert card is not None and card.gpus == 16
-    args, _ = cards.layered_args("/pscratch/team/models/acme/Big-MoE-400B-Instruct")
+    args, _ = cards.layered_args("/scratch/team/models/acme/Big-MoE-400B-Instruct")
     assert args.get("max_model_len") == 8192
     assert cards.find_card("acme/Big-MoE-400B-Instruct").gpus == 16   # plain id unchanged
     assert cards.find_card("acme/Other-Model") is None                # no false hits
