@@ -69,10 +69,25 @@ def test_ray_head_inner_starts_ray_waits_then_execs_vllm():
     head = distributed.ray_head_inner(argv, gpus_per_node=4, world=8)
     assert head[:2] == ["bash", "-lc"]
     script = head[2]
-    # order: start head -> wait for the whole cluster -> exec vLLM in the same shell
-    assert script.index("ray start --head --port=6379 --num-gpus=4") < script.index("python3 -c")
-    assert script.index("python3 -c") < script.index("exec vllm serve /mnt/models/m")
+    # order: ray fallback shim -> start head -> wait for the whole cluster ->
+    # exec vLLM in the same shell (ray.init marks the cluster-wait step)
+    assert script.index("command -v ray") < script.index("ray start --head --port=6379 --num-gpus=4")
+    assert script.index("ray start --head") < script.index("ray.init(address=")
+    assert script.index("ray.init(address=") < script.index("exec vllm serve /mnt/models/m")
     assert "&&" in script  # each step gates the next; a failed ray start never reaches vLLM
+
+
+def test_ray_fallback_shim_covers_imageless_ray():
+    """Field: `bash: ray: command not found` (rc=127) on a ROCm vLLM image —
+    the inner scripts shim `ray` over the module entrypoint when the CLI is
+    absent, and pip-install ray as the last resort before failing loudly."""
+    for inner in (distributed.ray_head_inner(["vllm", "serve", "/m"], 4, 8),
+                  distributed.ray_worker_inner(4)):
+        script = inner[2]
+        assert "command -v ray" in script
+        assert "from ray.scripts.scripts import main" in script     # module-entrypoint shim
+        assert "pip install -q --no-cache-dir ray" in script        # self-heal rung
+        assert "vllm[ray]" in script                                # the loud last-resort error
 
 
 def test_ray_head_wait_targets_world_gpu_count():

@@ -62,10 +62,28 @@ def _ray_wait(world: int, timeout_s: int = 600) -> str:
     return "python3 -c " + shlex.quote(py)
 
 
+# The serving image may not expose a `ray` CLI on PATH (field: `bash: ray:
+# command not found`, rc=127, ROCm vLLM image): when the binary is absent,
+# shim a bash function named `ray` over the module entrypoint — and when even
+# the module is missing, SELF-HEAL with a pip install at container start
+# (rides the job's forwarded proxy + CA, the card-pip-deps pattern).
+RAY_FALLBACK = (
+    "if ! command -v ray >/dev/null 2>&1; then "
+    "if ! python3 -c 'import ray' >/dev/null 2>&1; then "
+    "echo 'boxy: this image ships no ray — installing it (multi-node serving needs it) ...' >&2; "
+    "python3 -m pip install -q --no-cache-dir ray || "
+    "{ echo 'boxy: could not install ray — multi-node serving needs an image with vllm[ray]: "
+    "pin one with --image, or add ray to the model card pip list' >&2; exit 9; }; fi; "
+    "ray(){ python3 -c 'import sys; from ray.scripts.scripts import main; sys.exit(main())' \"$@\"; }; "
+    "fi"
+)
+
+
 def ray_head_inner(vllm_argv: list[str], gpus_per_node: int, world: int) -> list[str]:
     """Container inner command for the HEAD node: start the Ray head, wait for all
     workers to join (all `world` GPUs), then exec vLLM using the Ray cluster."""
     script = (
+        f"{RAY_FALLBACK}; "
         f"ray start --head --port={config.get_int('network.ray_port')} --num-gpus={gpus_per_node} && "
         f"{_ray_wait(world)} && "
         f"exec {shlex.join(vllm_argv)}"
@@ -84,7 +102,8 @@ def ray_worker_inner(gpus_per_node: int) -> list[str]:
     --block holds until the cluster shuts down and the loop breaks."""
     join = (f"ray start --address=${{{HEAD_ENV}}}:{config.get_int('network.ray_port')} "
             f"--num-gpus={gpus_per_node} --block")
-    script = (f"for _i in $(seq 30); do {join} && break; "
+    script = (f"{RAY_FALLBACK}; "
+              f"for _i in $(seq 30); do {join} && break; "
               f"echo \"boxy: ray join attempt $_i failed (head still starting?) — retrying in 10s\" >&2; "
               f"sleep 10; done")
     return ["bash", "-lc", script]
