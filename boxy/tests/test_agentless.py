@@ -178,7 +178,11 @@ def test_render_multinode_flux_uses_flux_run(tmp_path):
         _box("meta-llama/Llama-3.1-70B-Instruct", engine="vllm"), _vllm_loc(3, 4, "flux"),
         "flux", "boxy-70b", str(tmp_path / "ep.json"), str(tmp_path / "%j.log"),
         [], port=8000, engine_pulls_model=True)
-    assert "flux run -N2 -n2 --tasks-per-node=1" in script
+    # PER-RESOURCE flags only: adding -n made modern flux reject the launch
+    # ('Per-resource options can't be used with per-task options' — field:
+    # the worker never started and the head died ray-less)
+    assert "flux run -N2 --tasks-per-node=1" in script
+    assert "-n2" not in script
     assert "--pipeline-parallel-size=3" in script
 
 
