@@ -166,6 +166,11 @@ def test_render_multinode_fans_ray_workers_from_the_script(tmp_path):
     assert 'srun --nodes=1 --ntasks=1 --ntasks-per-node=1 --exclude "$(hostname -s)"' in script
     assert '_HEAD_IP="$(hostname -I' in script
     assert 'BOXY_RAY_HEAD="${_HEAD_IP}"' in script
+    # the WORKER container gets the same site CA the head does — its ray
+    # self-heal pip install rides the interceptor and dies TLS otherwise
+    # (field: head installed ray fine, every worker failed CERTIFICATE_VERIFY)
+    worker_line = [ln for ln in script.splitlines() if "srun --nodes=1" in ln][0]
+    assert "${_CAARGS}" in worker_line
     assert "ray start --address=${BOXY_RAY_HEAD}" in script
     assert "boxy serve" not in script                     # still zero-install
     # workers launch in the BACKGROUND; the head podman stays the foreground exec

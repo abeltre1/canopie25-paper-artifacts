@@ -317,7 +317,18 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
     worker_block = ""
     if multinode:
         nodes = location.resources.nodes
-        wcmd = shlex.join(deployment.worker_command or [])
+        # the worker container needs the SAME site CA the head gets — its
+        # in-container ray self-heal (pip install) rides the interceptor and
+        # dies with CERTIFICATE_VERIFY_FAILED without REQUESTS_CA_BUNDLE
+        # (field: head installed ray fine, workers all failed TLS). Splice
+        # ${_CAARGS} before the image exactly like the head podman command.
+        wlist = list(deployment.worker_command or [])
+        wimg = deployment.box.image or ""
+        if runtime in ("podman", "docker") and wimg and wimg in wlist:
+            widx = wlist.index(wimg)
+            wcmd = f"{shlex.join(wlist[:widx])} ${{_CAARGS}} {shlex.join(wlist[widx:])}"
+        else:
+            wcmd = shlex.join(wlist)
         wcmd = wcmd.replace(_HEAD_IP_TOKEN, '"${_HEAD_IP}"')
         if scheduler_name == "slurm":
             fan = (f'srun --nodes={nodes - 1} --ntasks={nodes - 1} --ntasks-per-node=1 '

@@ -71,7 +71,9 @@ RAY_FALLBACK = (
     "if ! command -v ray >/dev/null 2>&1; then "
     "if ! python3 -c 'import ray' >/dev/null 2>&1; then "
     "echo 'boxy: this image ships no ray — installing it (multi-node serving needs it) ...' >&2; "
-    "python3 -m pip install -q --no-cache-dir ray || "
+    # the in-container pip rides the site interceptor: use the CA boxy mounts
+    # (SSL_CERT_FILE) explicitly, or pip's vendored certifi rejects the cert
+    "python3 -m pip install -q --no-cache-dir ${SSL_CERT_FILE:+--cert \"$SSL_CERT_FILE\"} ray || "
     "{ echo 'boxy: could not install ray — multi-node serving needs an image with vllm[ray]: "
     "pin one with --image, or add ray to the model card pip list' >&2; exit 9; }; fi; "
     "ray(){ python3 -c 'import sys; from ray.scripts.scripts import main; sys.exit(main())' \"$@\"; }; "

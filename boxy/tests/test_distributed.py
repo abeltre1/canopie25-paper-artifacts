@@ -86,7 +86,8 @@ def test_ray_fallback_shim_covers_imageless_ray():
         script = inner[2]
         assert "command -v ray" in script
         assert "from ray.scripts.scripts import main" in script     # module-entrypoint shim
-        assert "pip install -q --no-cache-dir ray" in script        # self-heal rung
+        assert "pip install -q --no-cache-dir" in script and " ray" in script  # self-heal rung
+        assert 'SSL_CERT_FILE:+--cert "$SSL_CERT_FILE"' in script    # pip trusts the site CA
         assert "vllm[ray]" in script                                # the loud last-resort error
 
 
