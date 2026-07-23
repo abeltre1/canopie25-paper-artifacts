@@ -58,6 +58,12 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
                  "set 127.0.0.1 only for a purely local, single-host serve."),
     Setting("network.ray_port", "BOXY_RAY_PORT", 6379, int,
             help="Ray head port for multi-node (distributed) vLLM serving."),
+    Setting("network.ray_num_cpus", "BOXY_RAY_NUM_CPUS", 32, int,
+            help="CPU count DECLARED to each node's `ray start` (never probed). Capped "
+                 "low on purpose: Ray prestarts one worker process per declared CPU when "
+                 "the first driver registers, and on big HPC nodes (192-core MI300A) that "
+                 "fork storm wedges the raylet — vLLM only needs ~1 CPU per GPU actor "
+                 "plus slack."),
     Setting("network.replica_port_base", "BOXY_REPLICA_PORT_BASE", 8000, int,
             help="first port for --replicas fan-out (replica N binds base+N)."),
     Setting("network.proxy", "BOXY_PROXY", "",

@@ -343,8 +343,25 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
             # disjoint placement on every flux version, no scheduler involved.
             ranks = "1" if nodes == 2 else f"1-{nodes - 1}"
             fan = f'flux exec -r {ranks} '
+        # sweep stale same-name containers off EVERY job node before launching:
+        # field — conmon keeps a -worker container alive after the scheduler
+        # tears a failed job down, and the orphan then glomms onto the next
+        # run's Ray cluster on the shared host network (or hard-fails the new
+        # worker with 'name already in use'); a stale co-located worker on the
+        # head node puts two raylets on one host — the audit-confirmed
+        # driver-registration wedge. Apptainer needs no sweep (its containers
+        # are plain processes the scheduler already kills with the job).
+        sweep = ""
+        if runtime in ("podman", "docker"):
+            rmcmd = f"{runtime} rm -f {box.name} {box.name}-worker 2>/dev/null; true"
+            if scheduler_name == "slurm":
+                sweep = (f"srun --ntasks={nodes} --ntasks-per-node=1 "
+                         f"bash -c {shlex.quote(rmcmd)} 2>/dev/null || true\n")
+            else:  # flux exec with no -r targets every broker rank, head included
+                sweep = f"flux exec bash -c {shlex.quote(rmcmd)} 2>/dev/null || true\n"
         worker_block = (
-            '_HEAD_IP="$(hostname -I 2>/dev/null | awk \'{print $1}\')"\n'
+            sweep
+            + '_HEAD_IP="$(hostname -I 2>/dev/null | awk \'{print $1}\')"\n'
             '[ -n "$_HEAD_IP" ] || _HEAD_IP="$(getent hosts "$_H" | awk \'{print $1}\')"\n'
             f'{fan}{proxy_prefix}{wcmd} &\n'
         )

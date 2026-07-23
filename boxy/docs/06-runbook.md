@@ -602,6 +602,16 @@ boxy serve <model> --scheduler slurm --nodes 2 --gpus 4 --dryrun
 # On the node, sanity-check the cluster formed before/while the model loads:
 #   ray status          # EXPECT: 2 nodes, 8 GPUs total
 #   nvidia-smi          # (run per node) EXPECT: all GPUs busy once loaded
+# The job log narrates the cluster wait — it is NEVER silent:
+#   "boxy: ray cluster GPUs: 4/8 — waiting for workers ..."   (every 30s)
+#   "boxy: ray cluster complete (8/8 GPUs) — starting vLLM"   (then the vLLM banner)
+#   "-1" in the heartbeat = the status probe itself timed out (GCS wedged, not
+#   workers missing); at 10 min it dumps the node table and aborts loudly (exit 8).
+# Before launching, the batch script sweeps stale same-name containers off every
+# job node (orphans from a dead job otherwise rejoin the new Ray cluster), and
+# serve containers run with --pids-limit=-1 + a capped ray --num-cpus (config
+# network.ray_num_cpus, default 32) — on 192-core nodes Ray's per-CPU worker
+# prestart otherwise hits podman's 2048-pid ceiling and wedges the raylet.
 boxy serve <model> --scheduler slurm --nodes 2 --gpus 4     # for real; READY -> curl -> boxy stop <name>
 
 # --- B. N INDEPENDENT instances (data-parallel replicas) -----------------------

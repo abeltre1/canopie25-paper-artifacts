@@ -30,6 +30,10 @@ def test_plan_serve_clustera_end_to_end(vllm_box, clustera):
     cmd = d.command
     assert cmd[:3] == ["srun", "--nodes=2", "--gpus-per-node=4"]
     assert "podman" in cmd and "run" in cmd
+    # podman's default 2048-pid ceiling wedges Ray/vLLM on big nodes (field:
+    # 192-CPU MI300A — the raylet fork storm hit the limit and the driver hung
+    # forever in RegisterClient); serve containers always lift it.
+    assert "--pids-limit=-1" in cmd
     i = cmd.index("--device")
     assert cmd[i + 1] == "nvidia.com/gpu=all"
     # Model is a relative path in the shared models dir (paper flow)

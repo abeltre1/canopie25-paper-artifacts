@@ -144,10 +144,22 @@ def test_ray_worker_inner_joins_head_and_blocks():
     worker = distributed.ray_worker_inner(gpus_per_node=4)
     assert worker[:2] == ["bash", "-lc"]
     # head IP comes from the env var the launcher bakes in; --block holds the node
-    assert "ray start --address=${BOXY_RAY_HEAD}:6379 --num-gpus=4 --block" in worker[2]
+    assert "ray start --address=${BOXY_RAY_HEAD}:6379 --num-gpus=4 --num-cpus=32 --block" in worker[2]
     # the join RETRIES — workers race the head's `ray start --head` (field: the
     # agentless batch script launches both into the allocation together)
     assert "for _i in" in worker[2] and "sleep 10" in worker[2]
+
+
+def test_ray_declares_capped_cpu_count_on_both_sides():
+    """Field: on 192-CPU MI300A nodes, Ray prestarts one worker process per
+    DECLARED CPU the moment the first driver registers — the fork storm wedged
+    the raylet and the driver hung forever in RegisterClient's recv(). Declare
+    a small CPU count (config network.ray_num_cpus, default 32: ~1 CPU per GPU
+    actor plus slack) on the head AND worker ray starts."""
+    head = distributed.ray_head_inner(["vllm", "serve", "/m"], 4, 8)[2]
+    worker = distributed.ray_worker_inner(4)[2]
+    assert "ray start --head --port=6379 --num-gpus=4 --num-cpus=32" in head
+    assert "--num-cpus=32 --block" in worker
 
 
 def test_ray_worker_does_not_rejoin_a_dead_cluster():
@@ -397,7 +409,7 @@ def test_plan_serve_distributed_head_and_worker():
 
     assert dep.worker_command is not None
     worker = shlex.join(dep.worker_command)
-    assert "ray start --address=${BOXY_RAY_HEAD}:6379 --num-gpus=4 --block" in worker
+    assert "ray start --address=${BOXY_RAY_HEAD}:6379 --num-gpus=4 --num-cpus=32 --block" in worker
     # the head IP is baked into the worker container's env
     assert "BOXY_RAY_HEAD=192.0.2.7" in worker
     # worker container gets its own name so it never collides with the head

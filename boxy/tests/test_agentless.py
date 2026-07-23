@@ -191,6 +191,30 @@ def test_render_multinode_flux_uses_flux_run(tmp_path):
     assert "--pipeline-parallel-size=3" in script
 
 
+def test_render_multinode_sweeps_stale_containers_first(tmp_path):
+    """Field: conmon keeps a -worker container alive after the scheduler tears a
+    failed job down; the orphan glomms onto the next run's Ray cluster on the
+    shared host network (or hard-fails the new worker with 'name already in
+    use'), and a stale co-located worker on the head node puts two raylets on
+    one host — the driver-registration wedge. The batch script removes the
+    instance's containers on EVERY job node before launching anything."""
+    script = deploy.render_agentless_script(
+        _box("meta-llama/Llama-3.1-70B-Instruct", engine="vllm"), _vllm_loc(3, 4, "flux"),
+        "flux", "boxy-70b", str(tmp_path / "ep.json"), str(tmp_path / "%j.log"),
+        [], port=8000, engine_pulls_model=True)
+    # flux exec with NO -r -> every broker rank, head included; before the fan
+    sweep = "flux exec bash -c 'podman rm -f"
+    assert sweep in script
+    assert "-worker 2>/dev/null" in script
+    assert script.index(sweep) < script.index("flux exec -r 1-2")
+    # slurm variant sweeps all nodes with one task per node
+    s2 = deploy.render_agentless_script(
+        _box("meta-llama/Llama-3.1-70B-Instruct", engine="vllm"), _vllm_loc(2, 4),
+        "slurm", "b2", str(tmp_path / "ep2.json"), str(tmp_path / "l2.log"),
+        [], port=8000, engine_pulls_model=True)
+    assert "srun --ntasks=2 --ntasks-per-node=1 bash -c 'podman rm -f" in s2
+
+
 def test_render_multinode_opt_out_and_single_node_unchanged(staged_gguf, tmp_path):
     # --no-distributed renders the plain single-node script even at nodes=2 …
     script = deploy.render_agentless_script(

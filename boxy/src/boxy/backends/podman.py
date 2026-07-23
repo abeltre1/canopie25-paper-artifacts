@@ -98,7 +98,14 @@ class PodmanBackend(RuntimeBackend):
         accelerator: str,
     ) -> list[str]:
         entrypoint, inner_args = inner_cmd[0], inner_cmd[1:]
-        cmd = [self.name, self.run_verb, "--rm", f"--name={box.name}"]
+        # --pids-limit=-1: podman's default pid ceiling (2048) is far too small for
+        # inference serving on big nodes — field: on 192-CPU MI300A nodes, Ray
+        # prestarts one worker process per declared CPU when the first driver
+        # registers, the fork storm hits the ceiling mid-spawn, and the raylet
+        # wedges with the driver blocked forever in RegisterClient's recv().
+        # vLLM/llama.cpp thread pools scale with cores too. RamaLama lifts the
+        # limit the same way.
+        cmd = [self.name, self.run_verb, "--rm", "--pids-limit=-1", f"--name={box.name}"]
         cmd += self.network_args(box, inner_cmd)
         cmd += [f"--label=boxy.box={box.name}"]  # lets `boxy list` find boxy-launched containers
         if entrypoint:  # "" => keep the image's own ENTRYPOINT, pass args only

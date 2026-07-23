@@ -121,7 +121,8 @@ def ray_head_inner(vllm_argv: list[str], gpus_per_node: int, world: int) -> list
     # loud abort so the job dies with an unmistakable line instead of silence.
     script = (
         f"{RAY_FALLBACK}; "
-        f"ray start --head --port={config.get_int('network.ray_port')} --num-gpus={gpus_per_node} --disable-usage-stats && "
+        f"ray start --head --port={config.get_int('network.ray_port')} --num-gpus={gpus_per_node} "
+        f"--num-cpus={config.get_int('network.ray_num_cpus')} --disable-usage-stats && "
         f"{{ {_ray_wait(world)} || "
         f"{{ echo 'boxy: ray cluster wait failed (workers missing or GCS wedged) — job aborted' >&2; exit 8; }}; }} && "
         f"exec {shlex.join(vllm_argv)}"
@@ -146,7 +147,8 @@ def ray_worker_inner(gpus_per_node: int) -> list[str]:
     that held 120s+ was a real cluster; when it ends, exit instead of retrying."""
     join = (
         f"ray start --address=${{{HEAD_ENV}}}:{config.get_int('network.ray_port')} "
-        f"--num-gpus={gpus_per_node} --block --disable-usage-stats"
+        f"--num-gpus={gpus_per_node} --num-cpus={config.get_int('network.ray_num_cpus')} "
+        f"--block --disable-usage-stats"
     )
     script = (
         f"{RAY_FALLBACK}; "
