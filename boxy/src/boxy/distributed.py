@@ -51,14 +51,38 @@ def derive_parallelism(resources: Resources) -> tuple[int, int, int]:
 def _ray_wait(world: int, timeout_s: int = 600) -> str:
     """Inline python (runs INSIDE the head container, where ray is importable):
     block until the Ray cluster registers `world` GPUs, else exit non-zero so the
-    container fails loudly instead of vLLM starting against a half-formed cluster."""
+    container fails loudly instead of vLLM starting against a half-formed cluster.
+
+    NEVER silent (field: two runs stalled after 'Connected to Ray cluster' with
+    nothing to diagnose from): a heartbeat prints the GPU count every 30s, the
+    success path announces itself before vLLM takes over, and a timeout dumps
+    every node's address/liveness/resources."""
     py = (
-        "import ray,time,sys;ray.init(address='auto');dl=time.time()+{t};"
-        "g=lambda:ray.cluster_resources().get('GPU',0);"
-        "[time.sleep(2) for _ in iter(lambda:(g()<{w} and time.time()<dl),False)];"
-        "sys.exit(0 if g()>={w} else "
-        "(sys.stderr.write('ray cluster never reached {w} GPUs\\n') or 1))"
-    ).format(t=timeout_s, w=world)
+        "import json, sys, time\n"
+        "import ray\n"
+        "ray.init(address='auto')\n"
+        f"world = {world}\n"
+        f"deadline = time.time() + {timeout_s}\n"
+        "def gpus():\n"
+        "    return int(ray.cluster_resources().get('GPU', 0))\n"
+        "last = 0.0\n"
+        "while gpus() < world and time.time() < deadline:\n"
+        "    if time.time() - last >= 30:\n"
+        "        last = time.time()\n"
+        "        print('boxy: ray cluster GPUs: %d/%d — waiting for workers ...'\n"
+        "              % (gpus(), world), file=sys.stderr, flush=True)\n"
+        "    time.sleep(2)\n"
+        "if gpus() >= world:\n"
+        "    print('boxy: ray cluster complete (%d/%d GPUs) — starting vLLM'\n"
+        "          % (gpus(), world), file=sys.stderr, flush=True)\n"
+        "    sys.exit(0)\n"
+        "print('boxy: ray cluster never reached %d GPUs (have %d) — nodes:'\n"
+        "      % (world, gpus()), file=sys.stderr, flush=True)\n"
+        "for n in ray.nodes():\n"
+        "    print(json.dumps({'ip': n.get('NodeManagerAddress'), 'alive': n.get('Alive'),\n"
+        "                      'resources': n.get('Resources', {})}), file=sys.stderr, flush=True)\n"
+        "sys.exit(1)\n"
+    )
     return "python3 -c " + shlex.quote(py)
 
 
