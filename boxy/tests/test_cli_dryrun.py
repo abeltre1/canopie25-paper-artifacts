@@ -79,8 +79,9 @@ def test_cli_serve_dryrun_distributed_flux(capsys):
     assert "ray start --head" in out and "ray start --address=${BOXY_RAY_HEAD}" in out
     assert "--tensor-parallel-size=4" in out and "--pipeline-parallel-size=2" in out
     assert "--distributed-executor-backend=ray" in out
-    # flux location -> workers placed with flux run (not local containers)
-    assert "flux run" in out and "apptainer" in out and "vllm-rocm.sif" in out
+    # flux location -> workers rank-pinned with `flux exec -r` (never `flux run`:
+    # fluxion can't see the head's container and co-locates — audit)
+    assert "flux exec -r" in out and "apptainer" in out and "vllm-rocm.sif" in out
 
 
 def test_ca_bundle_propagated_into_container(vllm_box, clustera, tmp_path, monkeypatch):
