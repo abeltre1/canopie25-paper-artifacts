@@ -333,12 +333,16 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
         if scheduler_name == "slurm":
             fan = (f'srun --nodes={nodes - 1} --ntasks={nodes - 1} --ntasks-per-node=1 '
                    f'--exclude "$(hostname -s)" ')
-        else:  # flux (guarded above). PER-RESOURCE options only: mixing -N with the
-            # per-task -n is rejected by modern flux ('Per-resource options can't be
-            # used with per-task options' — field: the worker never launched and the
-            # head died ray-less). flux has no --exclude; the head rank may double as
-            # a worker host — container names differ, so they coexist.
-            fan = f'flux run -N{nodes - 1} --tasks-per-node=1 '
+        else:  # flux (guarded above). NOT `flux run`: the scheduler can't see the
+            # head's plain podman process, requests no GPUs for the worker, and has
+            # no --exclude — audit-confirmed it will happily place the worker ON the
+            # head's node, leaving the other node idle while Ray still reports the
+            # full DECLARED GPU count and vLLM wedges on the broken layout. `flux
+            # exec -r` runs directly on broker ranks (rank 0 = the head, always),
+            # so ranks 1..N-1 are exactly the non-head nodes — deterministic
+            # disjoint placement on every flux version, no scheduler involved.
+            ranks = "1" if nodes == 2 else f"1-{nodes - 1}"
+            fan = f'flux exec -r {ranks} '
         worker_block = (
             '_HEAD_IP="$(hostname -I 2>/dev/null | awk \'{print $1}\')"\n'
             '[ -n "$_HEAD_IP" ] || _HEAD_IP="$(getent hosts "$_H" | awk \'{print $1}\')"\n'

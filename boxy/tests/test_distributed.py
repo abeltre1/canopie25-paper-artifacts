@@ -129,8 +129,13 @@ def test_worker_launch_prefix_slurm():
 
 
 def test_worker_launch_prefix_flux():
+    """`flux exec -r`, never `flux run`: fluxion can't see the head's plain
+    podman process and co-locates the worker on the head's node (audit); broker
+    ranks 1..N-1 are exactly the non-head nodes."""
     assert distributed.worker_launch_prefix("flux", "node0", 2) == [
-        "flux", "run", "-N1", "-n1", "--tasks-per-node=1"]
+        "flux", "exec", "-r", "1"]
+    assert distributed.worker_launch_prefix("flux", "node0", 4) == [
+        "flux", "exec", "-r", "1-3"]
 
 
 def test_worker_launch_prefix_none_is_local():

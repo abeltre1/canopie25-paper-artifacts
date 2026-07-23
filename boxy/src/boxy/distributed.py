@@ -108,10 +108,14 @@ RAY_FALLBACK = (
 def ray_head_inner(vllm_argv: list[str], gpus_per_node: int, world: int) -> list[str]:
     """Container inner command for the HEAD node: start the Ray head, wait for all
     workers to join (all `world` GPUs), then exec vLLM using the Ray cluster."""
+    # the wait is wrapped in coreutils `timeout`: field evidence shows ray.init
+    # itself can wedge after logging 'Connected to Ray cluster' — without the
+    # hard kill the container sits silent forever; with it, the job fails loudly.
     script = (
         f"{RAY_FALLBACK}; "
-        f"ray start --head --port={config.get_int('network.ray_port')} --num-gpus={gpus_per_node} && "
-        f"{_ray_wait(world)} && "
+        f"ray start --head --port={config.get_int('network.ray_port')} --num-gpus={gpus_per_node} --disable-usage-stats && "
+        f"{{ timeout 660 {_ray_wait(world)} || "
+        f"{{ echo 'boxy: ray cluster wait died or hung (ray.init/GCS wedge?) — job aborted' >&2; exit 8; }}; }} && "
         f"exec {shlex.join(vllm_argv)}"
     )
     return ["bash", "-lc", script]
@@ -127,7 +131,7 @@ def ray_worker_inner(gpus_per_node: int) -> list[str]:
     --address` exits non-zero while the head port isn't up yet. On a clean join,
     --block holds until the cluster shuts down and the loop breaks."""
     join = (f"ray start --address=${{{HEAD_ENV}}}:{config.get_int('network.ray_port')} "
-            f"--num-gpus={gpus_per_node} --block")
+            f"--num-gpus={gpus_per_node} --block --disable-usage-stats")
     script = (f"{RAY_FALLBACK}; "
               f"for _i in $(seq 30); do {join} && break; "
               f"echo \"boxy: ray join attempt $_i failed (head still starting?) — retrying in 10s\" >&2; "
@@ -154,7 +158,12 @@ def worker_launch_prefix(launcher: str, head_node: str, nodes: int) -> list[str]
         return ["srun", f"--nodes={nodes - 1}", f"--ntasks={nodes - 1}",
                 "--ntasks-per-node=1", "--exclude", head_node]
     if launcher == "flux":
-        return ["flux", "run", f"-N{nodes - 1}", f"-n{nodes - 1}", "--tasks-per-node=1"]
+        # NOT `flux run`: fluxion can't see the head's plain podman process and
+        # will happily co-locate the worker on the head's node (audit-confirmed).
+        # `flux exec -r` targets broker RANKS directly — rank 0 is the head, so
+        # 1..N-1 are exactly the non-head nodes, on every flux version.
+        ranks = "1" if nodes == 2 else f"1-{nodes - 1}"
+        return ["flux", "exec", "-r", ranks]
     return []  # none: launched locally, one Popen per worker
 
 
