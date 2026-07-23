@@ -49,41 +49,49 @@ def derive_parallelism(resources: Resources) -> tuple[int, int, int]:
 
 
 def _ray_wait(world: int, timeout_s: int = 600) -> str:
-    """Inline python (runs INSIDE the head container, where ray is importable):
-    block until the Ray cluster registers `world` GPUs, else exit non-zero so the
-    container fails loudly instead of vLLM starting against a half-formed cluster.
+    """Bash poll loop (runs INSIDE the head container): block until the Ray
+    cluster registers `world` GPUs, else exit non-zero so the container fails
+    loudly instead of vLLM starting against a half-formed cluster.
 
-    NEVER silent (field: two runs stalled after 'Connected to Ray cluster' with
-    nothing to diagnose from): a heartbeat prints the GPU count every 30s, the
-    success path announces itself before vLLM takes over, and a timeout dumps
-    every node's address/liveness/resources."""
-    py = (
-        "import json, sys, time\n"
+    NO LONG-LIVED DRIVER. Field: a run with disjoint head/worker placement and
+    a healthy joined worker still went silent right after the wait driver's
+    'Connected to Ray cluster' — the first GCS RPC blocked inside Ray's C++
+    client, where no in-process guard (signal/alarm) can interrupt it. So each
+    poll is a FRESH python process hard-boxed by coreutils `timeout`: a wedged
+    probe is reaped in 45s and simply retried on the next tick, and the loop
+    itself is pure bash — it cannot hang, and a transient wedge is no longer
+    fatal to the job. Heartbeat every 30s, loud success line before vLLM takes
+    over, node-table dump if the deadline passes (g=-1 means the probe itself
+    kept timing out, i.e. GCS unreachable/wedged rather than workers missing)."""
+    probe = (
+        "import logging\n"
         "import ray\n"
-        "ray.init(address='auto')\n"
-        f"world = {world}\n"
-        f"deadline = time.time() + {timeout_s}\n"
-        "def gpus():\n"
-        "    return int(ray.cluster_resources().get('GPU', 0))\n"
-        "last = 0.0\n"
-        "while gpus() < world and time.time() < deadline:\n"
-        "    if time.time() - last >= 30:\n"
-        "        last = time.time()\n"
-        "        print('boxy: ray cluster GPUs: %d/%d — waiting for workers ...'\n"
-        "              % (gpus(), world), file=sys.stderr, flush=True)\n"
-        "    time.sleep(2)\n"
-        "if gpus() >= world:\n"
-        "    print('boxy: ray cluster complete (%d/%d GPUs) — starting vLLM'\n"
-        "          % (gpus(), world), file=sys.stderr, flush=True)\n"
-        "    sys.exit(0)\n"
-        "print('boxy: ray cluster never reached %d GPUs (have %d) — nodes:'\n"
-        "      % (world, gpus()), file=sys.stderr, flush=True)\n"
+        "ray.init(address='auto', logging_level=logging.ERROR, log_to_driver=False)\n"
+        "print(int(ray.cluster_resources().get('GPU', 0)))\n"
+    )
+    dump = (
+        "import json, logging\n"
+        "import ray\n"
+        "ray.init(address='auto', logging_level=logging.ERROR, log_to_driver=False)\n"
         "for n in ray.nodes():\n"
         "    print(json.dumps({'ip': n.get('NodeManagerAddress'), 'alive': n.get('Alive'),\n"
-        "                      'resources': n.get('Resources', {})}), file=sys.stderr, flush=True)\n"
-        "sys.exit(1)\n"
+        "                      'resources': n.get('Resources', {})}))\n"
     )
-    return "python3 -c " + shlex.quote(py)
+    return (
+        "( "
+        f"_bxg(){{ timeout -k 10 45 python3 -c {shlex.quote(probe)} 2>/dev/null | tail -1; }}; "
+        f"_bxend=$((SECONDS+{timeout_s})); _bxlast=-999; "
+        "while :; do "
+        "g=$(_bxg); case \"$g\" in ''|*[!0-9]*) g=-1;; esac; "
+        f'if [ "$g" -ge {world} ]; then '
+        f'echo "boxy: ray cluster complete ($g/{world} GPUs) — starting vLLM" >&2; exit 0; fi; '
+        'if [ "$SECONDS" -ge "$_bxend" ]; then '
+        f'echo "boxy: ray cluster never reached {world} GPUs (have $g; -1 = status probe timed out) — nodes:" >&2; '
+        f"timeout -k 10 60 python3 -c {shlex.quote(dump)} >&2 2>/dev/null; exit 1; fi; "
+        "if [ $((SECONDS - _bxlast)) -ge 30 ]; then _bxlast=$SECONDS; "
+        f'echo "boxy: ray cluster GPUs: $g/{world} — waiting for workers ..." >&2; fi; '
+        "sleep 5; done )"
+    )
 
 
 # The serving image may not expose a `ray` CLI on PATH (field: `bash: ray:
@@ -97,7 +105,7 @@ RAY_FALLBACK = (
     "echo 'boxy: this image ships no ray — installing it (multi-node serving needs it) ...' >&2; "
     # the in-container pip rides the site interceptor: use the CA boxy mounts
     # (SSL_CERT_FILE) explicitly, or pip's vendored certifi rejects the cert
-    "python3 -m pip install -q --no-cache-dir ${SSL_CERT_FILE:+--cert \"$SSL_CERT_FILE\"} ray || "
+    'python3 -m pip install -q --no-cache-dir ${SSL_CERT_FILE:+--cert "$SSL_CERT_FILE"} ray || '
     "{ echo 'boxy: could not install ray — multi-node serving needs an image with vllm[ray]: "
     "pin one with --image, or add ray to the model card pip list' >&2; exit 9; }; fi; "
     "ray(){ python3 -c 'import sys; from ray.scripts.scripts import main; sys.exit(main())' \"$@\"; }; "
@@ -108,14 +116,14 @@ RAY_FALLBACK = (
 def ray_head_inner(vllm_argv: list[str], gpus_per_node: int, world: int) -> list[str]:
     """Container inner command for the HEAD node: start the Ray head, wait for all
     workers to join (all `world` GPUs), then exec vLLM using the Ray cluster."""
-    # the wait is wrapped in coreutils `timeout`: field evidence shows ray.init
-    # itself can wedge after logging 'Connected to Ray cluster' — without the
-    # hard kill the container sits silent forever; with it, the job fails loudly.
+    # the wait is a poll loop of short time-boxed probes (see _ray_wait), so it
+    # is bounded by construction; its deadline failure still routes through the
+    # loud abort so the job dies with an unmistakable line instead of silence.
     script = (
         f"{RAY_FALLBACK}; "
         f"ray start --head --port={config.get_int('network.ray_port')} --num-gpus={gpus_per_node} --disable-usage-stats && "
-        f"{{ timeout 660 {_ray_wait(world)} || "
-        f"{{ echo 'boxy: ray cluster wait died or hung (ray.init/GCS wedge?) — job aborted' >&2; exit 8; }}; }} && "
+        f"{{ {_ray_wait(world)} || "
+        f"{{ echo 'boxy: ray cluster wait failed (workers missing or GCS wedged) — job aborted' >&2; exit 8; }}; }} && "
         f"exec {shlex.join(vllm_argv)}"
     )
     return ["bash", "-lc", script]
@@ -129,13 +137,25 @@ def ray_worker_inner(gpus_per_node: int) -> list[str]:
     The join RETRIES: the worker containers race the head container's `ray start
     --head` (both are launched into the allocation together), and `ray start
     --address` exits non-zero while the head port isn't up yet. On a clean join,
-    --block holds until the cluster shuts down and the loop breaks."""
-    join = (f"ray start --address=${{{HEAD_ENV}}}:{config.get_int('network.ray_port')} "
-            f"--num-gpus={gpus_per_node} --block --disable-usage-stats")
-    script = (f"{RAY_FALLBACK}; "
-              f"for _i in $(seq 30); do {join} && break; "
-              f"echo \"boxy: ray join attempt $_i failed (head still starting?) — retrying in 10s\" >&2; "
-              f"sleep 10; done")
+    --block holds until the cluster shuts down and the loop breaks.
+
+    But a worker that already HELD a formed cluster must not rejoin: field — the
+    head died, the worker's `--block` exited non-zero, and the retry loop cycled
+    'Ray runtime started' forever in an orphaned container (podman keeps the
+    container alive under conmon when the scheduler tears the job down). A join
+    that held 120s+ was a real cluster; when it ends, exit instead of retrying."""
+    join = (
+        f"ray start --address=${{{HEAD_ENV}}}:{config.get_int('network.ray_port')} "
+        f"--num-gpus={gpus_per_node} --block --disable-usage-stats"
+    )
+    script = (
+        f"{RAY_FALLBACK}; "
+        f"for _i in $(seq 30); do _t0=$SECONDS; {join} && break; "
+        f"if [ $((SECONDS - _t0)) -ge 120 ]; then "
+        f"echo 'boxy: ray worker left a formed cluster (head gone / job ending) — not retrying' >&2; break; fi; "
+        f'echo "boxy: ray join attempt $_i failed (head still starting?) — retrying in 10s" >&2; '
+        f"sleep 10; done"
+    )
     return ["bash", "-lc", script]
 
 
@@ -155,8 +175,14 @@ def worker_launch_prefix(launcher: str, head_node: str, nodes: int) -> list[str]
     Empty for 'none' — there the caller launches the worker containers directly
     on the local host (a single-host set of containers)."""
     if launcher == "slurm":
-        return ["srun", f"--nodes={nodes - 1}", f"--ntasks={nodes - 1}",
-                "--ntasks-per-node=1", "--exclude", head_node]
+        return [
+            "srun",
+            f"--nodes={nodes - 1}",
+            f"--ntasks={nodes - 1}",
+            "--ntasks-per-node=1",
+            "--exclude",
+            head_node,
+        ]
     if launcher == "flux":
         # NOT `flux run`: fluxion can't see the head's plain podman process and
         # will happily co-locate the worker on the head's node (audit-confirmed).
@@ -175,12 +201,20 @@ def discover_topology(launcher: str) -> tuple[str, str, int]:
         if launcher == "slurm":
             nodelist = os.environ.get("SLURM_JOB_NODELIST", "")
             if nodelist:
-                out = subprocess.run(["scontrol", "show", "hostnames", nodelist],
-                                     capture_output=True, text=True, timeout=15)
+                out = subprocess.run(
+                    ["scontrol", "show", "hostnames", nodelist],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
                 nodes = [n for n in out.stdout.split() if n]
         elif launcher == "flux":
-            out = subprocess.run(["flux", "hostlist", "-e", "local"],
-                                 capture_output=True, text=True, timeout=15)
+            out = subprocess.run(
+                ["flux", "hostlist", "-e", "local"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
             nodes = [n for n in out.stdout.split() if n]
     except (OSError, subprocess.SubprocessError):
         nodes = []

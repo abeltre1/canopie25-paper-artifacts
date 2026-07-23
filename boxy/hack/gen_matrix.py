@@ -16,6 +16,15 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 EXAMPLES = ROOT / "src" / "boxy" / "data" / "examples"
 
+# deterministic render: this doc regenerates on arbitrary dev machines, and
+# deploy propagates the AMBIENT proxy env into serve commands — scrub it and
+# pin the documentation-stable example proxy so the doc still demonstrates
+# proxy propagation without baking in anything machine-specific.
+for _v in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+    os.environ.pop(_v, None)
+    os.environ.pop(_v.upper(), None)
+os.environ["http_proxy"] = os.environ["https_proxy"] = "http://proxy.example.gov:80"
+
 from boxy.cli import main  # noqa: E402
 
 PREAMBLE = """\
@@ -69,12 +78,16 @@ ENGINES = [("llama.cpp", "qwen-gguf.toml"), ("vllm", "vllm.toml")]
 def dryrun(box: str, location: str) -> str:
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        rc = main([
-            "serve",
-            "--box", str(EXAMPLES / "boxes" / box),
-            "--location", str(EXAMPLES / "locations" / location),
-            "--dryrun",
-        ])
+        rc = main(
+            [
+                "serve",
+                "--box",
+                str(EXAMPLES / "boxes" / box),
+                "--location",
+                str(EXAMPLES / "locations" / location),
+                "--dryrun",
+            ]
+        )
     if rc != 0:
         raise SystemExit(f"dry-run failed for {box} x {location} (rc={rc})")
     return out.getvalue().replace(os.getcwd(), "$PWD").rstrip()
