@@ -252,3 +252,39 @@ def test_render_hf_via_s3_uri_names_the_hf_transport(tmp_path):
         deploy.render_agentless_script(
             _box("s3://huggingface.co/meta-llama/Llama-3.1-8B-Instruct"), _loc(),
             "slurm", "x", str(tmp_path / "x.json"), str(tmp_path / "x.log"), [])
+
+
+def test_pending_diagnosis_flux_and_slurm(monkeypatch):
+    """A job stuck PENDING gets the scheduler's own reason + the queue list +
+    the exact --partition retry hint (field: a 2-node flux job pended silently
+    with no queue choice offered)."""
+    from boxy import cli, remote
+
+    answers = {
+        "reason_pending": (0, "insufficient resources\n"),
+        "queue list": (0, "pdebug|true\npbatch|true\n"),
+        "squeue": (0, "Resources\n"),
+        "sinfo": (0, "gpu*\nshort\n"),
+    }
+
+    def fake_capture(target, cmd, timeout=15):
+        for key, ans in answers.items():
+            if key in cmd:
+                return ans
+        return (1, "")
+
+    monkeypatch.setattr(remote, "ssh_capture", fake_capture)
+    flux_lines = "\n".join(cli._pending_diagnosis("u@c", "flux", "f123"))
+    assert "insufficient resources" in flux_lines
+    assert "pdebug, pbatch" in flux_lines and "--partition <name>" in flux_lines
+    assert "flux --queue" in flux_lines
+    slurm_lines = "\n".join(cli._pending_diagnosis("u@c", "slurm", "42"))
+    assert "Resources" in slurm_lines and "gpu, short" in slurm_lines
+
+
+def test_pending_diagnosis_degrades_when_scheduler_says_nothing(monkeypatch):
+    from boxy import cli, remote
+
+    monkeypatch.setattr(remote, "ssh_capture", lambda t, c, timeout=15: (1, ""))
+    lines = "\n".join(cli._pending_diagnosis("u@c", "flux", "f1"))
+    assert "no pending reason available" in lines

@@ -3301,6 +3301,8 @@ def _serve_agentless_ssh(args, target: str) -> int:
               f"(auto-recovered).")
         return True
 
+    pend_since: float | None = None
+    pend_diagnosed = False
     try:
         while time.time() < deadline:
             rc, st = remote.ssh_capture(target, shlex.join(scheduler.state_command(job_id)), timeout=20)
@@ -3308,6 +3310,14 @@ def _serve_agentless_ssh(args, target: str) -> int:
             if state != last_state:
                 print(f"###   job {job_id}: {state}", flush=True)
                 last_state = state
+            if state == "PENDING":
+                pend_since = pend_since or time.time()
+                if not pend_diagnosed and time.time() - pend_since > 60:
+                    pend_diagnosed = True
+                    for line in _pending_diagnosis(target, scheduler_name, job_id):
+                        print(line, flush=True)
+            else:
+                pend_since = None
             if state == "DONE":
                 tail = _remote_log_tail(target, log_remote)
                 if _maybe_proxy_heal(tail) or _maybe_trust_heal(tail) or _maybe_pip_heal(tail):
@@ -5220,6 +5230,43 @@ def _log_token_glob(path: str) -> str:
 
 def _agentless_log_glob(record: dict) -> str:
     return _log_token_glob(record.get("log", ""))
+
+
+def _pending_diagnosis(target: str, scheduler_name: str, job_id: str) -> list[str]:
+    """One-shot WHY-is-it-pending readout for a job sitting in the queue: the
+    scheduler's own reason plus the queues/partitions it could run in, with the
+    exact boxy flag to retry (field: a 2-node flux job pended silently and the
+    CLI offered no queue choice)."""
+    from boxy import remote
+
+    lines: list[str] = []
+    if scheduler_name == "flux":
+        rc, why = remote.ssh_capture(
+            target, "flux jobs -no '{annotations.sched.reason_pending}' "
+                    + shlex.quote(job_id) + " 2>/dev/null", timeout=15)
+        if rc == 0 and why.strip():
+            lines.append(f"###   pending reason (flux): {why.strip().splitlines()[-1]}")
+        rc, q = remote.ssh_capture(
+            target, "flux queue list --no-header -o '{name}|{enabled}' 2>/dev/null", timeout=15)
+        names = [row.split("|")[0].strip() for row in q.splitlines() if row.strip()]
+        names = [n for n in names if n]
+        if rc == 0 and names:
+            lines.append(f"###   queues on this cluster: {', '.join(names)} — retry with "
+                         f"`--partition <name>` (boxy maps it to flux --queue)")
+    elif scheduler_name == "slurm":
+        rc, why = remote.ssh_capture(
+            target, f"squeue -j {shlex.quote(job_id)} -h -o %r 2>/dev/null", timeout=15)
+        if rc == 0 and why.strip():
+            lines.append(f"###   pending reason (slurm): {why.strip().splitlines()[-1]}")
+        rc, q = remote.ssh_capture(target, "sinfo -h -o '%P' 2>/dev/null | sort -u", timeout=15)
+        names = [n.strip().rstrip("*") for n in q.splitlines() if n.strip()]
+        if rc == 0 and names:
+            lines.append(f"###   partitions on this cluster: {', '.join(names)} — retry "
+                         f"with `--partition <name>`")
+    if not lines:
+        lines.append("###   (no pending reason available from the scheduler — busy cluster "
+                     "or a queue policy; try `--partition <name>` or a smaller --nodes/--time)")
+    return lines
 
 
 def _remote_log_tail(target: str, log_path: str, n: int = 60) -> str:
