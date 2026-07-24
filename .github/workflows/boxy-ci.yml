@@ -29,7 +29,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install boxy (+ramalama, test deps)
-        run: python -m pip install -e 'boxy[ramalama,s3,plot,test]' ruff
+        # ruff is PINNED to the 0.15 line: 0.16.0 changed default rule selection
+        # and lit up hundreds of style findings across the pre-existing tree
+        # (first seen: PR CI red on files the PR never touched). Bump the pin
+        # deliberately, together with the style sweep it demands.
+        run: python -m pip install -e 'boxy[ramalama,s3,plot,test]' 'ruff<0.16'
       - name: Lint (ruff)
         run: ruff check boxy/src boxy/tests
       - name: Unit + golden tests
