@@ -46,6 +46,37 @@ jobs:
         working-directory: boxy
         run: python -m pytest -q --ignore=tests/test_degraded_and_live.py
 
+  degraded:
+    # boxy PROMISES to degrade gracefully when RamaLama is absent (accelerator
+    # detection falls back, transport pulls explain themselves instead of
+    # crashing). tests/test_degraded_and_live.py proves that — but it needs
+    # ramalama genuinely NOT importable, so the `test` job above excludes it and
+    # the whole promise went unverified in CI. This leg installs boxy WITHOUT
+    # the ramalama extra, so those tests actually run.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install boxy WITHOUT the ramalama extra
+        run: python -m pip install -e 'boxy[test]'
+      - name: Assert the precondition (ramalama really absent)
+        # If a transitive dep ever pulls ramalama in, the degradation tests would
+        # silently self-skip and this leg would pass while proving nothing.
+        run: |
+          python - <<'PY'
+          import importlib.util, sys
+          if importlib.util.find_spec("ramalama") is not None:
+              sys.exit("ramalama is importable — the degraded leg would skip and prove nothing")
+          print("precondition OK: ramalama absent")
+          PY
+      - name: Degradation tests (no RamaLama)
+        working-directory: boxy
+        # -rs surfaces any skip in the log; the live-Docker test in this file
+        # still self-skips (no demo image on the runner), which is expected.
+        run: python -m pytest tests/test_degraded_and_live.py -q -rs
+
   package:
     # Prove the distribution actually builds, passes twine metadata checks, and
     # installs cleanly — the same artifact the release workflow will publish.
