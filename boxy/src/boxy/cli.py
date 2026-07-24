@@ -2713,13 +2713,16 @@ def _ensure_card_args(box, model_ref: str, accel: str = ""):
             f"engine args: {'; '.join(notes)} ({label} — merged into the final command)")
 
 
-def _serve_agentless_ssh(args, target: str) -> int:
+def _serve_agentless_ssh(args, target: str, follow: bool = True) -> int:
     """Fully AGENTLESS serve over --ssh: NOTHING is installed on the HPC system —
     no boxy, no Python, no RamaLama. The laptop does everything over the one ssh
     master: detect the scheduler + resolve the site (account/partition/time),
     render a self-contained `podman run` batch script, write + submit it, then
     poll the shared-FS endpoint file and confirm readiness via the tunnel
     (localhost/health). The compute node runs only podman + a bash endpoint-write.
+
+    `follow=False` submits and returns right after the job record is written —
+    the --replicas pool orchestrator owns the (combined) readiness wait.
 
     Model: an hf:// (transport-URI) model is pulled by the ENGINE at container
     start (`vllm serve <repo>` over the forwarded proxy); a shared-FS path is
@@ -3193,6 +3196,9 @@ def _serve_agentless_ssh(args, target: str) -> int:
                              "accelerator": getattr(args, "accelerator", "") or "",
                              "gpu_type": record_gpu_type})
 
+    if not follow:
+        return 0  # --replicas pool: the orchestrator owns the combined readiness wait
+
     # 9) poll the shared-FS endpoint file over the master; the moment it names the
     #    compute node, hand off to the tunnel + localhost/health readiness.
     print("### Waiting for the job to start and the server to become ready ... "
@@ -3393,6 +3399,137 @@ def _serve_agentless_ssh(args, target: str) -> int:
         print(f"###   reattach: boxy attach {name}    stop: boxy stop {name}")
         return 0
     return 1
+
+
+def _serve_replicas_agentless(args, target: str, replicas: int) -> int:
+    """--replicas over --ssh, fully agentless: the pool is K independent
+    single-instance agentless jobs — each rendered by the PROVEN single-serve
+    path, with a unique pool-wide port so scheduler co-location can never
+    clash — and the optional gateway (--lb nginx|litellm) is a containerized
+    reverse proxy on the LOGIN node fronting them with ONE OpenAI URL. This is
+    the AMD Instinct multi-node inference LB architecture (inference pool +
+    utility-node gateway with health-checked failover), containerized
+    end-to-end. Without --lb the replicas stand alone with per-replica
+    endpoints. Composes with --nodes-per-replica: each replica job is then the
+    multi-node Ray script."""
+    import copy as _copy
+    import json
+    import time
+
+    from boxy import jobs, lb, remote, resolve
+
+    lb_kind = (getattr(args, "lb", None) or "").strip()
+    host = target.split("@")[-1]
+    _, base, decisions = resolve.resolve_submission(
+        args.model, getattr(args, "scheduler", None) or "slurm",
+        name=args.name, require_exists=False)
+    for line in decisions:
+        print(f"  auto: {line}")
+    names = [f"{base}-r{i}" for i in range(replicas)]
+    port_base = config.get_int("network.replica_port_base")
+    lb_port = config.get_int("network.lb_port")
+    print(f"  auto: replicas: {replicas} agentless job(s) ({base}-r0..r{replicas - 1}), "
+          f"ports {port_base}..{port_base + replicas - 1}"
+          + (f" + {lb_kind} gateway on {host}:{lb_port}" if lb_kind else ""))
+
+    failures = 0
+    for i, nm in enumerate(names):
+        per = _copy.copy(args)
+        per.name, per.replicas, per.port = nm, 1, port_base + i
+        per.share, per.share_auto, per.lb = None, False, None
+        print(f"\n### Replica {i + 1}/{replicas}: {nm} (port {per.port})")
+        try:
+            rc = _serve_agentless_ssh(per, target, follow=False)
+        except (RuntimeError, OSError) as e:
+            print(f"boxy: replica {nm} failed: {e}", file=sys.stderr)
+            rc = 1
+        failures += (rc != 0)
+    if args.dryrun:
+        if lb_kind:
+            print(f"\n### dryrun: would then start the {lb_kind} gateway container on "
+                  f"{host}:{lb_port} fronting the {replicas}-replica pool")
+        return 0 if failures == 0 else 1
+    if failures == replicas:
+        print("boxy: no replica submitted — not starting a gateway", file=sys.stderr)
+        return 1
+
+    # combined readiness wait: ONE ssh round-trip per tick reads every replica's
+    # shared-FS endpoint file (the batch script writes it on the compute node).
+    records = {nm: jobs.read_record(nm) or {} for nm in names}
+    eps = {nm: r.get("endpoint_remote", "") for nm, r in records.items() if r.get("endpoint_remote")}
+    ready: dict[str, tuple[str, int]] = {}
+    window = max(getattr(args, "ready_timeout", 0) or 0, _SCHED_READY_FLOOR)
+    deadline = time.time() + window
+    print(f"\n### Waiting up to {window:.0f}s for {len(eps)} replica endpoint(s) ... "
+          "(Ctrl-C detaches; the jobs keep running)")
+    while time.time() < deadline and len(ready) < len(eps):
+        pending = [nm for nm in eps if nm not in ready]
+        probe = "; ".join(f"echo __BXEP__{nm}; cat {shlex.quote(eps[nm])} 2>/dev/null"
+                          for nm in pending)
+        rc, out = remote.ssh_capture(target, probe, timeout=30)
+        cur = None
+        for line in (out if rc == 0 else "").splitlines():
+            if line.startswith("__BXEP__"):
+                cur = line[len("__BXEP__"):].strip()
+            elif cur and line.strip().startswith("{"):
+                try:
+                    d = json.loads(line)
+                    if d.get("host") and d.get("port"):
+                        ready[cur] = (str(d["host"]), int(d["port"]))
+                        print(f"###   {cur}: up on {d['host']}:{d['port']}")
+                except (ValueError, TypeError):
+                    pass
+                cur = None
+        if len(ready) < len(eps):
+            time.sleep(10)
+    if not ready:
+        print(f"boxy: no replica became ready within {window:.0f}s — the jobs keep running; "
+              f"watch `boxy list`, then re-run the same serve to attach the gateway",
+              file=sys.stderr)
+        return 1
+    if len(ready) < len(eps):
+        print(f"### {len(ready)}/{len(eps)} replicas ready — starting the gateway over those "
+              f"(the gateway's passive health checks skip dead upstreams; re-run the same "
+              f"serve after stragglers come up to refresh the upstream list)")
+
+    if not lb_kind:
+        for nm in names:
+            if nm in ready:
+                h, p = ready[nm]
+                print(f"###   {nm}: http://{h}:{p}")
+        return 0
+
+    # gateway on the LOGIN node: render the config from the live endpoints, push
+    # it over the master, replace-run the containerized proxy under the user's
+    # podman/docker (login nodes reach compute endpoints — the same route the
+    # readiness probe and your curl already use).
+    upstreams = [ready[nm] for nm in names if nm in ready]
+    conf = (lb.nginx_conf(upstreams, lb_port) if lb_kind == "nginx"
+            else lb.litellm_config(args.model, upstreams))
+    rdir = os.path.dirname(next(iter(eps.values())))
+    conf_remote = f"{rdir}/{base}-lb.{'conf' if lb_kind == 'nginx' else 'yaml'}"
+    if remote.push_file(target, conf_remote, conf) != 0:
+        print("boxy: could not push the gateway config to the login node", file=sys.stderr)
+        return 1
+    rc, rt_out = remote.ssh_capture(target, "command -v podman || command -v docker", timeout=15)
+    runtime = ((rt_out.strip().splitlines() or ["podman"])[0].rsplit("/", 1)[-1]
+               if rc == 0 and rt_out.strip() else "podman")
+    lb_name = f"{base}-lb"
+    rc, out = remote.ssh_capture(
+        target, lb.gateway_container_cmd(runtime, lb_name, conf_remote, lb_kind, lb_port),
+        timeout=180)
+    if rc != 0:
+        print(f"boxy: gateway container failed to start on {host}:\n{out.strip()}", file=sys.stderr)
+        return 1
+    url = f"http://{host}:{lb_port}"
+    jobs.write_record(base, {"name": base, "submitted_from": "agentless-pool", "target": target,
+                             "model": args.model, "replicas": names,
+                             "lb": {"kind": lb_kind, "container": lb_name, "runtime": runtime,
+                                    "port": lb_port, "host": host}, "url": url})
+    print(f"\n### Pool READY behind the {lb_kind} gateway:  {url}/v1")
+    print("###   upstreams: " + ", ".join(f"{h}:{p}" for h, p in upstreams))
+    print(f"###   stop everything: boxy stop {base}")
+    return 0
 
 
 def _serve_submission(args, scheduler_name: str, profile, name_override: str | None = None,
@@ -4054,20 +4191,23 @@ def _delegate_remote(args, tunnel_ready: bool = False) -> int | None:
         return None
 
     # Fully-agentless serve is the DEFAULT over --ssh — NOTHING is installed on the
-    # HPC. A batch-eligible model serve (not --foreground/--box/--here, single
-    # instance) is rendered + submitted + polled from the laptop. Multi-node
-    # (--nodes N / --distributed) is covered: the batch script fans the Ray
-    # workers out itself. Opt out with --delegate / BOXY_SSH_DELEGATE=1 to run
-    # the cluster's own boxy (needed for --replicas, which agentless doesn't cover).
+    # HPC. A batch-eligible model serve (not --foreground/--box/--here) is
+    # rendered + submitted + polled from the laptop. Multi-node (--nodes N /
+    # --distributed) is covered: the batch script fans the Ray workers out
+    # itself. --replicas K becomes K agentless jobs, optionally fronted by a
+    # --lb gateway container on the login node. Opt out with --delegate /
+    # BOXY_SSH_DELEGATE=1 to run the cluster's own boxy.
     if (getattr(args, "subcommand", None) == "serve"
             and bool(getattr(args, "model", None))
             and not getattr(args, "foreground", False)
             and not getattr(args, "box", None)
             and not getattr(args, "here", False)
-            and (getattr(args, "replicas", 1) or 1) == 1
             and not getattr(args, "delegate", False)
             and not os.environ.get("BOXY_SSH_DELEGATE")
             and config.get_bool("serve.agentless_ssh")):
+        replicas = getattr(args, "replicas", 1) or 1
+        if replicas > 1:
+            return _serve_replicas_agentless(args, target, replicas)
         share_name, share_auto = _auto_share_name(args)
         args.share, args.share_auto = share_name, share_auto
         if share_auto and share_name:
@@ -4338,6 +4478,14 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
 
 def cmd_serve(args: argparse.Namespace) -> int:
     _print_provenance()
+    if getattr(args, "lb", None):
+        from boxy import remote as _remote
+
+        if (getattr(args, "replicas", 1) or 1) <= 1:
+            raise UsageError("--lb fronts a replica POOL — pass --replicas K (K > 1) with it")
+        if not _remote.resolve_target(args):
+            raise UsageError("--lb needs the agentless --ssh path (the gateway container runs "
+                             "on the cluster's login node) — add --ssh <host>")
     # `--nodes-per-replica M` with a SINGLE instance IS `--nodes M` — honor the
     # intent instead of silently ignoring it (field: a 2-node Maverick plan ran
     # on one node and died; the flag only differed from --nodes for --replicas).
@@ -5419,6 +5567,33 @@ def cmd_stop(args: argparse.Namespace) -> int:
     nm = args.name or (Box.from_toml(args.box).name if args.box else None)
     if nm:
         rec = _jobs.read_record(nm)
+        if rec and rec.get("submitted_from") == "agentless-pool" and rec.get("target"):
+            # --replicas pool: stop every replica job, then remove the login-node
+            # gateway container and the pool record itself.
+            from boxy import remote as _remote
+
+            failed = 0
+            for rn in rec.get("replicas", []):
+                sub = argparse.Namespace(**{**vars(args), "name": rn, "all": False})
+                try:
+                    failed += (cmd_stop(sub) != 0)
+                except (UsageError, RuntimeError) as e:
+                    print(f"boxy stop: {rn}: {e}", file=sys.stderr)
+                    failed += 1
+            lbrec = rec.get("lb") or {}
+            if lbrec.get("container"):
+                rt = lbrec.get("runtime", "podman")
+                rc_lb, out = _remote.ssh_capture(
+                    rec["target"], f"{rt} rm -f {shlex.quote(lbrec['container'])}", timeout=60)
+                if rc_lb == 0:
+                    print(f"### gateway {lbrec['container']} removed from "
+                          f"{rec['target'].split('@')[-1]}")
+                else:
+                    print(f"boxy stop: could not remove gateway {lbrec['container']}: "
+                          f"{out.strip()}", file=sys.stderr)
+                    failed += 1
+            _jobs.record_path(nm).unlink(missing_ok=True)
+            return 0 if failed == 0 else 1
         if rec and rec.get("submitted_from") == "agentless-ssh" and rec.get("target"):
             return _agentless_stop(args, rec, nm)
 
@@ -6907,6 +7082,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "batch job named <base>-r0..r{K-1} with its own endpoint/log/port. Requires "
                         "--scheduler slurm|flux; composes with --nodes>1 (each replica is itself a "
                         "distributed instance)")
+    p.add_argument("--lb", choices=("nginx", "litellm"), default=None,
+                   help="front a --replicas pool with a containerized gateway on the login node "
+                        "(one OpenAI URL, health-checked failover): nginx (reverse proxy, "
+                        "least_conn) or litellm (model-aware router). Agentless --ssh only.")
     p.add_argument("--gpus-per-replica", type=int, default=1, metavar="R", dest="gpus_per_replica",
                    help="GPUs each --replicas instance uses (default 1). Replicas bin-pack onto a "
                         "node: (--gpus // R) replicas per node, each pinned to its own GPU(s). R>1 "
@@ -6985,7 +7164,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--delegate", action="store_true",
                    help="with --ssh: run the CLUSTER's own boxy instead of the default fully-"
                         "agentless flow (needs boxy installed there; also BOXY_SSH_DELEGATE=1). "
-                        "Use for --replicas/--distributed/--box, which agentless doesn't cover yet.")
+                        "Use for --box serves, which agentless does not cover.")
     p.add_argument("--prestage", dest="prestage", action="store_const", const="always", default=None,
                    help="agentless --ssh: force PRE-STAGING the image + model on the login node (over "
                         "your SSH session's network) so an ISOLATED compute node needs no network. "
