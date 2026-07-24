@@ -20,6 +20,10 @@ import pytest
 
 ROOT = Path(__file__).parent.parent
 SRC = str(ROOT / "src")
+# The example profiles are PACKAGED (src/boxy/data/examples), not a top-level
+# examples/ dir — they moved there when the repo was slimmed. Derive the path
+# once so a future move breaks one line, not every test in this file.
+EXAMPLES = ROOT / "src" / "boxy" / "data" / "examples"
 
 
 def _run_isolated(code: str) -> subprocess.CompletedProcess:
@@ -68,10 +72,12 @@ class TestDegradedWithoutRamalama:
         assert "OK:" in p.stdout and "boxy-hpc[ramalama]" in p.stdout
 
     def test_serve_dryrun_works_with_explicit_location(self):
+        box = EXAMPLES / "boxes" / "vllm.toml"
+        loc = EXAMPLES / "locations" / "flux-apptainer-rocm.toml"
         p = _run_isolated(
             "from boxy.cli import main; import sys; "
-            "sys.exit(main(['serve', '--box', 'examples/boxes/vllm.toml', "
-            "'--location', 'examples/locations/flux-apptainer-rocm.toml', '--dryrun']))"
+            f"sys.exit(main(['serve', '--box', {str(box)!r}, "
+            f"'--location', {str(loc)!r}, '--dryrun']))"
         )
         assert p.returncode == 0
         assert "apptainer exec" in p.stdout and "vllm-rocm.sif" in p.stdout
@@ -106,8 +112,8 @@ needs_live_docker = pytest.mark.skipif(
 
 @needs_live_docker
 class TestLiveDockerCycle:
-    BOX = str(ROOT / "examples" / "boxes" / "llamacpp-demo.toml")
-    LOC = str(ROOT / "examples" / "locations" / "local-docker.toml")
+    BOX = str(EXAMPLES / "boxes" / "llamacpp-demo.toml")
+    LOC = str(EXAMPLES / "locations" / "local-docker.toml")
     URL = "http://127.0.0.1:8090"
 
     def _boxy(self, *args, background=False):
