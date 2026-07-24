@@ -66,6 +66,9 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
                  "plus slack."),
     Setting("network.replica_port_base", "BOXY_REPLICA_PORT_BASE", 8000, int,
             help="first port for --replicas fan-out (replica N binds base+N)."),
+    Setting("network.lb_port", "BOXY_LB_PORT", 9000, int,
+            help="listen port for the --lb gateway (nginx/LiteLLM) fronting a "
+                 "--replicas pool on the login node."),
     Setting("network.proxy", "BOXY_PROXY", "",
             help="corporate proxy URL for the job's image/model pulls, propagated to the "
                  "compute node and, over --ssh, to the cluster. No default: the ambient "
@@ -89,6 +92,12 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
                  "(one override mirrors both). Point BOXY_RELAY_IMAGE / [images].relay "
                  "at a site mirror when isolated/air-gapped compute nodes 403 on "
                  "Docker Hub."),
+    Setting("images.nginx_lb", "BOXY_NGINX_LB_IMAGE", "docker.io/library/nginx:1.27-alpine",
+            help="nginx image for the --lb nginx replica-pool gateway (runs "
+                 "containerized on the login node). Point at a site mirror when "
+                 "Docker Hub is blocked."),
+    Setting("images.litellm_lb", "BOXY_LITELLM_LB_IMAGE", "ghcr.io/berriai/litellm:main-stable",
+            help="LiteLLM proxy image for the --lb litellm replica-pool gateway."),
     Setting("images.flux_mcp", "BOXY_FLUX_MCP_IMAGE", "ghcr.io/converged-computing/flux-mcp:latest",
             help="flux-mcp image for the persistent OpenShift MCP service."),
     Setting("images.awscli", "BOXY_AWSCLI_IMAGE", "public.ecr.aws/aws-cli/aws-cli:latest",

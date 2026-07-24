@@ -626,6 +626,16 @@ boxy serve <model> --scheduler slurm --gpus 4 --replicas 4 --dryrun
 boxy serve <model> --scheduler slurm --gpus 4 --replicas 4      # for real (1 node, 4 GPUs)
 boxy list                                                       # the job + its 4 replica endpoints
 boxy stop <base>                                                # cancels the job -> all 4 replicas
+# Over --ssh the pool is FULLY AGENTLESS: K independent single-instance jobs
+# (ports 8000..8000+K-1, pool-unique so scheduler co-location can't clash), and
+# --lb fronts them with a battle-tested gateway CONTAINER on the login node —
+# one OpenAI URL, least-conn balancing, passive health checks that evict a dead
+# replica (the AMD Instinct multi-node inference LB architecture, containerized):
+boxy serve <model> --ssh <cluster> --replicas 4 --lb nginx
+# EXPECT: 4 submissions, a combined endpoint wait, then
+#   "### Pool READY behind the nginx gateway:  http://<login-node>:9000/v1"
+# boxy stop <base> stops every replica job AND removes the gateway container.
+# --lb litellm swaps nginx for LiteLLM's model-aware router (least-busy).
 # Knobs:
 #   --gpus-per-replica 2  -> 2 replicas/4-GPU node, each tensor-parallel=2.
 #   --nodes N             -> the POOL SIZE: spread K replicas across N nodes
