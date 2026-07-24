@@ -349,15 +349,25 @@ def push_path(host: str, remote_path: str, local_path) -> int:
     return proc.returncode
 
 
-def push_file(host: str, remote_path: str, content: str | bytes) -> int:
+def push_file(host: str, remote_path: str, content: str | bytes, private: bool = True) -> int:
     """Write `content` (text or raw bytes — e.g. a staged source tarball) to
     `remote_path` on host over the LIVE master (cat >, no re-auth), creating the
     parent dir. `remote_path` is used UNQUOTED so a leading $HOME expands
     remote-side — pass a boxy-controlled path (a job-name slug), never user
-    free-text. Returns the ssh rc (0 = written)."""
+    free-text. Returns the ssh rc (0 = written).
+
+    `private` (default True) runs the write under `umask 077`, so the file is
+    created mode 600 ATOMICALLY. This matters because boxy's batch scripts can
+    carry an HF token and HPC $HOME is a shared, multi-tenant filesystem:
+    writing world-readable and fixing it with a later `chmod 600` leaves a
+    window — one network round-trip wide — in which any other user on the login
+    node can read the credential, and leaves it exposed FOREVER if that chmod
+    round-trip fails. Creating it private in the first place has no window.
+    Pass private=False only for content that is deliberately world-readable."""
+    umask = "umask 077; " if private else ""
     proc = subprocess.run(
         [ssh_bin(), "-o", f"ControlPath={control_path()}", host,
-         f'mkdir -p "$(dirname {remote_path})" && cat > {remote_path}'],
+         f'{umask}mkdir -p "$(dirname {remote_path})" && cat > {remote_path}'],
         input=content if isinstance(content, bytes) else content.encode(), capture_output=True)
     if proc.returncode != 0:
         print(f"warning: could not write {remote_path} on {host}: "
