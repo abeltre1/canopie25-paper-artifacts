@@ -365,10 +365,48 @@ def test_diagnose_host_oom_beats_nothing_but_not_gpu_oom():
 def test_diagnose_engine_core_wrapper_alone_points_up():
     """The outer 'Engine core initialization failed' wrapper with no recognised
     root cause tells the user the real error is higher in the log."""
-    wrapper = ("RuntimeError: Engine core initialization failed. See root cause above. "
-               "Failed core proc(s): {}")
+    wrapper = "RuntimeError: Engine core initialization failed. See root cause above."
     hint = diagnostics.diagnose(wrapper)
     assert hint is not None and "actionable error is higher up" in hint
+
+
+def test_diagnose_silent_engine_death_is_oom_kill():
+    """FIELD (clusterb): a 70B weight load died after ~18 min with ONLY the
+    wrapper in a 1500-line window — no Python exception exists when a rank is
+    SIGKILLed (kernel OOM-killer). On unified-memory APUs (MI300A) vLLM's 0.9
+    GPU claim starves the host during the safetensors load. The diagnosis must
+    say so instead of sending the user hunting for a traceback that isn't there."""
+    log = ("(EngineCore pid=99) Engine core proc EngineCore_0 died unexpectedly, "
+           "shutting down client.\n"
+           "(APIServer pid=1) RuntimeError: Engine core initialization failed. "
+           "See root cause above. Failed core proc(s): {}\n")
+    hint = diagnostics.diagnose(log)
+    assert hint is not None
+    assert "WITHOUT a traceback" in hint
+    assert "OOM-killer" in hint
+    assert "unified-memory" in hint and "MI300A" in hint
+    assert "gpu_memory_utilization = 0.7" in hint
+    # the DURABLE fix leads: declare the pool once, boxy derives the value
+    assert "unified_memory = true" in hint
+    assert "dmesg" in hint
+    # a real extracted root cause still wins over the silent-death branch
+    log_with_cause = ("torch.OutOfMemoryError: HIP out of memory. Tried to allocate\n" + log)
+    hint2 = diagnostics.diagnose(log_with_cause)
+    assert "root cause extracted" in hint2 or "out of memory" in hint2.lower()
+
+
+def test_big_model_cards_leave_host_headroom():
+    """The 70B-class seed cards ship gpu_memory_utilization=0.7: on MI300A the
+    default 0.9 claim OOM-kills a rank mid-load (see the silent-death rule)."""
+    from pathlib import Path
+
+    import boxy
+
+    cards_dir = Path(boxy.__file__).parent / "data" / "cards" / "models"
+    for name in ("llama-3.3-70b-instruct.toml", "qwen2.5-72b-instruct.toml",
+                 "nvidia-llama-nemotron-70b.toml"):
+        text = (cards_dir / name).read_text()
+        assert "gpu_memory_utilization = 0.7" in text, name
 
 
 def test_specific_signature_beats_generic_wrapper():

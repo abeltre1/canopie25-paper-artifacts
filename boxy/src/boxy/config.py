@@ -276,6 +276,15 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
             help="per-GPU memory (GB) on the target system, for the model-card geometry "
                  "solver (e.g. 140 for H200-class parts). 0 = system card, else the "
                  "cardgen.gpu_class_gb 80GB-class assumption."),
+    Setting("site.unified_memory", "BOXY_UNIFIED_MEMORY", False, _as_bool,
+            help="the target's compute nodes are unified-memory APUs (MI300A-class: CPU "
+                 "and GPU share one physical pool). boxy then derives "
+                 "--gpu-memory-utilization from the model's weight footprint so the host "
+                 "keeps enough of the pool to stream the weights in — vLLM's 0.9 default "
+                 "gets an engine rank OOM-killed mid-load with no traceback. The durable "
+                 "home is unified_memory = true under [location.resources] in the "
+                 "cluster's system card; the probe also infers it from an MI300A part "
+                 "name."),
 
     # -- model storage on the cluster ------------------------------------------
     Setting("storage.model_dir", "BOXY_MODEL_DIR", "",

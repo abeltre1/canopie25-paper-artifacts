@@ -453,7 +453,7 @@ def system_card_path(name: str) -> str:
     return f.name
 
 
-def apply_to_args(args, shape: tuple[int, int, str] | None = None) -> list[str]:
+def apply_to_args(args, shape: tuple[int, int, str] | None = None, unified: bool = False) -> list[str]:
     """Turnkey fill for a SCHEDULER submission: when --gpus/--nodes/--engine are
     absent, take them from the model's card (or the size heuristic), returning
     the decision lines to print. Explicit flags always win; local (no-scheduler)
@@ -465,7 +465,14 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None) -> list[str]:
     declares min_vram_gb, the geometry is SOLVED (fit_geometry) instead of
     copied: fewer GPUs on fat-VRAM parts, and models bigger than one node
     automatically become N-node Ray instances. Power users' --gpus/--nodes
-    (and a card's own explicit nodes) always bypass the solver."""
+    (and a card's own explicit nodes) always bypass the solver.
+
+    `unified` = the target's memory is ONE CPU+GPU pool (APU parts: MI300A).
+    The solver then sizes against the claimable fraction of the pool, and
+    --gpu-memory-utilization is DERIVED from the model's weight footprint
+    (derive_gpu_memory_utilization) instead of trusting vLLM's 0.9 default —
+    which starves the host during the weight load and gets an engine rank
+    OOM-killed with no traceback."""
     decisions: list[str] = []
     model = getattr(args, "model", None)
     if not model:
@@ -488,7 +495,17 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None) -> list[str]:
     nodes_free = getattr(args, "nodes", None) is None
     if gpus_free and nodes_free and card.min_vram_gb and not card.nodes:
         w, v, src = shape or (0, 0, "")
-        nodes, gpus, why = fit_geometry(card.min_vram_gb, w, v)
+        v_solve = v
+        if unified and v:
+            # A unified-pool rank can never serve from the whole part: the engine's
+            # claim must leave the HOST the transient weight-stream headroom, so
+            # solve the geometry against the claimable fraction. This is what
+            # spreads a 70B over 4 MI300A ranks (35GB shards that load) instead of
+            # packing it onto 2 (70GB shards that get the host OOM-killed).
+            v_solve = int(v * _VRAM_HEADROOM / (_VRAM_HEADROOM + _UNIFIED_LOAD_FACTOR))
+        nodes, gpus, why = fit_geometry(card.min_vram_gb, w, v_solve)
+        if v_solve != v:
+            why += f" (unified pool: {v}GB shared with the host -> ~{v_solve}GB claimable)"
         args.gpus = gpus
         src_note = f"; {src}" if src else ""
         decisions.append(f"gpus: {gpus} per node ({card.label}: {why}{src_note})")
@@ -519,8 +536,29 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None) -> list[str]:
     # was never applied.
     flags = engine_flags(effective_args(card.args, accel))
     if flags:
-        args.args = flags + list(getattr(args, "args", None) or [])
         decisions.append(f"engine args: {' '.join(flags)} ({card.label})")
+    if unified and card.min_vram_gb and (getattr(args, "engine", None) or "vllm") == "vllm":
+        _w, pool, _src = shape or (0, 0, "")
+        world = int(getattr(args, "nodes", None) or 1) * int(getattr(args, "gpus", None) or 1)
+        util = derive_gpu_memory_utilization(card.min_vram_gb, world, pool)
+        if util is not None:
+            # AFTER the card's own flags (a card's blanket fallback loses to the
+            # footprint-derived value) and BEFORE the user's post-`--` args (an
+            # explicit --gpu-memory-utilization still wins — engine argparse is
+            # last-wins).
+            flags = flags + ["--gpu-memory-utilization", f"{util:g}"]
+            per = card.min_vram_gb / world
+            decisions.append(
+                f"gpu-memory-utilization: {util:g} (derived: ~{card.min_vram_gb}GB weights / "
+                f"{world} rank(s) = ~{per:.0f}GB per rank on a {pool}GB unified CPU+GPU pool "
+                f"— the host keeps the rest to stream the load)")
+        elif pool:
+            decisions.append(
+                f"gpu-memory-utilization: NOT derived — ~{card.min_vram_gb / world:.0f}GB per "
+                f"rank leaves a {pool}GB unified pool no room for both the weight load and "
+                f"the KV cache; spread wider (--gpus/--nodes) or set it by hand after `--`")
+    if flags:
+        args.args = flags + list(getattr(args, "args", None) or [])
     return decisions
 
 
@@ -582,6 +620,35 @@ def engine_flags(card_args: dict) -> list[str]:
 # tests), so geometry only changes when a system card declares real hardware.
 _VRAM_HEADROOM = 1.25
 
+# On unified-memory APUs (MI300A-class: CPU and GPU share ONE physical pool per
+# socket) the HOST's transient need during the weight load is ~one rank's shard
+# (weights / world_size) plus safetensors/streaming buffers — claim too much of
+# the pool for the engine and the kernel OOM-killer reaps a rank with NO
+# traceback (field: a 70B died silently after an 18-min load at vLLM's 0.9
+# default; 0.7 served).
+_UNIFIED_LOAD_FACTOR = 1.1     # shard + streaming/allocator buffers
+_UNIFIED_HOST_FLOOR_GB = 16    # OS + container + tokenizer, even for tiny models
+
+
+def derive_gpu_memory_utilization(min_vram_gb: float, world_size: int, pool_gb: int) -> float | None:
+    """The vLLM --gpu-memory-utilization for ONE rank of a unified-memory pool:
+    high enough that the rank's weight shard plus KV headroom fits the claim,
+    low enough that the HOST keeps ~a shard's worth of the pool to stream the
+    load. None when an input is unknown — or when NO value satisfies both
+    (the shard is too big for the pool; the fix is more ranks, which the
+    unified-aware geometry solver in apply_to_args already prefers).
+
+    Field calibration: 140GB of weights over 4 MI300A ranks on a 128GB pool
+    -> 0.7, exactly the hand-tuned value that ended the silent OOM kills."""
+    if min_vram_gb <= 0 or world_size <= 0 or pool_gb <= 0:
+        return None
+    per_rank = min_vram_gb / world_size
+    host_need = max(_UNIFIED_HOST_FLOOR_GB, per_rank * _UNIFIED_LOAD_FACTOR)
+    util = round((pool_gb - host_need) / pool_gb, 2)
+    if util * pool_gb < per_rank * _VRAM_HEADROOM:
+        return None
+    return min(0.9, util)
+
 
 def fit_geometry(min_vram_gb: float, gpus_per_node: int, gpu_vram_gb: int) -> tuple[int, int, str]:
     """(nodes, gpus_per_node, why): the smallest geometry that FITS a model card's
@@ -639,3 +706,21 @@ def system_shape(cluster: str) -> tuple[int, int, str] | None:
     except (tomllib.TOMLDecodeError, TypeError, ValueError):
         return None
     return (shape[0], shape[1], stem) if any(shape) else None
+
+
+def system_unified_memory(cluster: str) -> bool:
+    """True when the cluster's system card declares
+        [location.resources]
+        unified_memory = true
+    — APU parts (MI300A-class) where CPU and GPU share one physical pool, so
+    apply_to_args derives --gpu-memory-utilization from the model's footprint
+    instead of letting vLLM's 0.9 default starve the host mid-load. False on
+    no card / no flag / a card that doesn't parse."""
+    hit = _match_system_card(cluster)
+    if hit is None:
+        return False
+    try:
+        res = (tomllib.loads(hit[0]).get("location") or {}).get("resources") or {}
+        return bool(res.get("unified_memory", False))
+    except tomllib.TOMLDecodeError:
+        return False

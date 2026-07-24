@@ -614,6 +614,22 @@ boxy serve <model> --scheduler slurm --nodes 2 --gpus 4 --dryrun
 # prestart otherwise hits podman's 2048-pid ceiling and wedges the raylet.
 boxy serve <model> --scheduler slurm --nodes 2 --gpus 4     # for real; READY -> curl -> boxy stop <name>
 
+# UNIFIED-MEMORY APUs (MI300A-class: CPU and GPU share ONE pool per socket).
+# vLLM's default --gpu-memory-utilization 0.9 claims 90% of that pool while the
+# safetensors load still streams through HOST memory -> the kernel OOM-killer
+# reaps an engine rank with NO traceback (boxy's diagnosis names this). Declare
+# the pool ONCE and boxy derives the right claim from the model's footprint
+# (weights / ranks, host keeps ~a shard's worth) AND solves the geometry against
+# the claimable fraction — the field 70B lands on 4 ranks at 0.7 automatically:
+#   ~/.config/boxy/cards/systems/<cluster>.toml:
+#     [location.resources]
+#     gpus_per_node = 4
+#     gpu_vram_gb = 128
+#     unified_memory = true
+# `boxy generate system --ssh <cluster>` writes this for you when the probe sees
+# an MI300A part; BOXY_UNIFIED_MEMORY=1 (config site.unified_memory) is the
+# card-less override. An explicit `-- --gpu-memory-utilization X` still wins.
+
 # --- B. N INDEPENDENT instances (data-parallel replicas) -----------------------
 # Replicas BIN-PACK onto a node's GPUs: with --gpus = the node's GPU count and the
 # default --gpus-per-replica 1, K replicas share ONE node (K // 1 per node), each

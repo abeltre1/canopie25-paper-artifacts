@@ -133,6 +133,33 @@ def _engine_core_generic(m: "re.Match[str]", log: str) -> str:
     # out of the log window ourselves (field: users keep pasting the wrapper —
     # the 60-line tail had already scrolled the root cause away).
     root = extract_root_cause(log)
+    if not root and re.search(r"died unexpectedly|Failed core proc", log, re.I):
+        # NO exception exists anywhere in the log: the engine rank was killed
+        # from OUTSIDE (SIGKILL leaves no Python traceback). Field: a 70B
+        # weight load on MI300A died after ~18 min with only the wrapper —
+        # the kernel OOM-killer had reaped a rank. Unified-memory APUs
+        # (MI300A: CPU and GPU share ONE physical pool) are the classic case:
+        # vLLM's default --gpu-memory-utilization 0.9 claims 90% of the pool
+        # for the GPU side while the safetensors load still needs host-side
+        # memory — the host starves and the kernel kills the biggest process.
+        return _fmt(
+            "vLLM engine rank died WITHOUT a traceback — killed from outside (memory)",
+            "There is no Python exception in this log: the engine process was\n"
+            "SIGKILLed, which is almost always the kernel OOM-killer during the\n"
+            "weight load. On unified-memory APUs (MI300A: CPU+GPU share one pool)\n"
+            "vLLM's default 90% GPU-memory claim leaves the host too little while\n"
+            "the weights stream in.\n"
+            "  Confirm on the compute node:  dmesg -T | grep -i 'out of memory'\n"
+            "  Fixes (any one):\n"
+            "    - tell boxy the truth once: unified_memory = true under\n"
+            "      [location.resources] in the cluster's system card — every serve\n"
+            "      then DERIVES gpu-memory-utilization from the model's footprint\n"
+            "      (weights / ranks) so the host keeps enough of the pool\n"
+            "    - or pin it by hand: gpu_memory_utilization = 0.7 in the model\n"
+            "      card's [model.args] (boxy's 70B-class cards ship this fallback)\n"
+            "    - spread the weights: --gpus N / --nodes M (more ranks, less each)\n"
+            "    - shrink the KV plan: a smaller max_model_len in [model.args]",
+        )
     root_block = (f"extracted ROOT CAUSE (from earlier in this log):\n  >>> {root}\n\n"
                   if root else "")
     return _fmt(

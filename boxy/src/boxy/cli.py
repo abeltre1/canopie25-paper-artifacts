@@ -992,6 +992,30 @@ def _node_shape(host: str | None) -> tuple[int, int, str] | None:
     return None
 
 
+def _node_unified(host: str | None, cfacts=None, scheduler_name: str = "") -> bool:
+    """Is the target's memory ONE unified CPU+GPU pool (APU parts: MI300A)?
+    This is the signal that lets cards.apply_to_args derive
+    --gpu-memory-utilization from the model's weight footprint (and solve the
+    geometry against the claimable fraction of the pool) instead of trusting
+    vLLM's 0.9 default — which starves the host during a big weight load and
+    gets an engine rank OOM-killed with no traceback. Sources, most-durable
+    first: [location.resources] unified_memory in the cluster's system card,
+    config site.unified_memory (BOXY_UNIFIED_MEMORY), else this run's cluster
+    probe naming an APU part."""
+    from boxy import cards, jobs, site
+
+    cluster = jobs.cluster_id(host.split("@")[-1]) if host else jobs.local_cluster()
+    if cards.system_unified_memory(cluster) or config.get_bool("site.unified_memory"):
+        return True
+    if cfacts is not None:
+        gtype = ""
+        if scheduler_name:
+            gtype = str(cfacts.inventory(scheduler_name).get("gpu_type") or "")
+        gtype = gtype or cfacts.gpu_hw()[0]
+        return site.unified_gpu_type(gtype)
+    return False
+
+
 def _proxy_prefix(args) -> str:
     """`env VAR=val ...` prefix for the COMPUTE-NODE command, so its host-side
     `podman pull` (and the inner boxy) reach the corporate proxy — the usual fix
@@ -2822,7 +2846,8 @@ def _serve_agentless_ssh(args, target: str) -> int:
     #    over-one-node model becomes an N-node Ray instance — same bare
     #    `boxy serve MODEL --ssh HOST` command either way.
     shape = _facts_shape(cfacts, scheduler_name) or _node_shape(host)
-    for line in cards.apply_to_args(args, shape=shape):
+    for line in cards.apply_to_args(args, shape=shape,
+                                    unified=_node_unified(host, cfacts, scheduler_name)):
         print(f"  auto: {line}")
 
     # 3) box + location, accelerator/runtime PINNED so no local hardware probe runs
@@ -4399,7 +4424,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             # geometry is solved, not assumed.
             from boxy import cards
 
-            for line in cards.apply_to_args(args, shape=_node_shape(None)):
+            for line in cards.apply_to_args(args, shape=_node_shape(None),
+                                            unified=_node_unified(None)):
                 print(f"  auto: {line}")
             replicas = getattr(args, "replicas", 1) or 1
             if replicas > 1:

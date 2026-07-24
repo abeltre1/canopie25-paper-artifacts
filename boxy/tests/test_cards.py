@@ -407,6 +407,82 @@ def test_apply_solves_geometry_from_shape():
     assert any("nodes: 2" in ln and "Ray" in ln for ln in lines)
 
 
+# ---- unified-memory (APU) pools: derived gpu-memory-utilization ---------------------
+
+
+def test_derive_gpu_memory_utilization_field_calibration():
+    # THE field failure: 140GB of 70B weights over 4 MI300A ranks on a 128GB
+    # pool -> 0.7, exactly the hand-tuned value that ended the silent OOM kills
+    assert cards.derive_gpu_memory_utilization(140, 4, 128) == 0.7
+    # more ranks -> smaller shards -> the host needs less -> a bigger claim
+    assert cards.derive_gpu_memory_utilization(140, 8, 128) == 0.85
+    # small models never claim beyond vLLM's own 0.9 default
+    assert cards.derive_gpu_memory_utilization(8, 1, 1024) == 0.9
+    # 2 ranks x 70GB shards on a 128GB pool: NO value both fits weights+KV and
+    # leaves the host the stream headroom -> None (the fix is more ranks)
+    assert cards.derive_gpu_memory_utilization(140, 2, 128) is None
+    # unknown inputs -> None
+    assert cards.derive_gpu_memory_utilization(0, 4, 128) is None
+    assert cards.derive_gpu_memory_utilization(140, 0, 128) is None
+    assert cards.derive_gpu_memory_utilization(140, 4, 0) is None
+
+
+def test_apply_unified_solves_wider_and_derives_util():
+    # discrete 4x128 metal packs the 70B onto 2 GPUs (see the solver tests); the
+    # SAME node as a unified APU pool must spread to 4 (35GB shards that load)…
+    a = _args("meta-llama/Llama-3.3-70B-Instruct")
+    a.args = None
+    lines = cards.apply_to_args(a, shape=(4, 128, "x"), unified=True)
+    assert a.gpus == 4 and a.nodes is None
+    # …and derive the claim from the footprint, appended LAST so it wins over
+    # the card's static 0.7 fallback (engine argparse is last-wins)
+    assert a.args[-2:] == ["--gpu-memory-utilization", "0.7"]
+    assert any("derived" in ln and "unified" in ln for ln in lines)
+    # a user's own post-`--` value lands after the derived one and still wins
+    b = _args("meta-llama/Llama-3.3-70B-Instruct")
+    b.args = ["--gpu-memory-utilization", "0.6"]
+    cards.apply_to_args(b, shape=(4, 128, "x"), unified=True)
+    assert b.args[-2:] == ["--gpu-memory-utilization", "0.6"]
+    # smaller model, same pool: the derived claim scales UP (8B leaves plenty)
+    c = _args("hf://meta-llama/Llama-3.1-8B-Instruct")
+    c.args = None
+    cards.apply_to_args(c, shape=(4, 128, "x"), unified=True)
+    assert c.args[-2:] == ["--gpu-memory-utilization", "0.79"]
+
+
+def test_apply_unified_warns_when_user_geometry_is_too_tight():
+    # a power user pinning --gpus 2 on a unified pool: 70GB shards leave no
+    # feasible claim — boxy SAYS so instead of emitting a number that can't work
+    a = _args("meta-llama/Llama-3.3-70B-Instruct", gpus=2)
+    a.args = None
+    lines = cards.apply_to_args(a, shape=(4, 128, "x"), unified=True)
+    assert any("NOT derived" in ln and "spread wider" in ln for ln in lines)
+    # only the card's static fallback remains — no derived pair was appended
+    assert (a.args or []).count("--gpu-memory-utilization") == 1
+
+
+def test_apply_unified_skips_non_vllm_engines():
+    # llama-server exits 2 on --gpu-memory-utilization — never derive it there
+    a = _args("hf://meta-llama/Llama-3.1-8B-Instruct", engine="llama.cpp")
+    a.args = None
+    lines = cards.apply_to_args(a, shape=(4, 128, "x"), unified=True)
+    assert "--gpu-memory-utilization" not in (a.args or [])
+    assert not any("gpu-memory-utilization" in ln for ln in lines)
+
+
+def test_system_unified_memory_from_user_card(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    d = tmp_path / "boxy" / "cards" / "systems"
+    d.mkdir(parents=True)
+    (d / "clusterc.toml").write_text(
+        '[location]\nname = "clusterc"\nscheduler = "flux"\n'
+        '[location.resources]\ngpus_per_node = 4\ngpu_vram_gb = 128\nunified_memory = true\n')
+    assert cards.system_unified_memory("clusterc") is True
+    assert cards.system_unified_memory("no-such-cluster") is False
+    # the packaged MI300A example declares it too
+    assert cards.system_unified_memory("flux-rocm") is True
+
+
 def test_apply_solver_bypassed_by_power_user_flags_and_card_nodes(tmp_path, monkeypatch):
     # explicit --gpus/--nodes: the solver never runs
     a = _args("meta-llama/Llama-3.3-70B-Instruct", gpus=8)
