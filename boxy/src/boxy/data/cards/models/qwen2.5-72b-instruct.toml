@@ -6,3 +6,5 @@ gpus = 4
 min_vram_gb = 145
 [model.args]
 max_model_len = 8192
+# host headroom on unified-memory APUs (MI300A): see llama-3.3-70b-instruct.toml
+gpu_memory_utilization = 0.7

@@ -7,3 +7,10 @@ gpus = 4
 min_vram_gb = 140
 [model.args]
 max_model_len = 8192
+# leave the HOST memory headroom during the weight load: on unified-memory
+# APUs (MI300A — CPU and GPU share one physical pool) vLLM's default 0.9
+# claim starves the host while safetensors stream in and the kernel
+# OOM-killer reaps an engine rank with no traceback (field: 70B died silently
+# after an 18-min load). 0.7 matches the paper prototype's setting and costs
+# only some KV-cache capacity on discrete-memory GPUs.
+gpu_memory_utilization = 0.7
