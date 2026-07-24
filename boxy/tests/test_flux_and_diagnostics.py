@@ -386,6 +386,8 @@ def test_diagnose_silent_engine_death_is_oom_kill():
     assert "OOM-killer" in hint
     assert "unified-memory" in hint and "MI300A" in hint
     assert "gpu_memory_utilization = 0.7" in hint
+    # the DURABLE fix leads: declare the pool once, boxy derives the value
+    assert "unified_memory = true" in hint
     assert "dmesg" in hint
     # a real extracted root cause still wins over the silent-death branch
     log_with_cause = ("torch.OutOfMemoryError: HIP out of memory. Tried to allocate\n" + log)

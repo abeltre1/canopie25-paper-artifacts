@@ -9,5 +9,7 @@ modules = ["rocm/6.4.0"]
 [location.resources]
 gpus_per_node = 4
 gpu_vram_gb = 128    # MI300A-class parts; the model-card geometry solver sizes against this
+unified_memory = true    # MI300A is an APU: CPU+GPU share the 128GB pool, so serves DERIVE
+                         # gpu-memory-utilization from the model footprint (host keeps load headroom)
 [location.tuning]
 gpu_memory_utilization = 0.7

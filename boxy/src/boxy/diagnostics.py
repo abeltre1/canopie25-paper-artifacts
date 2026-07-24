@@ -151,8 +151,12 @@ def _engine_core_generic(m: "re.Match[str]", log: str) -> str:
             "the weights stream in.\n"
             "  Confirm on the compute node:  dmesg -T | grep -i 'out of memory'\n"
             "  Fixes (any one):\n"
-            "    - leave the host headroom: gpu_memory_utilization = 0.7 in the\n"
-            "      model card's [model.args] (boxy's big-model cards now ship this)\n"
+            "    - tell boxy the truth once: unified_memory = true under\n"
+            "      [location.resources] in the cluster's system card — every serve\n"
+            "      then DERIVES gpu-memory-utilization from the model's footprint\n"
+            "      (weights / ranks) so the host keeps enough of the pool\n"
+            "    - or pin it by hand: gpu_memory_utilization = 0.7 in the model\n"
+            "      card's [model.args] (boxy's 70B-class cards ship this fallback)\n"
             "    - spread the weights: --gpus N / --nodes M (more ranks, less each)\n"
             "    - shrink the KV plan: a smaller max_model_len in [model.args]",
         )

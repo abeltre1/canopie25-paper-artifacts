@@ -12,5 +12,9 @@ max_model_len = 8192
 # claim starves the host while safetensors stream in and the kernel
 # OOM-killer reaps an engine rank with no traceback (field: 70B died silently
 # after an 18-min load). 0.7 matches the paper prototype's setting and costs
-# only some KV-cache capacity on discrete-memory GPUs.
+# only some KV-cache capacity on discrete-memory GPUs. This is the FALLBACK
+# for when the target's memory architecture is unknown — when the cluster's
+# system card declares unified_memory = true (or the probe sees an MI300A),
+# boxy derives the exact value from this card's min_vram_gb / rank count and
+# that derivation wins (cards.derive_gpu_memory_utilization).
 gpu_memory_utilization = 0.7
