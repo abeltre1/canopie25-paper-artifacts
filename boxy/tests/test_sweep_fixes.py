@@ -220,6 +220,44 @@ def test_stop_refuses_foreign_containers(monkeypatch, capsys):
     assert "not created by boxy" in capsys.readouterr().err
 
 
+def test_stop_unknown_name_answers_like_its_siblings(monkeypatch, capsys):
+    """A name boxy has no record of and no container for must get boxy's own
+    'no instance named X' answer — the same shape curl/open/attach/unshare give
+    — not a shelled-out `<runtime> stop <name>` and its raw daemon error."""
+    import boxy.cli as cli
+
+    monkeypatch.setattr(cli, "_container_exists", lambda r, n: False)
+
+    def _boom(*a, **k):                       # must never reach the runtime
+        raise AssertionError("shelled out to the container runtime for an unknown name")
+
+    monkeypatch.setattr(cli, "_run_or_print", _boom)
+    rc = main(["stop", "no-such-instance", "--runtime", "docker"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "no instance named 'no-such-instance'" in err
+    assert "boxy list" in err
+
+
+def test_stop_still_reaches_a_real_container(monkeypatch, capsys):
+    """The guard is existence-scoped: a container that IS there (and is ours)
+    still gets stopped."""
+    import boxy.cli as cli
+
+    monkeypatch.setattr(cli, "_container_exists", lambda r, n: True)
+    monkeypatch.setattr(cli, "_container_label", lambda r, n: n)     # ours
+    seen = {}
+
+    def _record(cmd, dry):
+        seen["cmd"] = cmd
+        return 0
+
+    monkeypatch.setattr(cli, "_run_or_print", _record)
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: None)
+    assert main(["stop", "mine", "--runtime", "docker"]) == 0
+    assert seen["cmd"] == ["docker", "stop", "mine"]
+
+
 def test_ready_timeout_zero_means_dont_wait(gguf, monkeypatch, capsys):
     import boxy.cli as cli
     import boxy.deploy as dep

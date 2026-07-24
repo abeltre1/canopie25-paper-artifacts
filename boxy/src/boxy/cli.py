@@ -5450,7 +5450,15 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
     location = Location.from_toml(args.location) if args.location else None
     runtime = args.runtime or _container_runtime(location)
-    if not args.dryrun and _container_exists(runtime, target) and _container_label(runtime, target) != target:
+    if not args.dryrun and not _container_exists(runtime, target):
+        # No job record AND no such container: boxy has never heard of this name.
+        # Answer the way every other name-taking command does (curl/open/attach/
+        # unshare) instead of shelling out to `<runtime> stop <name>` and
+        # surfacing its raw daemon error — same question, same shape of answer.
+        raise UsageError(
+            f"no instance named {target!r} — no job record on this machine and no {runtime} "
+            f"container by that name (see `boxy list`)")
+    if not args.dryrun and _container_label(runtime, target) != target:
         raise RuntimeError(
             f"container {target!r} was not created by boxy (no boxy.box label) — refusing to "
             f"stop it; use `{runtime} stop {target}` directly if you own it"
