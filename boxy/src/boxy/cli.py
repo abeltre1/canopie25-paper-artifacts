@@ -45,7 +45,7 @@ def _emit(deployment, dryrun: bool) -> int:
     for warning in deployment.warnings:
         print(f"warning: {warning}", file=sys.stderr)
     for prep in deployment.prepare_commands:
-        print(f"### Prepare: {shlex.join(prep)}")
+        print(f"### Prepare: {redact.redact_command(shlex.join(prep))}")
     print(f"### Running Command:\n    {redact.redact_command(shlex.join(deployment.command))}")
     if dryrun:
         return 0
@@ -4015,9 +4015,9 @@ def _serve_distributed(args, box, location) -> int:
           f"({'local containers' if launcher == 'none' else launcher} launcher)")
     for w in dep.warnings:
         print(f"warning: {w}", file=sys.stderr)
-    print(f"### Head ({head_node}):\n    {shlex.join(dep.command)}")
+    print(f"### Head ({head_node}):\n    {redact.redact_command(shlex.join(dep.command))}")
     for wc in worker_cmds:
-        print(f"### Worker:\n    {shlex.join(wc)}")
+        print(f"### Worker:\n    {redact.redact_command(shlex.join(wc))}")
     if args.dryrun:
         return 0
     if getattr(args, "endpoint_file", None):
@@ -4536,7 +4536,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     for warning in deployment.warnings:
         print(f"warning: {warning}", file=sys.stderr)
     for prep in deployment.prepare_commands:
-        print(f"### Prepare: {shlex.join(prep)}")
+        print(f"### Prepare: {redact.redact_command(shlex.join(prep))}")
     print(f"### Running Command:\n    {redact.redact_command(shlex.join(deployment.command))}")
     if args.dryrun:
         return 0
@@ -4684,7 +4684,7 @@ def cmd_build(args: argparse.Namespace) -> int:
         print(f"runtime {backend.name}: uses {backend.image_format} images directly; nothing to build")
         return 0
     for prep in prepare:
-        print(f"### Build: {shlex.join(prep)}")
+        print(f"### Build: {redact.redact_command(shlex.join(prep))}")
     if args.dryrun:
         return 0
     import subprocess

@@ -42,10 +42,18 @@ if _STRIPPED_SECRETS:
 
 
 def _assert_no_secrets(text: str, where: str) -> None:
-    """Refuse to write a doc that contains a real credential. Belt-and-braces
-    behind the env scrub: catches a secret that reached the render by any other
-    route (a config file, a card, a hard-coded value)."""
-    leaked = sorted({v for v in _STRIPPED_SECRETS.values() if v and len(v) > 3 and v in text})
+    """Refuse to write a doc containing a value from THIS PROCESS'S secret
+    environment — the vars captured in _STRIPPED_SECRETS above.
+
+    Scope, precisely: this is a second line of defence behind the scrub (it
+    fires if a scrubbed value reaches the output anyway, e.g. because something
+    re-exported it mid-render). It does NOT detect a credential that arrived by
+    another route — a config file, a model card, a hard-coded string — because
+    it has no way to know those values. Generic credential-shaped detection was
+    considered and rejected: the false-positive rate on container digests and
+    base64 args is high enough to make the guard untrustworthy."""
+    leaked = sorted({v for v in _STRIPPED_SECRETS.values()
+                     if v and len(v) >= redact._MIN_MASKABLE_VALUE and v in text})
     if leaked:
         raise SystemExit(
             f"gen_matrix: REFUSING to write {where}: it contains {len(leaked)} value(s) from "

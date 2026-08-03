@@ -32,11 +32,12 @@ SECRET = "hf_liveSECRETvalue0123456789"
     ("HF_TOKEN", True),
     ("HUGGING_FACE_HUB_TOKEN", True),
     ("AWS_SECRET_ACCESS_KEY", True),
-    ("AWS_ACCESS_KEY_ID", True),
-    ("OPENAI_API_KEY", True),
-    ("SITE_REGISTRY_PASSWORD", True),          # name-shape fallback
+    ("AWS_ACCESS_KEY_ID", True),            # ends _ID — only the explicit list catches it
+    ("TAILSCALE_AUTHKEY", True),            # no underscore before KEY — likewise
+    ("LITELLM_MASTER_KEY", True),           # name-shape rule (_KEY)
+    ("SITE_REGISTRY_PASSWORD", True),       # name-shape rule (_PASSWORD)
     ("MY_THING_TOKEN", True),
-    ("SSL_CERT_FILE", False),                  # path, not a credential
+    ("SSL_CERT_FILE", False),               # path boxy sets itself — must stay readable
     ("REQUESTS_CA_BUNDLE", False),
     ("HF_HUB_OFFLINE", False),
     ("VLLM_USE_V1", False),
@@ -57,11 +58,33 @@ def test_redact_assignments_masks_only_secret_values():
     assert "SSL_CERT_FILE=/etc/ssl/ca.pem" in out and "image" in out
 
 
-def test_redact_values_catches_shell_quoted_secrets():
-    # the key-based pass can't parse every quoting shape, so the VALUE pass is
-    # the backstop: the literal secret is masked however it was written.
-    text = "bash -lc 'export HF_TOKEN='\"'\"'hf_abc123'\"'\"'; run'"
-    assert "hf_abc123" not in redact.redact_values(text, {"hf_abc123"})
+@pytest.mark.parametrize("shape", [
+    "podman run --env HF_TOKEN={s} img",
+    "podman run --env 'HF_TOKEN={s} trailing' img",
+    'podman run --env "HF_TOKEN={s}" img',
+    "bash -lc 'export HF_TOKEN={s}; vllm serve'",
+    # nested shell escaping: `export K='"'"'secret'"'"'`. A quote-aware value
+    # pattern used to match only a short prefix here and leave the token in the
+    # output — this asserts the simpler `\\S*` pattern does not regress to that.
+    """sh -c 'export HF_TOKEN='"'"'{s}'"'"'; vllm serve'""",
+])
+def test_key_pass_alone_never_leaks_across_quoting_shapes(shape, monkeypatch):
+    """The KEY pass must stand on its own: with the secret ABSENT from the
+    ambient environment the value pass cannot help, so any shape that survives
+    here is a real disclosure."""
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    text = shape.format(s=SECRET)
+    assert SECRET not in redact.redact_command(text), f"leaked in: {text}"
+
+
+def test_value_pass_catches_non_assignment_positions(monkeypatch):
+    """The VALUE pass is load-bearing, not decoration: a credential outside a
+    KEY=VALUE assignment (boxy builds an Authorization header for the HF whoami
+    check) is invisible to the key pass."""
+    monkeypatch.setenv("HF_TOKEN", SECRET)
+    header = f'curl -H "Authorization: Bearer {SECRET}" https://huggingface.co/api/whoami'
+    assert SECRET in redact.redact_assignments(header)      # key pass alone cannot see it
+    assert SECRET not in redact.redact_command(header)      # both passes together do
 
 
 def test_redact_command_uses_ambient_env(monkeypatch):
@@ -72,9 +95,15 @@ def test_redact_command_uses_ambient_env(monkeypatch):
     assert redact.redact_command(plain) == plain
 
 
-def test_ambient_secret_values_skips_trivially_short(monkeypatch):
-    monkeypatch.setenv("HF_TOKEN", "ab")        # too short to mask safely
-    assert "ab" not in redact.ambient_secret_values()
+def test_short_values_are_not_masked_by_value(monkeypatch):
+    """Masking by value must not scribble over ordinary words: a short value
+    that happens to equal a command token would blank it. Such a value is not a
+    credential anyway, and the KEY pass still covers it in assignments."""
+    monkeypatch.setenv("HF_TOKEN", "podman")
+    assert redact.redact_command("podman run --rm img") == "podman run --rm img"
+    # ...while the same short value in an assignment IS still masked by key
+    assert "podman" not in redact.redact_command("run --env HF_TOKEN=podman img").split("--env")[1]
+
 
 
 # ---- 2. rendered vs printed ---------------------------------------------------------
@@ -97,6 +126,30 @@ def test_echoed_script_is_redacted():
     lines = redact.redact_lines(_script_with_token())
     assert not any(SECRET in ln for ln in lines), "token echoed to the terminal"
     assert any("HF_TOKEN" in ln for ln in lines), "the key should stay visible"
+
+
+def test_distributed_dryrun_never_prints_the_token(tmp_path, monkeypatch, capsys):
+    """The multi-node Ray path echoes the HEAD and every WORKER command, which
+    carry the container env. Redacting only the agentless script left this one
+    open — a box profile with a token in [box.env] printed it in the clear.
+
+    Written as an end-to-end assertion on stdout+stderr rather than against a
+    specific print site, so a NEW echo added later is caught too."""
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    model = tmp_path / "m.gguf"
+    model.write_bytes(b"GGUF")
+    box = tmp_path / "box.toml"
+    box.write_text(f'[box]\nname = "lt"\nimage = "img:1"\nengine = "vllm"\n'
+                   f'model = "{model}"\n[box.env]\nHF_TOKEN = "{SECRET}"\n')
+    loc = tmp_path / "loc.toml"
+    loc.write_text('[location]\nname = "l"\nscheduler = "none"\naccelerator = "cuda"\n'
+                   'runtime = "podman"\n[location.resources]\nnodes = 2\n'
+                   'gpus_per_node = 4\ndistributed = true\n')
+    from boxy.cli import main
+    main(["serve", "--box", str(box), "--location", str(loc), "--here", "--dryrun"])
+    cap = capsys.readouterr()
+    assert "### Head" in cap.out, "expected the distributed path to run"
+    assert SECRET not in cap.out and SECRET not in cap.err
 
 
 def test_serve_agentless_dryrun_never_prints_the_token(tmp_path, monkeypatch, capsys):
