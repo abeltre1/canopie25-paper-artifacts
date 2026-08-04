@@ -618,9 +618,11 @@ boxy serve <model> --scheduler slurm --nodes 2 --gpus 4     # for real; READY ->
 # vLLM's default --gpu-memory-utilization 0.9 claims 90% of that pool while the
 # safetensors load still streams through HOST memory -> the kernel OOM-killer
 # reaps an engine rank with NO traceback (boxy's diagnosis names this). Declare
-# the pool ONCE and boxy derives the right claim from the model's footprint
-# (weights / ranks, host keeps ~a shard's worth) AND solves the geometry against
-# the claimable fraction — the field 70B lands on 4 ranks at 0.7 automatically:
+# the pool ONCE and boxy derives BOTH numbers from the model's footprint: how
+# many ranks it needs (the shard has to fit what a rank may claim) and the claim
+# itself (the pool minus what the host keeps to stream the load, bounded so a big
+# model is sized, not refused). Both field configurations land where they were
+# run by hand — the 70B on 4 ranks at 0.7, Llama-4-Scout on 4 ranks of ONE node:
 #   ~/.config/boxy/cards/systems/<cluster>.toml:
 #     [location.resources]
 #     gpus_per_node = 4
