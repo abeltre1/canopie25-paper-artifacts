@@ -54,11 +54,29 @@ class TestDegradedWithoutRamalama:
         p = _run_isolated("import importlib.util as u; print(u.find_spec('ramalama'))")
         assert p.stdout.strip() == "None"
 
-    def test_detect_accel_degrades_to_none(self):
-        p = _run_isolated("from boxy import ramalama_shim as s; "
-                          "print(s.ramalama_available(), s.detect_accel(), s.accel_env_vars(), s.gpu_device_paths())")
+    def test_accelerator_detection_works_without_ramalama(self):
+        """Detection is boxy's own since accel.py landed, so this is no longer a
+        degradation test — without ramalama you get a real answer, not a stub.
+
+        Asserted host-independently on purpose. A CI runner has no GPU but DOES
+        expose /dev/dri (a virtual DRM node with nothing behind it), and a dev
+        box may have CUDA_VISIBLE_DEVICES exported; an equality assertion on
+        either dict passes on one machine and fails on the next."""
+        p = _run_isolated(
+            "import json\n"
+            "from boxy import accel, ramalama_shim as s\n"
+            "print(json.dumps({'ramalama': s.ramalama_available(), 'accel': s.detect_accel(),\n"
+            "                  'env': s.accel_env_vars(), 'devices': s.gpu_device_paths(),\n"
+            "                  'known_env': sorted(accel.VISIBLE_DEVICE_VARS.values())}))\n"
+        )
         assert p.returncode == 0
-        assert p.stdout.strip() == "False none {} {}"
+        got = json.loads(p.stdout.strip().splitlines()[-1])
+        assert got["ramalama"] is False
+        # 'none' is the honest answer on a GPU-less runner; the point is that it
+        # was reached natively, with ramalama absent, rather than by giving up.
+        assert got["accel"] == "none"
+        assert set(got["env"]) <= set(got["known_env"])
+        assert all(node == f"/dev/{name}" for name, node in got["devices"].items())
 
     def test_pull_transport_uri_gives_guidance(self):
         p = _run_isolated(

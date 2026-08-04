@@ -77,6 +77,9 @@ def cmd_info(args: argparse.Namespace) -> int:
     launchers = [name for name, probe in (("slurm", "srun"), ("flux", "flux")) if shutil.which(probe)]
     _info_section("host", [
         ("accelerator", ramalama_shim.detect_accel()),
+        # tells "detected none, and there's no device node either" (no driver)
+        # apart from "node present but no accelerator behind it"
+        ("gpu device nodes", ", ".join(sorted(ramalama_shim.gpu_device_paths().values())) or "none present"),
         ("container runtimes", ", ".join(runtimes) or "none found"),
         ("schedulers", ", ".join(launchers) or "none found"),
         ("ramalama library", "available" if ramalama_shim.ramalama_available() else "not installed"),

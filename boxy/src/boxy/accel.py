@@ -69,7 +69,7 @@ class AccelInfo:
     kind: str = "none"
     visible_devices: str = ""      # e.g. "0" — advisory; never exported by us
     detail: str = ""               # human-readable provenance for `boxy info`
-    devices: dict = field(default_factory=dict)   # /dev paths to pass through
+    devices: dict = field(default_factory=dict)   # /dev nodes present (see gpu_device_paths)
     count: int = 0                 # how many accelerators of this kind
     vram_gb: int = 0               # per-device memory, GiB (0 = not determined)
 
@@ -206,7 +206,15 @@ def check_musa(run=_run) -> AccelInfo | None:
 
 
 def gpu_device_paths() -> dict:
-    """The /dev nodes a container needs bind-mounted for GPU access."""
+    """Which GPU device nodes this host actually exposes. Reported, not wired:
+    each backend derives its own flags from the accelerator KIND (podman's
+    `--device /dev/kfd`, apptainer's `--bind`), because the spelling differs per
+    runtime and CUDA passes through nvidia.com/gpu rather than a /dev path.
+
+    The value of reporting it is diagnostic — `boxy info` shows it, so "boxy
+    says none but I have a GPU" can be told apart from "the node isn't there at
+    all" (missing driver) in one look. Note the converse case: a CI runner
+    exposes /dev/dri with nothing behind it, so a node present is not a GPU."""
     return {d: f"/dev/{d}" for d in ("dri", "kfd", "accel") if os.path.exists(f"/dev/{d}")}
 
 
