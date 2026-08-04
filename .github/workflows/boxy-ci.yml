@@ -47,12 +47,12 @@ jobs:
         run: python -m pytest -q --ignore=tests/test_degraded_and_live.py
 
   degraded:
-    # boxy PROMISES to degrade gracefully when RamaLama is absent (accelerator
-    # detection falls back, transport pulls explain themselves instead of
-    # crashing). tests/test_degraded_and_live.py proves that — but it needs
-    # ramalama genuinely NOT importable, so the `test` job above excludes it and
-    # the whole promise went unverified in CI. This leg installs boxy WITHOUT
-    # the ramalama extra, so those tests actually run.
+    # boxy PROMISES to work without RamaLama — accelerator detection is native
+    # now, and registry transport pulls explain themselves instead of crashing.
+    # tests/test_degraded_and_live.py proves that, but it needs ramalama
+    # genuinely NOT importable, so the `test` job above excludes it and the whole
+    # promise went unverified in CI. This leg installs boxy WITHOUT the ramalama
+    # extra — the default install — so those tests actually run.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -60,6 +60,8 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install boxy WITHOUT the ramalama extra
+        # This is the DEFAULT install (`pip install boxy-hpc`), not a broken one:
+        # ramalama is optional, so omitting the extra is all it takes.
         run: python -m pip install -e 'boxy[test]'
       - name: Assert the precondition (ramalama really absent)
         # If a transitive dep ever pulls ramalama in, the degradation tests would
