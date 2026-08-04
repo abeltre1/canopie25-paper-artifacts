@@ -183,7 +183,9 @@ def test_default_images_cover_engines_and_accelerators():
     assert ramalama_shim.default_image("llama.cpp", "none").endswith(":server")
     for accel in ("cuda", "rocm", "intel", "none", "vulkan"):
         assert ramalama_shim.default_image("vllm", accel)  # never empty
-    assert ramalama_shim._ramalama_vllm_image("none") is None  # unmapped accel
+    # an unmapped accelerator still yields the CUDA-class default rather than
+    # nothing — callers rely on default_image never returning empty
+    assert ramalama_shim.default_image("vllm", "none") == "vllm/vllm-openai:latest"
 
 
 # ---------- sky export details ----------

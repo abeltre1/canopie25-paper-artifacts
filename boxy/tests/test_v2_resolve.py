@@ -7,6 +7,7 @@ import socket
 import pytest
 
 from boxy import resolve
+from boxy.location import ACCELERATORS
 
 pytestmark = []
 
@@ -65,17 +66,20 @@ def test_port_probe_sees_wildcard_binds():
     assert resolve._port_taken(port) is False  # released after close
 
 
-def test_hip_and_cann_normalized_at_the_seam(monkeypatch):
-    """ramalama's get_accel() says 'hip'/'cann'; boxy speaks 'rocm'/'ascend'.
-    Without normalization every v2 command dies on a ROCm node."""
-    import ramalama.common
+def test_detection_speaks_boxy_accelerator_names(monkeypatch):
+    """boxy speaks 'rocm'/'ascend' everywhere; the vendor runtimes call the same
+    things 'hip'/'cann'. Detection used to come from RamaLama and be translated
+    at this seam; it is now boxy's own (accel.py) and emits boxy's vocabulary
+    directly. The requirement is unchanged — a v2 command on a ROCm node dies if
+    anything leaks 'hip' — so it stays asserted here, at the seam every caller
+    actually uses."""
+    from boxy import accel, ramalama_shim
 
-    from boxy import ramalama_shim
-
-    monkeypatch.setattr(ramalama.common, "get_accel", lambda: "hip")
+    monkeypatch.setattr(accel, "detect_kind", lambda: "rocm")
     assert ramalama_shim.detect_accel() == "rocm"
-    monkeypatch.setattr(ramalama.common, "get_accel", lambda: "cann")
+    monkeypatch.setattr(accel, "detect_kind", lambda: "ascend")
     assert ramalama_shim.detect_accel() == "ascend"
+    assert "hip" not in ACCELERATORS and "cann" not in ACCELERATORS
 
 
 def test_inside_allocation_runs_direct(monkeypatch):
