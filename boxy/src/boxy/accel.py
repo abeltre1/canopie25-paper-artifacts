@@ -1,21 +1,17 @@
 """Accelerator detection — boxy's own, with no library dependency.
 
 This is a headline capability: `boxy serve MODEL` picking the right engine and
-image for the hardware is most of what boxy does. It used to come from
-RamaLama, which meant the feature was only present if an optional package was,
-and — worse — that RamaLama's opinion silently decided things boxy is
-responsible for.
+image for the hardware is most of what boxy does, so boxy implements it rather
+than delegating it. Delegation made the feature conditional on an optional
+package AND made the result vary with whether that package happened to be
+installed — unacceptable in a tool used to compare accelerators.
 
-Owning it is cheap because the territory is stable. These are kernel and
-vendor ABIs (`/sys/class/kfd` topology properties, `nvidia-smi --query-gpu`,
-`/dev/{dri,kfd,accel}`) that move on a scale of years. The upstream package
-moves on a scale of releases.
+Implemented directly against the public interfaces: the KFD sysfs topology
+(documented in linux/kfd_sysfs.h), `nvidia-smi --query-gpu`, PCI device ids,
+and `/dev/{dri,kfd,accel}`. Those are kernel and vendor ABIs, stable on a
+scale of years.
 
-Prior art: RamaLama solves the same problem, and reading it confirmed which
-kernel interfaces matter. What is here is boxy's own implementation against
-those public interfaces — the KFD sysfs topology documented in
-linux/kfd_sysfs.h, `nvidia-smi --query-gpu`, and the PCI device-id ranges —
-not a port of its code, and it differs where boxy's needs differ:
+Design notes — why this looks the way it does:
 
   * detection NEVER mutates os.environ. Setting CUDA_VISIBLE_DEVICES as a side
     effect of asking a question is a trap when you probe on a login node,
@@ -67,9 +63,9 @@ VISIBLE_DEVICE_VARS = {
 @dataclass(frozen=True)
 class AccelInfo:
     """What detection found. `kind` is boxy's accelerator spelling (the same
-    strings location.ACCELERATORS uses), NOT the vendor runtime name — RamaLama
-    reports 'hip'/'cann'; boxy says 'rocm'/'ascend' everywhere, so the seam
-    translates once, here."""
+    strings location.ACCELERATORS uses), NOT the vendor runtime name: the
+    runtimes call these 'hip'/'cann' while boxy says 'rocm'/'ascend'
+    everywhere, so detection emits boxy's vocabulary directly."""
     kind: str = "none"
     visible_devices: str = ""      # e.g. "0" — advisory; never exported by us
     detail: str = ""               # human-readable provenance for `boxy info`
@@ -147,11 +143,11 @@ def check_rocm(topology: str | None = None) -> AccelInfo | None:
 def check_nvidia(run=_run) -> AccelInfo | None:
     """NVIDIA GPUs via nvidia-smi.
 
-    Deliberately does NOT require a CDI configuration. RamaLama refuses without
-    one because it launches the container; boxy often detects on a login node
-    that will never run the workload, where missing CDI says nothing about the
-    compute nodes. Container wiring is the runtime backend's job (podman.py),
-    which fails loudly at run time if the toolkit is absent."""
+    Deliberately does NOT require a CDI configuration. A tool that launches the
+    container itself has reason to insist on one; boxy often detects on a login
+    node that will never run the workload, where missing CDI says nothing about
+    the compute nodes. Container wiring is the runtime backend's job
+    (podman.py), which fails loudly at run time if the toolkit is absent."""
     out = run(["nvidia-smi", "--query-gpu=index,memory.total",
                "--format=csv,noheader,nounits"])
     if not out:
