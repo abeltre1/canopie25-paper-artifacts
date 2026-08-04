@@ -289,32 +289,30 @@ def test_sif_name_matches_resolved_accelerator(monkeypatch, gguf):
 
 # ---- image maps (findings 28/29/53) ----
 
-def test_vllm_plugin_vocab_is_env_var_names(monkeypatch):
-    seen = {}
+def test_rocm_never_receives_a_cuda_image():
+    """finding 28/29, re-pointed. These used to drive RamaLama's plugin map
+    (whose vocabulary is env-var names, and which falls through to the CUDA-only
+    image for HIP). boxy no longer consults it — the image comes from boxy's own
+    static map — but the property that mattered is unchanged and now cheaper to
+    guarantee: a ROCm node must never be handed a CUDA build."""
+    from boxy import ramalama_shim
 
-    class FakePlugin:
-        def get_container_image(self, config, gpu_type):
-            seen["gpu_type"] = gpu_type
-            return "docker.io/vllm/vllm-openai-rocm:x"
-
-    import ramalama.plugins.loader as loader
-
-    monkeypatch.setattr(loader, "get_runtime", lambda name: FakePlugin())
-    image = ramalama_shim._ramalama_vllm_image("rocm")
-    assert seen["gpu_type"] == "HIP_VISIBLE_DEVICES"  # not "HIP" (finding 28)
-    assert image == "docker.io/vllm/vllm-openai-rocm:x"
+    for engine in ("vllm", "llama.cpp"):
+        image = ramalama_shim.default_image(engine, "rocm")
+        assert image, f"{engine}+rocm resolved to nothing"
+        assert "vllm-openai:" not in image      # the CUDA-only vLLM build
+        assert "cuda" not in image.lower()
 
 
-def test_vllm_plugin_cuda_image_rejected_for_rocm(monkeypatch):
-    class FakePlugin:
-        def get_container_image(self, config, gpu_type):
-            return "docker.io/vllm/vllm-openai:latest"  # CUDA-only fallthrough
+def test_default_image_does_not_depend_on_optional_packages():
+    """The image must be the same whether or not RamaLama is importable. It was
+    not: the plugin map answered when present and a static map otherwise, so the
+    same command chose vllm-openai-rocm on one machine and rocm/vllm on another
+    — different builds, different performance, invisible in the command line."""
+    from boxy import ramalama_shim
 
-    import ramalama.plugins.loader as loader
-
-    monkeypatch.setattr(loader, "get_runtime", lambda name: FakePlugin())
-    assert ramalama_shim._ramalama_vllm_image("rocm") is None
-    assert "rocm" in ramalama_shim.default_image("vllm", "rocm")  # static map wins
+    assert ramalama_shim.default_image("vllm", "rocm") == "rocm/vllm:latest"
+    assert ramalama_shim.default_image("vllm", "cuda") == "vllm/vllm-openai:latest"
 
 
 def test_llamacpp_rocm_image_is_static_not_vulkan():

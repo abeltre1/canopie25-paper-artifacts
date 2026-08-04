@@ -77,7 +77,6 @@ def ramalama_available() -> bool:
 # boxy's vocabulary is the platform name ("rocm", "ascend") — location.toml,
 # image maps, and backend GPU args all use it. Normalize at the seam, or every
 # v2 command dead-ends on a ROCm node with "unknown accelerator 'hip'".
-_ACCEL_NORMALIZE = {"hip": "rocm", "cann": "ascend"}
 
 
 # Why the last detect_accel() verdict was reached — "" for RamaLama's own
@@ -87,27 +86,23 @@ last_detect_note: str = ""
 
 
 def _ramalama_accel() -> str:
-    """RamaLama's own autodetect, normalized. 'none' when it is unavailable,
-    crashes, or genuinely sees nothing — the caller layers boxy's HPC ladder
-    on top of that verdict."""
+    """Local accelerator autodetect. Now boxy's OWN (see accel.py) rather than
+    RamaLama's: detection is a headline capability and must not depend on an
+    optional package, nor vary with whether one happens to be installed. The
+    caller layers boxy's HPC ladder on top of this verdict.
+
+    Kept under this name so the module's public seam (detect_accel) and every
+    existing monkeypatch in the tests keep working."""
+    from boxy import accel as _accel
+
     try:
-        _silence_prompts()
-        from ramalama.common import get_accel
-    except Exception:
-        return "none"
-    try:
-        accel = str(get_accel())
-    except Exception as e:
-        # malformed sysfs/KFD entries crash ramalama's probes on odd kernels;
-        # autodetect must degrade, not traceback (finding 33)
+        return _accel.detect_kind()
+    except Exception as e:  # noqa: BLE001 — autodetect degrades, never tracebacks
         import sys
 
         print(f"warning: GPU autodetect failed ({e.__class__.__name__}: {e}); "
               f"assuming none — pass --accelerator to override", file=sys.stderr)
         return "none"
-    # ramalama returns e.g. "cuda", "hip", "intel", "cann", ... or "none"
-    accel = accel.split(":")[0] if accel else "none"
-    return _ACCEL_NORMALIZE.get(accel, accel)
 
 
 def detect_accel() -> str:
@@ -152,22 +147,21 @@ def detect_accel() -> str:
 
 def accel_env_vars() -> dict[str, str]:
     """Accelerator visibility env vars (CUDA_VISIBLE_DEVICES, HIP_VISIBLE_DEVICES, ...)."""
-    try:
-        from ramalama.common import get_accel_env_vars, set_accel_env_vars
+    from boxy import accel as _accel
 
-        set_accel_env_vars()
-        return {k: str(v) for k, v in get_accel_env_vars().items()}
-    except Exception:
+    try:
+        return _accel.accel_env_vars()
+    except Exception:  # noqa: BLE001
         return {}
 
 
 def gpu_device_paths() -> dict[str, str]:
     """Host GPU device nodes ({"dri": "/dev/dri", "kfd": "/dev/kfd", ...})."""
-    try:
-        from ramalama.common import get_gpu_devices
+    from boxy import accel as _accel
 
-        return dict(get_gpu_devices())
-    except Exception:
+    try:
+        return _accel.gpu_device_paths()
+    except Exception:  # noqa: BLE001
         return {}
 
 
@@ -791,40 +785,6 @@ def vllm_image_for(accelerator: str) -> str:
     }.get(accelerator, "vllm/vllm-openai:latest")
 
 
-def _ramalama_vllm_image(accelerator: str) -> str | None:
-    """Ask RamaLama's vLLM plugin for its accelerator->image mapping (deeper
-    leverage than the static map); returns None when unavailable."""
-    try:
-        from ramalama.config import DefaultConfig
-        from ramalama.plugins.loader import get_runtime
-
-        # the plugin map is keyed by env-var names; "CUDA"/"HIP" silently fell
-        # through to the CUDA-only default image on ROCm/Intel (finding 28)
-        gpu_type = {"cuda": "CUDA_VISIBLE_DEVICES", "rocm": "HIP_VISIBLE_DEVICES",
-                    "intel": "INTEL_VISIBLE_DEVICES"}.get(accelerator)
-        if gpu_type is None:
-            return None
-        image = get_runtime("vllm").get_container_image(DefaultConfig(), gpu_type)
-        # never accept a CUDA image for a non-CUDA accelerator (fallthrough guard)
-        if accelerator != "cuda" and image and "vllm-openai:" in image:
-            return None
-        return image
-    except Exception:
-        return None
-
-
-# llama.cpp on non-CUDA GPUs: the upstream ghcr server image is CPU-only, so a
-# GGUF on a ROCm/Intel node would silently burn the allocation on CPU inference.
-# Use RamaLama's accelerator images (llama-server on $PATH) for those.
-_LLAMACPP_ACCEL_IMAGES = {
-    "rocm": "quay.io/ramalama/rocm:latest",
-    "intel": "quay.io/ramalama/intel-gpu:latest",
-    "musa": "quay.io/ramalama/musa:latest",
-    "ascend": "quay.io/ramalama/cann:latest",
-    "vulkan": "quay.io/ramalama/ramalama:latest",
-    "asahi": "quay.io/ramalama/asahi:latest",
-}
-
 
 def _ramalama_llamacpp_image(accelerator: str) -> str | None:
     """Ask RamaLama's llama.cpp plugin for its accelerator->image mapping
@@ -857,12 +817,36 @@ def default_entrypoint(engine: str, image: str) -> str:
     return ""
 
 
+# llama.cpp accelerator images. Static and authoritative: RamaLama's 'auto'
+# backend resolves HIP/INTEL to the generic vulkan image on Linux, which is not
+# what a ROCm or Intel node should run (finding 29). These are the accel-specific
+# quay.io/ramalama builds, chosen by boxy, overridable per card or with --image.
+_LLAMACPP_ACCEL_IMAGES = {
+    "rocm": "quay.io/ramalama/rocm:latest",
+    "intel": "quay.io/ramalama/intel-gpu:latest",
+    "musa": "quay.io/ramalama/musa:latest",
+    "ascend": "quay.io/ramalama/cann:latest",
+    "vulkan": "quay.io/ramalama/ramalama:latest",
+    "asahi": "quay.io/ramalama/asahi:latest",
+}
+
+
 def default_image(engine: str, accelerator: str) -> str:
     """Default container image when a box omits `image`, per engine+accelerator.
 
-    Defaults come from RamaLama's own plugin mappings when importable (falling
-    back to static maps). llama.cpp keeps the field-tested upstream ghcr images
-    for cuda/cpu; GPU accelerators map to RamaLama's accel images.
+    Resolved from boxy's OWN static maps, deliberately. This used to consult
+    RamaLama's plugin mapping first, which made the choice depend on whether an
+    optional package was installed:
+
+        with ramalama:   rocm -> docker.io/vllm/vllm-openai-rocm
+        without:         rocm -> rocm/vllm:latest
+
+    Those are different builds (upstream's ROCm image vs AMD's tuned one) with
+    materially different performance, and nothing in the command line revealed
+    which you got — two machines running the identical command could benchmark
+    differently for no visible reason. For a tool whose job is reproducible
+    deployment that is a defect, so the image is now boxy's decision, visible
+    in the maps below and overridable per model card or with --image.
     """
     if engine == "llama.cpp":
         if accelerator == "cuda":
@@ -872,4 +856,4 @@ def default_image(engine: str, accelerator: str) -> str:
             # HIP/INTEL to the generic vulkan image on Linux (finding 29)
             return _LLAMACPP_ACCEL_IMAGES[accelerator]
         return "ghcr.io/ggml-org/llama.cpp:server"
-    return _ramalama_vllm_image(accelerator) or vllm_image_for(accelerator)
+    return vllm_image_for(accelerator)
