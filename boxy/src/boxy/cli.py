@@ -2350,6 +2350,35 @@ def _pick_partition(args, scheduler_name: str, need_gpu: bool, where: str = "") 
         print(f"  auto: partition: {pick} ({note})")
 
 
+def _partition_unresolved_line(pwhy: str, scheduler_name: str) -> str:
+    """The decision line when no partition could be ranked — SHARED by the
+    agentless and non-agentless serve paths.
+
+    They had two copies of this resolution and only one printed on failure, so
+    the agentless path went silent exactly when it could not choose, and the job
+    took the cluster default (field: an 8-node job queued behind a
+    100%-allocated default while two other partitions sat idle). One function
+    now, so they cannot diverge again."""
+    return (f"  auto: partition: NOT chosen ({pwhy or 'no partitions could be listed'}) — "
+            f"the scheduler's default applies, which may be busy. "
+            f"{_partition_hint(scheduler_name)}")
+
+
+def _partition_hint(scheduler_name: str) -> str:
+    """What to run to see the choices boxy could not rank, per scheduler.
+
+    Flux is called out specifically: `flux queue list` reports no per-queue idle
+    count (schedulers/flux.py), so boxy can never rank Flux queues by
+    soonest-start. On a Flux site with Slurm compat shims — common — `sinfo`
+    answers with the idle counts boxy wanted, so that is the command to suggest.
+    """
+    if scheduler_name == "flux":
+        return ("Flux reports no per-queue idle counts, so boxy cannot rank them; list them with "
+                "`flux queue list` (or `sinfo -o '%R %a %F'` if this site runs Slurm shims) and "
+                "pass --partition <name>.")
+    return "List them with `sinfo -o '%R %a %F'` and pass --partition <name>."
+
+
 def _pick_remote_partition(args, names, host: str, target: str, scheduler_name: str) -> tuple[str, str]:
     """Choose a partition from a cluster-probed list for an --ssh serve. Returns
     (value, note). Interactive menu only when the picker is enabled AND 2+ exist;
@@ -2908,6 +2937,15 @@ def _serve_agentless_ssh(args, target: str) -> int:
             part = pick
             why = pnote or f"{scheduler_name} on {host}: {pwhy}"
             print(f"  auto: partition: {part} (via {why})")
+        else:
+            # SAY SO. This branch used to be absent, so a failed ranking printed
+            # nothing at all and the job silently took the cluster's default
+            # partition — which is exactly the one most likely to be full (field:
+            # an 8-node job queued behind a 100%-allocated default while two other
+            # partitions sat idle, with no line in the output to explain it).
+            # Every other choice boxy makes prints its reasoning; this one went
+            # quiet precisely when it failed.
+            print(_partition_unresolved_line(pwhy, scheduler_name))
     if part and site.partition_mode(part) not in ("off",):
         if scheduler_name == "flux" and "," in part:
             part = part.split(",")[0].strip()
@@ -4254,8 +4292,7 @@ def _inject_remote_site(args, target: str, raw_argv: list[str]) -> list[str]:
             if flagged:
                 head = _argv_set_flag(head, "--partition", None)  # drop unresolved auto/all
             # default (no flag): nothing to drop; the cluster's site default applies
-            print(f"  auto: partition: could not pick on {target} ({why}) — "
-                  f"the scheduler's site default applies")
+            print(_partition_unresolved_line(why, scheduler))
 
     # --- account: append --account unless one was given explicitly ---
     if not getattr(args, "account", None):

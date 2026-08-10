@@ -957,3 +957,50 @@ def test_accel_from_report_ladder():
     assert accel == "rocm" and "MI300A" in why
     # nothing anywhere -> undecided
     assert site.accel_from_report({}) == ("", "")
+
+
+# ---- a failed partition ranking must SAY SO ----------------------------------------
+
+
+def test_partition_hint_names_the_command_per_scheduler():
+    """Flux cannot be ranked (flux queue list carries no idle counts), so the
+    hint has to say that and point at what does work — on a Flux site with Slurm
+    compat shims, sinfo answers with exactly the counts boxy wanted."""
+    from boxy.cli import _partition_hint
+
+    flux = _partition_hint("flux")
+    assert "flux queue list" in flux and "--partition" in flux
+    assert "sinfo" in flux, "a Flux site with Slurm shims can still be listed"
+
+    slurm = _partition_hint("slurm")
+    assert "sinfo" in slurm and "--partition" in slurm
+
+
+def test_unresolved_partition_line_is_explicit_and_actionable():
+    """Ranking failed. The line must SAY it failed, warn that the default may be
+    busy, and name the command that lists the choices."""
+    from boxy.cli import _partition_unresolved_line
+
+    line = _partition_unresolved_line("no queues listed", "flux")
+    assert "NOT chosen" in line
+    assert "no queues listed" in line              # the reason, not a shrug
+    assert "may be busy" in line                   # why the default is not safe
+    assert "--partition" in line                   # what to do about it
+
+
+def test_unresolved_partition_line_survives_an_empty_reason():
+    from boxy.cli import _partition_unresolved_line
+
+    assert "no partitions could be listed" in _partition_unresolved_line("", "slurm")
+
+
+def test_both_serve_paths_share_one_unresolved_partition_line():
+    """The root cause was TWO copies of the partition resolution: the agentless
+    one lost its failure branch and went silent. One helper now, called by both,
+    so they cannot diverge again."""
+    import inspect
+
+    from boxy import cli
+
+    src = inspect.getsource(cli)
+    assert src.count("_partition_unresolved_line(") == 3   # 1 def + 2 call sites
