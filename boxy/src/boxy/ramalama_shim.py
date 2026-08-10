@@ -777,35 +777,15 @@ def _hf_404_diagnosis(model_uri: str) -> str:
 
 
 def vllm_image_for(accelerator: str) -> str:
-    """Default vLLM serving image per accelerator (mirrors VllmPlugin.get_container_image)."""
+    """Default vLLM serving image per accelerator. boxy's own map: `rocm` picks
+    AMD's tuned rocm/vllm build rather than the upstream ROCm variant, and the
+    choice must not depend on which optional packages happen to be installed
+    (see default_image below). Overridable per model card or with --image."""
     return {
         "cuda": "vllm/vllm-openai:latest",
         "rocm": "rocm/vllm:latest",
         "intel": "intel/vllm:latest",
     }.get(accelerator, "vllm/vllm-openai:latest")
-
-
-
-def _ramalama_llamacpp_image(accelerator: str) -> str | None:
-    """Ask RamaLama's llama.cpp plugin for its accelerator->image mapping
-    (version-tagged quay.io/ramalama images); returns None when unavailable."""
-    try:
-        from ramalama.config import DefaultConfig
-        from ramalama.plugins.loader import get_runtime
-
-        gpu_type = {
-            "rocm": "HIP_VISIBLE_DEVICES",
-            "intel": "INTEL_VISIBLE_DEVICES",
-            "musa": "MUSA_VISIBLE_DEVICES",
-            "ascend": "ASCEND_VISIBLE_DEVICES",
-            "vulkan": "GGML_VK_VISIBLE_DEVICES",
-            "asahi": "ASAHI_VISIBLE_DEVICES",
-        }.get(accelerator)
-        if gpu_type is None:
-            return None
-        return get_runtime("llama.cpp").get_container_image(DefaultConfig(), gpu_type)
-    except Exception:
-        return None
 
 
 def default_entrypoint(engine: str, image: str) -> str:

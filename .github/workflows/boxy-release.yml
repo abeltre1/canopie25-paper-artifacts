@@ -50,11 +50,29 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#boxy-v}"
           owner="${GITHUB_REPOSITORY_OWNER}"
+          repo="${GITHUB_REPOSITORY}"
+          whl="https://github.com/$repo/releases/download/${GITHUB_REF_NAME}/boxy_hpc-$version-py3-none-any.whl"
           {
-            echo "## Install"
+            echo "## Install — one command, nothing to download first"
             echo
+            echo '```bash'
+            echo "uv tool install \"boxy-hpc @ $whl\"      # isolated, on \$PATH, ~3s"
             echo '```'
-            echo "pip install boxy_hpc-$version-py3-none-any.whl   # wheel attached below"
+            echo
+            echo "or with pip:"
+            echo
+            echo '```bash'
+            echo "pip install \"boxy-hpc @ $whl\""
+            echo '```'
+            echo
+            echo "That is the whole install: accelerator autodetection is built in, and"
+            echo "the only dependency is \`certifi\`. Optional extras: \`ramalama\` (pulls from"
+            echo "\`hf://\`/\`ollama://\`/\`oci://\`), \`s3\`, \`plot\`, \`cloud\`."
+            echo "To add them, use the PEP 508 form (the extras go on the NAME, not the URL —"
+            echo '`pip install "<url>[s3]"` silently installs nothing extra):'
+            echo
+            echo '```bash'
+            echo "pip install \"boxy-hpc[ramalama,s3] @ $whl\""
             echo '```'
             echo
             echo "## Container images (GHCR — Packages sidebar)"

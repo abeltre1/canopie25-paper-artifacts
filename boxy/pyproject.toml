@@ -31,9 +31,19 @@ classifiers = [
 # CAs together). Tiny, pure-data, load-bearing for model pulls.
 dependencies = ["certifi"]
 
-# RamaLama is an optional (but recommended) library dependency: boxy degrades
-# gracefully without it (no accelerator autodetect, no transport pulls).
-# Pinned to a minor series because its internals carry no API promise.
+# ramalama: OPTIONAL, and now genuinely so. It was briefly promoted to a required
+# dependency for two reasons, both since fixed at the source instead:
+#   * accelerator autodetection — a headline capability, so an install lacking it
+#     was not really boxy. boxy now detects accelerators natively (src/boxy/
+#     accel.py), so a bare `pip install boxy-hpc` has that capability.
+#   * image determinism — the default image used to resolve through RamaLama's
+#     plugin map when importable and a static map otherwise, so the SAME command
+#     could choose different images depending on whether an optional package
+#     happened to be present. default_image() is now boxy's own map either way.
+# What remains behind the extra is registry transport pulls (`hf://`, `ollama://`,
+# `oci://` into the local model store). Without it those URIs explain themselves
+# instead of working; path-based and pre-staged models are unaffected.
+# Pinned to a minor series because RamaLama's internals carry no API promise.
 [project.optional-dependencies]
 ramalama = ["ramalama==0.23.*"]
 cloud = ["skypilot>=0.12"]

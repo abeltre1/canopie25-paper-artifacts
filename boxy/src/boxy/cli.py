@@ -17,7 +17,7 @@ import socket
 import subprocess
 import sys
 
-from boxy import config, ramalama_shim, version_string
+from boxy import config, ramalama_shim, redact, version_string
 from boxy.backends import BACKENDS
 from boxy.box import TRANSPORT_SCHEMES, Box
 from boxy.location import ACCELERATORS, Location
@@ -45,8 +45,8 @@ def _emit(deployment, dryrun: bool) -> int:
     for warning in deployment.warnings:
         print(f"warning: {warning}", file=sys.stderr)
     for prep in deployment.prepare_commands:
-        print(f"### Prepare: {shlex.join(prep)}")
-    print(f"### Running Command:\n    {shlex.join(deployment.command)}")
+        print(f"### Prepare: {redact.redact_command(shlex.join(prep))}")
+    print(f"### Running Command:\n    {redact.redact_command(shlex.join(deployment.command))}")
     if dryrun:
         return 0
     return deploy.execute(deployment)
@@ -77,6 +77,9 @@ def cmd_info(args: argparse.Namespace) -> int:
     launchers = [name for name, probe in (("slurm", "srun"), ("flux", "flux")) if shutil.which(probe)]
     _info_section("host", [
         ("accelerator", ramalama_shim.detect_accel()),
+        # tells "detected none, and there's no device node either" (no driver)
+        # apart from "node present but no accelerator behind it"
+        ("gpu device nodes", ", ".join(sorted(ramalama_shim.gpu_device_paths().values())) or "none present"),
         ("container runtimes", ", ".join(runtimes) or "none found"),
         ("schedulers", ", ".join(launchers) or "none found"),
         ("ramalama library", "available" if ramalama_shim.ramalama_available() else "not installed"),
@@ -1782,10 +1785,10 @@ def _app_agentless_ssh(args, card, target: str) -> int:
     else:
         print(f"### Agentless app run from {card.label} (no boxy on the cluster).")
     print(f"### Batch script ({script_remote}):")
-    for line in script_text.rstrip().splitlines():
+    for line in redact.redact_lines(script_text.rstrip()):
         print(f"    {line}")
     submit_cmd = shlex.join(scheduler.submit_command(script_remote))
-    print(f"### Submit Command (on {host}):\n    {submit_cmd}")
+    print(f"### Submit Command (on {host}):\n    {redact.redact_command(submit_cmd)}")
     if args.dryrun:
         return 0
 
@@ -2021,7 +2024,7 @@ def _app_local(args, card) -> int:
 
     print(f"### App run from {card.label}.")
     print(f"### Batch script ({script_path}):")
-    for line in script_text.rstrip().splitlines():
+    for line in redact.redact_lines(script_text.rstrip()):
         print(f"    {line}")
     if args.dryrun:
         return 0
@@ -3093,10 +3096,10 @@ def _serve_agentless_ssh(args, target: str) -> int:
     print("### Agentless (no boxy on the cluster): a self-contained podman batch script, "
           "submitted + polled from your laptop over SSH.")
     print(f"### Batch script ({script_remote}):")
-    for line in script_text.rstrip().splitlines():
+    for line in redact.redact_lines(script_text.rstrip()):
         print(f"    {line}")
     submit_cmd = shlex.join(scheduler.submit_command(script_remote))
-    print(f"### Submit Command (on {host}):\n    {submit_cmd}")
+    print(f"### Submit Command (on {host}):\n    {redact.redact_command(submit_cmd)}")
     if args.dryrun:
         deploy.set_agentless_ca(None)
         return 0
@@ -3633,9 +3636,9 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
                                              distributed=want_distributed)
     submit = scheduler.submit_command(str(jobs.script_path(name)))
     print(f"### Batch script ({jobs.script_path(name)}):")
-    for line in script_text.rstrip().splitlines():
+    for line in redact.redact_lines(script_text.rstrip()):
         print(f"    {line}")
-    print(f"### Submit Command:\n    {shlex.join(submit)}")
+    print(f"### Submit Command:\n    {redact.redact_command(shlex.join(submit))}")
     if args.dryrun:
         return 0
     _require_scheduler_binary(submit[0], scheduler_name)
@@ -3925,9 +3928,9 @@ def _serve_replicas(args, scheduler_name: str, profile, replicas: int, router_po
         print(f"\n### Node job {job_name}: {m} replica(s) x {r} GPU = {m * r} GPU on 1 node "
               f"({', '.join(replica_names[i] for i in members)})")
         print(f"### Batch script ({jobs.script_path(job_name)}):")
-        for line in script_text.rstrip().splitlines():
+        for line in redact.redact_lines(script_text.rstrip()):
             print(f"    {line}")
-        print(f"### Submit Command:\n    {shlex.join(submit)}")
+        print(f"### Submit Command:\n    {redact.redact_command(shlex.join(submit))}")
         if args.dryrun:
             continue
         _require_scheduler_binary(submit[0], scheduler_name)
@@ -4040,9 +4043,9 @@ def _serve_distributed(args, box, location) -> int:
           f"({'local containers' if launcher == 'none' else launcher} launcher)")
     for w in dep.warnings:
         print(f"warning: {w}", file=sys.stderr)
-    print(f"### Head ({head_node}):\n    {shlex.join(dep.command)}")
+    print(f"### Head ({head_node}):\n    {redact.redact_command(shlex.join(dep.command))}")
     for wc in worker_cmds:
-        print(f"### Worker:\n    {shlex.join(wc)}")
+        print(f"### Worker:\n    {redact.redact_command(shlex.join(wc))}")
     if args.dryrun:
         return 0
     if getattr(args, "endpoint_file", None):
@@ -4562,8 +4565,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     for warning in deployment.warnings:
         print(f"warning: {warning}", file=sys.stderr)
     for prep in deployment.prepare_commands:
-        print(f"### Prepare: {shlex.join(prep)}")
-    print(f"### Running Command:\n    {shlex.join(deployment.command)}")
+        print(f"### Prepare: {redact.redact_command(shlex.join(prep))}")
+    print(f"### Running Command:\n    {redact.redact_command(shlex.join(deployment.command))}")
     if args.dryrun:
         return 0
 
@@ -4710,7 +4713,7 @@ def cmd_build(args: argparse.Namespace) -> int:
         print(f"runtime {backend.name}: uses {backend.image_format} images directly; nothing to build")
         return 0
     for prep in prepare:
-        print(f"### Build: {shlex.join(prep)}")
+        print(f"### Build: {redact.redact_command(shlex.join(prep))}")
     if args.dryrun:
         return 0
     import subprocess
@@ -5168,7 +5171,7 @@ def _container_runtime(location: Location | None) -> str:
 
 
 def _run_or_print(cmd: list[str], dryrun: bool) -> int:
-    print(f"### Running Command:\n    {shlex.join(cmd)}")
+    print(f"### Running Command:\n    {redact.redact_command(shlex.join(cmd))}")
     if dryrun:
         return 0
     import subprocess
@@ -6693,7 +6696,7 @@ def cmd_launch(args: argparse.Namespace) -> int:
                                           proxy=args.proxy, ca_bundle=ca)
         print(f"### Task YAML: {yaml_path}")
         cmd = cloud.launch_command(box, yaml_path, serve=args.serve)
-    print(f"### Running Command:\n    {shlex.join(cmd)}")
+    print(f"### Running Command:\n    {redact.redact_command(shlex.join(cmd))}")
     if args.dryrun:
         return 0
     cloud.ensure_sky()
