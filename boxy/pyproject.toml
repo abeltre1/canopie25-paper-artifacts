@@ -49,7 +49,10 @@ ramalama = ["ramalama==0.23.*"]
 cloud = ["skypilot>=0.12"]
 s3 = ["boto3"]
 plot = ["matplotlib"]
-test = ["pytest"]
+# pyyaml: tests PARSE the OpenShift manifests boxy emits rather than string-matching
+# them, so a malformed document fails loudly. boxy itself never imports it —
+# the emitters are pure string builders with no runtime YAML dependency.
+test = ["pytest", "pyyaml"]
 
 [project.urls]
 Homepage = "https://github.com/abeltre1/canopie25-paper-artifacts/tree/main/boxy"
