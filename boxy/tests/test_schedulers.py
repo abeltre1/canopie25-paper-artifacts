@@ -15,7 +15,7 @@ def test_slurm_parse_job_id_ignores_sbatch_info_noise():
     # field: clustera merges sbatch's stderr INFO line into the captured output, and it
     # can land AFTER the job id — the id must still be extracted, not the INFO line.
     noisy = ("1819345\nsbatch: INFO: Adding filesystem licenses to job: "
-             "gpfs:1,sitescratch:1,pscratch:1,rlfs01:1,rnfs01:1")
+             "gpfs:1,sitescratch:1,pscratch:1,projfs01:1,homefs01:1")
     assert s.parse_job_id(noisy) == "1819345"
     assert s.parse_job_id("sbatch: INFO: Adding filesystem licenses\n1819345") == "1819345"
     assert s.parse_job_id("1818768") == "1818768"
