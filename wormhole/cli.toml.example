@@ -1,0 +1,37 @@
+# Wormhole CLI config — copy to ~/.config/wormhole/cli.toml and edit.
+#
+# Layering, lowest precedence first:
+#   1. /etc/wormhole/cli.toml     the site's defaults (managed by center admins)
+#   2. this file                  your defaults
+#   3. WORMHOLE_* environment     e.g. WORMHOLE_TOKEN, WORMHOLE_ENDPOINT
+#   4. command-line flags         e.g. --endpoint, --name
+#
+# `wh --nodefaults` skips step 1, and `--config PATH` (repeatable) inserts more
+# files. Keys are lowercase under [defaults].
+
+[defaults]
+
+# The route registry your center runs. Ask your support desk for the value —
+# there is no universal default, and this placeholder will not resolve.
+endpoint = "https://route-registry.example.gov"
+
+# The local port your application listens on. Override per-run with --app-port.
+app_port = 8080
+
+# DO NOT put your token here if you can avoid it.
+#
+# A token in a config file persists on a shared filesystem, gets backed up, and
+# survives long after you stop using it. Prefer the environment:
+#
+#     export WORMHOLE_TOKEN=...        # e.g. from a password manager, per session
+#
+# and never pass --token on the command line: argv is world-readable in `ps` to
+# every other user on a login node.
+#
+# If you must keep it here, create the file with a private mode from the start
+# rather than fixing it afterwards — `chmod 600` after the fact leaves a
+# world-readable window:
+#
+#     (umask 077; $EDITOR ~/.config/wormhole/cli.toml)
+#
+# token = "..."
