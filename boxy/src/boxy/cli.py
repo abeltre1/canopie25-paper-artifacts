@@ -2369,13 +2369,21 @@ def _partition_hint(scheduler_name: str) -> str:
 
     Flux is called out specifically: `flux queue list` reports no per-queue idle
     count (schedulers/flux.py), so boxy can never rank Flux queues by
-    soonest-start. On a Flux site with Slurm compat shims — common — `sinfo`
-    answers with the idle counts boxy wanted, so that is the command to suggest.
+    soonest-start.
+
+    It must NOT suggest sinfo for a Flux submission, however tempting the idle
+    counts are. Slurm partitions and Flux queues are DIFFERENT NAMESPACES: on a
+    Flux site with Slurm compat shims, sinfo happily lists partitions that
+    `flux batch --queue=` then rejects with `queue "X" not valid for user`
+    (field, 2026-08 — an earlier draft of this very hint sent a user straight
+    into it). If sinfo's partitions are the ones that matter at a site, the fix
+    is to submit through Slurm, not to borrow its names for Flux.
     """
     if scheduler_name == "flux":
-        return ("Flux reports no per-queue idle counts, so boxy cannot rank them; list them with "
-                "`flux queue list` (or `sinfo -o '%R %a %F'` if this site runs Slurm shims) and "
-                "pass --partition <name>.")
+        return ("Flux reports no per-queue idle counts, so boxy cannot rank them; list the valid "
+                "ones with `flux queue list` and pass --partition <name>. Do not use sinfo's "
+                "partition names here — Slurm partitions are a different namespace and Flux will "
+                "reject them; if those are the ones you want, submit with --scheduler slurm.")
     return "List them with `sinfo -o '%R %a %F'` and pass --partition <name>."
 
 

@@ -964,13 +964,17 @@ def test_accel_from_report_ladder():
 
 def test_partition_hint_names_the_command_per_scheduler():
     """Flux cannot be ranked (flux queue list carries no idle counts), so the
-    hint has to say that and point at what does work — on a Flux site with Slurm
-    compat shims, sinfo answers with exactly the counts boxy wanted."""
+    hint says that and names the command that lists VALID queues — and warns off
+    sinfo, whose partition names Flux rejects."""
     from boxy.cli import _partition_hint
 
     flux = _partition_hint("flux")
     assert "flux queue list" in flux and "--partition" in flux
-    assert "sinfo" in flux, "a Flux site with Slurm shims can still be listed"
+    # Slurm partitions are NOT Flux queues. Suggesting sinfo names for a flux
+    # submission sends the user into `queue "X" not valid for user` — an earlier
+    # draft of this hint did exactly that (field, 2026-08).
+    assert "Do not use sinfo" in flux
+    assert "--scheduler slurm" in flux, "name the real escape hatch instead"
 
     slurm = _partition_hint("slurm")
     assert "sinfo" in slurm and "--partition" in slurm
