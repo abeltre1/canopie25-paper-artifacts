@@ -4786,7 +4786,11 @@ def cmd_generate_card(args: argparse.Namespace) -> int:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(text)
     print(f"### wrote {dest}  (engine: {engine})")
-    print(f"###   serve it:  boxy serve {repo}")
+    # hf://, not a bare id. A bare id is a LOCAL PATH to `serve` (resolve.py
+    # deliberately never guesses a name into a registry), so printing one here
+    # emitted a command boxy itself rejects — after resolving this very card and
+    # probing the cluster for it (field, 2026-08).
+    print(f"###   serve it:  boxy serve hf://{repo}")
     return 0
 
 

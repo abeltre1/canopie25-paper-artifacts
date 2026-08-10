@@ -177,7 +177,7 @@ def test_cli_write_lands_in_the_cards_dir_and_is_discoverable(cards_home, capfd,
     assert rc == 0
     dest = cards_home / "meta-llama-llama-3.3-70b-instruct.toml"
     assert dest.exists()
-    assert "### wrote" in out and "boxy serve meta-llama/Llama-3.3-70B-Instruct" in out
+    assert "### wrote" in out and "boxy serve hf://meta-llama/Llama-3.3-70B-Instruct" in out
     # the written card is the one boxy would use for that model
     found = cards.find_card("meta-llama/Llama-3.3-70B-Instruct")
     assert found is not None and found.source == "user" and found.gpus == 4

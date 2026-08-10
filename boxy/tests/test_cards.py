@@ -618,3 +618,66 @@ def test_match_keys_shapes():
     keys = cards.match_keys("/fs/models/meta-llama/X")
     assert keys[0] == "/fs/models/meta-llama/X"
     assert "meta-llama/X" in keys and "X" in keys
+
+
+# ---- bare HuggingFace ids: say what to type, never guess -----------------------------
+
+
+@pytest.mark.parametrize("model", [
+    "thinkingmachines/Inkling",
+    "meta-llama/Llama-3.3-70B-Instruct",     # version dots must not read as a suffix
+    "Qwen/Qwen2.5-72B-Instruct",
+])
+def test_bare_repo_id_error_names_the_exact_command(model):
+    """A bare id stays a local path on purpose (same command, same meaning, every
+    machine). The error must then name the command that DOES work — the old text
+    said 'hf://<org>/Inkling', making the reader substitute an org they had just
+    typed."""
+    from boxy import resolve
+
+    with pytest.raises(RuntimeError) as e:
+        resolve._classify_model(model, require_exists=True)
+    msg = str(e.value)
+    assert f"hf://{model}" in msg
+    assert "<org>" not in msg
+
+
+@pytest.mark.parametrize("model,is_id", [
+    ("thinkingmachines/Inkling", True),
+    ("meta-llama/Llama-3.3-70B-Instruct", True),   # dots are versions, not extensions
+    ("./models/x", False),
+    ("/abs/path", False),
+    ("~/models/x", False),
+    ("a/b/c", False),                              # two slashes = a path
+    ("dir/model.gguf", False),                     # weight suffix = a path
+    ("models/llama.safetensors", False),
+    ("models/tiny-demo.ggu", False),               # a TYPO'd suffix is still a path
+    ("Qwen/Qwen2.5-72B", True),                    # version dot, not an extension
+    ("justaname", False),
+])
+def test_repo_id_shape_excludes_paths(model, is_id):
+    from boxy import resolve
+
+    assert resolve._looks_like_repo_id(model) is is_id
+
+
+def test_non_repo_id_keeps_the_generic_hint():
+    from boxy import resolve
+
+    with pytest.raises(RuntimeError, match=r"did you mean ollama://"):
+        resolve._classify_model("some-random-thing", require_exists=True)
+
+
+def test_generate_card_suggests_a_command_that_works(tmp_path, monkeypatch, capsys):
+    """The reported bug: `generate card <id>` printed `boxy serve <id>`, which
+    serve then rejects — after resolving that very card and probing the cluster."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    from boxy import cardgen
+    from boxy.cli import main
+
+    monkeypatch.setattr(cardgen, "generate", lambda repo, **kw: (
+        '[model]\nmatch = "org/Thing*"\nengine = "vllm"\ngpus = 1\n', "vllm", []))
+    assert main(["generate", "card", "org/Thing"]) == 0
+    out = capsys.readouterr().out
+    assert "boxy serve hf://org/Thing" in out
+    assert "boxy serve org/Thing" not in out
