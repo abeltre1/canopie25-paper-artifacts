@@ -2,6 +2,9 @@
 # (~218GB weights bf16): 4 80GB-class GPUs; tensor-parallel from the GPU count.
 # Generated from the captured HF config (`boxy generate card` shape) and shipped
 # packaged so filtered-egress laptops don't need the Hub to serve it.
+# FIELD: run at tensor_parallel_size=4 on ONE 4x128GB MI300A node
+# (hpc-workflow/3-start-vllm-llama4-scout.sh). That configuration calibrates the
+# unified-pool solver in cards.py — see the constants there before changing them.
 [model]
 match = "meta-llama/Llama-4-Scout-17B-16E-Instruct*"
 engine = "vllm"

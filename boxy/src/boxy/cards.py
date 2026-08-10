@@ -453,7 +453,7 @@ def system_card_path(name: str) -> str:
     return f.name
 
 
-def apply_to_args(args, shape: tuple[int, int, str] | None = None) -> list[str]:
+def apply_to_args(args, shape: tuple[int, int, str] | None = None, unified: bool = False) -> list[str]:
     """Turnkey fill for a SCHEDULER submission: when --gpus/--nodes/--engine are
     absent, take them from the model's card (or the size heuristic), returning
     the decision lines to print. Explicit flags always win; local (no-scheduler)
@@ -465,7 +465,14 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None) -> list[str]:
     declares min_vram_gb, the geometry is SOLVED (fit_geometry) instead of
     copied: fewer GPUs on fat-VRAM parts, and models bigger than one node
     automatically become N-node Ray instances. Power users' --gpus/--nodes
-    (and a card's own explicit nodes) always bypass the solver."""
+    (and a card's own explicit nodes) always bypass the solver.
+
+    `unified` = the target's memory is ONE CPU+GPU pool (APU parts: MI300A).
+    The solver then sizes against the claimable fraction of the pool, and
+    --gpu-memory-utilization is DERIVED from the model's weight footprint
+    (derive_gpu_memory_utilization) instead of trusting vLLM's 0.9 default —
+    which starves the host during the weight load and gets an engine rank
+    OOM-killed with no traceback."""
     decisions: list[str] = []
     model = getattr(args, "model", None)
     if not model:
@@ -488,7 +495,11 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None) -> list[str]:
     nodes_free = getattr(args, "nodes", None) is None
     if gpus_free and nodes_free and card.min_vram_gb and not card.nodes:
         w, v, src = shape or (0, 0, "")
-        nodes, gpus, why = fit_geometry(card.min_vram_gb, w, v)
+        # On a unified pool the solver sizes against what a rank may CLAIM, not
+        # the whole part — the host keeps a reserve to stream the load. That is
+        # what spreads a 70B over 4 MI300A ranks (35GB shards that load) instead
+        # of packing it onto 2 (70GB shards that get the host OOM-killed).
+        nodes, gpus, why = fit_geometry(card.min_vram_gb, w, v, unified=bool(unified and v))
         args.gpus = gpus
         src_note = f"; {src}" if src else ""
         decisions.append(f"gpus: {gpus} per node ({card.label}: {why}{src_note})")
@@ -519,8 +530,34 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None) -> list[str]:
     # was never applied.
     flags = engine_flags(effective_args(card.args, accel))
     if flags:
-        args.args = flags + list(getattr(args, "args", None) or [])
         decisions.append(f"engine args: {' '.join(flags)} ({card.label})")
+    if unified and card.min_vram_gb and (getattr(args, "engine", None) or "vllm") == "vllm":
+        _w, pool, _src = shape or (0, 0, "")
+        world = int(getattr(args, "nodes", None) or 1) * int(getattr(args, "gpus", None) or 1)
+        util = derive_gpu_memory_utilization(card.min_vram_gb, world, pool)
+        if util is not None:
+            # AFTER the card's own flags (a card's blanket fallback loses to the
+            # footprint-derived value) and BEFORE the user's post-`--` args (an
+            # explicit --gpu-memory-utilization still wins — engine argparse is
+            # last-wins).
+            flags = flags + ["--gpu-memory-utilization", f"{util:g}"]
+            per = card.min_vram_gb / world
+            decisions.append(
+                f"gpu-memory-utilization: {util:g} (derived: ~{card.min_vram_gb}GB weights / "
+                f"{world} rank(s) = ~{per:.0f}GB per rank on a {pool}GB unified CPU+GPU pool "
+                f"— the host keeps ~{unified_host_reserve_gb(per):.0f}GB to stream the load)")
+        elif pool:
+            # Say what WOULD work. "spread wider" without a number leaves the user
+            # to re-derive the arithmetic boxy just did.
+            fits = unified_ranks_needed(card.min_vram_gb, pool)
+            remedy = (f"spread wider — {fits} ranks fit (--gpus/--nodes)" if fits
+                      else "no rank count fits this pool; use a smaller or quantized variant")
+            decisions.append(
+                f"gpu-memory-utilization: NOT derived — ~{card.min_vram_gb / world:.0f}GB per "
+                f"rank leaves a {pool}GB unified pool no room for both the weight load and "
+                f"the KV cache; {remedy}, or set it by hand after `--`")
+    if flags:
+        args.args = flags + list(getattr(args, "args", None) or [])
     return decisions
 
 
@@ -582,8 +619,94 @@ def engine_flags(card_args: dict) -> list[str]:
 # tests), so geometry only changes when a system card declares real hardware.
 _VRAM_HEADROOM = 1.25
 
+# ---- unified-memory (APU) pools -----------------------------------------------------
+#
+# On MI300A-class APUs the CPU and GPU share ONE physical pool per socket, so the
+# engine's claim and the host's working set come out of the same 128GB. Claim too
+# much and the kernel OOM-killer reaps a rank with NO traceback (field: a 70B died
+# silently after an 18-minute load at vLLM's 0.9 default; 0.7 served).
+#
+# The host's reserve is modelled as ~a rank's weight shard plus streaming buffers,
+# but BOUNDED at both ends. The cap is what makes the model usable: the loader
+# streams, so the host's transient need does not keep growing with the shard, and
+# an unbounded reserve made big models look impossible — it refused to produce any
+# number for Llama-4-Scout on 4 ranks, and sent it to two nodes, a configuration
+# the field ran on ONE.
+#
+# The three constants are pinned by the two configurations observed on real
+# MI300A hardware, and reproduce both exactly (see the calibration test):
+#   * Llama-3.3-70B, 140GB over 4 ranks: 0.9 was OOM-killed, 0.7 served -> the
+#     reserve at a 35GB shard must be ~38GB, and 2x70GB shards must stay
+#     INFEASIBLE so the solver spreads to 4.
+#   * Llama-4-Scout-17B-16E, 228GB over 4 ranks: ran on one node -> a 57GB shard
+#     must remain FEASIBLE.
+# No shard-proportional reserve fits both points monotonically, which is the
+# honest limit of this model: 0.9 killed the smaller model and served the larger
+# one on the same hardware, so shard size cannot be the whole story. The cap keeps
+# the envelope that explains the observed FAILURE, which makes the derived value
+# conservative for large models (Scout derives ~0.62 where 0.9 was seen to work).
+# Conservative-but-serving beats a silent OOM kill; `-- --gpu-memory-utilization`
+# raises it for anyone who has measured their own model.
+_UNIFIED_LOAD_FACTOR = 1.1     # shard + streaming/allocator buffers
+_UNIFIED_HOST_FLOOR_GB = 16    # OS + container + tokenizer, even for tiny models
+_UNIFIED_HOST_CAP_GB = 48      # the loader streams: the host's need stops growing
 
-def fit_geometry(min_vram_gb: float, gpus_per_node: int, gpu_vram_gb: int) -> tuple[int, int, str]:
+# Ceiling on the unified solver's node search. A model that needs more than this
+# is not a turnkey serve; say so rather than return an absurd allocation.
+_MAX_SPILL_NODES = 64
+
+
+def unified_host_reserve_gb(shard_gb: float) -> float:
+    """GB of a unified pool the HOST keeps while a rank of `shard_gb` loads."""
+    return min(_UNIFIED_HOST_CAP_GB, max(_UNIFIED_HOST_FLOOR_GB, shard_gb * _UNIFIED_LOAD_FACTOR))
+
+
+def unified_claimable_gb(shard_gb: float, pool_gb: float) -> float:
+    """GB of a unified pool the ENGINE may claim — the pool minus the host's reserve."""
+    return pool_gb - unified_host_reserve_gb(shard_gb)
+
+
+def unified_rank_fits(shard_gb: float, pool_gb: float) -> bool:
+    """Can one rank hold `shard_gb` of weights plus KV/activation headroom inside
+    what it is allowed to claim? This is the single feasibility test — the geometry
+    solver and the utilization derivation both use it, so they cannot disagree
+    (they used to: the solver would pick a rank count the derivation then refused)."""
+    return unified_claimable_gb(shard_gb, pool_gb) >= shard_gb * _VRAM_HEADROOM
+
+
+def unified_ranks_needed(min_vram_gb: float, pool_gb: float, limit: int = 1024) -> int | None:
+    """Smallest power-of-two rank count whose shard FITS a `pool_gb` unified pool
+    — the GPU need, derived from the model's footprint. None when even `limit`
+    ranks cannot hold it."""
+    if min_vram_gb <= 0 or pool_gb <= 0:
+        return None
+    ranks = 1
+    while ranks <= limit:
+        if unified_rank_fits(min_vram_gb / ranks, pool_gb):
+            return ranks
+        ranks *= 2
+    return None
+
+
+def derive_gpu_memory_utilization(min_vram_gb: float, world_size: int, pool_gb: int) -> float | None:
+    """The vLLM --gpu-memory-utilization for ONE rank of a unified-memory pool:
+    the whole pool minus what the host keeps to stream the load, capped at vLLM's
+    own 0.9. None when an input is unknown, or when this rank count genuinely
+    cannot hold the model — in which case the fix is more ranks, and
+    unified_ranks_needed() says how many.
+
+    Field calibration: 140GB of weights over 4 MI300A ranks on a 128GB pool
+    -> 0.7, exactly the hand-tuned value that ended the silent OOM kills."""
+    if min_vram_gb <= 0 or world_size <= 0 or pool_gb <= 0:
+        return None
+    shard = min_vram_gb / world_size
+    if not unified_rank_fits(shard, pool_gb):
+        return None
+    return min(0.9, round(unified_claimable_gb(shard, pool_gb) / pool_gb, 2))
+
+
+def fit_geometry(min_vram_gb: float, gpus_per_node: int, gpu_vram_gb: int,
+                 unified: bool = False) -> tuple[int, int, str]:
     """(nodes, gpus_per_node, why): the smallest geometry that FITS a model card's
     min_vram_gb (the demand, plus KV/overhead headroom) on this system's nodes
     (the supply: gpus_per_node x gpu_vram_gb from the location/system card).
@@ -591,7 +714,15 @@ def fit_geometry(min_vram_gb: float, gpus_per_node: int, gpu_vram_gb: int) -> tu
     model exceeds a FULL node does it spill to N full nodes — which the serve
     path then runs as one Ray instance (TP=gpus/node x PP=nodes). Unknown supply
     degrades to the same 80GB-class / 4-wide assumptions the card tiers use,
-    stated in `why`."""
+    stated in `why`.
+
+    `unified=True` sizes against a shared CPU+GPU pool: a rank can never use the
+    whole part, because the host keeps a reserve to stream the load, and that
+    reserve depends on the shard — which depends on the rank count being solved
+    for. So the unified path tries rank counts against unified_rank_fits()
+    directly rather than discounting the pool by a fixed fraction. The old fixed
+    discount double-counted headroom (it shrank the supply AND inflated the
+    demand) and sent Llama-4-Scout to two nodes; the field ran it on one."""
     from boxy import config
 
     assumed = []
@@ -608,6 +739,29 @@ def fit_geometry(min_vram_gb: float, gpus_per_node: int, gpu_vram_gb: int) -> tu
     budget = min_vram_gb * _VRAM_HEADROOM
     need = f"~{min_vram_gb:g}GB weights + KV/overhead headroom = {budget:g}GB"
     node_capacity = width * vram
+
+    if unified:
+        def _pool_note(ranks: int) -> str:
+            shard = min_vram_gb / ranks
+            return (f"; the {vram}GB pool is shared with the host, leaving each rank "
+                    f"~{unified_claimable_gb(shard, vram):.0f}GB to claim for a "
+                    f"~{shard:.0f}GB shard")
+
+        gpus = 1
+        while gpus <= width:
+            if unified_rank_fits(min_vram_gb / gpus, vram):
+                return 1, gpus, f"{need}; a node offers {width}x{vram}GB{_pool_note(gpus)}{note}"
+            gpus *= 2
+        nodes = 2
+        while nodes <= _MAX_SPILL_NODES:
+            if unified_rank_fits(min_vram_gb / (width * nodes), vram):
+                return nodes, width, (f"{need} exceeds one node ({width}x{vram}GB)"
+                                      f"{_pool_note(width * nodes)}{note}")
+            nodes *= 2
+        return _MAX_SPILL_NODES, width, (f"{need} does not fit {_MAX_SPILL_NODES} unified "
+                                         f"nodes ({width}x{vram}GB each); pin --gpus/--nodes "
+                                         f"and --gpu-memory-utilization by hand{note}")
+
     if budget <= node_capacity:
         gpus = 1
         while gpus * vram < budget:
@@ -639,3 +793,21 @@ def system_shape(cluster: str) -> tuple[int, int, str] | None:
     except (tomllib.TOMLDecodeError, TypeError, ValueError):
         return None
     return (shape[0], shape[1], stem) if any(shape) else None
+
+
+def system_unified_memory(cluster: str) -> bool:
+    """True when the cluster's system card declares
+        [location.resources]
+        unified_memory = true
+    — APU parts (MI300A-class) where CPU and GPU share one physical pool, so
+    apply_to_args derives --gpu-memory-utilization from the model's footprint
+    instead of letting vLLM's 0.9 default starve the host mid-load. False on
+    no card / no flag / a card that doesn't parse."""
+    hit = _match_system_card(cluster)
+    if hit is None:
+        return False
+    try:
+        res = (tomllib.loads(hit[0]).get("location") or {}).get("resources") or {}
+        return bool(res.get("unified_memory", False))
+    except tomllib.TOMLDecodeError:
+        return False
