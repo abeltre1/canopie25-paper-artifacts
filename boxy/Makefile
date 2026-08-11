@@ -33,13 +33,19 @@ TWINE       = $(PYTHON) -m twine
 DEPS        = $(PYTHON) -m pip install --quiet build twine
 endif
 
-.PHONY: deps wheel sdist dist check publish clean
+.PHONY: deps wheel sdist dist check publish clean repo-wheel repo-wheel-check
 
 deps:                             ## install the build tools (no-op under uv)
 	$(DEPS)
 
 wheel: deps                       ## build only the wheel into dist/
 	$(BUILD_WHEEL)
+
+repo-wheel:                       ## refresh the installable wheel committed at ../wheels/
+	python3 hack/repo_wheel.py build
+
+repo-wheel-check:                 ## CI: assert the committed wheel matches src/
+	python3 hack/repo_wheel.py check
 
 sdist: deps                       ## build only the sdist into dist/
 	$(BUILD_SDIST)
