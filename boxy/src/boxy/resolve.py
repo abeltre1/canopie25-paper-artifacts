@@ -272,6 +272,32 @@ def auto_location(
     return location, decisions
 
 
+# `org/name` with one slash and no path syntax — the shape of a HuggingFace repo
+# id. Used ONLY to sharpen an error message; it never changes what gets resolved.
+_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*$")
+# A trailing ".ext" of only letters — 'demo.gguf', and equally a typo'd 'demo.ggu',
+# which must stay a PATH. Deliberately not a fixed extension list: a mistyped
+# suffix is exactly the case where telling someone to "name the registry" is worse
+# than the generic hint. Version dots survive because what follows them is not
+# all-alphabetic ('Llama-3.3-70B' -> '3-70B', 'Qwen2.5-72B' -> '5-72B').
+_FILE_SUFFIX_RE = re.compile(r"\.[A-Za-z]{2,12}$")
+
+
+def _looks_like_repo_id(model: str) -> bool:
+    """Does this read as a HuggingFace repo id rather than a path? Excludes
+    anything with path syntax (leading ./ ~ /, a second slash) or a weight-file
+    suffix.
+
+    The suffix test is a shape rule, not os.path.splitext: model ids are full of
+    version dots and splitext reads 'meta-llama/Llama-3.3-70B' as having the
+    extension '.3-70B'."""
+    if model.startswith((".", "/", "~")) or model.count("/") != 1:
+        return False
+    if _FILE_SUFFIX_RE.search(model):              # 'dir/model.gguf' is a path
+        return False
+    return bool(_REPO_ID_RE.match(model))
+
+
 def _classify_model(model: str, require_exists: bool, remote_target: str = "") -> tuple[str, str]:
     """Syntax decides: a transport scheme means remote; anything else is a local
     path, full stop. Bare names are never guessed into registries — same
@@ -322,9 +348,19 @@ def _classify_model(model: str, require_exists: bool, remote_target: str = "") -
                 raise RuntimeError(
                     f"no such model path on {remote_target}: {model!r} (checked over the "
                     f"ssh master) — is it on a filesystem the cluster mounts?")
+        # When the input ALREADY looks like a HuggingFace repo id, name the exact
+        # command instead of a placeholder: 'hf://<org>/Inkling' made the reader
+        # substitute an org they had already typed. Bare ids stay unresolved on
+        # purpose (see this function's docstring) — the fix is to say precisely
+        # what to type, not to guess.
         base = model.rsplit("/", 1)[-1]
-        hint = (f"no such model file: {model!r}. MODEL is a local path or a transport URI — "
-                f"did you mean ollama://{base} or hf://<org>/{base}?")
+        if _looks_like_repo_id(model):
+            hint = (f"no such model file: {model!r}. A bare id is treated as a local path so "
+                    f"the same command means the same thing on every machine — name the "
+                    f"registry explicitly: hf://{model} (or ollama://{base})")
+        else:
+            hint = (f"no such model file: {model!r}. MODEL is a local path or a transport URI — "
+                    f"did you mean ollama://{base} or hf://<org>/{base}?")
         if require_exists:
             raise RuntimeError(hint)
         return resolved, f"model: {resolved} (local path; NOT PRESENT — dryrun only. {hint})"
