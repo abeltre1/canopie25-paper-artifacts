@@ -83,3 +83,48 @@ def test_slurm_gpu_directive_none_omits_the_request(clustera, monkeypatch):
     config.reset()
     sched = get_scheduler("slurm")
     assert not any("gpu" in ln.lower() or "gres" in ln.lower() for ln in sched.resource_directives(clustera))
+
+
+# ---- Flux terminal states must not read as "boxy lost the scheduler" ----------------
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("SCHED", "PENDING"), ("DEPEND", "PENDING"), ("PRIORITY", "PENDING"),
+    ("RUN", "RUNNING"), ("CLEANUP", "RUNNING"),
+    ("INACTIVE", "DONE"),
+    # the render can come back as the RESULT rather than the state, depending on
+    # site and flux version — all of these mean the job ENDED, not that boxy
+    # lost the scheduler
+    ("COMPLETED", "DONE"), ("FAILED", "DONE"), ("TIMEOUT", "DONE"), ("EXCEPTION", "DONE"),
+    # Flux spells it with ONE L where Slurm uses two; matching only Slurm's
+    # spelling silently misses every cancelled Flux job
+    ("CANCELED", "DONE"), ("CANCELLED", "DONE"),
+    ("", "DONE"),
+    ("SOMETHING_NEW", "UNKNOWN"),
+])
+def test_flux_interpret_state_covers_terminal_states(raw, expected):
+    assert get_scheduler("flux").interpret_state(raw) == expected
+
+
+def test_flux_terminal_coverage_matches_slurm():
+    """The same bug was found and fixed for Slurm ('r2: these spun as UNKNOWN')
+    and never carried across. Neither scheduler may report a FINISHED job as
+    UNKNOWN, which reads as an unreachable scheduler rather than an ended job."""
+    for sched in ("flux", "slurm"):
+        s = get_scheduler(sched)
+        for ended in ("COMPLETED", "FAILED", "TIMEOUT"):
+            assert s.interpret_state(ended) == "DONE", f"{sched} does not map {ended}"
+
+
+def test_unknown_state_hint_names_a_command_that_sees_ended_jobs():
+    """UNKNOWN alone cannot be acted on — the user can't tell 'still queued' from
+    'already died'. The hint must reach jobs that LEFT the active list, which is
+    what produces an unmapped state in the first place."""
+    from boxy.cli import _sched_inspect_hint
+
+    flux = _sched_inspect_hint("flux", "f2hHZ")
+    assert "flux jobs -a" in flux and "f2hHZ" in flux      # -a includes inactive
+    assert "flux job attach" in flux                        # ...and how to read its output
+
+    slurm = _sched_inspect_hint("slurm", "12345")
+    assert "sacct" in slurm and "12345" in slurm            # sacct sees finished jobs

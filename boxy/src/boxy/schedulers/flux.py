@@ -104,6 +104,20 @@ class FluxScheduler(Scheduler):
         return ["flux", "jobs", "-n", "-o", "{state}", job_id]
 
     def interpret_state(self, stdout: str) -> str:
+        """Flux job state -> PENDING | RUNNING | DONE | UNKNOWN.
+
+        Terminal states are enumerated the way slurm.py already does, because the
+        SAME bug was found and fixed there ("r2: these spun as UNKNOWN") and
+        never brought across: a job that had actually finished reported UNKNOWN,
+        which reads as "boxy lost the scheduler" rather than "your job ended".
+
+        Two Flux-specific traps in that list. `{state}` is what state_command
+        asks for, but sites and versions differ in whether the terminal render
+        comes back as the state (INACTIVE) or the RESULT (COMPLETED / FAILED /
+        TIMEOUT), so both vocabularies are accepted. And Flux spells it CANCELED
+        with one L where Slurm uses CANCELLED — matching only Slurm's spelling
+        silently misses every cancelled Flux job.
+        """
         state = stdout.strip().upper()
         if not state:
             return "DONE"
@@ -111,7 +125,8 @@ class FluxScheduler(Scheduler):
             return "PENDING"
         if state in ("RUN", "RUNNING", "CLEANUP"):
             return "RUNNING"
-        if state == "INACTIVE":
+        if state in ("INACTIVE", "COMPLETED", "FAILED", "CANCELED", "CANCELLED",
+                     "TIMEOUT", "EXCEPTION"):
             return "DONE"
         return "UNKNOWN"
 
