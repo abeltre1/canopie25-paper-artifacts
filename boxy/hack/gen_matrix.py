@@ -25,6 +25,41 @@ for _v in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
     os.environ.pop(_v.upper(), None)
 os.environ["http_proxy"] = os.environ["https_proxy"] = "http://proxy.example.gov:80"
 
+# This doc is COMMITTED to a public repo and is generated from real serve
+# output, which propagates the ambient environment. A maintainer who happens to
+# have HF_TOKEN (or AWS keys) exported would otherwise bake their credential
+# into a public markdown file. Drop every secret-looking var before generating,
+# and verify the result afterwards — see _assert_no_secrets below.
+sys.path.insert(0, str(ROOT / "src"))
+from boxy import redact  # noqa: E402
+
+_STRIPPED_SECRETS = {k: v for k, v in os.environ.items() if redact.is_secret_key(k)}
+for _k in _STRIPPED_SECRETS:
+    os.environ.pop(_k, None)
+if _STRIPPED_SECRETS:
+    print(f"gen_matrix: scrubbed {len(_STRIPPED_SECRETS)} secret env var(s) from the render env: "
+          f"{', '.join(sorted(_STRIPPED_SECRETS))}", file=sys.stderr)
+
+
+def _assert_no_secrets(text: str, where: str) -> None:
+    """Refuse to write a doc containing a value from THIS PROCESS'S secret
+    environment — the vars captured in _STRIPPED_SECRETS above.
+
+    Scope, precisely: this is a second line of defence behind the scrub (it
+    fires if a scrubbed value reaches the output anyway, e.g. because something
+    re-exported it mid-render). It does NOT detect a credential that arrived by
+    another route — a config file, a model card, a hard-coded string — because
+    it has no way to know those values. Generic credential-shaped detection was
+    considered and rejected: the false-positive rate on container digests and
+    base64 args is high enough to make the guard untrustworthy."""
+    leaked = sorted({v for v in _STRIPPED_SECRETS.values()
+                     if v and len(v) >= redact._MIN_MASKABLE_VALUE and v in text})
+    if leaked:
+        raise SystemExit(
+            f"gen_matrix: REFUSING to write {where}: it contains {len(leaked)} value(s) from "
+            f"your secret environment. This file is committed to a PUBLIC repo. "
+            f"Unset those vars and re-run.")
+
 from boxy.cli import main  # noqa: E402
 
 PREAMBLE = """\
@@ -106,5 +141,7 @@ def generate() -> str:
 if __name__ == "__main__":
     os.chdir(ROOT)
     target = EXAMPLES / "MATRIX.md"
-    target.write_text(generate())
+    text = generate()
+    _assert_no_secrets(text, str(target))
+    target.write_text(text)
     print(f"wrote {target}")

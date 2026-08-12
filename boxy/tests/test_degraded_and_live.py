@@ -20,6 +20,10 @@ import pytest
 
 ROOT = Path(__file__).parent.parent
 SRC = str(ROOT / "src")
+# The example profiles are PACKAGED (src/boxy/data/examples), not a top-level
+# examples/ dir — they moved there when the repo was slimmed. Derive the path
+# once so a future move breaks one line, not every test in this file.
+EXAMPLES = ROOT / "src" / "boxy" / "data" / "examples"
 
 
 def _run_isolated(code: str) -> subprocess.CompletedProcess:
@@ -50,11 +54,29 @@ class TestDegradedWithoutRamalama:
         p = _run_isolated("import importlib.util as u; print(u.find_spec('ramalama'))")
         assert p.stdout.strip() == "None"
 
-    def test_detect_accel_degrades_to_none(self):
-        p = _run_isolated("from boxy import ramalama_shim as s; "
-                          "print(s.ramalama_available(), s.detect_accel(), s.accel_env_vars(), s.gpu_device_paths())")
+    def test_accelerator_detection_works_without_ramalama(self):
+        """Detection is boxy's own since accel.py landed, so this is no longer a
+        degradation test — without ramalama you get a real answer, not a stub.
+
+        Asserted host-independently on purpose. A CI runner has no GPU but DOES
+        expose /dev/dri (a virtual DRM node with nothing behind it), and a dev
+        box may have CUDA_VISIBLE_DEVICES exported; an equality assertion on
+        either dict passes on one machine and fails on the next."""
+        p = _run_isolated(
+            "import json\n"
+            "from boxy import accel, ramalama_shim as s\n"
+            "print(json.dumps({'ramalama': s.ramalama_available(), 'accel': s.detect_accel(),\n"
+            "                  'env': s.accel_env_vars(), 'devices': s.gpu_device_paths(),\n"
+            "                  'known_env': sorted(accel.VISIBLE_DEVICE_VARS.values())}))\n"
+        )
         assert p.returncode == 0
-        assert p.stdout.strip() == "False none {} {}"
+        got = json.loads(p.stdout.strip().splitlines()[-1])
+        assert got["ramalama"] is False
+        # 'none' is the honest answer on a GPU-less runner; the point is that it
+        # was reached natively, with ramalama absent, rather than by giving up.
+        assert got["accel"] == "none"
+        assert set(got["env"]) <= set(got["known_env"])
+        assert all(node == f"/dev/{name}" for name, node in got["devices"].items())
 
     def test_pull_transport_uri_gives_guidance(self):
         p = _run_isolated(
@@ -68,10 +90,12 @@ class TestDegradedWithoutRamalama:
         assert "OK:" in p.stdout and "boxy-hpc[ramalama]" in p.stdout
 
     def test_serve_dryrun_works_with_explicit_location(self):
+        box = EXAMPLES / "boxes" / "vllm.toml"
+        loc = EXAMPLES / "locations" / "flux-apptainer-rocm.toml"
         p = _run_isolated(
             "from boxy.cli import main; import sys; "
-            "sys.exit(main(['serve', '--box', 'examples/boxes/vllm.toml', "
-            "'--location', 'examples/locations/flux-apptainer-rocm.toml', '--dryrun']))"
+            f"sys.exit(main(['serve', '--box', {str(box)!r}, "
+            f"'--location', {str(loc)!r}, '--dryrun']))"
         )
         assert p.returncode == 0
         assert "apptainer exec" in p.stdout and "vllm-rocm.sif" in p.stdout
@@ -106,8 +130,8 @@ needs_live_docker = pytest.mark.skipif(
 
 @needs_live_docker
 class TestLiveDockerCycle:
-    BOX = str(ROOT / "examples" / "boxes" / "llamacpp-demo.toml")
-    LOC = str(ROOT / "examples" / "locations" / "local-docker.toml")
+    BOX = str(EXAMPLES / "boxes" / "llamacpp-demo.toml")
+    LOC = str(EXAMPLES / "locations" / "local-docker.toml")
     URL = "http://127.0.0.1:8090"
 
     def _boxy(self, *args, background=False):
