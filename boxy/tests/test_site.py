@@ -1034,3 +1034,34 @@ def test_both_serve_paths_share_one_unresolved_partition_line():
 
     src = inspect.getsource(cli)
     assert src.count("_partition_unresolved_line(") == 3   # 1 def + 2 call sites
+
+
+# ---- the cluster's boxy is a DIFFERENT boxy -----------------------------------------
+
+
+def test_doctor_flags_an_older_cluster_boxy():
+    """`--ssh` runs the CLUSTER's install for list/logs/stop/curl. This check used
+    to read the remote version and report OK unconditionally, reasoning that a
+    serve injects --account laptop-side so an older cluster boxy is 'covered' —
+    that covers ONE flag on ONE path. Field: a cluster on 0.1.0 from a feature
+    branch against a 0.2.0 laptop was reported OK, and the user had no way to
+    learn they were driving two different tools."""
+    from boxy.doctor import OK, WARN, _cluster_boxy_result
+
+    older = _cluster_boxy_result("boxy 0.1.0 (git 610c606, some-branch)")
+    assert older.status == WARN
+    assert "OLDER" in older.detail
+    assert older.fix, "a warning without a fix is just nagging"
+
+    newer = _cluster_boxy_result("boxy 99.0.0")
+    assert newer.status == WARN and "NEWER" in newer.detail
+
+    from boxy import __version__
+    assert _cluster_boxy_result(f"boxy {__version__}").status == OK
+
+
+def test_doctor_does_not_invent_a_problem_from_an_odd_version():
+    """An unparseable banner is not evidence of skew."""
+    from boxy.doctor import OK, _cluster_boxy_result
+
+    assert _cluster_boxy_result("boxy weird-build").status == OK

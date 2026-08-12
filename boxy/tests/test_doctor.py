@@ -3,6 +3,7 @@ Each check reuses an existing boxy helper and reports OK/WARN/FAIL + a fix;
 `boxy doctor` exits non-zero only on FAIL."""
 
 from boxy import doctor
+from boxy import __version__ as boxy_version
 from boxy.cli import main
 
 
@@ -180,7 +181,10 @@ def test_remote_checks_healthy_cluster_all_ok():
         "nvidia-smi": "cuda\n",
         "https_proxy": "||\n",
         "ghcr.io/v2": "307",                        # a redirect (reachable) — the clustera case
-        "boxy --version": "boxy 0.1.0\n",
+        # a HEALTHY cluster runs the same boxy this machine does; an older one is
+        # a warning now (you would be driving two different tools over --ssh), so
+        # this tracks __version__ rather than pinning a number that goes stale
+        "boxy --version": f"boxy {boxy_version}\n",
         "boxy/jobs": "/home/u/.local/share/boxy/jobs/clustera/\n",
     })
     results = doctor.remote_checks(run)
