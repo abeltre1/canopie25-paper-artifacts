@@ -30,6 +30,11 @@ class Resources:
     # geometry solver (a model card's min_vram_gb is the demand side). 0 = unknown;
     # the solver then assumes config cardgen.gpu_class_gb (80, A100/H100-class).
     gpu_vram_gb: int = 0
+    # unified-memory APU (MI300A-class): CPU and GPU share one physical pool, so
+    # the engine's VRAM claim starves the host during weight loads — with this
+    # set, the cards solver derives gpu-memory-utilization from the model's
+    # footprint instead of trusting vLLM's 0.9 default.
+    unified_memory: bool = False
     # CLUSTER INVENTORY (from `boxy generate system`) — informational supply-side
     # facts, deliberately SEPARATE from `nodes` above, which is a JOB REQUEST.
     # total_nodes/total_gpu_nodes cap what the geometry solver may ever ask for.

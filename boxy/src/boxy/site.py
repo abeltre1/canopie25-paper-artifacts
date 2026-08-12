@@ -794,6 +794,19 @@ _GPU_VRAM_GB = (
 )
 
 
+# Unified-memory APU parts: CPU and GPU share ONE physical pool, so the engine's
+# VRAM claim and the host's weight-streaming need come out of the same GBs
+# (cards.derive_gpu_memory_utilization). MI300X/MI250 are discrete-HBM — only
+# the APU belongs here.
+_UNIFIED_GPU_TOKENS = ("mi300a",)
+
+
+def unified_gpu_type(gpu_type: str) -> bool:
+    """True when the GRES/probe type token names a unified-memory APU part."""
+    t = (gpu_type or "").lower()
+    return any(tok in t for tok in _UNIFIED_GPU_TOKENS)
+
+
 def gpu_vram_from_type(gpu_type: str) -> tuple[int, str]:
     """(vram_gb, note) for a GRES type token like 'h100', 'a100_40gb',
     'nvidia_h200'. 0 = unknown type (the card says how to fill it in)."""
@@ -920,6 +933,9 @@ def render_system_card(cluster: str, scheduler: str, accelerator: str, runtime: 
             lines.append(f"gpu_vram_gb = {vram}    # {vram_note}")
         else:
             lines.append(f"# gpu_vram_gb = 80    # {vram_note}")
+        if unified_gpu_type(inv.get("gpu_type", "")):
+            lines.append("unified_memory = true    # APU: CPU+GPU share this pool — serves derive")
+            lines.append("                         # gpu-memory-utilization from the model footprint")
     if inv.get("cpus_per_node"):
         lines.append(f"cpus_per_node = {inv['cpus_per_node']}")
     if inv.get("mem_gb_per_node"):

@@ -566,6 +566,16 @@ def test_gpu_vram_table_covers_the_fleet():
     assert gb == 0 and "fill in gpu_vram_gb" in note             # unknown -> operator hint
 
 
+def test_unified_gpu_type_is_the_apu_only():
+    from boxy import site
+
+    assert site.unified_gpu_type("mi300a")
+    assert site.unified_gpu_type("AMD Instinct MI300A Accelerator")
+    assert not site.unified_gpu_type("mi300x")     # discrete HBM, host RAM separate
+    assert not site.unified_gpu_type("h100")
+    assert not site.unified_gpu_type("")
+
+
 def test_parse_flux_inventory_coarse_totals():
     from boxy import site
 
@@ -589,6 +599,22 @@ def test_render_system_card_roundtrips_into_the_solver(tmp_path, monkeypatch):
     assert "cpus_per_node = 112" in text and "mem_gb_per_node = 500" in text
     assert "/sitescratch/users/me" in text                          # storage documented
     assert "a100_40gb" in text                                   # heterogeneity listed
+
+
+def test_render_system_card_marks_apu_pools_unified(tmp_path, monkeypatch):
+    # an MI300A inventory renders unified_memory = true — and the lookup that
+    # drives the derived gpu-memory-utilization reads it back
+    from boxy import cards, site
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    inv = {"gpus_per_node": 4, "gpu_type": "mi300a", "total_nodes": 2,
+           "total_gpu_nodes": 2, "cpus_per_node": 192, "mem_gb_per_node": 512}
+    text = site.render_system_card("clusterb", "flux", "rocm", "podman", inv, [])
+    assert "unified_memory = true" in text and "gpu_vram_gb = 128" in text
+    d = cards._user_systems_dir()
+    d.mkdir(parents=True)
+    (d / "clusterb.toml").write_text(text)
+    assert cards.system_unified_memory("clusterb") is True
 
 
 def test_generate_system_cli_end_to_end(tmp_path, monkeypatch, capsys):
