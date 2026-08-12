@@ -5056,6 +5056,8 @@ def cmd_generate(args: argparse.Namespace) -> int:
         return _generate_flux_mcp(args)
     if args.format == "relay":
         return _generate_relay(args)
+    if args.format == "openshift":
+        return _generate_openshift(args)
     if not args.box or not args.location:
         print(f"boxy generate {args.format}: --box and --location are required", file=sys.stderr)
         return 2
@@ -5136,6 +5138,56 @@ def _generate_flux_mcp(args: argparse.Namespace) -> int:
     text = mcp.emit_flux_mcp_manifest(args.host, args.namespace or "flux-mcp",
                                       image=args.image or config.get("images.flux_mcp"),
                                       flux_uri=args.flux_uri, port=config.get_int("mcp.flux_port"))
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(text)
+        print(f"wrote {args.output}")
+    else:
+        print(text, end="")
+    return 0
+
+
+def _generate_openshift(args: argparse.Namespace) -> int:
+    """Emit a Deployment + Service that serve a MODEL inside an OpenShift project.
+
+    The point of routing this through boxy rather than hand-writing YAML is that
+    the geometry, image, and engine args come from the SAME model cards the HPC
+    path uses — so `boxy serve <model> --scheduler slurm` and this manifest agree
+    about what the model needs instead of drifting apart.
+    """
+    from boxy import cards, engines, openshift, ramalama_shim
+
+    if not args.model:
+        print("boxy generate openshift: --model is required (a HF id, or a path under "
+              "--model-pvc's mount when the weights are already staged)", file=sys.stderr)
+        return 2
+
+    accel = args.accelerator or "cuda"
+    resolved = argparse.Namespace(model=args.model, gpus=args.gpus, nodes=None,
+                                  engine=args.engine, image=args.image,
+                                  accelerator=accel, args=None)
+    decisions = cards.apply_to_args(resolved)
+    engine = resolved.engine or "vllm"
+    image = resolved.image or ramalama_shim.default_image(engine, accel)
+    port = args.port or engines.default_port(engine)
+    gpus = 0 if args.gpus == 0 else int(resolved.gpus or 0)
+
+    # Decisions go to stderr so stdout stays pure YAML for `| oc apply -f -`
+    # (the same split _generate_agentless uses).
+    for line in decisions:
+        print(f"auto: {line}", file=sys.stderr)
+
+    try:
+        text = openshift.emit_serve_manifest(
+            args.name or openshift.k8s_name(args.model),
+            image, args.model, namespace=args.namespace or "", engine=engine, port=port,
+            gpus=gpus, accelerator=accel, engine_args=resolved.args or [],
+            model_pvc=args.model_pvc or "", hf_secret=args.hf_secret or "",
+            route_host=args.host or "")
+    except ValueError as e:
+        print(f"boxy generate openshift: {e}", file=sys.stderr)
+        return 2
+
     if args.output:
         with open(args.output, "w") as f:
             f.write(text)
@@ -7109,13 +7161,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("generate", help="transpile box+location to another orchestrator: "
                                         "sky (SkyPilot YAML), slurm|flux (boxy-free job script), "
-                                        "flux-mcp (persistent OpenShift MCP service), or "
-                                        "relay (the everyone-URL share ingress on OpenShift)")
+                                        "flux-mcp (persistent OpenShift MCP service), "
+                                        "relay (the everyone-URL share ingress on OpenShift), or "
+                                        "openshift (serve a MODEL in your own OpenShift project)")
     p.add_argument("format", choices=["sky", "slurm", "flux", "sbatch", "flux-mcp", "relay", "card",
-                                      "system"],
+                                      "system", "openshift"],
                    help="sky = SkyPilot task YAML; slurm|flux = agentless batch script (no boxy on the "
                         "cluster); flux-mcp = the Flux MCP server as a persistent OpenShift service; "
                         "relay = the chisel relay behind `boxy open --share` (deploy once); "
+                        "openshift = a Deployment+Service serving a model in your CURRENT project "
+                        "(user level: no cluster-scoped objects, no privileged SCC); "
                         "card = a model card from a HuggingFace id (see `card <hf-model-id>`); "
                         "system = a per-cluster SYSTEM card probed from the cluster's own "
                         "scheduler inventory (nodes/GPUs/CPUs/memory/storage; use --ssh)")
@@ -7143,13 +7198,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default=None,
                    help="flux-mcp/relay: the OpenShift Route hostname (e.g. relay-boxy.apps.<cluster>)")
     p.add_argument("--flux-uri", default="", help="flux-mcp: FLUX_URI for reaching a remote Flux instance")
+    # openshift: serve a model inside the user's own project
+    p.add_argument("--model", default=None,
+                   help="openshift: the model to serve — a HF id, or a path under --model-pvc's "
+                        "mount when the weights are already staged on a PVC")
+    p.add_argument("--name", default=None,
+                   help="openshift: Deployment/Service name (default: derived from the model)")
+    p.add_argument("--gpus", type=int, default=None,
+                   help="openshift: GPUs per pod (default: the model card's geometry; 0 = CPU)")
+    p.add_argument("--model-pvc", default=None, dest="model_pvc",
+                   help="openshift: PersistentVolumeClaim holding staged weights, mounted read-only "
+                        "at /models")
+    p.add_argument("--hf-secret", default=None, dest="hf_secret",
+                   help="openshift: name of a Secret with key 'token' for gated repos. The token is "
+                        "REFERENCED, never written into the manifest")
     p.add_argument("--auth", default="", help="relay: user:pass tunnel credential (else a REPLACE_ME "
                                               "placeholder + `oc create secret` hint)")
     p.add_argument("--key-seed", default="", help="relay: seed keeping the chisel host key stable across "
                                                   "pod restarts (else REPLACE_ME)")
     p.add_argument("--serve", action="store_true", help="add a SkyServe service block (sky serve up)")
     # agentless (slurm|flux) pins: hardware can't be detected off the compute node
-    p.add_argument("--accelerator", default=None, help="agentless: pin the compute node's accelerator (cuda|rocm|…)")
+    p.add_argument("--accelerator", default=None,
+                   help="agentless: pin the compute node's accelerator (cuda|rocm|…); "
+                        "openshift: also picks the device-plugin resource name")
     p.add_argument("--image", default=None,
                    help="agentless: pin the container image (else the engine+accel default); "
                         "relay: the chisel image (point at a mirror if Docker Hub is blocked)")
