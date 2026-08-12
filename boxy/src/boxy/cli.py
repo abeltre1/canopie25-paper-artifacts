@@ -18,6 +18,7 @@ import subprocess
 import sys
 
 from boxy import config, ramalama_shim, redact, version_string
+from boxy import usage
 from boxy.backends import BACKENDS
 from boxy.box import TRANSPORT_SCHEMES, Box
 from boxy.location import ACCELERATORS, Location
@@ -6815,7 +6816,7 @@ def _stub(name: str):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="boxy", description=__doc__)
+    parser = usage.BoxyParser(prog="boxy", description=__doc__)
     parser.add_argument("--version", action="version", version=f"boxy {version_string()}")
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
