@@ -1034,3 +1034,52 @@ def test_both_serve_paths_share_one_unresolved_partition_line():
 
     src = inspect.getsource(cli)
     assert src.count("_partition_unresolved_line(") == 3   # 1 def + 2 call sites
+
+
+# ---- a failed ACCOUNT lookup must say so too ----------------------------------------
+
+
+def test_unresolved_account_line_is_explicit_and_actionable():
+    """Same silent-`if` as the partition bug, in the branch immediately above it:
+    `if acct:` with no else printed nothing and the job took the scheduler's
+    default account — which can bounce a submission or bill the wrong project."""
+    from boxy.cli import _account_unresolved_line
+
+    line = _account_unresolved_line("myaccounts not found", "slurm")
+    assert "NOT chosen" in line
+    assert "myaccounts not found" in line          # the reason, not a shrug
+    assert "--account" in line                     # what to do about it
+
+
+def test_unresolved_account_line_survives_an_empty_reason():
+    from boxy.cli import _account_unresolved_line
+
+    assert "no accounts could be listed" in _account_unresolved_line("", "flux")
+
+
+def test_account_hint_does_not_send_a_flux_user_to_sacctmgr():
+    """Account discovery is Slurm-shaped (myaccounts -> sacctmgr) with no
+    per-scheduler equivalent, so on Flux it finds nothing. Flux charges BANKS —
+    naming sacctmgr there would repeat the mistake of suggesting sinfo partition
+    names for a flux queue."""
+    from boxy.cli import _account_hint
+
+    flux = _account_hint("flux")
+    assert "bank" in flux.lower()
+    # the RECOMMENDED command must be Flux's own. sacctmgr may still appear —
+    # explaining what boxy probed and why it came back empty is the useful part.
+    assert "list yours with `flux account" in flux
+    assert "--account" in flux
+
+    slurm = _account_hint("slurm")
+    assert "myaccounts" in slurm or "sacctmgr" in slurm
+
+
+def test_both_agentless_paths_share_one_unresolved_account_line():
+    """The app path and the serve path each had their own copy of this branch,
+    and both lost the failure case. One helper, two call sites."""
+    import inspect
+
+    from boxy import cli
+
+    assert inspect.getsource(cli).count("_account_unresolved_line(") == 3   # 1 def + 2 calls

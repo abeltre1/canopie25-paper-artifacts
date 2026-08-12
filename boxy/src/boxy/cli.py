@@ -1433,6 +1433,8 @@ def _app_site_args(args, card, scheduler, scheduler_name: str, target: str = "",
     if acct:
         site_args.append(scheduler.site_directive("account", acct))
         print(f"  auto: account: {acct} (via {awhy})")
+    else:
+        print(_account_unresolved_line(awhy, scheduler_name))
     need_gpu = card.gpus_per_node > 0
     part = getattr(args, "partition", None)
     if target and site.partition_mode(part) in ("auto", "all"):
@@ -2378,6 +2380,36 @@ def _pick_partition(args, scheduler_name: str, need_gpu: bool, where: str = "") 
         print(f"  auto: partition: {pick} ({note})")
 
 
+def _account_hint(scheduler_name: str) -> str:
+    """What to run to find a chargeable account, per scheduler.
+
+    Discovery is Slurm-shaped — `myaccounts` (config site.account_command) then
+    `sacctmgr` — and there is no per-scheduler equivalent, so on a Flux site
+    those commands are absent or are compat shims and the probe returns nothing.
+    Flux charges BANKS via flux-accounting, a different vocabulary entirely, so
+    the hint names that rather than pretending sacctmgr will answer.
+    """
+    if scheduler_name == "flux":
+        return ("Flux charges banks rather than Slurm accounts, and boxy probes only "
+                "`myaccounts`/`sacctmgr`; list yours with `flux account list-banks` (or ask your "
+                "support desk) and pass --account <bank>, or set config site.account.")
+    return ("List yours with `myaccounts` (or `sacctmgr -nP show assoc user=$USER format=account`) "
+            "and pass --account <name>, or set config site.account.")
+
+
+def _account_unresolved_line(awhy: str, scheduler_name: str) -> str:
+    """The decision line when no account could be discovered — SHARED by the app
+    and serve agentless paths.
+
+    Both had `if acct:` with no else, so a failed lookup printed NOTHING and the
+    job went to the scheduler's default account. That is the same silent-failure
+    shape fixed for partitions, in the branch immediately above it, and it hides
+    a decision that can bounce a submission or bill the wrong project.
+    """
+    return (f"  auto: account: NOT chosen ({awhy or 'no accounts could be listed'}) — the "
+            f"scheduler's default applies. {_account_hint(scheduler_name)}")
+
+
 def _partition_unresolved_line(pwhy: str, scheduler_name: str) -> str:
     """The decision line when no partition could be ranked — SHARED by the
     agentless and non-agentless serve paths.
@@ -2959,6 +2991,8 @@ def _serve_agentless_ssh(args, target: str) -> int:
     if acct:
         site_args.append(scheduler.site_directive("account", acct))
         print(f"  auto: account: {acct} (via {awhy})")
+    else:
+        print(_account_unresolved_line(awhy, scheduler_name))
     need_gpu = _job_wants_gpu(args)
     part = getattr(args, "partition", None)
     if site.partition_mode(part) in ("auto", "all"):
