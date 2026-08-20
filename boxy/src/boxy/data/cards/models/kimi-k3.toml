@@ -1,0 +1,43 @@
+# moonshotai/Kimi-K3 — 2.8T-total / 104B-active MoE (896 experts, 16 active),
+# 1M-token native context, MXFP4 weights + MXFP8 activations, ~1.56TB on disk
+# (96 shards). Flags from the vLLM recipe (recipes.vllm.ai/moonshotai/Kimi-K3;
+# day-0 support landed 2026-07-27, so the serving image must be from the
+# July 2026 vLLM line or newer — kimi_k3 parsers and Kimi Delta Attention do
+# not exist before that).
+#
+# GEOMETRY IS DERIVED, NOT HAND-SET: min_vram_gb x boxy's headroom = ~1950GB,
+# so on an 8x256GB MI325X node the solver lands on ONE node at TP8 — exactly
+# the recipe's published shape — and spills to a multi-node Ray instance on
+# smaller parts (7 nodes on the assumed 4x80GB tier; 8 nodes / 32 ranks on
+# 4x128GB MI300A). `gpus = 4` below is only the assumed-hardware advisory the
+# calibration contract pins; a system card with the real node shape overrides
+# it through fit_geometry().
+#
+# The recipe also passes `--load-format fastsafetensors` for faster cold loads.
+# NOT set here: it hard-fails on any image without the fastsafetensors package,
+# and a slow first load beats a crashed one. Add it back with
+# `-- --load-format fastsafetensors` on an image known to carry it.
+[model]
+match = "moonshotai/Kimi-K3*"
+engine = "vllm"
+gpus = 4
+min_vram_gb = 1560
+[model.args]
+trust_remote_code = true
+# Native window is 1M tokens; vLLM profiles KV for the FULL window at startup
+# and can OOM even with KDA's small attention state. Cap the turnkey serve;
+# raise with `-- --max-model-len N` once your allocation is measured.
+max_model_len = 262144
+enable_prefix_caching = true
+reasoning_parser = "kimi_k3"
+tool_call_parser = "kimi_k3"
+enable_auto_tool_choice = true
+[model.env.rocm]
+# The AITER path is what the Kimi MI325X (gfx942) recipes run; MI325X shares
+# that ISA.
+VLLM_ROCM_USE_AITER = "1"
+[model.images]
+# The ROCm tag is the image the recipe names for K3 (vllm/vllm-openai_rocm);
+# for CUDA any vllm-openai from the July 2026 line onward carries kimi_k3.
+cuda = "docker.io/vllm/vllm-openai:latest"
+rocm = "docker.io/vllm/vllm-openai_rocm:kimi-k3"
