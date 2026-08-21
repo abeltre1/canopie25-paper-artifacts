@@ -2850,15 +2850,27 @@ def _pull_agentless_ssh(args, target: str) -> int:
     inner = (f"{reset}mkdir -p {q(stage)} && {pfx}podman pull {q(image)} && "
              f"{pfx}{shlex.join(_hf_download_argv(repo, stage, image, ca_remote))} && "
              f"touch {q(done)}")
-    launch = (f"mkdir -p {q(rdir)} && setsid nohup sh -c {q(inner)} >> {q(log_remote)} 2>&1 "
-              f"< /dev/null & echo $! > {q(pid_remote)}; cat {q(pid_remote)}")
+    # The backgrounded job must be a SINGLE fully-redirected command. With
+    # `mkdir && setsid ... &` the non-interactive remote shell backgrounds the
+    # WHOLE and-list in a child that waits on the (8-hour) download with the ssh
+    # session's stdout/stderr still open — ssh never returns, ssh_capture kills
+    # it at 30s, and the launch reports rc=124 with no output (field: eldorado,
+    # first Kimi-K3 launch). `mkdir; setsid ... &` leaves nothing holding the
+    # channel: the download is orphaned to init, guarded by setsid+nohup.
+    launch = (f"mkdir -p {q(rdir)}; "
+              f"setsid nohup sh -c {q(inner)} >> {q(log_remote)} 2>&1 < /dev/null & "
+              f"echo $! > {q(pid_remote)}; cat {q(pid_remote)}")
     if args.dryrun:
         print(f"### would launch on {host} (detached, survives disconnect): "
               f"{redact.redact_command(inner)}")
         return 0
     rc, out = remote.ssh_capture(target, launch, timeout=30)
     if rc != 0:
-        print(f"boxy: pull launch failed on {host}:\n{out.strip()[-600:]}", file=sys.stderr)
+        why = ("the ssh channel stayed open past 30s and was killed — the detached download "
+               "may STILL have started; re-run this command to check (RUNNING = it did)"
+               if rc == 124 else f"rc={rc}")
+        print(f"boxy: pull launch failed on {host} ({why}):\n"
+              f"{out.strip()[-600:] or '(no output)'}", file=sys.stderr)
         return 1
     resumed = (" (RESUMING — complete shards are kept)"
                if got_shards not in ("", "0") and not args.force else "")
