@@ -968,13 +968,27 @@ def _facts_shape(facts, scheduler_name: str) -> tuple[int, int, str] | None:
     gpus = int(inv.get("gpus_per_node") or 0)
     if not gpus:
         return None
-    vram = int(inv.get("gpu_vram_gb") or 0) or site.gpu_vram_from_type(inv.get("gpu_type", ""))[0]
+    # A measured MiB figure is data; a spec-table lookup keyed on the GPU-type
+    # token is an ASSUMPTION (a100 -> 80, but 40GB variants exist). Say which
+    # in the provenance — consumers that must not act on guessed VRAM (the
+    # context derivation) key off the word 'assumed'.
+    vram = int(inv.get("gpu_vram_gb") or 0)
+    assumed = False
+    if not vram:
+        vram = site.gpu_vram_from_type(inv.get("gpu_type", ""))[0]
+        assumed = bool(vram)
     if not vram:
         htype, hvram, _ = facts.gpu_hw()
-        vram = hvram or site.gpu_vram_from_type(htype)[0]
+        vram = hvram
+        if not vram:
+            vram = site.gpu_vram_from_type(htype)[0]
+            assumed = bool(vram)
     if not vram:
         return None
-    return gpus, vram, "cluster probe inventory"
+    src = "cluster probe inventory"
+    if assumed:
+        src += " (VRAM assumed from the GPU type — pin gpu_vram_gb in a system card)"
+    return gpus, vram, src
 
 
 def _node_shape(host: str | None) -> tuple[int, int, str] | None:

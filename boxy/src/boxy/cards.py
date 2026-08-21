@@ -64,6 +64,15 @@ class ModelCard:
     gpus: int = 0                  # 0 -> no opinion
     nodes: int = 0                 # 0 -> no opinion
     min_vram_gb: int = 0           # weight footprint; 0 -> geometry solver stays off
+    # Model's NATIVE context window in tokens (config.json max_position_embeddings);
+    # 0 = unknown. The ceiling for the derived --max-model-len.
+    native_ctx: int = 0
+    # Whole-model KV-cache bytes per ONE token at bf16: summed over the layers
+    # that actually cache per-token KV (GQA/MLA); linear-attention/KDA layers
+    # cost 0 per token (constant state, counted into the activation reserve).
+    # 0 = unknown -> the runtime context derivation stays off and the card's
+    # static max_model_len (if any) stands.
+    kv_bytes_per_token: float = 0.0
     args: dict = field(default_factory=dict)
     # extra pip packages the model's custom code imports that the engine image
     # doesn't ship (installed at container start; field: Nemotron-Parse/open_clip)
@@ -152,6 +161,8 @@ def _parse_card(text: str, card_name: str, source: str, path: str) -> ModelCard:
         gpus=int(section.get("gpus", 0)),
         nodes=int(section.get("nodes", 0)),
         min_vram_gb=int(section.get("min_vram_gb", 0)),
+        native_ctx=int(section.get("native_ctx", 0)),
+        kv_bytes_per_token=float(section.get("kv_bytes_per_token", 0.0)),
         args=dict(args),
         pip=[str(x) for x in section.get("pip", [])],
         aux_repos=[str(x) for x in section.get("aux_repos", [])],
@@ -528,9 +539,73 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None, unified: bool
     # the user's own post-`--` engine args, appended after, win (last-wins in the
     # engine's argparse). Field failure: bare 8B serve OOM'd because this table
     # was never applied.
-    flags = engine_flags(effective_args(card.args, accel))
+    card_args_flat = effective_args(card.args, accel)
+    flags = engine_flags(card_args_flat)
+    # Derived max_model_len (the card's static cap is a workaround sized for the
+    # smallest machine — field: Kimi-K3's 1M native window hand-capped to 131072
+    # on hardware whose arithmetic supports the full window). Fires only when
+    # the card carries the KV fields AND the system card declares REAL node
+    # VRAM (an assumed shape must never change a deployment); otherwise the
+    # static cap stands and the decision line names the missing piece.
+    ctx_pair: list[str] = []
+    ctx_lines: list[str] = []
+    if card.min_vram_gb and (getattr(args, "engine", None) or "vllm") == "vllm":
+        _w, vram, _src = shape or (0, 0, "")
+        # A shape whose VRAM was ASSUMED from the GPU-type table (a100 -> 80GB,
+        # but 40GB variants exist) must not feed the context arithmetic: a 2x
+        # overshoot OOMs the KV profile at startup. _facts_shape marks that
+        # case in the provenance; treat it as unknown here.
+        if "assumed" in (_src or "").lower():
+            vram = 0
+        user_args = getattr(args, "args", None)
+        if card.kv_bytes_per_token and card.native_ctx and vram:
+            world = int(getattr(args, "nodes", None) or 1) * int(getattr(args, "gpus", None) or 1)
+            # PP divides the layers (and so the per-rank KV cost): honor an
+            # explicit pipeline size (card or post-`--`, last-wins) over the
+            # geometric default of PP=nodes — the field K3 serve ran TP8xPP4
+            # on 8 nodes where the default assumed PP8.
+            pp_val = _flag_value(user_args, "--pipeline-parallel-size") \
+                or card_args_flat.get("pipeline_parallel_size")
+            try:
+                pp = int(pp_val) if pp_val is not None else int(getattr(args, "nodes", None) or 1)
+            except (TypeError, ValueError):
+                pp = int(getattr(args, "nodes", None) or 1)
+            tokens, why = derive_max_model_len(
+                card.kv_bytes_per_token, card.native_ctx, card.min_vram_gb,
+                world, pp, vram, unified=bool(unified and vram),
+                util=None if unified else _explicit_util(card_args_flat, user_args),
+                kv_dtype_factor=_kv_dtype_factor(card_args_flat, user_args))
+            if tokens is not None:
+                ctx_pair = ["--max-model-len", str(tokens)]
+                full = (" — the FULL native window fits" if tokens >= card.native_ctx
+                        else "")
+                ctx_lines.append(
+                    f"max-model-len: {tokens} (derived: {why}{full}; native "
+                    f"{card.native_ctx}; `-- --max-model-len N` overrides)")
+            else:
+                ctx_lines.append(
+                    f"max-model-len: NOT derived — {why}; the card's static cap stands; "
+                    f"spread wider (--gpus/--nodes) or set it after `--`")
+        elif card.native_ctx and not card.kv_bytes_per_token:
+            ctx_lines.append(
+                "max-model-len: card cap kept (KV bytes/token unknown — regenerate the "
+                "card with `boxy generate card` to derive the largest context that fits)")
+        elif card.kv_bytes_per_token and not vram:
+            ctx_lines.append(
+                "max-model-len: card cap kept (node VRAM unknown — a system card with the "
+                "real gpu_vram_gb lets boxy derive the largest context that fits)")
+    if ctx_pair:
+        # the derived value REPLACES the card's static pair (a dead duplicate in
+        # the argv reads like a bug); the engine-args line is emitted AFTER the
+        # removal so it never shows a flag that is not actually passed.
+        flags = _strip_flag_pair(flags, "--max-model-len")
     if flags:
         decisions.append(f"engine args: {' '.join(flags)} ({card.label})")
+    decisions.extend(ctx_lines)
+    # ctx pair goes BEFORE the derived gpu-mem pair (appended below), keeping
+    # the long-standing contract that the gpu-mem pair is LAST among boxy's
+    # flags; the user's post-`--` args still land after everything and win.
+    flags = flags + ctx_pair
     if unified and card.min_vram_gb and (getattr(args, "engine", None) or "vllm") == "vllm":
         _w, pool, _src = shape or (0, 0, "")
         world = int(getattr(args, "nodes", None) or 1) * int(getattr(args, "gpus", None) or 1)
@@ -592,6 +667,67 @@ def check_accelerator(card: ModelCard, accel: str) -> None:
 
 def model_hint_name(card: ModelCard) -> str:
     return f"{card.label} (match {card.match!r})"
+
+
+def _flag_value(user_args, flag: str) -> str | None:
+    """LAST value of `--flag V` / `--flag=V` in a raw engine-args list — the
+    engines' argparse honors the last occurrence, so must we."""
+    val = None
+    args_list = list(user_args or [])
+    for i, a in enumerate(args_list):
+        if a == flag and i + 1 < len(args_list):
+            val = args_list[i + 1]
+        elif isinstance(a, str) and a.startswith(flag + "="):
+            val = a.split("=", 1)[1]
+    return val
+
+
+_FP8_KV = ("fp8", "fp8_e4m3", "fp8_e5m2")
+
+
+def _kv_dtype_factor(card_args_flat: dict, user_args) -> float:
+    """0.5 when the EFFECTIVE kv-cache dtype is an fp8 variant — the card's
+    flattened args first, then the user's post-`--` list (last-wins, so a user
+    flipping a card's fp8 back to auto restores the bf16 cost). Scanning the
+    user list matters in the DANGEROUS direction: missing that override would
+    derive a context twice as large as the cache can hold."""
+    val = card_args_flat.get("kv_cache_dtype")
+    uval = _flag_value(user_args, "--kv-cache-dtype")
+    if uval is not None:
+        val = uval
+    return 0.5 if str(val).lower() in _FP8_KV else 1.0
+
+
+def _explicit_util(card_args_flat: dict, user_args) -> float | None:
+    """An explicit gpu-memory-utilization from the card or the user's post-`--`
+    args (last-wins), for the DISCRETE-part context budget; None -> vLLM's 0.9."""
+    val = card_args_flat.get("gpu_memory_utilization")
+    uval = _flag_value(user_args, "--gpu-memory-utilization")
+    if uval is not None:
+        val = uval
+    try:
+        return float(val) if val is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _strip_flag_pair(flags: list[str], name: str) -> list[str]:
+    """Remove every `name value` pair (and `name=value`) from a flag list —
+    used when a DERIVED value replaces a card's static one, so the argv never
+    carries a dead duplicate."""
+    out: list[str] = []
+    skip = False
+    for f in flags:
+        if skip:
+            skip = False
+            continue
+        if f == name:
+            skip = True
+            continue
+        if isinstance(f, str) and f.startswith(name + "="):
+            continue
+        out.append(f)
+    return out
 
 
 def engine_flags(card_args: dict) -> list[str]:
@@ -703,6 +839,75 @@ def derive_gpu_memory_utilization(min_vram_gb: float, world_size: int, pool_gb: 
     if not unified_rank_fits(shard, pool_gb):
         return None
     return min(0.9, round(unified_claimable_gb(shard, pool_gb) / pool_gb, 2))
+
+
+# ---- derived context window (max_model_len) -----------------------------------------
+#
+# A card's static max_model_len is a workaround sized for the SMALLEST machine
+# the model might land on; on real hardware it silently wastes the KV budget
+# (field: Kimi-K3's 1M native window hand-capped to 131072 on a deployment
+# whose per-rank arithmetic supports the full million). When a card knows its
+# KV cost per token and the system card knows the node, boxy derives the
+# largest context that PROVABLY fits and serves that instead.
+
+# Per-rank reserve (GB) for activations, CUDA graphs, sampler and allocator
+# slack when translating a VRAM budget into KV-cache tokens. PLACEHOLDER
+# calibration: to be pinned by the field-measured Kimi-K3 'GPU KV cache size'
+# line (see the golden calibration test) — tune it there, not here.
+_CTX_ACT_RESERVE_GB = 8.0
+# A derived context below this is not worth serving; decline (the card's
+# static cap stands) and say why instead.
+_CTX_FLOOR = 4096
+
+
+def derive_max_model_len(kv_bytes_per_token: float, native_ctx: int, min_vram_gb: float,
+                         world: int, pp_stages: int, gpu_vram_gb: int,
+                         unified: bool = False, util: float | None = None,
+                         kv_dtype_factor: float = 1.0) -> tuple[int | None, str]:
+    """(tokens, why): the largest context whose KV cache provably fits ONE rank,
+    or (None, why-not). Deliberately CONSERVATIVE v1: the per-token cost is NOT
+    divided by TP — exact for MLA models (the compressed cache is replicated
+    across TP ranks), an under-estimate for GQA models (vLLM shards KV heads
+    across TP) — so a derived value never OOMs where a hand-raised one might.
+    PP divides layers across stages, so the per-rank cost divides by pp_stages.
+
+    `util` = an explicit gpu-memory-utilization (card/user) on DISCRETE parts;
+    None -> vLLM's 0.9 default. On unified pools the claim mirrors what
+    derive_gpu_memory_utilization actually grants (min of the claimable pool
+    and 0.9), so the two derivations cannot disagree about the budget.
+    `kv_dtype_factor` = 0.5 when the effective kv-cache dtype is fp8."""
+    if (kv_bytes_per_token <= 0 or native_ctx <= 0 or min_vram_gb <= 0
+            or world <= 0 or gpu_vram_gb <= 0):
+        return None, "model KV shape or node VRAM unknown"
+    shard = min_vram_gb / world
+    if unified:
+        # same single feasibility test the solver and the util derivation use —
+        # deriving a context on top of a claim the util derivation refuses to
+        # grant would rebuild the exact silent-OOM the unified model exists to
+        # prevent (2x70GB shards on a 128GB pool have a positive "budget" on
+        # paper and a dead rank in the field).
+        if not unified_rank_fits(shard, gpu_vram_gb):
+            return None, (f"a ~{shard:.0f}GB weight shard does not fit a {gpu_vram_gb}GB "
+                          f"unified pool (no gpu-memory-utilization derivable either)")
+        claim = min(unified_claimable_gb(shard, gpu_vram_gb), 0.9 * gpu_vram_gb)
+    else:
+        claim = gpu_vram_gb * (util if util is not None else 0.9)
+    budget = claim - shard - _CTX_ACT_RESERVE_GB
+    per_tok_gb = kv_bytes_per_token * kv_dtype_factor / 1e9 / max(1, pp_stages)
+    if budget <= 0:
+        return None, (f"~{shard:.0f}GB weight shard + ~{_CTX_ACT_RESERVE_GB:.0f}GB reserve "
+                      f"leave no KV budget in the ~{claim:.0f}GB a rank may claim")
+    tokens = int(budget / per_tok_gb)
+    tokens -= tokens % 1024
+    if tokens < _CTX_FLOOR:
+        return None, (f"~{budget:.0f}GB KV budget per rank fits fewer than "
+                      f"{_CTX_FLOOR} tokens")
+    tokens = min(tokens, native_ctx)
+    why = (f"~{claim:.0f}GB claimable − ~{shard:.0f}GB weight shard − "
+           f"~{_CTX_ACT_RESERVE_GB:.0f}GB reserve = ~{budget:.0f}GB for KV at "
+           f"~{kv_bytes_per_token * kv_dtype_factor / max(1, pp_stages) / 1024:.1f}KB/token/rank"
+           f" (PP={max(1, pp_stages)})")
+    return tokens, why
 
 
 def fit_geometry(min_vram_gb: float, gpus_per_node: int, gpu_vram_gb: int,
