@@ -2709,7 +2709,8 @@ def _model_slug(repo: str) -> str:
     return repo.strip().strip("/").replace("/", "-").replace(":", "-").lower()
 
 
-def _hf_download_argv(repo: str, stage_dir: str, image: str, ca_remote: str | None) -> list[str]:
+def _hf_download_argv(repo: str, stage_dir: str, image: str, ca_remote: str | None,
+                      proxy_env: dict | None = None) -> list[str]:
     """The in-container huggingface_hub download — the ONE way boxy lands an
     hf:// safetensors model on a cluster's shared FS (used by the serve prestage
     AND `boxy pull --ssh`, so the two can never disagree on layout). Runs inside
@@ -2727,8 +2728,10 @@ def _hf_download_argv(repo: str, stage_dir: str, image: str, ca_remote: str | No
         run += ["-v", f"{ca_remote}:{deploy.CA_CONTAINER_PATH}:ro"]
         for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
             cenv[var] = deploy.CA_CONTAINER_PATH
-    # proxy vars for INSIDE the download container (the pull reaches HF via the proxy)
-    cenv.update(remote.remote_proxy_env())
+    # proxy vars for INSIDE the download container (the pull reaches HF via the
+    # proxy). `proxy_env={}` means the caller PROBED and the cluster has direct
+    # egress — inject nothing; None keeps the legacy laptop-env forwarding.
+    cenv.update(remote.remote_proxy_env() if proxy_env is None else proxy_env)
     for k, v in cenv.items():
         run += ["-e", f"{k}={v}"]
     # skip the redundant PyTorch 'original/' checkpoint (Llama ships both) and any
@@ -2881,11 +2884,28 @@ def _pull_agentless_ssh(args, target: str) -> int:
     print(f"  auto: image: {image} (runs the download; it is also pre-pulled for the serve — "
           "--image to override)")
 
-    ca_remote = _stage_agentless_ca(target, host, rdir, dryrun=args.dryrun)
-    pfx = _proxy_prefix(args)
+    # Evidence over configuration: probe HF from the LOGIN node first. If it
+    # verifies DIRECTLY with the node's stock trust (field: eldorado — direct:
+    # 200, issuer Amazon, no interception), the container needs NO proxy and NO
+    # CA override — forwarding the laptop's proxy forced traffic through an
+    # interceptor and MANUFACTURED the very CERTIFICATE_VERIFY_FAILED that four
+    # CA fixes then chased. Only a cluster whose direct probe fails gets the
+    # proxy env + staged-CA treatment.
+    rc_e, _eout = remote.ssh_capture(
+        target, "curl -sIf https://huggingface.co -o /dev/null --max-time 12", timeout=20)
+    if rc_e == 0:
+        print(f"  auto: egress: huggingface.co verifies directly from {host} with its stock "
+              "trust — no proxy, no CA override in the download container")
+        ca_remote, pfx, penv = None, "", {}
+    else:
+        print(f"  auto: egress: direct HF probe failed from {host} — forwarding the proxy and "
+              "staging the merged site CA into the container")
+        ca_remote = _stage_agentless_ca(target, host, rdir, dryrun=args.dryrun)
+        pfx = _proxy_prefix(args)
+        penv = None
     reset = f"rm -rf {q(stage)} && " if args.force else ""
     inner = (f"{reset}mkdir -p {q(stage)} && {pfx}podman pull {q(image)} && "
-             f"{pfx}{shlex.join(_hf_download_argv(repo, stage, image, ca_remote))} && "
+             f"{pfx}{shlex.join(_hf_download_argv(repo, stage, image, ca_remote, proxy_env=penv))} && "
              f"touch {q(done)}")
     # The backgrounded job must be a SINGLE fully-redirected command. With
     # `mkdir && setsid ... &` the non-interactive remote shell backgrounds the

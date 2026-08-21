@@ -174,6 +174,43 @@ def test_explicit_image_wins(monkeypatch):
     assert "quay.io/my/vllm:x" in launch
 
 
+def test_direct_egress_omits_the_laptop_proxy_and_ca(monkeypatch, capsys):
+    """FIELD (the Kimi-K3 CA saga's actual root cause): the cluster reached HF
+    DIRECTLY with stock trust (direct: 200, issuer Amazon — no interception),
+    but boxy injected the LAPTOP's proxy into the container, forcing traffic
+    through an interceptor and manufacturing CERTIFICATE_VERIFY_FAILED. When
+    the login-node probe verifies direct egress, inject nothing."""
+    calls = _wire(monkeypatch)
+    monkeypatch.setattr("boxy.remote.remote_proxy_env",
+                        lambda: {"https_proxy": "http://laptop-proxy:80"})
+    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
+    assert "verifies directly" in capsys.readouterr().out
+    launch = next(c for c in calls if "setsid" in c)
+    assert "laptop-proxy" not in launch, "direct egress must not inherit the laptop proxy"
+    assert "REQUESTS_CA_BUNDLE" not in launch, "stock trust verified; no CA override"
+
+
+def test_blocked_egress_forwards_proxy_and_stages_ca(monkeypatch, capsys):
+    # the OTHER kind of site: direct probe fails -> proxy env + staged CA, as before
+    calls = _wire(monkeypatch)
+    monkeypatch.setattr("boxy.remote.remote_proxy_env",
+                        lambda: {"https_proxy": "http://site-proxy:80"})
+    monkeypatch.setattr(cli, "_stage_agentless_ca", lambda *a, **k: "/rdir/boxy-ca-merged.pem")
+    orig = __import__("boxy.remote", fromlist=["ssh_capture"]).ssh_capture
+
+    def blocked_probe(target, cmd, timeout=20):
+        if cmd.startswith("curl -sIf https://huggingface.co"):
+            return 6, ""
+        return orig(target, cmd, timeout)
+
+    monkeypatch.setattr("boxy.remote.ssh_capture", blocked_probe)
+    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
+    assert "direct HF probe failed" in capsys.readouterr().out
+    launch = next(c for c in calls if "setsid" in c)
+    assert "https_proxy=http://site-proxy:80" in launch
+    assert "boxy-ca-merged.pem" in launch and "REQUESTS_CA_BUNDLE" in launch
+
+
 def test_stopped_attempt_surfaces_its_log_before_resuming(monkeypatch, capsys):
     """FIELD: the same old traceback was read three times as three new failures
     — an appended log never says which attempt it belongs to. On IDLE-with-log,
