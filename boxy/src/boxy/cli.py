@@ -2852,6 +2852,16 @@ def _pull_agentless_ssh(args, target: str) -> int:
         print(f"  or watch live:  ssh {target} tail -f {log_remote}")
         return 0
 
+    # IDLE with a log left behind: the previous attempt STOPPED — say why, right
+    # here, instead of leaving the user to tail a stale file (field: the same
+    # old traceback was read three times as three new failures; an appended log
+    # never says which attempt it belongs to).
+    rc_t, tail = remote.ssh_capture(target, f"tail -n 12 {q(log_remote)} 2>/dev/null", timeout=15)
+    if rc_t == 0 and tail.strip():
+        print(f"  note: the previous attempt stopped — its last lines ({host}:{log_remote}):")
+        for ln in tail.strip().splitlines()[-12:]:
+            print(f"    | {ln}")
+
     # IDLE: fresh start, or an interrupted pull about to RESUME. Guard the disk first.
     free_gb = _free_space_gb(target, store)
     if size_gb and free_gb and free_gb < size_gb * 1.05:
@@ -2885,6 +2895,7 @@ def _pull_agentless_ssh(args, target: str) -> int:
     # first Kimi-K3 launch). `mkdir; setsid ... &` leaves nothing holding the
     # channel: the download is orphaned to init, guarded by setsid+nohup.
     launch = (f"mkdir -p {q(rdir)}; "
+              f"[ -f {q(log_remote)} ] && mv -f {q(log_remote)} {q(log_remote)}.prev; "
               f"setsid nohup sh -c {q(inner)} >> {q(log_remote)} 2>&1 < /dev/null & "
               f"echo $! > {q(pid_remote)}; cat {q(pid_remote)}")
     if args.dryrun:

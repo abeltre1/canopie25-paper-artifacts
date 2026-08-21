@@ -174,6 +174,29 @@ def test_explicit_image_wins(monkeypatch):
     assert "quay.io/my/vllm:x" in launch
 
 
+def test_stopped_attempt_surfaces_its_log_before_resuming(monkeypatch, capsys):
+    """FIELD: the same old traceback was read three times as three new failures
+    — an appended log never says which attempt it belongs to. On IDLE-with-log,
+    boxy prints WHY the last attempt stopped, then resumes; and every launch
+    rotates the log so one file never mixes two attempts."""
+    calls = _wire(monkeypatch, state="STATE=IDLE\nGOT=16G\nSHARDS=1")
+    orig = __import__("boxy.remote", fromlist=["ssh_capture"]).ssh_capture
+
+    def with_tail(target, cmd, timeout=20):
+        if cmd.startswith("tail -n"):
+            calls.append(cmd)
+            return 0, "requests.exceptions.SSLError: CERTIFICATE_VERIFY_FAILED ...\n"
+        return orig(target, cmd, timeout)
+
+    monkeypatch.setattr("boxy.remote.ssh_capture", with_tail)
+    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
+    out = capsys.readouterr().out
+    assert "the previous attempt stopped" in out
+    assert "| requests.exceptions.SSLError" in out          # the reason, inline
+    launch = next(c for c in calls if "setsid" in c)
+    assert ".prev" in launch                                # the log is rotated per attempt
+
+
 def test_stage_agentless_ca_builds_the_merged_bundle_itself(monkeypatch, tmp_path):
     """FIELD (first Kimi-K3 pull): image pulled fine, model download died with
     CERTIFICATE_VERIFY_FAILED — the site CA never reached the container. The
