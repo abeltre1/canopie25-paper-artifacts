@@ -2495,7 +2495,24 @@ def _stage_agentless_ca(target: str, host: str, rdir: str, dryrun: bool = False)
         print(f"boxy: warning: could not stage the site CA to {host}; an in-container "
               "HuggingFace pull may fail TLS (CERTIFICATE_VERIFY_FAILED)", file=sys.stderr)
         return None
-    print(f"  auto: CA: staged your merged site CA -> {host}:{remote_path} "
+    # The laptop's CA answers for the LAPTOP's network path; the container runs
+    # on the CLUSTER, whose egress may be intercepted by a DIFFERENT root — one
+    # the cluster's own OS trust store carries (site-managed nodes trust their
+    # own interceptor). Append the cluster's OS bundle so the mounted file
+    # answers for BOTH paths (field: laptop bundle staged and mounted, HF fetch
+    # in-container still CERTIFICATE_VERIFY_FAILED — the cluster route's issuer
+    # was not in the laptop's chain).
+    os_bundles = ("/etc/pki/tls/certs/ca-bundle.crt "
+                  "/etc/ssl/certs/ca-certificates.crt "
+                  "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem")
+    rc_append, _out = remote.ssh_capture(
+        target,
+        (f"for f in {os_bundles}; do if [ -f \"$f\" ]; then "
+         f"cat \"$f\" >> {shlex.quote(remote_path)} && echo \"$f\"; break; fi; done"),
+        timeout=20)
+    appended = _out.strip().splitlines()[-1].strip() if rc_append == 0 and _out.strip() else ""
+    plus = f" + {host}'s own trust store ({appended})" if appended else ""
+    print(f"  auto: CA: staged your merged site CA{plus} -> {host}:{remote_path} "
           "(mounted into the container so its HuggingFace/TLS trusts the site CA)")
     return remote_path
 

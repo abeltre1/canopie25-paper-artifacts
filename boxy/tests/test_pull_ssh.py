@@ -197,9 +197,17 @@ def test_stage_agentless_ca_builds_the_merged_bundle_itself(monkeypatch, tmp_pat
     pushed = {}
     monkeypatch.setattr("boxy.remote.push_file",
                         lambda t, p, data: pushed.update(path=p, data=data) or 0)
+    appended = []
+    monkeypatch.setattr("boxy.remote.ssh_capture",
+                        lambda t, cmd, timeout=20: (appended.append(cmd), (0, "/etc/pki/tls/certs/ca-bundle.crt"))[1])
     out = cli._stage_agentless_ca("user@c", "c", "/home/u/agentless/c")
     assert out == "/home/u/agentless/c/boxy-ca-merged.pem"
     assert pushed["data"] == "MERGED"                 # the MERGED bundle, not the bare site CA
+    # ... and the CLUSTER's own OS trust store is appended remote-side: the
+    # laptop CA answers for the laptop's network path, the cluster's egress may
+    # be intercepted by a different root that only ITS bundle carries.
+    assert appended and "cat" in appended[0] and "boxy-ca-merged.pem" in appended[0]
+    assert "/etc/pki/tls/certs/ca-bundle.crt" in appended[0]
 
 
 def test_stage_agentless_ca_still_noop_when_no_bundle_can_be_built(monkeypatch, tmp_path):
