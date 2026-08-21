@@ -340,6 +340,11 @@ def test_packaged_kimi_k3_card():
     # gfx942 (24 heads invalid; 12 heads selects the CDNA4-only Gluon kernel,
     # which asserted AFTER the full 87-minute weight load — field, 8x MI300A)
     assert card.env["rocm"]["VLLM_ROCM_USE_AITER"] == "0"
+    # CUDA gets the K3-specific tag (ships ray — :latest doesn't, and the
+    # runtime pip-install dropped an H200 worker mid-formation; field, cronus-
+    # class 2x8 nodes) and the recipe's long-load engine-ready timeout.
+    assert card.images["cuda"] == "docker.io/vllm/vllm-openai:kimi-k3"
+    assert card.env["cuda"]["VLLM_ENGINE_READY_TIMEOUT_S"] == "3600"
     assert cards.fit_geometry(card.min_vram_gb, 8, 256)[:2] == (1, 8)      # MI325X node
     # smaller parts spill to one Ray instance across full nodes, never refuse
     nodes, gpus, why = cards.fit_geometry(card.min_vram_gb, 4, 128, unified=True)   # MI300A
