@@ -502,6 +502,36 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None, unified: bool
         decisions.append(
             f"card: {_last_autogen['fail']} — geometry below is a NAME GUESS; run "
             f"`boxy generate card {model_key(model)}` from a connected machine for the real numbers")
+    # --context turns the window into a DEMAND the geometry must meet (Mode B).
+    # Hard preconditions raise ValueError — main() prints them as clean
+    # `boxy: error:` lines — because silently under-serving an EXPLICIT context
+    # request is the one thing this feature must never do.
+    card_args_flat = effective_args(card.args, accel)
+    user_args = getattr(args, "args", None)
+    raw_ctx = getattr(args, "context", None)
+    ctx_demand = 0
+    ctx_kv_bytes = 0.0
+    if raw_ctx is not None:
+        if (getattr(args, "engine", None) or card.engine or "vllm") != "vllm":
+            raise ValueError("--context: only the vllm engine has KV-cache geometry to size")
+        ctx_demand = parse_context_request(raw_ctx, card.native_ctx)
+        if card.native_ctx and ctx_demand > card.native_ctx:
+            decisions.append(
+                f"context: {ctx_demand} requested > the model's {card.native_ctx}-token "
+                f"native window — clamped (the engine refuses past max_position_embeddings)")
+            ctx_demand = card.native_ctx
+        if not card.kv_bytes_per_token:
+            raise ValueError(
+                f"--context {raw_ctx}: {card.label} doesn't know the model's KV bytes/token — "
+                f"regenerate it with `boxy generate card {model_key(model)}` or set "
+                f"kv_bytes_per_token in the card")
+        _sw, _sv, _ssrc = shape or (0, 0, "")
+        if not _sv or "assumed" in (_ssrc or "").lower():
+            raise ValueError(
+                f"--context {raw_ctx}: the target's node VRAM is unknown, so the KV fit "
+                f"can't be proven — write a system card with [location.resources] "
+                f"gpu_vram_gb (or set BOXY_GPU_VRAM_GB)")
+        ctx_kv_bytes = card.kv_bytes_per_token * _kv_dtype_factor(card_args_flat, user_args)
     gpus_free = getattr(args, "gpus", None) is None
     nodes_free = getattr(args, "nodes", None) is None
     if gpus_free and nodes_free and card.min_vram_gb and not card.nodes:
@@ -510,7 +540,13 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None, unified: bool
         # the whole part — the host keeps a reserve to stream the load. That is
         # what spreads a 70B over 4 MI300A ranks (35GB shards that load) instead
         # of packing it onto 2 (70GB shards that get the host OOM-killed).
-        nodes, gpus, why = fit_geometry(card.min_vram_gb, w, v, unified=bool(unified and v))
+        nodes, gpus, why = fit_geometry(card.min_vram_gb, w, v, unified=bool(unified and v),
+                                        ctx_tokens=ctx_demand,
+                                        ctx_kv_bytes_per_token=ctx_kv_bytes)
+        if ctx_demand and "does not fit" in why:
+            # refuse UP FRONT: a submitted job would burn its queue wait and
+            # then OOM the KV profile; the message names the largest that fits
+            raise ValueError(f"--context {raw_ctx}: {why}")
         args.gpus = gpus
         src_note = f"; {src}" if src else ""
         decisions.append(f"gpus: {gpus} per node ({card.label}: {why}{src_note})")
@@ -518,6 +554,9 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None, unified: bool
             args.nodes = nodes
             decisions.append(f"nodes: {nodes} ({card.label}: the model exceeds one node -> "
                              f"one Ray instance across {nodes} nodes)")
+        if ctx_demand:
+            decisions.append(f"context: {ctx_demand} tokens (--context {raw_ctx}) — "
+                             f"geometry sized so the window provably fits")
     elif gpus_free and card.gpus:
         args.gpus = card.gpus
         note = f" (~{card.min_vram_gb}GB VRAM)" if card.min_vram_gb else ""
@@ -539,7 +578,6 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None, unified: bool
     # the user's own post-`--` engine args, appended after, win (last-wins in the
     # engine's argparse). Field failure: bare 8B serve OOM'd because this table
     # was never applied.
-    card_args_flat = effective_args(card.args, accel)
     flags = engine_flags(card_args_flat)
     # Derived max_model_len (the card's static cap is a workaround sized for the
     # smallest machine — field: Kimi-K3's 1M native window hand-capped to 131072
@@ -557,8 +595,7 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None, unified: bool
         # case in the provenance; treat it as unknown here.
         if "assumed" in (_src or "").lower():
             vram = 0
-        user_args = getattr(args, "args", None)
-        if card.kv_bytes_per_token and card.native_ctx and vram:
+        if card.kv_bytes_per_token and (card.native_ctx or ctx_demand) and vram:
             world = int(getattr(args, "nodes", None) or 1) * int(getattr(args, "gpus", None) or 1)
             # PP divides the layers (and so the per-rank KV cost): honor an
             # explicit pipeline size (card or post-`--`, last-wins) over the
@@ -571,11 +608,28 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None, unified: bool
             except (TypeError, ValueError):
                 pp = int(getattr(args, "nodes", None) or 1)
             tokens, why = derive_max_model_len(
-                card.kv_bytes_per_token, card.native_ctx, card.min_vram_gb,
+                card.kv_bytes_per_token, card.native_ctx or ctx_demand, card.min_vram_gb,
                 world, pp, vram, unified=bool(unified and vram),
                 util=None if unified else _explicit_util(card_args_flat, user_args),
                 kv_dtype_factor=_kv_dtype_factor(card_args_flat, user_args))
-            if tokens is not None:
+            if ctx_demand:
+                # Mode B: the pair carries EXACTLY the demand — the geometry
+                # was sized (or is being verified) for it. tokens < demand is
+                # only reachable with user-pinned --gpus/--nodes (the solver
+                # path refused up front): warn, emit nothing, let the static
+                # cap stand — never silently under-serve an explicit request.
+                if tokens is not None and tokens >= ctx_demand:
+                    ctx_pair = ["--max-model-len", str(ctx_demand)]
+                    ctx_lines.append(
+                        f"max-model-len: {ctx_demand} (--context {raw_ctx}: verified — {why})")
+                else:
+                    largest = f"~{tokens} tokens" if tokens else "no context at all"
+                    ctx_lines.append(
+                        f"context: NOT honored — {ctx_demand} tokens do not fit the pinned "
+                        f"{world} rank(s) at PP={pp} ({why}); largest that fits is {largest}; "
+                        f"free --gpus/--nodes to let boxy grow the geometry, or set "
+                        f"`-- --max-model-len` yourself")
+            elif tokens is not None:
                 ctx_pair = ["--max-model-len", str(tokens)]
                 full = (" — the FULL native window fits" if tokens >= card.native_ctx
                         else "")
@@ -911,8 +965,34 @@ def derive_max_model_len(kv_bytes_per_token: float, native_ctx: int, min_vram_gb
     return tokens, why
 
 
+def parse_context_request(raw, native_ctx: int) -> int:
+    """`--context N|full` -> tokens. 'full' = the model's native window; k/m
+    suffixes are binary (256k = 262144) because context windows are. Raises
+    ValueError with the remedy — main() turns that into a clean exit-1 line."""
+    s = str(raw).strip().lower()
+    if s == "full":
+        if not native_ctx:
+            raise ValueError(
+                "--context full: the model card doesn't know the native window — regenerate "
+                "it with `boxy generate card <id>` or set native_ctx in the card")
+        return native_ctx
+    mult = 1
+    if s.endswith("k"):
+        mult, s = 1024, s[:-1]
+    elif s.endswith("m"):
+        mult, s = 1024 * 1024, s[:-1]
+    try:
+        n = int(s) * mult
+    except ValueError:
+        raise ValueError(f"--context {raw!r}: expected a token count (4096, 256k, 1m) or 'full'") from None
+    if n <= 0:
+        raise ValueError(f"--context {raw!r}: must be positive")
+    return n
+
+
 def fit_geometry(min_vram_gb: float, gpus_per_node: int, gpu_vram_gb: int,
-                 unified: bool = False) -> tuple[int, int, str]:
+                 unified: bool = False, *, ctx_tokens: int = 0,
+                 ctx_kv_bytes_per_token: float = 0.0) -> tuple[int, int, str]:
     """(nodes, gpus_per_node, why): the smallest geometry that FITS a model card's
     min_vram_gb (the demand, plus KV/overhead headroom) on this system's nodes
     (the supply: gpus_per_node x gpu_vram_gb from the location/system card).
@@ -946,6 +1026,33 @@ def fit_geometry(min_vram_gb: float, gpus_per_node: int, gpu_vram_gb: int,
     need = f"~{min_vram_gb:g}GB weights + KV/overhead headroom = {budget:g}GB"
     node_capacity = width * vram
 
+    # --- context as DEMAND (--context): a candidate geometry must also leave
+    # each rank room for the requested window's KV. The fit test IS the runtime
+    # derivation at that geometry, so the solver can never pick a shape the
+    # derivation then refuses — the same by-construction agreement
+    # unified_rank_fits gives the utilization side. ctx kwargs default to 0:
+    # every default-path code line below is byte-identical without them (the
+    # calibration/parity contracts stand).
+    want_ctx = bool(ctx_tokens and ctx_kv_bytes_per_token)
+
+    def _ctx_ok(nodes_: int, gpus_: int) -> bool:
+        if not want_ctx:
+            return True
+        t, _ = derive_max_model_len(ctx_kv_bytes_per_token, ctx_tokens, min_vram_gb,
+                                    nodes_ * gpus_, nodes_, vram, unified=unified)
+        return t is not None and t >= ctx_tokens
+
+    ctx_note = f"; holds a {ctx_tokens}-token context" if want_ctx else ""
+
+    def _ctx_infeasible() -> str:
+        best, _ = derive_max_model_len(ctx_kv_bytes_per_token, 10 ** 12, min_vram_gb,
+                                       width * _MAX_SPILL_NODES, _MAX_SPILL_NODES,
+                                       vram, unified=unified)
+        remedy = (f"the largest context that fits there is ~{best} tokens"
+                  if best else "no context fits at all")
+        return (f"KV for a {ctx_tokens}-token context does not fit even "
+                f"{_MAX_SPILL_NODES} nodes ({width}x{vram}GB each); {remedy}")
+
     if unified:
         def _pool_note(ranks: int) -> str:
             shard = min_vram_gb / ranks
@@ -955,15 +1062,20 @@ def fit_geometry(min_vram_gb: float, gpus_per_node: int, gpu_vram_gb: int,
 
         gpus = 1
         while gpus <= width:
-            if unified_rank_fits(min_vram_gb / gpus, vram):
-                return 1, gpus, f"{need}; a node offers {width}x{vram}GB{_pool_note(gpus)}{note}"
+            if unified_rank_fits(min_vram_gb / gpus, vram) and _ctx_ok(1, gpus):
+                return 1, gpus, (f"{need}; a node offers {width}x{vram}GB"
+                                 f"{_pool_note(gpus)}{ctx_note}{note}")
             gpus *= 2
         nodes = 2
         while nodes <= _MAX_SPILL_NODES:
-            if unified_rank_fits(min_vram_gb / (width * nodes), vram):
+            if unified_rank_fits(min_vram_gb / (width * nodes), vram) and _ctx_ok(nodes, width):
                 return nodes, width, (f"{need} exceeds one node ({width}x{vram}GB)"
-                                      f"{_pool_note(width * nodes)}{note}")
-            nodes *= 2
+                                      f"{_pool_note(width * nodes)}{ctx_note}{note}")
+            # a context demand scans every node count (PP need not be a power
+            # of two); the default weight-only spill keeps its doubling steps
+            nodes = nodes + 1 if want_ctx else nodes * 2
+        if want_ctx:
+            return _MAX_SPILL_NODES, width, f"{need}; {_ctx_infeasible()}{note}"
         return _MAX_SPILL_NODES, width, (f"{need} does not fit {_MAX_SPILL_NODES} unified "
                                          f"nodes ({width}x{vram}GB each); pin --gpus/--nodes "
                                          f"and --gpu-memory-utilization by hand{note}")
@@ -973,10 +1085,26 @@ def fit_geometry(min_vram_gb: float, gpus_per_node: int, gpu_vram_gb: int,
         while gpus * vram < budget:
             gpus *= 2
         gpus = min(gpus, width)
-        return 1, gpus, f"{need}; a node offers {width}x{vram}GB{note}"
-    nodes = -(-int(budget) // node_capacity)               # ceil
-    return nodes, width, (f"{need} exceeds one node ({width}x{vram}GB = "
-                          f"{node_capacity}GB){note}")
+        if _ctx_ok(1, gpus):
+            return 1, gpus, f"{need}; a node offers {width}x{vram}GB{ctx_note}{note}"
+        # widen within the node first: smaller shards free per-rank KV budget
+        while gpus < width:
+            gpus = min(gpus * 2, width)
+            if _ctx_ok(1, gpus):
+                return 1, gpus, (f"{need}; widened to {gpus} GPUs so the KV for a "
+                                 f"{ctx_tokens}-token context fits{note}")
+        nodes = 2
+    else:
+        nodes = -(-int(budget) // node_capacity)               # ceil
+        if not want_ctx:
+            return nodes, width, (f"{need} exceeds one node ({width}x{vram}GB = "
+                                  f"{node_capacity}GB){note}")
+    while nodes <= _MAX_SPILL_NODES:
+        if budget <= nodes * node_capacity and _ctx_ok(nodes, width):
+            return nodes, width, (f"{need}; KV for a {ctx_tokens}-token context fits at "
+                                  f"{nodes} nodes / PP={nodes} ({width}x{vram}GB each){note}")
+        nodes += 1
+    return _MAX_SPILL_NODES, width, f"{need}; {_ctx_infeasible()}{note}"
 
 
 def system_shape(cluster: str) -> tuple[int, int, str] | None:
