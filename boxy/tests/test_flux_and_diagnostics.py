@@ -511,13 +511,33 @@ def test_version_string_reports_git_commit_in_a_checkout(tmp_path, monkeypatch):
     assert "git abcdef1" in boxy.version_string() and "claude/my-branch" in boxy.version_string()
 
 
-def test_version_string_plain_outside_a_checkout(tmp_path, monkeypatch):
+def test_version_string_marks_an_installed_copy(tmp_path, monkeypatch):
     import boxy
 
     loose = tmp_path / "site-packages" / "boxy"
     loose.mkdir(parents=True)
     monkeypatch.setattr(boxy, "__file__", str(loose / "__init__.py"))
-    assert boxy.version_string() == boxy.__version__
+    assert boxy.version_string() == f"{boxy.__version__} (installed copy)"
+
+
+def test_version_string_never_wears_the_repo_sha_from_inside_its_venv(tmp_path, monkeypatch):
+    """FIELD: a wheel install whose venv sat INSIDE the repo walked up to
+    <repo>/.git and reported the repo's sha as its own — six fixes 'confirmed
+    current' by --version while a frozen snapshot did the work. A site-packages
+    copy must never claim to BE the checkout, and must name the remedy."""
+    import boxy
+
+    git = tmp_path / "repo" / ".git"
+    (git / "refs" / "heads").mkdir(parents=True)
+    (git / "HEAD").write_text("ref: refs/heads/main\n")
+    (git / "refs" / "heads" / "main").write_text("600a5811234567890\n")
+    pkg = tmp_path / "repo" / ".venv" / "lib" / "python3.12" / "site-packages" / "boxy"
+    pkg.mkdir(parents=True)
+    monkeypatch.setattr(boxy, "__file__", str(pkg / "__init__.py"))
+    out = boxy.version_string()
+    assert "INSTALLED COPY" in out and "not tracking" in out and "600a581" in out
+    assert "pip install -e" in out
+    assert not out.startswith(f"{boxy.__version__} (git ")   # never plain checkout format
 
 
 # ---- incomplete-checkpoint guard --------------------------------------------

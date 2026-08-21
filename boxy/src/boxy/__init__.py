@@ -2,7 +2,7 @@
 
 import os
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 
 def _read_git_revision():
@@ -48,9 +48,23 @@ def _read_git_revision():
 
 
 def version_string() -> str:
-    """`__version__`, annotated with the checkout's git commit/branch when
-    available, so a stale editable install is obvious."""
+    """`__version__`, annotated with the checkout's git commit/branch — but ONLY
+    when the RUNNING code actually lives in that checkout.
+
+    A copied install whose venv sits INSIDE the repo (site-packages under
+    <repo>/.venv/...) walks up to <repo>/.git and used to wear the repo's sha as
+    if it were its own. Field: six fixes 'confirmed current' by --version while
+    a frozen snapshot predating all of them did the work. A frozen copy now says
+    so, loudly, with the remedy."""
+    here = os.path.abspath(os.path.dirname(__file__))
+    frozen = "site-packages" in here.split(os.sep) or "dist-packages" in here.split(os.sep)
     sha, branch = _read_git_revision()
+    if frozen:
+        if sha:
+            at = f"git {sha}{', ' + branch if branch else ''}"
+            return (f"{__version__} (INSTALLED COPY — not tracking the checkout at {at}; "
+                    f"`pip install -e ./boxy` to run the checkout)")
+        return f"{__version__} (installed copy)"
     if sha and branch:
         return f"{__version__} (git {sha}, {branch})"
     if sha:
