@@ -33,9 +33,17 @@ reasoning_parser = "kimi_k3"
 tool_call_parser = "kimi_k3"
 enable_auto_tool_choice = true
 [model.env.rocm]
-# The AITER path is what the Kimi MI325X (gfx942) recipes run; MI325X shares
-# that ISA.
-VLLM_ROCM_USE_AITER = "1"
+# AITER OFF by default — vLLM falls back to TRITON_MLA, which runs on every
+# CDNA part. FIELD (8x MI300A nodes, two full allocations burned): with
+# AITER=1 the MLA backend picks its decode kernel by heads-per-rank, and on
+# Kimi-K3 (96 heads) BOTH choices lose on gfx942 — TP4 gives 24 heads
+# ('requires 1-15 for Gluon or a multiple of 16 for persistent'), and TP8
+# gives 12, which selects the Gluon kernel... that asserts 'mla_gluon
+# requires gfx950 (CDNA4), got gfx942' AFTER the full 87-minute weight load.
+# The AITER=1 advice came from the Kimi K2.x recipes, written for newer
+# silicon. On CDNA4 (MI350/MI355, gfx950) flip it back to "1" in a user card
+# for the faster kernels.
+VLLM_ROCM_USE_AITER = "0"
 [model.images]
 # The ROCm image is the one the recipe page itself names for K3
 # (vllm/vllm-openai-rocm — HYPHEN: the first cut of this card used an
