@@ -201,10 +201,7 @@ def _bytes_per_param(cfg: dict) -> tuple[float, str]:
 def _moe_info(cfg: dict) -> tuple[bool, int]:
     """(is_moe, num_experts)."""
     for key in ("num_local_experts", "num_experts", "n_routed_experts", "moe_num_experts"):
-        n = cfg.get(key)
-        # some configs nest this under text_config (multimodal wrappers)
-        if n is None and isinstance(cfg.get("text_config"), dict):
-            n = cfg["text_config"].get(key)
+        n = _cfg_get(cfg, key)   # text_config nesting handled there
         if isinstance(n, int) and n > 1:
             return True, n
     return False, 0
@@ -266,17 +263,85 @@ def size_model(repo: str, cfg: dict, index: dict | None, *, max_model_len: int |
         "bpp": bpp, "is_moe": is_moe, "experts": experts,
         "native_ctx": native_ctx, "max_model_len": cap, "capped": bool(native_ctx and native_ctx > cap),
         "gpu_class_gb": gpu_gb,
+        "kv_bytes_per_token": _kv_bytes_per_token(cfg) or 0,
     }
+
+
+def _cfg_get(cfg: dict, key: str):
+    """A config.json value, looking through the text_config nesting multimodal
+    wrappers use (the same fallback _moe_info and _native_context carried as
+    inline copies — this is the shared third)."""
+    v = cfg.get(key)
+    if v is None and isinstance(cfg.get("text_config"), dict):
+        v = cfg["text_config"].get(key)
+    return v
 
 
 def _native_context(cfg: dict) -> int:
     for key in ("max_position_embeddings", "max_sequence_length", "max_seq_len", "n_positions"):
-        v = cfg.get(key)
-        if v is None and isinstance(cfg.get("text_config"), dict):
-            v = cfg["text_config"].get(key)
+        v = _cfg_get(cfg, key)
         if isinstance(v, int) and v > 0:
             return v
     return 0
+
+
+def _full_attn_layers(cfg: dict) -> int | None:
+    """How many layers actually cache per-token KV. Dense transformers: all of
+    them. Hybrids (linear/Mamba/KDA + a minority of full-attention layers)
+    declare a schedule; count only the KV-caching layers. Sliding-window layers
+    are counted as FULL — they cache less, so this only under-derives context,
+    never over. An unknown schedule returns None: a wrong guess here OOMs a
+    serve, a declined estimate only keeps the static cap."""
+    n = _cfg_get(cfg, "num_hidden_layers")
+    if not isinstance(n, int) or n <= 0:
+        return None
+    layer_types = _cfg_get(cfg, "layer_types")
+    if isinstance(layer_types, list) and layer_types:
+        full = sum(1 for t in layer_types
+                   if str(t) in ("full_attention", "attention", "sliding_attention"))
+        return full or None
+    interval = _cfg_get(cfg, "full_attention_interval")
+    if isinstance(interval, int) and interval > 0:
+        return math.ceil(n / interval)
+    pattern = _cfg_get(cfg, "hybrid_override_pattern")   # Nemotron-H style: 'M*M...'
+    if isinstance(pattern, str) and pattern:
+        return pattern.count("*") or None
+    if _cfg_get(cfg, "linear_attn_config") is not None:
+        # a linear-attention hybrid whose schedule we can't read — refuse
+        # rather than price every layer as a KV layer (the whole point of
+        # these architectures is that most layers are NOT)
+        return None
+    return n
+
+
+def _kv_bytes_per_token(cfg: dict) -> float | None:
+    """Whole-model KV-cache bytes for ONE token at bf16 (2 bytes), or None when
+    the architecture can't be read. MLA (kv_lora_rank present — DeepSeek/Kimi
+    family) caches one compressed (kv_lora_rank + qk_rope_head_dim) vector per
+    layer; GQA/MHA cache 2 x num_key_value_heads x head_dim. The KV dtype is
+    bf16 regardless of WEIGHT quantization (an MXFP4 checkpoint still runs its
+    cache in bf16 unless --kv-cache-dtype says otherwise — the serve-time
+    derivation applies that factor, not this estimate)."""
+    layers = _full_attn_layers(cfg)
+    if not layers:
+        return None
+    rank = _cfg_get(cfg, "kv_lora_rank")
+    if isinstance(rank, int) and rank > 0:
+        rope = _cfg_get(cfg, "qk_rope_head_dim")
+        if not isinstance(rope, int) or rope <= 0:
+            return None
+        return float((rank + rope) * 2 * layers)
+    kvh = _cfg_get(cfg, "num_key_value_heads") or _cfg_get(cfg, "num_attention_heads")
+    if not isinstance(kvh, int) or kvh <= 0:
+        return None
+    head_dim = _cfg_get(cfg, "head_dim")
+    if not isinstance(head_dim, int) or head_dim <= 0:
+        hidden, heads = _cfg_get(cfg, "hidden_size"), _cfg_get(cfg, "num_attention_heads")
+        if isinstance(hidden, int) and isinstance(heads, int) and heads > 0:
+            head_dim = hidden // heads
+        else:
+            return None
+    return float(2 * kvh * head_dim * 2 * layers)
 
 
 # ---- render + validate --------------------------------------------------------------
@@ -329,6 +394,12 @@ def render_card(repo: str, engine: str, sizing: dict, *,
              f"gpus = {b['gpus']}"]
     if b["min_vram_gb"]:
         lines.append(f"min_vram_gb = {b['min_vram_gb']}")
+    if b.get("native_ctx"):
+        lines.append(f"native_ctx = {b['native_ctx']}")
+    if b.get("kv_bytes_per_token"):
+        lines.append("# whole-model KV-cache bytes per token at bf16, estimated from config.json;")
+        lines.append("# serve derives the largest --max-model-len that provably fits from it.")
+        lines.append(f"kv_bytes_per_token = {int(b['kv_bytes_per_token'])}")
     lines.append("[model.args]")
     if trust_remote_code:
         lines.append("# the repo ships custom modeling code (config auto_map); vLLM refuses to")
