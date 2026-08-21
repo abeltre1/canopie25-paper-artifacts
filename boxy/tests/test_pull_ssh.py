@@ -4,12 +4,16 @@ Field (Kimi-K3, 1.56TB in 96 shards): the pull went to the transport store under
 a 301GB $HOME at 93% — died at shard 2 on quota, silently — and the ssh session
 was a single point of failure for an 8-hour download. The user's own words:
 "remember we are supposed to have a simple command that abstracts all resources."
-These tests pin the three hazards behind the one command:
+These tests pin the hazards behind the one command:
 
   * the model lands in the shared-FS store the agentless SERVE reads (never $HOME),
   * a download the filesystem cannot hold is refused BEFORE it starts,
   * the download runs detached (setsid) and re-running the command is a
-    progress report / resume, not a restart.
+    progress report / resume, not a restart,
+  * and — after SIX rounds of in-container CERTIFICATE_VERIFY_FAILED — the
+    download is plain curl ON THE LOGIN NODE: the same binary, trust store, and
+    network path as the egress probe that verifies. No container, no Python TLS
+    stack, no certifi anywhere in the download.
 """
 
 import argparse
@@ -19,6 +23,7 @@ from boxy import cli
 TARGET = "user@clusterb"
 STORE = "/scratch/u/boxy"
 STAGE = f"{STORE}/models/moonshotai-kimi-k3"
+SCRIPT = "/home/u/.local/share/boxy/agentless/clusterb/pull-moonshotai-kimi-k3.sh"
 
 
 def _args(**kw):
@@ -30,8 +35,10 @@ def _args(**kw):
 
 def _wire(monkeypatch, *, state="STATE=IDLE\nGOT=\nSHARDS=0", df_kb="5000000000",
           size=(1560.0, 96)):
-    """Fake the cluster: ssh replies keyed on a command fragment; records calls."""
+    """Fake the cluster: ssh replies keyed on a command fragment; records the
+    commands in `calls` and any pushed file in `pushed` (path -> content)."""
     calls = []
+    pushed = {}
 
     def fake_capture(target, cmd, timeout=20):
         calls.append(cmd)
@@ -43,35 +50,88 @@ def _wire(monkeypatch, *, state="STATE=IDLE\nGOT=\nSHARDS=0", df_kb="5000000000"
             return 0, f"{df_kb}\n"
         if "setsid" in cmd:
             return 0, "12345\n"
-        if cmd.startswith("for f in /etc/pki"):        # host trust-bundle detect
-            return 0, "/etc/pki/tls/certs/ca-bundle.crt\n"
         return 0, ""
 
     monkeypatch.setattr("boxy.remote.ensure_master", lambda t: 0)
     monkeypatch.setattr("boxy.remote.ssh_capture", fake_capture)
     monkeypatch.setattr("boxy.remote.remote_proxy_env", lambda: {})
+    monkeypatch.setattr("boxy.remote.push_file",
+                        lambda t, p, data: pushed.update({p: data}) or 0)
     monkeypatch.setattr(cli, "_remote_model_store", lambda *a, **k: STORE)
     monkeypatch.setattr(cli, "_stage_agentless_ca", lambda *a, **k: None)
     monkeypatch.setattr(cli, "_hf_size_probe", lambda repo: size)
     monkeypatch.setattr(cli, "_system_card_accel", lambda host: "rocm")
-    return calls
+    return calls, pushed
 
 
 def test_fresh_pull_launches_detached_into_the_serve_store(monkeypatch, capsys):
-    calls = _wire(monkeypatch)
+    calls, pushed = _wire(monkeypatch)
     assert cli._pull_agentless_ssh(_args(), TARGET) == 0
     out = capsys.readouterr().out
     # the announced destination is the SERVE's stage dir, not the $HOME transport store
     assert STAGE in out and "pull started on clusterb (pid 12345)" in out
     assert "laptop may sleep or disconnect" in out
-    # size was announced from the exact index, and the same command is the status command
     assert "~1560GB in 96 weight shards" in out
     assert "boxy pull hf://moonshotai/Kimi-K3 --ssh user@clusterb" in out
     launch = next(c for c in calls if "setsid" in c)
-    # detached + resumable + completion marker + in-container download
-    for frag in ("setsid", "nohup", "snapshot_download", ".boxy-pull-complete", STAGE):
+    # detached, log rotated per attempt, script mode-tightened, marker read by the probe
+    for frag in ("setsid", "nohup", SCRIPT, ".prev", "chmod 600"):
         assert frag in launch, frag
-    assert "rm -rf" not in launch                      # no --force -> no clean restart
+    script = pushed[SCRIPT]
+    # the script IS the download: host curl, resume via .part, skip patterns, marker
+    for frag in ("curl -sfL", "resolve/main", "-C -", '.part"', ".boxy-pull-complete",
+                 "original/*", STAGE):
+        assert frag in script, frag
+    assert "podman pull" in script and "|| true" in script     # image warmed, never fatal
+    assert "python" not in script.lower(), "no Python TLS stack anywhere in the download"
+    assert "rm -rf" not in script                              # no --force -> no clean restart
+
+
+def test_direct_egress_downloads_with_plain_host_curl(monkeypatch, capsys):
+    """FIELD (the whole CERTIFICATE_VERIFY_FAILED saga): the login node's own
+    curl verified HF every single time while every in-container Python attempt
+    failed. On a verified-direct cluster the script must carry NO proxy and NO
+    --cacert — it runs exactly the configuration the probe just proved."""
+    calls, pushed = _wire(monkeypatch)
+    monkeypatch.setattr("boxy.remote.remote_proxy_env",
+                        lambda: {"https_proxy": "http://laptop-proxy:80"})
+    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
+    assert "login node's own curl" in capsys.readouterr().out
+    script = pushed[SCRIPT]
+    assert " -x " not in script, "direct egress must not inherit the laptop proxy"
+    assert "--cacert" not in script, "the probe verified with default trust; add nothing"
+
+
+def test_blocked_egress_gives_curl_the_proxy_and_staged_ca(monkeypatch, capsys):
+    # the OTHER kind of site: direct probe fails -> curl goes through the proxy
+    # with the staged merged CA, still on the host, still resumable
+    calls, pushed = _wire(monkeypatch)
+    monkeypatch.setattr("boxy.remote.remote_proxy_env",
+                        lambda: {"https_proxy": "http://site-proxy:80"})
+    monkeypatch.setattr(cli, "_stage_agentless_ca", lambda *a, **k: "/rdir/boxy-ca-merged.pem")
+    orig = __import__("boxy.remote", fromlist=["ssh_capture"]).ssh_capture
+
+    def blocked_probe(target, cmd, timeout=20):
+        if cmd.startswith("curl -sIf https://huggingface.co"):
+            return 6, ""
+        return orig(target, cmd, timeout)
+
+    monkeypatch.setattr("boxy.remote.ssh_capture", blocked_probe)
+    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
+    assert "direct HF probe failed" in capsys.readouterr().out
+    script = pushed[SCRIPT]
+    assert "-x http://site-proxy:80" in script
+    assert "--cacert /rdir/boxy-ca-merged.pem" in script
+
+
+def test_hf_token_rides_as_an_auth_header_not_in_the_url(monkeypatch):
+    calls, pushed = _wire(monkeypatch)
+    monkeypatch.setenv("HF_TOKEN", "hf_secret_token")
+    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
+    script = pushed[SCRIPT]
+    assert "Authorization: Bearer $HF_TOKEN" in script and "hf_secret_token" in script
+    launch = next(c for c in calls if "setsid" in c)
+    assert "chmod 600" in launch, "the script carries the token; tighten it before running"
 
 
 def test_launch_backgrounds_a_single_redirected_command(monkeypatch):
@@ -80,8 +140,8 @@ def test_launch_backgrounds_a_single_redirected_command(monkeypatch):
     WAITS on the 8-hour download with the ssh session's stdout/stderr still
     open. ssh never returned; ssh_capture killed it at 30s (rc=124, no output);
     nothing was diagnosed. The backgrounded job must be a single command with
-    all three fds redirected, and mkdir must run in the foreground before it."""
-    calls = _wire(monkeypatch)
+    all three fds redirected, and everything else must run in the foreground."""
+    calls, _pushed = _wire(monkeypatch)
     assert cli._pull_agentless_ssh(_args(), TARGET) == 0
     launch = next(c for c in calls if "setsid" in c)
     assert "&& setsid" not in launch, "and-list backgrounding holds the ssh channel open"
@@ -94,8 +154,7 @@ def test_launch_backgrounds_a_single_redirected_command(monkeypatch):
 def test_launch_timeout_is_diagnosed_not_swallowed(monkeypatch, capsys):
     # rc=124 with empty output used to print a blank error. It now says what
     # happened and that a re-run will find the download if it did start.
-    calls = _wire(monkeypatch)
-
+    calls, _pushed = _wire(monkeypatch)
     orig = __import__("boxy.remote", fromlist=["ssh_capture"]).ssh_capture
 
     def timeout_on_launch(target, cmd, timeout=20):
@@ -110,121 +169,12 @@ def test_launch_timeout_is_diagnosed_not_swallowed(monkeypatch, capsys):
     assert "re-run this command to check" in err and "(no output)" in err
 
 
-def test_too_small_filesystem_is_refused_before_a_byte_moves(monkeypatch, capsys):
-    # 100GB free vs a 1560GB model: the exact Kimi-on-$HOME failure, now refused
-    # up front with the fix named — instead of dying at shard 2.
-    calls = _wire(monkeypatch, df_kb="100000000")
-    assert cli._pull_agentless_ssh(_args(), TARGET) == 1
-    err = capsys.readouterr().err
-    assert "refusing to start" in err and "1560" in err and "BOXY_MODEL_DIR" in err
-    assert not any("setsid" in c for c in calls)       # nothing was launched
-
-
-def test_unknown_size_never_blocks(monkeypatch, capsys):
-    # egress-filtered laptop: the Hub is unreachable, size unknown -> pull proceeds
-    calls = _wire(monkeypatch, size=(0.0, 0), df_kb="100000000")
-    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
-    assert any("setsid" in c for c in calls)
-
-
-def test_rerun_while_running_reports_progress_not_a_second_download(monkeypatch, capsys):
-    calls = _wire(monkeypatch, state="STATE=RUNNING\nGOT=800G\nSHARDS=50")
-    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
-    out = capsys.readouterr().out
-    assert "pull RUNNING on clusterb: 800G of ~1560GB, 50/96 shards" in out
-    assert not any("setsid" in c for c in calls)       # a rerun must NOT double-download
-
-
-def test_rerun_after_interruption_resumes(monkeypatch, capsys):
-    # 1 shard landed, then the session died (the field case): the rerun relaunches
-    # and says it is resuming — complete shards are kept, not re-fetched.
-    calls = _wire(monkeypatch, state="STATE=IDLE\nGOT=16G\nSHARDS=1")
-    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
-    out = capsys.readouterr().out
-    assert "RESUMING" in out
-    assert any("setsid" in c for c in calls)
-    assert "rm -rf" not in next(c for c in calls if "setsid" in c)
-
-
-def test_done_reports_the_staged_path_and_the_serve_line(monkeypatch, capsys):
-    calls = _wire(monkeypatch, state="STATE=DONE\nGOT=1560G\nSHARDS=96")
-    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
-    out = capsys.readouterr().out
-    assert f"model staged at: clusterb:{STAGE} (96/96 shards, 1560G)" in out
-    assert "serve it:  boxy serve hf://moonshotai/Kimi-K3 --ssh user@clusterb" in out
-    assert not any("setsid" in c for c in calls)
-
-
-def test_force_restarts_clean_even_when_done(monkeypatch):
-    calls = _wire(monkeypatch, state="STATE=DONE\nGOT=1560G\nSHARDS=96")
-    assert cli._pull_agentless_ssh(_args(force=True), TARGET) == 0
-    launch = next(c for c in calls if "setsid" in c)
-    assert "rm -rf" in launch and STAGE in launch
-
-
-def test_dryrun_plans_but_never_launches(monkeypatch, capsys):
-    calls = _wire(monkeypatch)
-    assert cli._pull_agentless_ssh(_args(dryrun=True), TARGET) == 0
-    assert "would launch on clusterb (detached" in capsys.readouterr().out
-    assert not any("setsid" in c for c in calls)
-
-
-def test_explicit_image_wins(monkeypatch):
-    calls = _wire(monkeypatch)
-    assert cli._pull_agentless_ssh(_args(image="quay.io/my/vllm:x"), TARGET) == 0
-    launch = next(c for c in calls if "setsid" in c)
-    assert "quay.io/my/vllm:x" in launch
-
-
-def test_direct_egress_uses_the_nodes_own_trust_not_the_laptops(monkeypatch, capsys):
-    """FIELD (the Kimi-K3 CA saga, both halves): the cluster reached HF
-    DIRECTLY (direct: 200, issuer Amazon — no interception), so no laptop
-    proxy may be injected. But the image's certifi still refused the same
-    chain ('unable to get local issuer certificate' — the OS ca-trust carries
-    the intermediate, certifi only roots), so the container must be given the
-    NODE's own bundle — the exact trust the probe verified with."""
-    calls = _wire(monkeypatch)
-    monkeypatch.setattr("boxy.remote.remote_proxy_env",
-                        lambda: {"https_proxy": "http://laptop-proxy:80"})
-    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
-    out = capsys.readouterr().out
-    assert "verifies directly" in out and "node's own /etc/pki/tls/certs/ca-bundle.crt" in out
-    launch = next(c for c in calls if "setsid" in c)
-    assert "laptop-proxy" not in launch, "direct egress must not inherit the laptop proxy"
-    # the mounted trust is the HOST's bundle, not a staged laptop file
-    assert "-v /etc/pki/tls/certs/ca-bundle.crt:" in launch
-    assert "REQUESTS_CA_BUNDLE" in launch                  # requests honors this, not SSL_CERT_FILE
-    assert "agentless/clusterb/boxy-ca-merged.pem" not in launch, \
-        "no laptop bundle staged on the direct path"
-
-
-def test_blocked_egress_forwards_proxy_and_stages_ca(monkeypatch, capsys):
-    # the OTHER kind of site: direct probe fails -> proxy env + staged CA, as before
-    calls = _wire(monkeypatch)
-    monkeypatch.setattr("boxy.remote.remote_proxy_env",
-                        lambda: {"https_proxy": "http://site-proxy:80"})
-    monkeypatch.setattr(cli, "_stage_agentless_ca", lambda *a, **k: "/rdir/boxy-ca-merged.pem")
-    orig = __import__("boxy.remote", fromlist=["ssh_capture"]).ssh_capture
-
-    def blocked_probe(target, cmd, timeout=20):
-        if cmd.startswith("curl -sIf https://huggingface.co"):
-            return 6, ""
-        return orig(target, cmd, timeout)
-
-    monkeypatch.setattr("boxy.remote.ssh_capture", blocked_probe)
-    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
-    assert "direct HF probe failed" in capsys.readouterr().out
-    launch = next(c for c in calls if "setsid" in c)
-    assert "https_proxy=http://site-proxy:80" in launch
-    assert "boxy-ca-merged.pem" in launch and "REQUESTS_CA_BUNDLE" in launch
-
-
 def test_stopped_attempt_surfaces_its_log_before_resuming(monkeypatch, capsys):
     """FIELD: the same old traceback was read three times as three new failures
     — an appended log never says which attempt it belongs to. On IDLE-with-log,
     boxy prints WHY the last attempt stopped, then resumes; and every launch
     rotates the log so one file never mixes two attempts."""
-    calls = _wire(monkeypatch, state="STATE=IDLE\nGOT=16G\nSHARDS=1")
+    calls, _pushed = _wire(monkeypatch, state="STATE=IDLE\nGOT=16G\nSHARDS=1")
     orig = __import__("boxy.remote", fromlist=["ssh_capture"]).ssh_capture
 
     def with_tail(target, cmd, timeout=20):
@@ -243,11 +193,10 @@ def test_stopped_attempt_surfaces_its_log_before_resuming(monkeypatch, capsys):
 
 
 def test_stage_agentless_ca_builds_the_merged_bundle_itself(monkeypatch, tmp_path):
-    """FIELD (first Kimi-K3 pull): image pulled fine, model download died with
-    CERTIFICATE_VERIFY_FAILED — the site CA never reached the container. The
-    old precondition wanted SSL_CERT_FILE to ALREADY be boxy's merged bundle,
-    but the merge is process-local, so a fresh invocation never arrives
-    pre-merged and the CA silently stayed home. Staging must merge first."""
+    """FIELD: the site CA never reached the download. The old precondition
+    wanted SSL_CERT_FILE to ALREADY be boxy's merged bundle, but the merge is
+    process-local, so a fresh invocation never arrives pre-merged and the CA
+    silently stayed home. Staging must merge first."""
     import os
 
     site_ca = tmp_path / "site-ca.crt"
@@ -267,7 +216,8 @@ def test_stage_agentless_ca_builds_the_merged_bundle_itself(monkeypatch, tmp_pat
                         lambda t, p, data: pushed.update(path=p, data=data) or 0)
     appended = []
     monkeypatch.setattr("boxy.remote.ssh_capture",
-                        lambda t, cmd, timeout=20: (appended.append(cmd), (0, "/etc/pki/tls/certs/ca-bundle.crt"))[1])
+                        lambda t, cmd, timeout=20: (appended.append(cmd),
+                                                    (0, "/etc/pki/tls/certs/ca-bundle.crt"))[1])
     out = cli._stage_agentless_ca("user@c", "c", "/home/u/agentless/c")
     assert out == "/home/u/agentless/c/boxy-ca-merged.pem"
     assert pushed["data"] == "MERGED"                 # the MERGED bundle, not the bare site CA
@@ -279,12 +229,74 @@ def test_stage_agentless_ca_builds_the_merged_bundle_itself(monkeypatch, tmp_pat
 
 
 def test_stage_agentless_ca_still_noop_when_no_bundle_can_be_built(monkeypatch, tmp_path):
-    # BOXY_NO_CA_MERGE (or no certifi): ensure_trust_bundle yields nothing ->
-    # stage stays a no-op instead of pushing a bare/unusable file.
     monkeypatch.delenv("BOXY_NO_CA_PROPAGATE", raising=False)
     monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "site.crt"))
     monkeypatch.setattr(cli.ramalama_shim, "ensure_trust_bundle", lambda: None)
     assert cli._stage_agentless_ca("user@c", "c", "/x") is None
+
+
+def test_too_small_filesystem_is_refused_before_a_byte_moves(monkeypatch, capsys):
+    # 100GB free vs a 1560GB model: the exact Kimi-on-$HOME failure, now refused
+    # up front with the fix named — instead of dying at shard 2.
+    calls, pushed = _wire(monkeypatch, df_kb="100000000")
+    assert cli._pull_agentless_ssh(_args(), TARGET) == 1
+    err = capsys.readouterr().err
+    assert "refusing to start" in err and "1560" in err and "BOXY_MODEL_DIR" in err
+    assert not any("setsid" in c for c in calls) and not pushed
+
+
+def test_unknown_size_never_blocks(monkeypatch, capsys):
+    # egress-filtered laptop: the Hub is unreachable, size unknown -> pull proceeds
+    calls, _pushed = _wire(monkeypatch, size=(0.0, 0), df_kb="100000000")
+    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
+    assert any("setsid" in c for c in calls)
+
+
+def test_rerun_while_running_reports_progress_not_a_second_download(monkeypatch, capsys):
+    calls, pushed = _wire(monkeypatch, state="STATE=RUNNING\nGOT=800G\nSHARDS=50")
+    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
+    out = capsys.readouterr().out
+    assert "pull RUNNING on clusterb: 800G of ~1560GB, 50/96 shards" in out
+    assert not any("setsid" in c for c in calls) and not pushed
+
+
+def test_rerun_after_interruption_resumes(monkeypatch, capsys):
+    # 1 shard landed, then the session died (the field case): the rerun relaunches
+    # and says it is resuming — complete shards are kept, not re-fetched.
+    calls, pushed = _wire(monkeypatch, state="STATE=IDLE\nGOT=16G\nSHARDS=1")
+    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
+    assert "RESUMING" in capsys.readouterr().out
+    assert any("setsid" in c for c in calls)
+    assert "rm -rf" not in pushed[SCRIPT]             # resume never wipes the stage
+
+
+def test_done_reports_the_staged_path_and_the_serve_line(monkeypatch, capsys):
+    calls, pushed = _wire(monkeypatch, state="STATE=DONE\nGOT=1560G\nSHARDS=96")
+    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
+    out = capsys.readouterr().out
+    assert f"model staged at: clusterb:{STAGE} (96/96 shards, 1560G)" in out
+    assert "serve it:  boxy serve hf://moonshotai/Kimi-K3 --ssh user@clusterb" in out
+    assert not any("setsid" in c for c in calls) and not pushed
+
+
+def test_force_restarts_clean_even_when_done(monkeypatch):
+    calls, pushed = _wire(monkeypatch, state="STATE=DONE\nGOT=1560G\nSHARDS=96")
+    assert cli._pull_agentless_ssh(_args(force=True), TARGET) == 0
+    assert any("setsid" in c for c in calls)
+    assert 'rm -rf "$STAGE"' in pushed[SCRIPT]        # --force wipes, then re-pulls
+
+
+def test_dryrun_plans_but_never_launches_or_pushes(monkeypatch, capsys):
+    calls, pushed = _wire(monkeypatch)
+    assert cli._pull_agentless_ssh(_args(dryrun=True), TARGET) == 0
+    assert "would launch on clusterb (detached" in capsys.readouterr().out
+    assert not any("setsid" in c for c in calls) and not pushed
+
+
+def test_explicit_image_wins(monkeypatch):
+    calls, pushed = _wire(monkeypatch)
+    assert cli._pull_agentless_ssh(_args(image="quay.io/my/vllm:x"), TARGET) == 0
+    assert "podman pull quay.io/my/vllm:x" in pushed[SCRIPT]
 
 
 def test_local_pull_refuses_a_store_that_cannot_hold_the_model(monkeypatch, capsys):
