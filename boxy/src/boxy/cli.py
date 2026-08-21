@@ -2645,7 +2645,7 @@ def _prestage_agentless_model(args, target: str, host: str, box, image: str,
     (safetensors) is auto-staged this way; a GGUF/llama.cpp repo is left to the
     engine (its image may lack python). The image pull alone still runs so a
     networked compute node reuses $HOME's podman store with no re-download."""
-    from boxy import deploy, remote
+    from boxy import remote
 
     repo = box.model  # already the bare repo id (scheme stripped by the caller)
     # 1) pull the image on the login node over the forwarded proxy (reused by every
@@ -2662,29 +2662,7 @@ def _prestage_agentless_model(args, target: str, host: str, box, image: str,
               "pre-pulled); pass a shared-FS GGUF path for a fully offline node.")
         return None
     stage_dir = f"{store_dir}/models/{_model_slug(repo)}"
-    hf_tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
-    # proxy vars for INSIDE the download container (the pull reaches HF via the proxy)
-    penv = remote.remote_proxy_env()
-    run = ["podman", "run", "--rm", "--network", "host", "-v", f"{stage_dir}:/stage"]
-    cenv = {"HF_HUB_ENABLE_HF_TRANSFER": "0"}
-    if hf_tok:
-        cenv["HF_TOKEN"] = hf_tok
-        cenv["HUGGING_FACE_HUB_TOKEN"] = hf_tok
-    if ca_remote:
-        run += ["-v", f"{ca_remote}:{deploy.CA_CONTAINER_PATH}:ro"]
-        for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
-            cenv[var] = deploy.CA_CONTAINER_PATH
-    cenv.update(penv)
-    for k, v in cenv.items():
-        run += ["-e", f"{k}={v}"]
-    # skip the redundant PyTorch 'original/' checkpoint (Llama ships both) and any
-    # GGUF — vLLM serves the safetensors; this halves the download.
-    py = ("from huggingface_hub import snapshot_download; "
-          "snapshot_download(repo_id=%r, local_dir='/stage', "
-          "ignore_patterns=['original/*','*.pth','consolidated*','*.gguf'])"
-          % repo)
-    run += ["--entrypoint", "python3", image, "-c", py]
-    dl = pfx + shlex.join(run)
+    dl = pfx + shlex.join(_hf_download_argv(repo, stage_dir, image, ca_remote))
     print(f"  auto: prestage: downloading {repo} on {host} -> {stage_dir} "
           "(in-container huggingface_hub; may take several minutes) ...")
     rc, out = remote.ssh_capture(target, f"mkdir -p {shlex.quote(stage_dir)} && {dl}", timeout=7200)
@@ -2702,6 +2680,193 @@ def _prestage_agentless_model(args, target: str, host: str, box, image: str,
 def _model_slug(repo: str) -> str:
     """Filesystem-safe slug for a HF repo id (org/name -> org-name)."""
     return repo.strip().strip("/").replace("/", "-").replace(":", "-").lower()
+
+
+def _hf_download_argv(repo: str, stage_dir: str, image: str, ca_remote: str | None) -> list[str]:
+    """The in-container huggingface_hub download — the ONE way boxy lands an
+    hf:// safetensors model on a cluster's shared FS (used by the serve prestage
+    AND `boxy pull --ssh`, so the two can never disagree on layout). Runs inside
+    `image` (every vLLM image ships huggingface_hub — nothing is installed on
+    the cluster) and RESUMES: files already complete in stage_dir are skipped."""
+    from boxy import deploy, remote
+
+    hf_tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+    run = ["podman", "run", "--rm", "--network", "host", "-v", f"{stage_dir}:/stage"]
+    cenv = {"HF_HUB_ENABLE_HF_TRANSFER": "0"}
+    if hf_tok:
+        cenv["HF_TOKEN"] = hf_tok
+        cenv["HUGGING_FACE_HUB_TOKEN"] = hf_tok
+    if ca_remote:
+        run += ["-v", f"{ca_remote}:{deploy.CA_CONTAINER_PATH}:ro"]
+        for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+            cenv[var] = deploy.CA_CONTAINER_PATH
+    # proxy vars for INSIDE the download container (the pull reaches HF via the proxy)
+    cenv.update(remote.remote_proxy_env())
+    for k, v in cenv.items():
+        run += ["-e", f"{k}={v}"]
+    # skip the redundant PyTorch 'original/' checkpoint (Llama ships both) and any
+    # GGUF — vLLM serves the safetensors; this halves the download.
+    py = ("from huggingface_hub import snapshot_download; "
+          "snapshot_download(repo_id=%r, local_dir='/stage', "
+          "ignore_patterns=['original/*','*.pth','consolidated*','*.gguf'])"
+          % repo)
+    run += ["--entrypoint", "python3", image, "-c", py]
+    return run
+
+
+def _hf_size_probe(repo: str) -> tuple[float, int]:
+    """(size_gb, weight_shards) for an HF repo — EXACT bytes from the model's own
+    safetensors index, fetched laptop-side. Best-effort: (0, 0) when the Hub is
+    unreachable (an egress-filtered laptop must not lose the ability to pull) —
+    callers treat 0 as 'unknown', never as 'fits'."""
+    try:
+        from boxy import cardgen
+
+        data = cardgen.fetch_model(repo, cardgen.resolve_token())
+        idx = data.get("index") or {}
+        total = int((idx.get("metadata") or {}).get("total_size") or 0)
+        shards = len(set((idx.get("weight_map") or {}).values()))
+        return total / 1e9, shards
+    except Exception:  # noqa: BLE001 — a size probe must never block a pull
+        return 0.0, 0
+
+
+def _system_card_accel(cluster: str) -> str:
+    """The accelerator this cluster's system card declares ('' when unknown) —
+    the same source serve uses, so `pull --ssh` picks the SAME image the serve
+    will run (the download image doubles as the pre-pulled serving image)."""
+    from boxy import cards
+    from boxy.location import Location
+
+    try:
+        shape = cards.system_shape(cluster)
+        if not shape:
+            return ""
+        return (Location.from_toml(cards.system_card_path(shape[2])).accelerator or "").lower()
+    except Exception:  # noqa: BLE001 — image choice degrades, never crashes
+        return ""
+
+
+def _free_space_gb(target: str, path: str) -> float:
+    """GB free on the filesystem holding `path` on the cluster (0 = unknown)."""
+    from boxy import remote
+
+    rc, out = remote.ssh_capture(
+        target, f"df -Pk {shlex.quote(path)} 2>/dev/null | awk 'NR==2{{print $4}}'", timeout=20)
+    val = out.strip().splitlines()[-1].strip() if rc == 0 and out.strip() else ""
+    return int(val) / 1e6 if val.isdigit() else 0.0
+
+
+def _pull_agentless_ssh(args, target: str) -> int:
+    """`boxy pull hf://ORG/REPO --ssh HOST`: ONE command that abstracts the
+    resources — agentless, like serve. It
+
+      * stages into the big shared-FS model store (the SAME `<store>/models/<slug>`
+        the agentless serve reads — never the $HOME transport store),
+      * refuses to start a download the filesystem cannot hold (exact bytes from
+        the safetensors index vs `df` on the store),
+      * runs DETACHED on the login node (setsid), so the laptop may disconnect
+        and the download continues,
+      * makes re-running the SAME command a progress report — and, after an
+        interruption, an automatic resume (complete files are skipped).
+        `--force` restarts clean.
+
+    Field (Kimi-K3, 1.56TB in 96 shards): the pull went to the transport store
+    under a 301GB $HOME at 93%% — died at shard 2 on quota, silently, and the ssh
+    session was a single point of failure for an 8-hour download. Three hazards,
+    one command; all three now live behind it."""
+    from boxy import cards, remote
+
+    repo = cards.model_key(args.model)
+    if remote.ensure_master(target) != 0:
+        print(f"boxy: cannot reach {target}", file=sys.stderr)
+        return 1
+    host = target.split("@")[-1].split(".")[0]
+    rc, rhome = remote.ssh_capture(target, 'printf %s "$HOME"', timeout=15)
+    rhome = rhome.strip() if rc == 0 and rhome.strip() else f"/home/{target.split('@')[0]}"
+    rdir = f"{rhome}/{AGENTLESS_REMOTE_SUBDIR}/{host}"
+    store = _remote_model_store(target, host, rdir, dryrun=args.dryrun)
+    slug = _model_slug(repo)
+    stage = f"{store}/models/{slug}"
+    done = f"{stage}/.boxy-pull-complete"
+    log_remote = f"{rdir}/pull-{slug}.log"
+    pid_remote = f"{rdir}/pull-{slug}.pid"
+    q = shlex.quote
+
+    size_gb, shards = _hf_size_probe(repo)
+    if size_gb:
+        print(f"  auto: size: ~{size_gb:.0f}GB in {shards} weight shards (exact, from the safetensors index)")
+
+    # A prior launch? The SAME command doubles as the status command. RUNNING is
+    # pid-alive OR log-active-in-5min (multiple login nodes: the pid check only
+    # sees this node's processes; a fresh log says the download lives elsewhere).
+    probe = (f"if [ -e {q(done)} ]; then echo STATE=DONE; "
+             f"elif [ -s {q(pid_remote)} ] && kill -0 \"$(cat {q(pid_remote)})\" 2>/dev/null; "
+             f"then echo STATE=RUNNING; "
+             f"elif [ -n \"$(find {q(log_remote)} -mmin -5 2>/dev/null)\" ]; then echo STATE=RUNNING; "
+             f"else echo STATE=IDLE; fi; "
+             f"echo GOT=$(du -s -BG {q(stage)} 2>/dev/null | cut -f1); "
+             f"echo SHARDS=$(ls {q(stage)} 2>/dev/null | grep -c 'safetensors$')")
+    rc, out = remote.ssh_capture(target, probe, timeout=30)
+    kv = dict(ln.strip().split("=", 1) for ln in out.splitlines() if "=" in ln) if rc == 0 else {}
+    state = kv.get("STATE") or "IDLE"
+    got_gb = kv.get("GOT") or "0G"
+    got_shards = kv.get("SHARDS") or "0"
+    of_shards = f"/{shards}" if shards else ""
+    of_gb = f" of ~{size_gb:.0f}GB" if size_gb else ""
+
+    if state == "DONE" and not args.force:
+        print(f"model staged at: {host}:{stage} ({got_shards}{of_shards} shards, {got_gb})")
+        print(f"  serve it:  boxy serve {args.model} --ssh {target}")
+        return 0
+    if state == "RUNNING":
+        print(f"pull RUNNING on {host}: {got_gb}{of_gb}, {got_shards}{of_shards} shards so far")
+        print("  it survives this laptop disconnecting. Run the same command again for fresh progress,")
+        print(f"  or watch live:  ssh {target} tail -f {log_remote}")
+        return 0
+
+    # IDLE: fresh start, or an interrupted pull about to RESUME. Guard the disk first.
+    free_gb = _free_space_gb(target, store)
+    if size_gb and free_gb and free_gb < size_gb * 1.05:
+        print(f"boxy: refusing to start: {host}:{store} has {free_gb:.0f}GB free but {repo} "
+              f"needs ~{size_gb:.0f}GB (plus headroom). Point BOXY_MODEL_DIR at a bigger shared "
+              f"filesystem (or free space there) and re-run.", file=sys.stderr)
+        return 1
+
+    image = getattr(args, "image", None)
+    if not image:
+        card = cards.find_card(repo)
+        images = dict(card.images) if card and card.images else {}
+        accel = _system_card_accel(host)
+        image = (images.get(accel) or images.get("default", "")
+                 or (next(iter(images.values())) if len(images) == 1 else "")
+                 or ramalama_shim.default_image("vllm", accel or "none"))
+    print(f"  auto: image: {image} (runs the download; it is also pre-pulled for the serve — "
+          "--image to override)")
+
+    ca_remote = _stage_agentless_ca(target, host, rdir, dryrun=args.dryrun)
+    pfx = _proxy_prefix(args)
+    reset = f"rm -rf {q(stage)} && " if args.force else ""
+    inner = (f"{reset}mkdir -p {q(stage)} && {pfx}podman pull {q(image)} && "
+             f"{pfx}{shlex.join(_hf_download_argv(repo, stage, image, ca_remote))} && "
+             f"touch {q(done)}")
+    launch = (f"mkdir -p {q(rdir)} && setsid nohup sh -c {q(inner)} >> {q(log_remote)} 2>&1 "
+              f"< /dev/null & echo $! > {q(pid_remote)}; cat {q(pid_remote)}")
+    if args.dryrun:
+        print(f"### would launch on {host} (detached, survives disconnect): "
+              f"{redact.redact_command(inner)}")
+        return 0
+    rc, out = remote.ssh_capture(target, launch, timeout=30)
+    if rc != 0:
+        print(f"boxy: pull launch failed on {host}:\n{out.strip()[-600:]}", file=sys.stderr)
+        return 1
+    resumed = (" (RESUMING — complete shards are kept)"
+               if got_shards not in ("", "0") and not args.force else "")
+    print(f"pull started on {host} (pid {out.strip() or '?'}) -> {stage}{resumed}")
+    print("  detached on the login node — your laptop may sleep or disconnect; the download continues.")
+    print(f"  progress:  boxy pull {args.model} --ssh {target}     (the same command reports status)")
+    print(f"  log:       ssh {target} tail -f {log_remote}")
+    return 0
 
 
 # import name -> PyPI distribution name, for packages where they differ. The
@@ -4692,12 +4857,11 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_pull(args: argparse.Namespace) -> int:
     """Pre-stage a model (login-node flow: pull where the network is, serve
-    where the GPUs are — the store defaults to shared $HOME)."""
-    rc = _delegate_remote(args)
-    if rc is not None:
-        return rc
-    _apply_proxy_env(args)  # --proxy: reach HF through the corporate proxy
-    _apply_bind_host_env(args)  # --bind-host wins over env/file/default
+    where the GPUs are). An hf:// pull over --ssh goes AGENTLESS into the
+    shared-FS model store the serve reads (see _pull_agentless_ssh); other
+    transports over --ssh still delegate to the cluster's own boxy."""
+    from boxy import remote
+
     model = args.model
     if not model and args.box:
         box = Box.from_toml(args.box)
@@ -4705,16 +4869,58 @@ def cmd_pull(args: argparse.Namespace) -> int:
             print(f"box {box.name}: no model set", file=sys.stderr)
             return 1
         model = box.model
+        args.model = model
     if not model:
         raise UsageError("usage: boxy pull MODEL   (or: boxy pull --box box.toml)")
+    if model.startswith("hf://") and not os.environ.get(remote.ENV_ACTIVE):
+        target = remote.resolve_target(args)
+        if target:
+            _apply_proxy_env(args)
+            return _pull_agentless_ssh(args, target)
+    rc = _delegate_remote(args)
+    if rc is not None:
+        return rc
+    _apply_proxy_env(args)  # --proxy: reach HF through the corporate proxy
+    _apply_bind_host_env(args)  # --bind-host wins over env/file/default
     if model.startswith("s3://"):
         return cmd_stage(args)  # s3:// is staged, not RamaLama-pulled
     if not model.startswith(TRANSPORT_SCHEMES):
         print(f"model is a path ({model}); nothing to pull (shared-FS flow)")
         return 0
+    if model.startswith("hf://") and not args.dryrun:
+        # Guard the LOCAL transport store the same way the --ssh path guards the
+        # cluster store (field: a 1.56TB model into a 93%-full 301GB $HOME died
+        # at shard 2, silently). Best-effort: unknown size/space never blocks.
+        from boxy import cards
+
+        size_gb, _shards = _hf_size_probe(cards.model_key(model))
+        free_gb = _store_free_gb(ramalama_shim.DEFAULT_STORE)
+        if (size_gb and free_gb and free_gb < size_gb * 1.05
+                and not os.environ.get("BOXY_PULL_IGNORE_SPACE")):
+            print(f"boxy: refusing to pull: the store's filesystem has {free_gb:.0f}GB free but "
+                  f"{model} needs ~{size_gb:.0f}GB (plus headroom).\n"
+                  f"  store: {ramalama_shim.DEFAULT_STORE}\n"
+                  f"  fix:   export BOXY_STORE=/path/on/a/big/shared/fs   (or free space; "
+                  f"BOXY_PULL_IGNORE_SPACE=1 overrides)", file=sys.stderr)
+            return 1
     path = ramalama_shim.pull_model(model, dryrun=args.dryrun, force=getattr(args, "force", False))
     print(f"model available at: {path}")
     return 0
+
+
+def _store_free_gb(store: str) -> float:
+    """GB free on the filesystem that holds (or would hold) `store` — walks up to
+    the nearest existing ancestor so a not-yet-created store still answers."""
+    d = os.path.abspath(os.path.expanduser(store))
+    while not os.path.isdir(d):
+        parent = os.path.dirname(d)
+        if parent == d:
+            return 0.0
+        d = parent
+    try:
+        return shutil.disk_usage(d).free / 1e9
+    except OSError:
+        return 0.0
 
 
 def cmd_stage(args: argparse.Namespace) -> int:
@@ -7140,9 +7346,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("args", nargs=argparse.REMAINDER, help="arguments passed to the box entrypoint")
     p.set_defaults(func=cmd_run)
 
-    p = sub.add_parser("pull", help="pre-stage a model via RamaLama transports (pull on the login node)")
+    p = sub.add_parser("pull", help="pre-stage a model (with --ssh: detached on the cluster, "
+                                    "into the store the serve reads; rerun = progress)")
     p.add_argument("model", nargs="?", default=None,
-                   help="transport URI: hf://, ollama:// (pulled via RamaLama). oci://, docker:// "
+                   help="transport URI: hf://, ollama:// . With --ssh, an hf:// pull is AGENTLESS: "
+                        "sized first (refused if the store cannot hold it), downloaded detached on "
+                        "the login node (survives disconnects), resumed on re-run. oci://, docker:// "
                         "are recognized but their pull is not implemented yet (pull with "
                         "podman/docker, serve by path). Alternative: --box")
     p.add_argument("--box", default=None, help="pull the model named by a box TOML profile")
@@ -7152,7 +7361,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--proxy", default=None, metavar="URL",
                    help="reach Hugging Face through this corporate proxy (e.g. http://proxy.site:80)")
     p.add_argument("--ssh", default=None, metavar="USER@HOST",
-                   help="run the pull ON that cluster's login node over SSH (where the network is)")
+                   help="pull ON that cluster (agentless, detached): the model lands in the shared-FS "
+                        "store the serve reads, and the download outlives this session")
+    p.add_argument("--image", default=None,
+                   help="image that runs the hf:// download over --ssh (default: the model card's "
+                        "image for this cluster's accelerator — it doubles as the pre-pulled "
+                        "serving image)")
     p.add_argument("--dryrun", action="store_true")
     p.set_defaults(func=cmd_pull, location=None)
 
