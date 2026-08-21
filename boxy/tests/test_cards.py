@@ -872,3 +872,203 @@ def test_generate_card_suggests_a_command_that_works(tmp_path, monkeypatch, caps
     out = capsys.readouterr().out
     assert "boxy serve hf://org/Thing" in out
     assert "boxy serve org/Thing" not in out
+
+
+# ---- derived context window (max_model_len) ------------------------------------------
+#
+# FIELD (Kimi-K3): the 1M-native-window model shipped with a static 262144 cap
+# and was hand-served at --max-model-len 131072 — on hardware whose per-rank
+# arithmetic supports the full million. When a card knows its KV bytes/token
+# and the system card knows the node, the largest context that PROVABLY fits
+# is derived and the static cap replaced.
+
+CTX_CARD = (
+    '[model]\n'
+    'match = "acme/Ctx-Aware-24B*"\n'
+    'engine = "vllm"\n'
+    'min_vram_gb = 24\n'
+    'native_ctx = 1000000\n'
+    'kv_bytes_per_token = 131072\n'
+    '[model.args]\n'
+    'max_model_len = 8192\n'
+)
+
+
+def _ctx_card(tmp_path, monkeypatch, text=CTX_CARD):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    d = tmp_path / "boxy" / "cards" / "models"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "ctx-aware.toml").write_text(text)
+
+
+def test_parse_card_reads_native_ctx_and_kv_bytes(tmp_path, monkeypatch):
+    _ctx_card(tmp_path, monkeypatch)
+    card = cards.resolve_model_card("acme/Ctx-Aware-24B-Instruct")
+    assert card.native_ctx == 1000000
+    assert card.kv_bytes_per_token == 131072.0
+    # cards without the fields default to 0 (derivation stays off)
+    legacy = cards.resolve_model_card("meta-llama/Llama-3.1-8B-Instruct")
+    assert legacy.native_ctx == 0 and legacy.kv_bytes_per_token == 0.0
+
+
+def test_derive_max_model_len_discrete_arithmetic():
+    # hand-checkable: 80GB part at vLLM's 0.9 default -> 72GB claim; minus a
+    # 24GB shard and the 8GB reserve -> 40GB KV budget; at 131072 B/token
+    # (Llama-8B-class GQA) that is 305175 tokens, floored to a 1024 multiple.
+    tokens, why = cards.derive_max_model_len(131072, 1000000, 24, 1, 1, 80)
+    assert tokens == 305152
+    assert "40GB" in why
+    # PP=2 splits the layers -> half the per-rank cost -> double the tokens
+    tokens2, _ = cards.derive_max_model_len(131072, 1000000, 24, 1, 2, 80)
+    assert tokens2 == 610304
+    # native window is the hard ceiling — and the derivation says so
+    capped, why3 = cards.derive_max_model_len(131072, 65536, 24, 1, 1, 80)
+    assert capped == 65536
+    # an explicit utilization changes the claim (0.5 * 80 = 40GB -> 8GB budget)
+    lower, _ = cards.derive_max_model_len(131072, 1000000, 24, 1, 1, 80, util=0.5)
+    assert lower == 60416
+    # fp8 kv cache halves the per-token cost -> double the tokens
+    fp8, _ = cards.derive_max_model_len(131072, 1000000, 24, 1, 1, 80, kv_dtype_factor=0.5)
+    assert fp8 == 610304
+
+
+def test_derive_max_model_len_declines():
+    # unknown inputs
+    assert cards.derive_max_model_len(0, 1000000, 24, 1, 1, 80)[0] is None
+    assert cards.derive_max_model_len(131072, 0, 24, 1, 1, 80)[0] is None
+    assert cards.derive_max_model_len(131072, 1000000, 24, 1, 1, 0)[0] is None
+    # weights + reserve eat the whole claim -> no budget
+    tokens, why = cards.derive_max_model_len(131072, 1000000, 70, 1, 1, 80)
+    assert tokens is None and "no KV budget" in why
+    # a budget that fits fewer than the floor is not worth serving
+    tokens, why = cards.derive_max_model_len(13_000_000, 1000000, 24, 1, 1, 80)
+    assert tokens is None and "fewer than" in why
+
+
+def test_derive_max_model_len_unified_agrees_with_util_derivation():
+    # the util derivation's calibration point: 140GB over 4 ranks on a 128GB
+    # pool claims 0.7 -> the ctx budget must be built on that SAME claim
+    tokens, why = cards.derive_max_model_len(131072, 1000000, 140, 4, 1, 128, unified=True)
+    assert tokens == 354304
+    # ...and where the util derivation refuses (2x70GB shards), the ctx
+    # derivation must refuse too — deriving a context on top of a claim that
+    # gets the rank OOM-killed would rebuild the field failure
+    tokens, why = cards.derive_max_model_len(131072, 1000000, 140, 2, 1, 128, unified=True)
+    assert tokens is None and "does not fit" in why
+
+
+def test_apply_derives_context_and_replaces_static_cap(tmp_path, monkeypatch):
+    _ctx_card(tmp_path, monkeypatch)
+    a = _args("acme/Ctx-Aware-24B-Instruct")
+    a.args = None
+    lines = cards.apply_to_args(a, shape=(4, 80, "x"))
+    # exactly ONE --max-model-len: the derived value, the static 8192 stripped
+    assert a.args.count("--max-model-len") == 1
+    assert a.args[a.args.index("--max-model-len") + 1] == "305152"
+    assert "8192" not in a.args
+    assert any(ln.startswith("max-model-len: 305152 (derived:") for ln in lines)
+    # the card's only static arg was the cap, so no engine-args line remains
+    assert not any(ln.startswith("engine args:") for ln in lines)
+
+
+def test_apply_context_pair_precedes_derived_gpu_mem_pair(tmp_path, monkeypatch):
+    _ctx_card(tmp_path, monkeypatch)
+    a = _args("acme/Ctx-Aware-24B-Instruct")
+    a.args = None
+    cards.apply_to_args(a, shape=(4, 128, "x"), unified=True)
+    # the long-standing contract: the derived gpu-mem pair stays LAST...
+    assert a.args[-2:] == ["--gpu-memory-utilization", "0.79"]
+    # ...and the derived ctx pair sits immediately before it
+    assert a.args[-4:-2] == ["--max-model-len", "530432"]
+
+
+def test_apply_context_user_max_model_len_still_wins(tmp_path, monkeypatch):
+    _ctx_card(tmp_path, monkeypatch)
+    a = _args("acme/Ctx-Aware-24B-Instruct")
+    a.args = ["--max-model-len", "4096"]
+    cards.apply_to_args(a, shape=(4, 80, "x"))
+    # derived pair emitted, user pair appended after -> engine last-wins
+    assert a.args[-2:] == ["--max-model-len", "4096"]
+    assert a.args[-4:-2] == ["--max-model-len", "305152"]
+
+
+def test_apply_context_honors_fp8_kv_cache_and_user_override(tmp_path, monkeypatch):
+    _ctx_card(tmp_path, monkeypatch, CTX_CARD + 'kv_cache_dtype = "fp8"\n')
+    a = _args("acme/Ctx-Aware-24B-Instruct")
+    a.args = None
+    cards.apply_to_args(a, shape=(4, 80, "x"))
+    assert a.args[a.args.index("--max-model-len") + 1] == "610304"  # 2x: fp8 kv
+    # the user flipping the card's fp8 BACK to auto must restore the bf16 cost
+    # (missing this would derive a context twice what the cache can hold)
+    b = _args("acme/Ctx-Aware-24B-Instruct")
+    b.args = ["--kv-cache-dtype", "auto"]
+    cards.apply_to_args(b, shape=(4, 80, "x"))
+    assert b.args[b.args.index("--max-model-len") + 1] == "305152"
+
+
+def test_apply_context_honors_user_pipeline_parallelism(tmp_path, monkeypatch):
+    # FIELD: the K3 serve ran user-pinned TP8xPP4 on 8 nodes where the
+    # geometric default assumes PP=nodes — the KV-per-rank math must follow
+    # the pipeline size the engine will actually use
+    _ctx_card(tmp_path, monkeypatch)
+    a = _args("acme/Ctx-Aware-24B-Instruct")
+    a.args = ["--pipeline-parallel-size", "2"]
+    cards.apply_to_args(a, shape=(4, 80, "x"))
+    assert a.args[a.args.index("--max-model-len") + 1] == "610304"  # PP=2 halves cost
+
+
+def test_apply_context_declines_without_real_shape(tmp_path, monkeypatch):
+    _ctx_card(tmp_path, monkeypatch)
+    # no shape at all -> static cap stands, remedy names the system card
+    a = _args("acme/Ctx-Aware-24B-Instruct")
+    a.args = None
+    lines = cards.apply_to_args(a, shape=None)
+    assert a.args == ["--max-model-len", "8192"]
+    assert any("node VRAM unknown" in ln for ln in lines)
+    # VRAM assumed from the GPU-type table is NOT real hardware: an a100 could
+    # be the 40GB variant and a 2x context overshoot OOMs the KV profile
+    b = _args("acme/Ctx-Aware-24B-Instruct")
+    b.args = None
+    lines = cards.apply_to_args(
+        b, shape=(4, 80, "cluster probe inventory (VRAM assumed from the GPU type)"))
+    assert b.args == ["--max-model-len", "8192"]
+    assert any("node VRAM unknown" in ln for ln in lines)
+
+
+def test_apply_context_names_missing_kv_field(tmp_path, monkeypatch):
+    _ctx_card(tmp_path, monkeypatch, (
+        '[model]\nmatch = "acme/Ctx-Aware-24B*"\nengine = "vllm"\n'
+        'min_vram_gb = 24\nnative_ctx = 1000000\n'
+        '[model.args]\nmax_model_len = 8192\n'))
+    a = _args("acme/Ctx-Aware-24B-Instruct")
+    a.args = None
+    lines = cards.apply_to_args(a, shape=(4, 80, "x"))
+    assert a.args == ["--max-model-len", "8192"]
+    assert any("regenerate the card" in ln for ln in lines)
+
+
+def test_apply_context_silent_for_cards_without_the_fields():
+    # every pre-existing card: no ctx fields -> not one word about max-model-len
+    # beyond the engine-args line; zero decision-line churn
+    a = _args("meta-llama/Llama-3.3-70B-Instruct")
+    a.args = None
+    lines = cards.apply_to_args(a, shape=(4, 140, "x"))
+    assert not any(ln.startswith("max-model-len:") for ln in lines)
+
+
+def test_apply_context_skips_non_vllm(tmp_path, monkeypatch):
+    _ctx_card(tmp_path, monkeypatch)
+    a = _args("acme/Ctx-Aware-24B-Instruct", engine="llama.cpp")
+    a.args = None
+    lines = cards.apply_to_args(a, shape=(4, 80, "x"))
+    assert not any(ln.startswith("max-model-len:") for ln in lines)
+
+
+def test_apply_context_full_native_window_says_so(tmp_path, monkeypatch):
+    _ctx_card(tmp_path, monkeypatch, CTX_CARD.replace(
+        "native_ctx = 1000000", "native_ctx = 65536"))
+    a = _args("acme/Ctx-Aware-24B-Instruct")
+    a.args = None
+    lines = cards.apply_to_args(a, shape=(4, 80, "x"))
+    assert a.args[a.args.index("--max-model-len") + 1] == "65536"
+    assert any("FULL native window fits" in ln for ln in lines)
