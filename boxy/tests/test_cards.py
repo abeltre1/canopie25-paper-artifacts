@@ -336,6 +336,10 @@ def test_packaged_kimi_k3_card():
     # HYPHEN, not underscore: the underscore spelling doesn't exist on Docker Hub
     # ("access denied" = no such repo; field: 32 ranks retried it, job died in 4s)
     assert card.images["rocm"] == "docker.io/vllm/vllm-openai-rocm:latest"
+    # AITER stays OFF on rocm: with it on, K3's 96 heads leave NO valid TP on
+    # gfx942 (24 heads invalid; 12 heads selects the CDNA4-only Gluon kernel,
+    # which asserted AFTER the full 87-minute weight load — field, 8x MI300A)
+    assert card.env["rocm"]["VLLM_ROCM_USE_AITER"] == "0"
     assert cards.fit_geometry(card.min_vram_gb, 8, 256)[:2] == (1, 8)      # MI325X node
     # smaller parts spill to one Ray instance across full nodes, never refuse
     nodes, gpus, why = cards.fit_geometry(card.min_vram_gb, 4, 128, unified=True)   # MI300A
