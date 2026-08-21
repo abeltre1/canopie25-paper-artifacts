@@ -183,6 +183,22 @@ def build_vllm_serve_cmd(
 
     if not os.environ.get("BOXY_NO_VLLM_EAGER"):
         cmd = _tack_on_last(cmd, {"safetensors_load_strategy": "eager"})
+    # Serve under the CANONICAL model id. The engine is usually handed a staged
+    # PATH while the user asked for hf://org/name — vLLM then advertises the
+    # path in /v1/models and a request naming the friendly id 404s (field:
+    # Kimi-K3 served as /mnt/models/moonshotai-kimi-k3). A flow that rewrote
+    # box.model to a path records the real id in box.served_name; a transport-URI
+    # model derives it. Skipped when the engine is given the id itself
+    # (engine-pull: model_path IS the id); skip-if-present keeps a user/box/
+    # tuning --served-model-name winning. A bare-path model with no recorded
+    # provenance is NOT guessed at — the store's dash slug is ambiguous.
+    served = box.served_name
+    if not served and box.model_is_transport_uri:
+        from boxy.cards import model_key
+
+        served = model_key(box.model)
+    if served and served != model_path:
+        cmd = _tack_on_last(cmd, {"served_model_name": served})
     resolved_port = port or (box.ports[0] if box.ports else default_port("vllm"))
     cmd = _tack_on_last(cmd, {"host": host or config.get("network.bind_host"),
                               "port": resolved_port})

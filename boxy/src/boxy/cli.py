@@ -3394,9 +3394,16 @@ def _serve_agentless_ssh(args, target: str) -> int:
     if engine_pull and not bundle:
         _staged = _pull_completed_stage(target, store_dir, box.model)
         if _staged:
+            from boxy.cards import model_key
+
             print(f"  auto: prestage: {box.model} is already fully staged by `boxy pull` at "
                   f"{host}:{_staged} — serving BY PATH (no download, no Hub contact).")
-            box = dc_replace(box, model=_staged)
+            # keep the CANONICAL id for --served-model-name: the path alone
+            # can't recover it (field: /v1/models advertised the mount path
+            # and a curl naming the real id 404'd)
+            box = dc_replace(box, model=_staged, served_name=model_key(box.model))
+            print(f"  auto: served-model-name: {box.served_name} (clients use this id, not "
+                  f"the staged path; your own `-- --served-model-name` wins)")
             engine_pull = False
 
     pmode = "never" if bundle else _prestage_mode(args)
@@ -3411,7 +3418,11 @@ def _serve_agentless_ssh(args, target: str) -> int:
         elif engine_pull:
             staged = _prestage_agentless_model(args, target, host, box, image, pfx, store_dir, ca_remote)
             if staged:
-                box = dc_replace(box, model=staged)
+                from boxy.cards import model_key
+
+                box = dc_replace(box, model=staged, served_name=model_key(box.model))
+                print(f"  auto: served-model-name: {box.served_name} (clients use this id, "
+                      f"not the staged path; your own `-- --served-model-name` wins)")
                 engine_pull = False
         else:
             # path model: just warm the image on the login node so an isolated node
