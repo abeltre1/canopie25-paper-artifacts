@@ -33,6 +33,18 @@ VLLM_ENV: dict[str, str] = {
     # transport ('Error while creating shared memory segment', peer-access
     # denials, ...) when it isn't. box.env / --env can override.
     "NCCL_DEBUG": "WARN",
+    # Ray's USERSPACE memory monitor kills workers at ~95% host-memory usage.
+    # On unified-memory APUs (MI300A) that policy is miscalibrated by design:
+    # every byte vLLM legitimately claims for weights/KV IS host memory, so a
+    # healthy node running 4 ranks looks "out of memory" to the raylet and a
+    # worker gets shot. FIELD (Kimi-K3, 8x MI300A, twice): rank 19 'died
+    # unexpectedly' — first during memory profiling, then ONE forward pass
+    # short of the first token, with the raylet logging 'Workers killed due to
+    # memory pressure (OOM)'. vLLM manages device memory itself and the
+    # kernel's OOM killer remains the true backstop; Ray's advisory killer
+    # adds only false positives here. 0 disables it (Ray's own documented
+    # switch). box.env / --env can override.
+    "RAY_memory_monitor_refresh_ms": "0",
 }
 
 # vLLM-on-ROCm quirks (prototype: clusterA/MI300a).
