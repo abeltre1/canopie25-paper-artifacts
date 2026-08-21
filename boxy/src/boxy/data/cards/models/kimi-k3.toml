@@ -50,6 +50,17 @@ VLLM_ROCM_USE_AITER = "0"
 # underscore spelling from search-attested text and Docker Hub answered
 # "requested access to the resource is denied", its phrasing for a repo that
 # does not exist; field: 32 ranks retried that pull and the job died in 4s).
-# For CUDA any vllm-openai from the July 2026 line onward carries kimi_k3.
-cuda = "docker.io/vllm/vllm-openai:latest"
+#
+# CUDA: the K3-specific tag (Docker Hub layer page confirms it exists — the
+# lesson of the rocm tag, applied). It is a CUDA-13 (cu130) build: the host
+# needs an r580+ NVIDIA driver. Why not :latest — FIELD (2x H200 nodes):
+# :latest ships no ray, boxy pip-installed it at container start, and the
+# worker node dropped out of the Ray cluster in the 60s between formation and
+# engine start; the placement group then waited forever for GPUs that no
+# longer existed. The K3 tag is built for the recipe's multi-node serve.
+cuda = "docker.io/vllm/vllm-openai:kimi-k3"
 rocm = "docker.io/vllm/vllm-openai-rocm:latest"
+[model.env.cuda]
+# 1.56TB takes longer to load than vLLM's default engine-ready patience;
+# recipe-recommended for K3 (a too-short timeout kills a HEALTHY load).
+VLLM_ENGINE_READY_TIMEOUT_S = "3600"
