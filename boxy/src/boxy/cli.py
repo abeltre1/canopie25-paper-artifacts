@@ -2136,6 +2136,14 @@ def _submission_hint(stderr: str) -> str:
 
 AGENTLESS_REMOTE_SUBDIR = ".local/share/boxy/agentless"
 
+# The standard OS trust-bundle locations (RHEL symlink, Debian, RHEL ca-trust
+# target), in the order tried. This is the trust a cluster node's own curl
+# verifies with — richer than certifi (ca-trust ships intermediates; certifi
+# only roots), and the only bundle guaranteed to match the node's own network.
+_OS_TRUST_BUNDLES = ("/etc/pki/tls/certs/ca-bundle.crt",
+                     "/etc/ssl/certs/ca-certificates.crt",
+                     "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem")
+
 
 def _is_gres_error(text: str) -> bool:
     """True when a scheduler's rejection is about the GPU request — the signal to
@@ -2502,12 +2510,9 @@ def _stage_agentless_ca(target: str, host: str, rdir: str, dryrun: bool = False)
     # answers for BOTH paths (field: laptop bundle staged and mounted, HF fetch
     # in-container still CERTIFICATE_VERIFY_FAILED — the cluster route's issuer
     # was not in the laptop's chain).
-    os_bundles = ("/etc/pki/tls/certs/ca-bundle.crt "
-                  "/etc/ssl/certs/ca-certificates.crt "
-                  "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem")
     rc_append, _out = remote.ssh_capture(
         target,
-        (f"for f in {os_bundles}; do if [ -f \"$f\" ]; then "
+        (f"for f in {' '.join(_OS_TRUST_BUNDLES)}; do if [ -f \"$f\" ]; then "
          f"cat \"$f\" >> {shlex.quote(remote_path)} && echo \"$f\"; break; fi; done"),
         timeout=20)
     appended = _out.strip().splitlines()[-1].strip() if rc_append == 0 and _out.strip() else ""
@@ -2894,9 +2899,23 @@ def _pull_agentless_ssh(args, target: str) -> int:
     rc_e, _eout = remote.ssh_capture(
         target, "curl -sIf https://huggingface.co -o /dev/null --max-time 12", timeout=20)
     if rc_e == 0:
-        print(f"  auto: egress: huggingface.co verifies directly from {host} with its stock "
-              "trust — no proxy, no CA override in the download container")
-        ca_remote, pfx, penv = None, "", {}
+        # Direct egress verifies — but with the NODE's trust, and the image's
+        # own (certifi) can still refuse the same chain: field, the login-node
+        # curl verified via the OS bundle while the container died with
+        # 'unable to get local issuer certificate' — the missing-intermediate
+        # signature (the OS ca-trust carries the intermediate; certifi carries
+        # only roots). Mount the node's OWN bundle — the exact trust the probe
+        # just verified with — instead of pushing anything from the laptop.
+        rc_b, bout = remote.ssh_capture(
+            target,
+            (f"for f in {' '.join(_OS_TRUST_BUNDLES)}; do "
+             f"if [ -f \"$f\" ]; then echo \"$f\"; break; fi; done"),
+            timeout=15)
+        host_trust = bout.strip().splitlines()[-1].strip() if rc_b == 0 and bout.strip() else ""
+        where = f", trusting the node's own {host_trust}" if host_trust else ""
+        print(f"  auto: egress: huggingface.co verifies directly from {host}{where} — "
+              "no proxy, no laptop CA in the download container")
+        ca_remote, pfx, penv = (host_trust or None), "", {}
     else:
         print(f"  auto: egress: direct HF probe failed from {host} — forwarding the proxy and "
               "staging the merged site CA into the container")

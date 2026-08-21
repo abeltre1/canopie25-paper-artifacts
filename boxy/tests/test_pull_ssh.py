@@ -43,6 +43,8 @@ def _wire(monkeypatch, *, state="STATE=IDLE\nGOT=\nSHARDS=0", df_kb="5000000000"
             return 0, f"{df_kb}\n"
         if "setsid" in cmd:
             return 0, "12345\n"
+        if cmd.startswith("for f in /etc/pki"):        # host trust-bundle detect
+            return 0, "/etc/pki/tls/certs/ca-bundle.crt\n"
         return 0, ""
 
     monkeypatch.setattr("boxy.remote.ensure_master", lambda t: 0)
@@ -174,20 +176,26 @@ def test_explicit_image_wins(monkeypatch):
     assert "quay.io/my/vllm:x" in launch
 
 
-def test_direct_egress_omits_the_laptop_proxy_and_ca(monkeypatch, capsys):
-    """FIELD (the Kimi-K3 CA saga's actual root cause): the cluster reached HF
-    DIRECTLY with stock trust (direct: 200, issuer Amazon — no interception),
-    but boxy injected the LAPTOP's proxy into the container, forcing traffic
-    through an interceptor and manufacturing CERTIFICATE_VERIFY_FAILED. When
-    the login-node probe verifies direct egress, inject nothing."""
+def test_direct_egress_uses_the_nodes_own_trust_not_the_laptops(monkeypatch, capsys):
+    """FIELD (the Kimi-K3 CA saga, both halves): the cluster reached HF
+    DIRECTLY (direct: 200, issuer Amazon — no interception), so no laptop
+    proxy may be injected. But the image's certifi still refused the same
+    chain ('unable to get local issuer certificate' — the OS ca-trust carries
+    the intermediate, certifi only roots), so the container must be given the
+    NODE's own bundle — the exact trust the probe verified with."""
     calls = _wire(monkeypatch)
     monkeypatch.setattr("boxy.remote.remote_proxy_env",
                         lambda: {"https_proxy": "http://laptop-proxy:80"})
     assert cli._pull_agentless_ssh(_args(), TARGET) == 0
-    assert "verifies directly" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "verifies directly" in out and "node's own /etc/pki/tls/certs/ca-bundle.crt" in out
     launch = next(c for c in calls if "setsid" in c)
     assert "laptop-proxy" not in launch, "direct egress must not inherit the laptop proxy"
-    assert "REQUESTS_CA_BUNDLE" not in launch, "stock trust verified; no CA override"
+    # the mounted trust is the HOST's bundle, not a staged laptop file
+    assert "-v /etc/pki/tls/certs/ca-bundle.crt:" in launch
+    assert "REQUESTS_CA_BUNDLE" in launch                  # requests honors this, not SSL_CERT_FILE
+    assert "agentless/clusterb/boxy-ca-merged.pem" not in launch, \
+        "no laptop bundle staged on the direct path"
 
 
 def test_blocked_egress_forwards_proxy_and_stages_ca(monkeypatch, capsys):
