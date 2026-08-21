@@ -1072,3 +1072,48 @@ def test_apply_context_full_native_window_says_so(tmp_path, monkeypatch):
     lines = cards.apply_to_args(a, shape=(4, 80, "x"))
     assert a.args[a.args.index("--max-model-len") + 1] == "65536"
     assert any("FULL native window fits" in ln for ln in lines)
+
+
+def test_kimi_k3_card_carries_kv_fields():
+    # the load_cards silent-drop tripwire: a malformed packaged card VANISHES
+    # (load_cards skips it), so the new fields must be pinned here or a typo
+    # would quietly remove Kimi-K3 from the registry
+    card = cards.find_card("hf://moonshotai/Kimi-K3")
+    assert card is not None
+    assert card.native_ctx == 1048576
+    assert card.kv_bytes_per_token == 27648.0   # (512+64) x 2B x 24 MLA layers
+
+
+def test_kimi_k3_derives_past_static_cap_on_fat_metal():
+    # the recipe's own MI325X shape (1 node x 8 x 256GB): the static 262144
+    # fallback is REPLACED by the derived window — 230.4GB claim − 195GB shard
+    # − 8GB reserve = 27.4GB of KV at ~27.6KB/token = ~990K tokens, closing in
+    # on the full 1M native window with zero flags
+    a = _args("moonshotai/Kimi-K3")
+    a.args = None
+    lines = cards.apply_to_args(a, shape=(8, 256, "x"))
+    assert a.args.count("--max-model-len") == 1
+    derived = int(a.args[a.args.index("--max-model-len") + 1])
+    assert derived == 990208
+    assert "262144" not in a.args
+    assert any(ln.startswith("max-model-len: 990208 (derived:") for ln in lines)
+
+
+# vLLM's own measured ground truth from the fielded 8-node MI300A serve — fill
+# from the log line 'GPU KV cache size: N tokens' and un-skip. This is the
+# calibration that pins _CTX_ACT_RESERVE_GB (tune the constant, not the test).
+MEASURED_K3_KV_TOKENS = None
+
+
+@pytest.mark.skipif(MEASURED_K3_KV_TOKENS is None,
+                    reason="awaiting the field-measured K3 'GPU KV cache size' line")
+def test_kimi_k3_context_calibration():
+    """The estimator is PROVEN when the derivation's implied per-deployment KV
+    capacity lands within 20% of what vLLM itself measured at the exact fielded
+    settings (8 nodes x 4 MI300A, TP8xPP4, unified 128GB pools)."""
+    card = cards.find_card("hf://moonshotai/Kimi-K3")
+    # native_ctx sentinel far above capacity so the clamp cannot mask the error
+    tokens, _ = cards.derive_max_model_len(
+        card.kv_bytes_per_token, 10**9, card.min_vram_gb, 32, 4, 128, unified=True)
+    assert tokens is not None
+    assert abs(tokens - MEASURED_K3_KV_TOKENS) / MEASURED_K3_KV_TOKENS < 0.20

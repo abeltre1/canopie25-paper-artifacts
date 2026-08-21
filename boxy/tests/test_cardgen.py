@@ -58,6 +58,59 @@ FIXTURES = {
         "index": {"metadata": {"total_size": 1_800_000_000}},    # ~0.9B params bf16
         "generation": None,
     },
+    # ---- KV-estimator shapes: attention geometry present (the fixtures above
+    # deliberately carry none, proving the estimator declines rather than guesses)
+    "acme/GQA-Dense-8B": {
+        # head_dim absent on purpose: derived as hidden_size // num_attention_heads
+        "config": {"architectures": ["LlamaForCausalLM"], "torch_dtype": "bfloat16",
+                   "max_position_embeddings": 131072, "num_hidden_layers": 32,
+                   "num_attention_heads": 32, "num_key_value_heads": 8,
+                   "hidden_size": 4096},
+        "index": {"metadata": {"total_size": 16_060_000_000}},
+        "generation": None,
+    },
+    "acme/MLA-V3-Chat": {
+        # kv_lora_rank present -> the MLA branch must beat the GQA decoy heads
+        "config": {"architectures": ["DeepseekV3ForCausalLM"], "torch_dtype": "bfloat16",
+                   "max_position_embeddings": 163840, "num_hidden_layers": 61,
+                   "kv_lora_rank": 512, "qk_rope_head_dim": 64,
+                   "num_attention_heads": 128, "num_key_value_heads": 128,
+                   "hidden_size": 7168},
+        "index": {"metadata": {"total_size": 100_000_000_000}},
+        "generation": None,
+    },
+    "acme/Hybrid-Linear-9B": {
+        # layer_types schedule: only the full/sliding layers cache per-token KV
+        "config": {"architectures": ["HybridForCausalLM"], "torch_dtype": "bfloat16",
+                   "max_position_embeddings": 262144, "num_hidden_layers": 8,
+                   "num_key_value_heads": 8, "head_dim": 128,
+                   "layer_types": ["linear_attention", "linear_attention",
+                                   "full_attention", "linear_attention",
+                                   "linear_attention", "full_attention",
+                                   "linear_attention", "sliding_attention"]},
+        "index": {"metadata": {"total_size": 18_000_000_000}},
+        "generation": None,
+    },
+    "acme/Interval-Hybrid-48B": {
+        # Qwen3-Next/Kimi-Linear style: 1 full-attention layer every N
+        "config": {"architectures": ["KimiLinearForCausalLM"], "torch_dtype": "bfloat16",
+                   "max_position_embeddings": 1_048_576, "num_hidden_layers": 27,
+                   "full_attention_interval": 4,
+                   "kv_lora_rank": 512, "qk_rope_head_dim": 64},
+        "index": {"metadata": {"total_size": 96_000_000_000}},
+        "generation": None,
+    },
+    "acme/Unreadable-Hybrid-7B": {
+        # linear_attn_config present but NO readable schedule: the estimator must
+        # decline, not price all 48 layers as KV layers (the whole point of a
+        # linear hybrid is that most layers are NOT)
+        "config": {"architectures": ["MysteryForCausalLM"], "torch_dtype": "bfloat16",
+                   "max_position_embeddings": 131072, "num_hidden_layers": 48,
+                   "num_key_value_heads": 8, "head_dim": 128,
+                   "linear_attn_config": {"kind": "kda"}},
+        "index": {"metadata": {"total_size": 14_000_000_000}},
+        "generation": None,
+    },
 }
 
 
@@ -326,3 +379,58 @@ def test_opener_falls_back_to_config_proxy(monkeypatch):
     proxies = [getattr(h, "proxies", {}) for h in op.handlers
                if isinstance(h, urllib.request.ProxyHandler)]
     assert proxies and proxies[0].get("https") == "http://env-proxy:80"
+
+
+# ---- KV bytes/token estimator (feeds the serve-time context derivation) --------------
+
+
+def test_kv_bytes_gqa():
+    cfg = FIXTURES["acme/GQA-Dense-8B"]["config"]
+    # 2 x 8 kv-heads x 128 head-dim (derived: 4096 // 32) x 2 bytes x 32 layers
+    assert cardgen._kv_bytes_per_token(cfg) == 131072.0
+
+
+def test_kv_bytes_mla_wins_over_gqa_decoys():
+    cfg = FIXTURES["acme/MLA-V3-Chat"]["config"]
+    # (512 kv_lora_rank + 64 rope) x 2 bytes x 61 layers — NOT the 128 decoy heads
+    assert cardgen._kv_bytes_per_token(cfg) == 70272.0
+
+
+def test_kv_bytes_hybrid_counts_only_kv_layers():
+    cfg = FIXTURES["acme/Hybrid-Linear-9B"]["config"]
+    # 2 full + 1 sliding (counted full — under-derives context, never over) of 8
+    assert cardgen._kv_bytes_per_token(cfg) == 12288.0
+    cfg = FIXTURES["acme/Interval-Hybrid-48B"]["config"]
+    # ceil(27 / 4) = 7 MLA layers
+    assert cardgen._kv_bytes_per_token(cfg) == 8064.0
+
+
+def test_kv_bytes_unknown_shapes_decline():
+    # unreadable hybrid schedule
+    assert cardgen._kv_bytes_per_token(FIXTURES["acme/Unreadable-Hybrid-7B"]["config"]) is None
+    # no layer count at all (the pre-existing 70B fixture)
+    assert cardgen._kv_bytes_per_token(FIXTURES["meta-llama/Llama-3.3-70B-Instruct"]["config"]) is None
+    # layer count but no attention geometry (the pre-existing 8B fixture)
+    assert cardgen._kv_bytes_per_token(FIXTURES["meta-llama/Llama-3.1-8B-Instruct"]["config"]) is None
+    assert cardgen._kv_bytes_per_token({}) is None
+
+
+def test_generated_card_carries_kv_fields_and_roundtrips():
+    text, _, _ = _gen("acme/GQA-Dense-8B")
+    assert "native_ctx = 131072" in text
+    assert "kv_bytes_per_token = 131072" in text
+    # [model] scalars must land above the [model.args] header — anything below
+    # it becomes an engine CLI flag and crashes vLLM
+    assert text.index("native_ctx") < text.index("[model.args]")
+    assert text.index("kv_bytes_per_token") < text.index("[model.args]")
+    card = cards._parse_card(text, "x", "user", "x")
+    assert card.native_ctx == 131072
+    assert card.kv_bytes_per_token == 131072.0
+
+
+def test_unreadable_architecture_omits_kv_field_and_still_roundtrips():
+    text, _, _ = _gen("acme/Unreadable-Hybrid-7B")
+    assert "kv_bytes_per_token" not in text
+    assert "native_ctx = 131072" in text
+    card = cards._parse_card(text, "x", "user", "x")
+    assert card.kv_bytes_per_token == 0.0                # serve derivation stays off

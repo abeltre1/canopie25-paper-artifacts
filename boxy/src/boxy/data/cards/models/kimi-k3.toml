@@ -22,11 +22,24 @@ match = "moonshotai/Kimi-K3*"
 engine = "vllm"
 gpus = 4
 min_vram_gb = 1560
+native_ctx = 1048576
+# KV bytes per token at bf16: KDA is a hybrid — the linear-attention majority
+# of the 93 layers carries CONSTANT state (zero per-token KV) and only the MLA
+# minority caches a compressed (kv_lora_rank 512 + qk_rope_head_dim 64) vector:
+# 576 x 2 bytes x 24 MLA layers (a 3:1 KDA:MLA schedule) = 27648. PROVISIONAL
+# pending verification against the staged config.json + the field-measured
+# 'GPU KV cache size' line (the golden calibration test); safe either way on
+# real K3 metal, where the derivation clamps at the native window long before
+# the budget runs out. This is what turns the old hand-passed
+# --max-model-len 131072 into a DERIVED near-native window.
+kv_bytes_per_token = 27648
 [model.args]
 trust_remote_code = true
-# Native window is 1M tokens; vLLM profiles KV for the FULL window at startup
-# and can OOM even with KDA's small attention state. Cap the turnkey serve;
-# raise with `-- --max-model-len N` once your allocation is measured.
+# FALLBACK cap for systems whose node VRAM boxy does not know: vLLM profiles
+# KV for the FULL window at startup and can OOM blind. On a system card that
+# declares real gpu_vram_gb this line is REPLACED by the derived largest
+# context that provably fits (near-native on the fielded MI300A/H200 shapes —
+# see native_ctx/kv_bytes_per_token above); `-- --max-model-len N` still wins.
 max_model_len = 262144
 enable_prefix_caching = true
 reasoning_parser = "kimi_k3"

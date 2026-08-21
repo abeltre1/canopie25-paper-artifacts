@@ -589,7 +589,8 @@ def apply_to_args(args, shape: tuple[int, int, str] | None = None, unified: bool
         elif card.native_ctx and not card.kv_bytes_per_token:
             ctx_lines.append(
                 "max-model-len: card cap kept (KV bytes/token unknown — regenerate the "
-                "card with `boxy generate card` to derive the largest context that fits)")
+                "card with `boxy generate card`, or set kv_bytes_per_token in it by "
+                "hand, to derive the largest context that fits)")
         elif card.kv_bytes_per_token and not vram:
             ctx_lines.append(
                 "max-model-len: card cap kept (node VRAM unknown — a system card with the "
