@@ -2694,6 +2694,17 @@ def _prestage_agentless_model(args, target: str, host: str, box, image: str,
               "pre-pulled); pass a shared-FS GGUF path for a fully offline node.")
         return None
     stage_dir = f"{store_dir}/models/{_model_slug(repo)}"
+    # `boxy pull --ssh` stamps .boxy-pull-complete when EVERY file has landed.
+    # Serve straight from that copy: the in-container download below would only
+    # re-verify against the Hub — the TLS path that failed six times in the
+    # field while the pull's host-curl worked. The pull's work IS the prestage.
+    rc, out = remote.ssh_capture(
+        target, f"[ -f {shlex.quote(stage_dir + '/.boxy-pull-complete')} ] && echo STAGED",
+        timeout=15)
+    if rc == 0 and "STAGED" in out:
+        print(f"  auto: prestage: {repo} is already fully staged by `boxy pull` at "
+              f"{host}:{stage_dir} — serving BY PATH (no download, no Hub contact).")
+        return stage_dir
     dl = pfx + shlex.join(_hf_download_argv(repo, stage_dir, image, ca_remote))
     print(f"  auto: prestage: downloading {repo} on {host} -> {stage_dir} "
           "(in-container huggingface_hub; may take several minutes) ...")

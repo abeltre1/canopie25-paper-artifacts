@@ -1415,6 +1415,37 @@ def test_ssh_agentless_no_prestage_keeps_engine_pull(ssh, capfd, monkeypatch):
     assert "the engine downloads it at container start" in cap.out
 
 
+def test_prestage_uses_a_completed_boxy_pull_without_redownloading(monkeypatch):
+    """FIELD (Kimi-K3, 1.56TB): `boxy pull --ssh` staged all 96 shards and
+    stamped .boxy-pull-complete — then the serve's prestage ran its own
+    in-container snapshot_download anyway (the TLS path that failed six times),
+    would have warned, and fallen back to a compute-node download. A completed
+    pull IS the prestage: serve by that path, no download, no Hub contact."""
+    import argparse
+
+    from boxy import cli
+    from boxy.box import Box
+
+    calls = []
+
+    def fake_capture(target, cmd, timeout=20):
+        calls.append(cmd)
+        if ".boxy-pull-complete" in cmd:
+            return 0, "STAGED"
+        return 0, ""
+
+    monkeypatch.setattr("boxy.remote.ssh_capture", fake_capture)
+    monkeypatch.setattr("boxy.remote.remote_proxy_env", lambda: {})
+    box = Box(name="m", image="", entrypoint="vllm", engine="vllm",
+              model="moonshotai/Kimi-K3")
+    staged = cli._prestage_agentless_model(
+        argparse.Namespace(), "user@clusterb", "clusterb", box, "img:latest", "",
+        "/scratch/u/boxy", None)
+    assert staged == "/scratch/u/boxy/models/moonshotai-kimi-k3"
+    assert not any("snapshot_download" in c for c in calls), \
+        "a completed pull must never be re-downloaded (nor re-verified via the Hub)"
+
+
 def test_prestage_agentless_model_stages_and_rewrites_to_path(monkeypatch, tmp_path):
     # Unit: _prestage_agentless_model pulls the image, runs the in-container
     # snapshot_download, and returns the shared-FS path (which the caller mounts).
