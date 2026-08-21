@@ -687,3 +687,19 @@ def test_diagnose_nccl_shm_too_small_beats_generic_wrapper():
     assert "shared memory" in hint
     assert "--ipc=host" in hint and "--shm-size" in hint
     assert "NCCL_DEBUG=INFO" in hint
+
+
+def test_vllm_env_disables_rays_userspace_oom_killer():
+    """FIELD (Kimi-K3, 8x MI300A, twice): Ray's memory monitor kills workers at
+    ~95% host memory — but on unified-memory APUs vLLM's legitimate weight/KV
+    claims ARE host memory, so a healthy rank was shot one forward pass short
+    of the first token ('Workers killed due to memory pressure (OOM)' in the
+    raylet log). vLLM manages device memory; the kernel OOM killer is the real
+    backstop; Ray's advisory killer adds only false positives here."""
+    from boxy import envs
+
+    env = envs.build_env({}, "rocm", offline=False, engine="vllm")
+    assert env["RAY_memory_monitor_refresh_ms"] == "0"
+    # a user/box value still wins
+    env2 = envs.build_env({"RAY_memory_monitor_refresh_ms": "250"}, "rocm", offline=False)
+    assert env2["RAY_memory_monitor_refresh_ms"] == "250"
