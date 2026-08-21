@@ -72,6 +72,42 @@ def test_fresh_pull_launches_detached_into_the_serve_store(monkeypatch, capsys):
     assert "rm -rf" not in launch                      # no --force -> no clean restart
 
 
+def test_launch_backgrounds_a_single_redirected_command(monkeypatch):
+    """FIELD (eldorado, first Kimi-K3 launch): `mkdir && setsid ... &` made the
+    non-interactive remote shell background the WHOLE and-list — a child that
+    WAITS on the 8-hour download with the ssh session's stdout/stderr still
+    open. ssh never returned; ssh_capture killed it at 30s (rc=124, no output);
+    nothing was diagnosed. The backgrounded job must be a single command with
+    all three fds redirected, and mkdir must run in the foreground before it."""
+    calls = _wire(monkeypatch)
+    assert cli._pull_agentless_ssh(_args(), TARGET) == 0
+    launch = next(c for c in calls if "setsid" in c)
+    assert "&& setsid" not in launch, "and-list backgrounding holds the ssh channel open"
+    bg = launch.split(" & ")[0]                       # the job that gets backgrounded
+    assert bg.startswith("mkdir -p") and "; setsid" in bg
+    for fd in (">>", "2>&1", "< /dev/null"):
+        assert fd in bg.split("; setsid", 1)[1], f"background job must redirect {fd}"
+
+
+def test_launch_timeout_is_diagnosed_not_swallowed(monkeypatch, capsys):
+    # rc=124 with empty output used to print a blank error. It now says what
+    # happened and that a re-run will find the download if it did start.
+    calls = _wire(monkeypatch)
+
+    orig = __import__("boxy.remote", fromlist=["ssh_capture"]).ssh_capture
+
+    def timeout_on_launch(target, cmd, timeout=20):
+        if "setsid" in cmd:
+            calls.append(cmd)
+            return 124, ""
+        return orig(target, cmd, timeout)
+
+    monkeypatch.setattr("boxy.remote.ssh_capture", timeout_on_launch)
+    assert cli._pull_agentless_ssh(_args(), TARGET) == 1
+    err = capsys.readouterr().err
+    assert "re-run this command to check" in err and "(no output)" in err
+
+
 def test_too_small_filesystem_is_refused_before_a_byte_moves(monkeypatch, capsys):
     # 100GB free vs a 1560GB model: the exact Kimi-on-$HOME failure, now refused
     # up front with the fix named — instead of dying at shard 2.
