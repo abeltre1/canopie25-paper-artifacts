@@ -37,7 +37,11 @@ enable_auto_tool_choice = true
 # that ISA.
 VLLM_ROCM_USE_AITER = "1"
 [model.images]
-# The ROCm tag is the image the recipe names for K3 (vllm/vllm-openai_rocm);
-# for CUDA any vllm-openai from the July 2026 line onward carries kimi_k3.
+# The ROCm image is the one the recipe page itself names for K3
+# (vllm/vllm-openai-rocm — HYPHEN: the first cut of this card used an
+# underscore spelling from search-attested text and Docker Hub answered
+# "requested access to the resource is denied", its phrasing for a repo that
+# does not exist; field: 32 ranks retried that pull and the job died in 4s).
+# For CUDA any vllm-openai from the July 2026 line onward carries kimi_k3.
 cuda = "docker.io/vllm/vllm-openai:latest"
-rocm = "docker.io/vllm/vllm-openai_rocm:kimi-k3"
+rocm = "docker.io/vllm/vllm-openai-rocm:latest"

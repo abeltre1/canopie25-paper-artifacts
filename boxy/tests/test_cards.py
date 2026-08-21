@@ -333,6 +333,9 @@ def test_packaged_kimi_k3_card():
     assert card.args["reasoning_parser"] == "kimi_k3"
     assert card.args["trust_remote_code"] is True
     assert card.args["max_model_len"] == 262144          # native 1M would OOM the KV profile
+    # HYPHEN, not underscore: the underscore spelling doesn't exist on Docker Hub
+    # ("access denied" = no such repo; field: 32 ranks retried it, job died in 4s)
+    assert card.images["rocm"] == "docker.io/vllm/vllm-openai-rocm:latest"
     assert cards.fit_geometry(card.min_vram_gb, 8, 256)[:2] == (1, 8)      # MI325X node
     # smaller parts spill to one Ray instance across full nodes, never refuse
     nodes, gpus, why = cards.fit_geometry(card.min_vram_gb, 4, 128, unified=True)   # MI300A
