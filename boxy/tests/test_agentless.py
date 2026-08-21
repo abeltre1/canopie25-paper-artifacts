@@ -312,3 +312,56 @@ def test_pending_diagnosis_degrades_when_scheduler_says_nothing(monkeypatch):
     monkeypatch.setattr(remote, "ssh_capture", lambda t, c, timeout=15: (1, ""))
     lines = "\n".join(cli._pending_diagnosis("u@c", "flux", "f1"))
     assert "no pending reason available" in lines
+
+
+# ---- user `--` flags reach the multi-node engine command -----------------------
+
+
+def _staged_model_dir(tmp_path):
+    d = tmp_path / "models" / "some-model"
+    d.mkdir(parents=True)
+    (d / "config.json").write_text("{}")
+    return d
+
+
+def test_multinode_render_honors_user_parallelism(tmp_path):
+    """FIELD (Kimi-K3 on 4-wide MI300A nodes): 96 heads / TP4 = 24, invalid for
+    the AITER MLA kernel. The user passed `-- --tensor-parallel-size 8
+    --pipeline-parallel-size 4 --gpu-memory-utilization 0.62`; the agentless
+    render dropped all of it and the job served boxy's own TP4xPP8 — dying on
+    the exact constraint the user had worked around. User flags must reach the
+    engine command and must beat the derived geometry."""
+    from dataclasses import replace
+
+    from boxy.location import Resources
+
+    loc = replace(Location(name="e", scheduler="flux", accelerator="rocm", runtime="podman"),
+                  resources=Resources(nodes=8, gpus_per_node=4))
+    script = deploy.render_agentless_script(
+        _box(_staged_model_dir(tmp_path), image="docker.io/vllm/vllm-openai-rocm:latest",
+             engine="vllm"),
+        loc, "flux", "boxy-al", str(tmp_path / "e.json"), str(tmp_path / "e.log"), [],
+        port=8000,
+        extra_args=["--tensor-parallel-size", "8", "--pipeline-parallel-size", "4",
+                    "--gpu-memory-utilization", "0.62"])
+    assert "--tensor-parallel-size 8" in script
+    assert "--pipeline-parallel-size 4" in script
+    assert "--gpu-memory-utilization 0.62" in script
+    # the derived geometry must NOT also appear and win by position
+    assert "--tensor-parallel-size=4" not in script
+    assert "--pipeline-parallel-size=8" not in script
+
+
+def test_multinode_render_derives_geometry_without_user_flags(tmp_path):
+    from dataclasses import replace
+
+    from boxy.location import Resources
+
+    loc = replace(Location(name="e", scheduler="flux", accelerator="rocm", runtime="podman"),
+                  resources=Resources(nodes=8, gpus_per_node=4))
+    script = deploy.render_agentless_script(
+        _box(_staged_model_dir(tmp_path), image="docker.io/vllm/vllm-openai-rocm:latest",
+             engine="vllm"),
+        loc, "flux", "boxy-al", str(tmp_path / "e.json"), str(tmp_path / "e.log"), [],
+        port=8000)
+    assert "--tensor-parallel-size=4" in script and "--pipeline-parallel-size=8" in script
