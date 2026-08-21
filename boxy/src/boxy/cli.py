@@ -2665,6 +2665,22 @@ def _remote_model_store(target: str, host: str, rdir: str, dryrun: bool = False,
     return rdir
 
 
+def _pull_completed_stage(target: str, store_dir: str, model: str) -> str:
+    """The shared-FS path of a COMPLETED `boxy pull` for `model` ('' if none).
+    A finished pull outranks EVERY prestage mode — 'never' means 'do not
+    download', not 'ignore 1.5TB already on disk'. Field (Kimi-K3): the
+    laptop's prestage config was 'never', so the marker check living inside
+    the prestage never ran, and the multi-node serve set out to re-download a
+    fully staged 96-shard model inside the job."""
+    from boxy import cards, remote
+
+    stage = f"{store_dir}/models/{_model_slug(cards.model_key(model))}"
+    rc, out = remote.ssh_capture(
+        target, f"[ -f {shlex.quote(stage + '/.boxy-pull-complete')} ] && echo STAGED",
+        timeout=15)
+    return stage if rc == 0 and "STAGED" in out else ""
+
+
 def _prestage_agentless_model(args, target: str, host: str, box, image: str,
                               pfx: str, store_dir: str, ca_remote: str | None):
     """PRE-STAGE the container image + hf:// model on the LOGIN node (which has the
@@ -3373,6 +3389,16 @@ def _serve_agentless_ssh(args, target: str) -> int:
     #     path model's image; 'never'/--no-prestage skips it. Best-effort: a failure
     #     falls back to engine-pull (only works on a networked node). Skipped under
     #     --dryrun (a real network/disk op); the plan line prints instead.
+    # A completed `boxy pull` IS the prestage, regardless of prestage mode —
+    # one ssh probe, zero downloads, so even prestage='never' honors it.
+    if engine_pull and not bundle:
+        _staged = _pull_completed_stage(target, store_dir, box.model)
+        if _staged:
+            print(f"  auto: prestage: {box.model} is already fully staged by `boxy pull` at "
+                  f"{host}:{_staged} — serving BY PATH (no download, no Hub contact).")
+            box = dc_replace(box, model=_staged)
+            engine_pull = False
+
     pmode = "never" if bundle else _prestage_mode(args)
     if pmode != "never" and (engine_pull or pmode == "always"):
         image = args.image or box.image or ramalama_shim.default_image(box.engine, accel)
@@ -3438,7 +3464,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
     try:
         script_text = deploy.render_agentless_script(
             box, location, scheduler_name, name, ep_remote, log_remote, site_args,
-            proxy_prefix=pfx, port=args.port, engine_pulls_model=engine_pull, distributed=getattr(args, "distributed", None),
+            proxy_prefix=pfx, port=args.port, engine_pulls_model=engine_pull, distributed=getattr(args, "distributed", None), extra_args=getattr(args, "args", None),
             prelude=prelude)
     except deploy.AgentlessError as e:
         deploy.set_agentless_ca(None)
@@ -3501,7 +3527,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
             try:
                 script_text = deploy.render_agentless_script(
                     box, location, scheduler_name, name, ep_remote, log_remote, site_args,
-                    proxy_prefix=_proxy_prefix(args), port=args.port, engine_pulls_model=engine_pull, distributed=getattr(args, "distributed", None),
+                    proxy_prefix=_proxy_prefix(args), port=args.port, engine_pulls_model=engine_pull, distributed=getattr(args, "distributed", None), extra_args=getattr(args, "args", None),
                     prelude=prelude)
             except deploy.AgentlessError:
                 break
@@ -3531,7 +3557,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
             try:
                 script_text = deploy.render_agentless_script(
                     box, location, scheduler_name, name, ep_remote, log_remote, site_args,
-                    proxy_prefix=_proxy_prefix(args), port=args.port, engine_pulls_model=engine_pull, distributed=getattr(args, "distributed", None),
+                    proxy_prefix=_proxy_prefix(args), port=args.port, engine_pulls_model=engine_pull, distributed=getattr(args, "distributed", None), extra_args=getattr(args, "args", None),
                     prelude=prelude)
             except deploy.AgentlessError:
                 script_text = ""
@@ -3604,7 +3630,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
         try:
             heal_text = deploy.render_agentless_script(
                 box, location, scheduler_name, name, ep_remote, log_remote, site_args,
-                proxy_prefix=pfx, port=args.port, engine_pulls_model=engine_pull, distributed=getattr(args, "distributed", None),
+                proxy_prefix=pfx, port=args.port, engine_pulls_model=engine_pull, distributed=getattr(args, "distributed", None), extra_args=getattr(args, "args", None),
                 prelude=prelude)
         except deploy.AgentlessError:
             return False
@@ -3984,7 +4010,7 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
             script_text = deploy.render_agentless_script(
                 box, aloc, scheduler_name, name, str(jobs.endpoint_path(name)),
                 output_log, site_args, proxy_prefix=_proxy_prefix(args), port=args.port,
-                distributed=getattr(args, "distributed", None))
+                distributed=getattr(args, "distributed", None), extra_args=getattr(args, "args", None))
         except deploy.AgentlessError as e:
             print(f"boxy: agentless: {e}", file=sys.stderr)
             return 2
@@ -4023,7 +4049,7 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
                     script_text = deploy.render_agentless_script(
                         box, aloc, scheduler_name, name, str(jobs.endpoint_path(name)),
                         output_log, site_args, proxy_prefix=_proxy_prefix(args), port=args.port,
-                        distributed=getattr(args, "distributed", None))
+                        distributed=getattr(args, "distributed", None), extra_args=getattr(args, "args", None))
                 else:
                     script_text = scheduler.batch_script(inner, location, name, output_log,
                                                          site_args, distributed=want_distributed)
@@ -5576,7 +5602,7 @@ def _agentless_script(box: Box, location: Location, scheduler_name: str, name: s
     ep = endpoint_file or str(jobs.endpoint_path(name))
     return deploy.render_agentless_script(box, location, scheduler_name, name, ep, log_file,
                                           site_args, proxy_prefix=_proxy_prefix(args), port=args.port,
-                                          distributed=getattr(args, "distributed", None))
+                                          distributed=getattr(args, "distributed", None), extra_args=getattr(args, "args", None))
 
 
 def _generate_agentless(args: argparse.Namespace) -> int:

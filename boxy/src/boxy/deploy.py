@@ -192,7 +192,8 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
                             proxy_prefix: str = "", port: int | None = None,
                             engine_pulls_model: bool = False,
                             prelude: list[str] | None = None,
-                            distributed: bool | None = None) -> str:
+                            distributed: bool | None = None,
+                            extra_args: list[str] | None = None) -> str:
     """A FULLY SELF-CONTAINED batch script — no boxy/Python/RamaLama on the
     cluster. The compute node runs only `podman run` (resolved HERE) plus a
     bash endpoint-write to the shared FS; the laptop submits it and polls that
@@ -251,14 +252,22 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
 
     podman_backend.set_target_os("linux")
     try:
+        # extra_args = the user's `--` passthrough. It MUST reach the engine
+        # command: the agentless render dropped it, so `-- --tensor-parallel-size 8`
+        # silently became boxy's own TP=gpus/node and the job died on a kernel
+        # head-count constraint the user had explicitly worked around (field:
+        # Kimi-K3 on 4-wide MI300A nodes — 96 heads / TP4 = 24, invalid for
+        # AITER MLA; the user passed TP8xPP4 and the script served TP4xPP8).
         if multinode:
             try:
                 deployment = plan_serve(box, local, port=port, dryrun=True,
-                                        distributed=True, head_ip=_HEAD_IP_TOKEN)
+                                        distributed=True, head_ip=_HEAD_IP_TOKEN,
+                                        extra_args=extra_args)
             except RuntimeError as e:  # e.g. gpus_per_node unknown
                 raise AgentlessError(str(e)) from e
         else:
-            deployment = plan_serve(box, local, port=port, dryrun=True)  # dryrun: no pull, no verify
+            deployment = plan_serve(box, local, port=port, dryrun=True,
+                                    extra_args=extra_args)  # dryrun: no pull, no verify
     finally:
         _AGENTLESS_RENDER = False
         podman_backend.set_target_os(None)

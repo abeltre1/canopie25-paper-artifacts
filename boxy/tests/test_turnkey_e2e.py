@@ -1415,6 +1415,27 @@ def test_ssh_agentless_no_prestage_keeps_engine_pull(ssh, capfd, monkeypatch):
     assert "the engine downloads it at container start" in cap.out
 
 
+def test_completed_pull_beats_prestage_never(ssh, capfd, monkeypatch):
+    """FIELD (Kimi-K3 multi-node): the laptop's prestage mode was 'never', so
+    the marker check inside the prestage never ran and the serve set out to
+    re-download a fully staged 1.56TB model inside the job. 'never' means
+    'do not download' — a COMPLETED pull is already downloaded, and must be
+    served BY PATH under every prestage mode. (The suite default here IS
+    prestage='never', which is exactly the field configuration.)"""
+    from boxy import cli
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    staged = "/scratch/u/boxy/models/meta-llama-llama-3.1-8b-instruct"
+    monkeypatch.setattr(cli, "_pull_completed_stage", lambda t, s, m: staged)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "already fully staged by `boxy pull`" in cap.out and "serving BY PATH" in cap.out
+    # ... and the rendered batch script serves the STAGED PATH, not the repo id
+    assert f"vllm serve {staged}" in cap.out.replace("=", " ") or staged in cap.out
+
+
 def test_prestage_uses_a_completed_boxy_pull_without_redownloading(monkeypatch):
     """FIELD (Kimi-K3, 1.56TB): `boxy pull --ssh` staged all 96 shards and
     stamped .boxy-pull-complete — then the serve's prestage ran its own
