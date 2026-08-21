@@ -1117,3 +1117,173 @@ def test_kimi_k3_context_calibration():
         card.kv_bytes_per_token, 10**9, card.min_vram_gb, 32, 4, 128, unified=True)
     assert tokens is not None
     assert abs(tokens - MEASURED_K3_KV_TOKENS) / MEASURED_K3_KV_TOKENS < 0.20
+
+
+# ---- --context: the window as a DEMAND the geometry must meet (Mode B) ---------------
+
+
+def test_fit_geometry_ctx_kwargs_default_inert():
+    # without the kwargs every path is byte-identical (the parity + calibration
+    # contracts above already sweep this; here the equality is explicit)
+    assert cards.fit_geometry(140, 4, 80) == cards.fit_geometry(
+        140, 4, 80, ctx_tokens=0, ctx_kv_bytes_per_token=0.0)
+    assert cards.fit_geometry(140, 4, 128, unified=True) == cards.fit_geometry(
+        140, 4, 128, unified=True, ctx_tokens=0, ctx_kv_bytes_per_token=0.0)
+
+
+def test_parse_context_request():
+    assert cards.parse_context_request("4096", 0) == 4096
+    assert cards.parse_context_request("256k", 0) == 262144
+    assert cards.parse_context_request("1m", 0) == 1048576
+    assert cards.parse_context_request("full", 131072) == 131072
+    with pytest.raises(ValueError, match="native window"):
+        cards.parse_context_request("full", 0)
+    with pytest.raises(ValueError, match="token count"):
+        cards.parse_context_request("lots", 131072)
+    with pytest.raises(ValueError, match="positive"):
+        cards.parse_context_request("-5", 131072)
+
+
+def test_fit_geometry_grows_nodes_for_ctx_demand():
+    # 140GB of weights on 4x80 nodes fits ONE node by weight — but a 1M-token
+    # window of GQA KV (131072 B/token) needs PP to split the layers: at PP=3
+    # each rank holds ~11.7GB of shard + ~43.7GB of KV inside a 72GB claim
+    nodes, gpus, why = cards.fit_geometry(
+        140, 4, 80, ctx_tokens=1_000_000, ctx_kv_bytes_per_token=131072.0)
+    assert (nodes, gpus) == (3, 4)
+    assert "1000000-token context" in why
+    # the same call without the demand stays single-node (the inert contract)
+    assert cards.fit_geometry(140, 4, 80)[:2] == (1, 4)
+
+
+def test_fit_geometry_ctx_widens_within_a_node_before_spilling():
+    # a 24GB model asking 400K tokens: 1 GPU gives a 40GB budget (~305K), but
+    # widening to 4 GPUs shrinks the shard and frees enough — no second node
+    nodes, gpus, why = cards.fit_geometry(
+        24, 4, 80, ctx_tokens=400_000, ctx_kv_bytes_per_token=131072.0)
+    assert (nodes, gpus) == (1, 4)
+    assert "widened" in why
+    assert cards.fit_geometry(24, 4, 80)[:2] == (1, 1)
+
+
+def test_ctx_solver_and_derivation_never_disagree():
+    """The Mode B analog of the unified sweep above: whatever geometry the
+    solver picks FOR a context demand, the runtime derivation at that exact
+    geometry must honor the demand — otherwise the serve would print a
+    'sized to fit' line and then emit a smaller window."""
+    for card in cards.load_cards():
+        if card.source != "packaged" or not card.min_vram_gb or not card.kv_bytes_per_token:
+            continue
+        demand = card.native_ctx
+        for pool in (64, 96, 128, 192, 256):
+            for width in (1, 2, 4, 8):
+                for uni in (False, True):
+                    nodes, gpus, why = cards.fit_geometry(
+                        card.min_vram_gb, width, pool, unified=uni,
+                        ctx_tokens=demand, ctx_kv_bytes_per_token=card.kv_bytes_per_token)
+                    if "does not fit" in why:
+                        continue
+                    tokens, dwhy = cards.derive_max_model_len(
+                        card.kv_bytes_per_token, demand, card.min_vram_gb,
+                        nodes * gpus, nodes, pool, unified=uni)
+                    assert tokens is not None and tokens >= demand, (
+                        f"{card.label}: solver chose {nodes}x{gpus} on a {pool}GB "
+                        f"{'unified ' if uni else ''}pool for {demand} tokens, but the "
+                        f"derivation only honors {tokens} ({dwhy})")
+
+
+def test_serve_context_full_grows_geometry_end_to_end(tmp_path, monkeypatch, capsys):
+    _ctx_card(tmp_path, monkeypatch)
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setenv("BOXY_GPUS_PER_NODE", "4")
+    monkeypatch.setenv("BOXY_GPU_VRAM_GB", "80")
+    rc = main(["serve", "acme/Ctx-Aware-24B-Instruct",
+               "--scheduler", "slurm", "--context", "full", "--dryrun"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "auto: context: 1000000 tokens (--context full)" in out
+    assert "auto: nodes: 3" in out                       # grown for the window
+    assert "--max-model-len 1000000" in out.replace("=", " ")
+    assert "auto: max-model-len: 1000000 (--context full: verified" in out
+
+
+def test_serve_context_infeasible_is_a_clean_error(tmp_path, monkeypatch, capsys):
+    # absurd per-token cost: no node count holds the window — refuse UP FRONT
+    # (a submitted job would burn its queue wait and OOM the KV profile)
+    _ctx_card(tmp_path, monkeypatch, CTX_CARD.replace(
+        "kv_bytes_per_token = 131072", "kv_bytes_per_token = 1310720000"))
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setenv("BOXY_GPUS_PER_NODE", "4")
+    monkeypatch.setenv("BOXY_GPU_VRAM_GB", "80")
+    rc = main(["serve", "acme/Ctx-Aware-24B-Instruct",
+               "--scheduler", "slurm", "--context", "full", "--dryrun"])
+    cap = capsys.readouterr()
+    assert rc == 1
+    assert "boxy: error:" in cap.err and "does not fit" in cap.err
+
+
+def test_context_with_pinned_geometry_verifies_only(tmp_path, monkeypatch, capsys):
+    # explicit --gpus pins the world; boxy must not silently under-serve the
+    # request — it warns, emits NO pair, and the static cap stands
+    _ctx_card(tmp_path, monkeypatch)
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setenv("BOXY_GPUS_PER_NODE", "4")
+    monkeypatch.setenv("BOXY_GPU_VRAM_GB", "80")
+    rc = main(["serve", "acme/Ctx-Aware-24B-Instruct", "--gpus", "1",
+               "--scheduler", "slurm", "--context", "400k", "--dryrun"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "context: NOT honored" in out
+    assert "--max-model-len 409600" not in out.replace("=", " ")
+    assert "--max-model-len 8192" in out.replace("=", " ")   # static cap kept
+
+
+def test_context_requires_kv_and_a_real_shape(tmp_path, monkeypatch):
+    # no kv_bytes_per_token -> the remedy names the card fix
+    _ctx_card(tmp_path, monkeypatch, (
+        '[model]\nmatch = "acme/Ctx-Aware-24B*"\nengine = "vllm"\n'
+        'min_vram_gb = 24\nnative_ctx = 1000000\n'
+        '[model.args]\nmax_model_len = 8192\n'))
+    a = _args("acme/Ctx-Aware-24B-Instruct")
+    a.args, a.context = None, "full"
+    with pytest.raises(ValueError, match="KV bytes/token"):
+        cards.apply_to_args(a, shape=(4, 80, "x"))
+    # kv known but the shape is missing or assumed -> the system-card remedy
+    _ctx_card(tmp_path, monkeypatch)
+    b = _args("acme/Ctx-Aware-24B-Instruct")
+    b.args, b.context = None, "full"
+    with pytest.raises(ValueError, match="VRAM is unknown"):
+        cards.apply_to_args(b, shape=None)
+    c = _args("acme/Ctx-Aware-24B-Instruct")
+    c.args, c.context = None, "full"
+    with pytest.raises(ValueError, match="VRAM is unknown"):
+        cards.apply_to_args(c, shape=(4, 80, "probe (VRAM assumed from the GPU type)"))
+
+
+def test_context_refuses_replicas(tmp_path, monkeypatch, capsys):
+    _ctx_card(tmp_path, monkeypatch)
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    rc = main(["serve", "acme/Ctx-Aware-24B-Instruct", "--scheduler", "slurm",
+               "--context", "full", "--replicas", "2", "--dryrun"])
+    assert rc == 2
+    assert "--context sizes ONE" in capsys.readouterr().err
+
+
+def test_context_local_path_is_rejected(capsys):
+    rc = main(["serve", "hf://meta-llama/Llama-3.1-8B-Instruct",
+               "--context", "full", "--here", "--dryrun"])
+    assert rc == 2
+    assert "--context" in capsys.readouterr().err
+
+
+def test_context_overshoot_clamps_to_native(tmp_path, monkeypatch, capsys):
+    _ctx_card(tmp_path, monkeypatch)
+    monkeypatch.setenv("BOXY_JOBS_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setenv("BOXY_GPUS_PER_NODE", "4")
+    monkeypatch.setenv("BOXY_GPU_VRAM_GB", "80")
+    rc = main(["serve", "acme/Ctx-Aware-24B-Instruct",
+               "--scheduler", "slurm", "--context", "9m", "--dryrun"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "clamped" in out
+    assert "--max-model-len 1000000" in out.replace("=", " ")

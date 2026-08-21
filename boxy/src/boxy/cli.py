@@ -4836,6 +4836,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
             # geometry is solved, not assumed.
             from boxy import cards
 
+            if (getattr(args, "context", None) is not None
+                    and (getattr(args, "replicas", 1) or 1) > 1):
+                raise UsageError("--context sizes ONE distributed instance; with --replicas "
+                                 "pass explicit --nodes and `-- --max-model-len N` per replica")
             for line in cards.apply_to_args(args, shape=_node_shape(None),
                                             unified=_node_unified(None)):
                 print(f"  auto: {line}")
@@ -4849,6 +4853,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 return 2
             return _serve_submission(args, scheduler_name, profile)
 
+    if getattr(args, "context", None) is not None:
+        print("boxy: --context is supported on the batch-submission path "
+              "(boxy serve MODEL --scheduler slurm|flux, or --ssh to a cluster) — that is "
+              "where geometry can grow. For a local/foreground serve pass "
+              "`-- --max-model-len N` directly.", file=sys.stderr)
+        return 2
     if (getattr(args, "replicas", 1) or 1) > 1:
         print("boxy: --replicas is supported on the batch-submission path "
               "(boxy serve MODEL --scheduler slurm|flux). It doesn't apply to --box, "
@@ -7418,6 +7428,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="node count for the job. For one instance: nodes to distribute across "
                         "(Ray). With --replicas: the POOL size to spread the replicas across "
                         "(NOT per-replica; see --nodes-per-replica for that)")
+    p.add_argument("--context", default=None, metavar="N|full",
+                   help="serve with AT LEAST this context window: boxy proves the KV-cache "
+                        "arithmetic fits and GROWS the geometry (more nodes) when it must, then "
+                        "sets --max-model-len to the request. 'full' = the model's native window; "
+                        "k/m suffixes are binary (256k, 1m). Needs a model card that knows "
+                        "kv_bytes_per_token (`boxy generate card`) and a system card with the real "
+                        "node shape; explicit --gpus/--nodes pin the geometry and boxy then only "
+                        "verifies the request fits it")
     p.add_argument("--name", default=None, help="container name (default: derived from the model)")
     p.add_argument("--models-dir", default=None,
                    help="where to download an s3:// model (default: ./models, or "
