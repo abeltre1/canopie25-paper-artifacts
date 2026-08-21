@@ -33,6 +33,13 @@ class Box:
     engine: str = "vllm"  # inference engine inside the box: vllm | llama.cpp
     entrypoint: str = ""
     model: str = ""
+    # The model id the API should ADVERTISE. Flows that rewrite `model` from the
+    # id the user asked for into a staged filesystem path record the original id
+    # here, so vLLM serves under --served-model-name org/name instead of the
+    # path (field: Kimi-K3 answered /v1/models with /mnt/models/moonshotai-kimi-k3
+    # and a request naming the id the user typed 404'd). "" = derive it from a
+    # transport-URI model, else keep the engine's default.
+    served_name: str = ""
     workdir: str = ""
     ports: list[int] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)

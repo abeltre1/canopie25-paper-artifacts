@@ -1436,6 +1436,24 @@ def test_completed_pull_beats_prestage_never(ssh, capfd, monkeypatch):
     assert f"vllm serve {staged}" in cap.out.replace("=", " ") or staged in cap.out
 
 
+def test_completed_pull_serves_under_the_canonical_id(ssh, capfd, monkeypatch):
+    """FIELD (Kimi-K3): the staged-path serve answered /v1/models with
+    /mnt/models/moonshotai-kimi-k3 — a request naming the id the user typed
+    404'd. The rendered script must alias the staged path back to the id
+    (--served-model-name), and the decision line must say so."""
+    from boxy import cli
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    staged = "/scratch/u/boxy/models/meta-llama-llama-3.1-8b-instruct"
+    monkeypatch.setattr(cli, "_pull_completed_stage", lambda t, s, m: staged)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "--served-model-name=meta-llama/Llama-3.1-8B-Instruct" in cap.out
+    assert "auto: served-model-name: meta-llama/Llama-3.1-8B-Instruct" in cap.out
+
+
 def test_prestage_uses_a_completed_boxy_pull_without_redownloading(monkeypatch):
     """FIELD (Kimi-K3, 1.56TB): `boxy pull --ssh` staged all 96 shards and
     stamped .boxy-pull-complete — then the serve's prestage ran its own
