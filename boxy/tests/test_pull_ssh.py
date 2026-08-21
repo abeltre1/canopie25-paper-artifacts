@@ -174,6 +174,43 @@ def test_explicit_image_wins(monkeypatch):
     assert "quay.io/my/vllm:x" in launch
 
 
+def test_stage_agentless_ca_builds_the_merged_bundle_itself(monkeypatch, tmp_path):
+    """FIELD (first Kimi-K3 pull): image pulled fine, model download died with
+    CERTIFICATE_VERIFY_FAILED — the site CA never reached the container. The
+    old precondition wanted SSL_CERT_FILE to ALREADY be boxy's merged bundle,
+    but the merge is process-local, so a fresh invocation never arrives
+    pre-merged and the CA silently stayed home. Staging must merge first."""
+    import os
+
+    site_ca = tmp_path / "site-ca.crt"
+    site_ca.write_text("SITE")
+    merged = tmp_path / "ca-merged.crt"
+    monkeypatch.delenv("BOXY_NO_CA_PROPAGATE", raising=False)   # suite opts out; opt in
+    monkeypatch.setenv("SSL_CERT_FILE", str(site_ca))
+
+    def fake_merge():
+        merged.write_text("MERGED")
+        os.environ["SSL_CERT_FILE"] = str(merged)
+        return str(merged)
+
+    monkeypatch.setattr(cli.ramalama_shim, "ensure_trust_bundle", fake_merge)
+    pushed = {}
+    monkeypatch.setattr("boxy.remote.push_file",
+                        lambda t, p, data: pushed.update(path=p, data=data) or 0)
+    out = cli._stage_agentless_ca("user@c", "c", "/home/u/agentless/c")
+    assert out == "/home/u/agentless/c/boxy-ca-merged.pem"
+    assert pushed["data"] == "MERGED"                 # the MERGED bundle, not the bare site CA
+
+
+def test_stage_agentless_ca_still_noop_when_no_bundle_can_be_built(monkeypatch, tmp_path):
+    # BOXY_NO_CA_MERGE (or no certifi): ensure_trust_bundle yields nothing ->
+    # stage stays a no-op instead of pushing a bare/unusable file.
+    monkeypatch.delenv("BOXY_NO_CA_PROPAGATE", raising=False)
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "site.crt"))
+    monkeypatch.setattr(cli.ramalama_shim, "ensure_trust_bundle", lambda: None)
+    assert cli._stage_agentless_ca("user@c", "c", "/x") is None
+
+
 def test_local_pull_refuses_a_store_that_cannot_hold_the_model(monkeypatch, capsys):
     # The LOCAL path gets the same guard (the $HOME quota trap, caught up front).
     monkeypatch.delenv("BOXY_SSH_HOST", raising=False)

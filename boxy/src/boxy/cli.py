@@ -2471,7 +2471,17 @@ def _stage_agentless_ca(target: str, host: str, rdir: str, dryrun: bool = False)
         return None
     ca = os.environ.get("SSL_CERT_FILE", "")
     if not (ca.endswith("ca-merged.crt") and os.path.isfile(ca)):
-        return None  # no boxy-merged bundle to carry (the cluster uses its own store)
+        # The merge is PROCESS-LOCAL (ensure_trust_bundle mutates this process's
+        # SSL_CERT_FILE; that never survives into the next shell command), so a
+        # fresh boxy invocation never arrives pre-merged and this precondition
+        # never held — the CA silently stayed home and the in-container
+        # HuggingFace fetch died with CERTIFICATE_VERIFY_FAILED behind the site's
+        # TLS interceptor (field: first Kimi-K3 pull — image pulled fine, model
+        # download dead on arrival). Build the merged bundle NOW, from the user's
+        # site CA (SSL_CERT_FILE) or the OS trust store; BOXY_NO_CA_MERGE opts out.
+        ca = ramalama_shim.ensure_trust_bundle() or ""
+    if not (ca.endswith("ca-merged.crt") and os.path.isfile(ca)):
+        return None  # no bundle to carry (BOXY_NO_CA_MERGE, or no certifi/OS store)
     remote_path = f"{rdir}/boxy-ca-merged.pem"
     if dryrun:
         print(f"  auto: CA: would stage your merged site CA -> {host}:{remote_path} "
