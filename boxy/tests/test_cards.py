@@ -321,6 +321,25 @@ def test_packaged_llama4_scout_card():
     assert card.args["max_model_len"] == 8192
 
 
+def test_packaged_kimi_k3_card():
+    # 2.8T MoE, MXFP4, ~1.56TB of weights: the biggest thing boxy ships a card
+    # for. The interesting assertion is the geometry — the card hand-sets
+    # nothing, yet on the recipe's own hardware (8x256GB MI325X) the solver must
+    # reproduce the recipe's shape: ONE node, TP8.
+    card = cards.find_card("hf://moonshotai/Kimi-K3")
+    assert card and card.source == "packaged" and card.engine == "vllm"
+    assert card.min_vram_gb == 1560
+    assert card.args["tool_call_parser"] == "kimi_k3"
+    assert card.args["reasoning_parser"] == "kimi_k3"
+    assert card.args["trust_remote_code"] is True
+    assert card.args["max_model_len"] == 262144          # native 1M would OOM the KV profile
+    assert cards.fit_geometry(card.min_vram_gb, 8, 256)[:2] == (1, 8)      # MI325X node
+    # smaller parts spill to one Ray instance across full nodes, never refuse
+    nodes, gpus, why = cards.fit_geometry(card.min_vram_gb, 4, 128, unified=True)   # MI300A
+    assert nodes > 1 and gpus == 4 and "exceeds one node" in why
+    assert cards.derive_gpu_memory_utilization(card.min_vram_gb, nodes * gpus, 128) is not None
+
+
 def test_single_node_multi_gpu_gets_tensor_parallel():
     # FIELD (Llama-4-Scout): a 4-GPU single-node allocation still ran vLLM with
     # its default tensor_parallel_size=1 — 218GB of MoE weights loaded onto GPU
