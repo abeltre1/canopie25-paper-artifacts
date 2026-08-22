@@ -906,10 +906,15 @@ def derive_gpu_memory_utilization(min_vram_gb: float, world_size: int, pool_gb: 
 # largest context that PROVABLY fits and serves that instead.
 
 # Per-rank reserve (GB) for activations, CUDA graphs, sampler and allocator
-# slack when translating a VRAM budget into KV-cache tokens. PLACEHOLDER
-# calibration: to be pinned by the field-measured Kimi-K3 'GPU KV cache size'
-# line (see the golden calibration test) — tune it there, not here.
-_CTX_ACT_RESERVE_GB = 8.0
+# slack when translating a VRAM budget into KV-cache tokens. CALIBRATED by the
+# field-measured Kimi-K3 deployment (8x4 MI300A, TP8xPP4, 128GB unified pools):
+# vLLM's own accounting reported 'Available KV cache memory: 32.97 GiB' per
+# rank and 'GPU KV cache size: 4,588,273 tokens'. At 4.0 the formula lands 14%
+# UNDER that measurement (conservative by design — vLLM profiles the real
+# activation peak, we budget a flat floor on top of an estimated shard); the
+# original 8.0 placeholder was 27% under and failed the golden test's +-20%
+# band. Tune ONLY against test_kimi_k3_context_calibration.
+_CTX_ACT_RESERVE_GB = 4.0
 # A derived context below this is not worth serving; decline (the card's
 # static cap stands) and say why instead.
 _CTX_FLOOR = 4096
