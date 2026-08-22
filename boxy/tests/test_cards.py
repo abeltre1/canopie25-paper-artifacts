@@ -916,20 +916,20 @@ def test_derive_max_model_len_discrete_arithmetic():
     # 24GB shard and the 8GB reserve -> 40GB KV budget; at 131072 B/token
     # (Llama-8B-class GQA) that is 305175 tokens, floored to a 1024 multiple.
     tokens, why = cards.derive_max_model_len(131072, 1000000, 24, 1, 1, 80)
-    assert tokens == 305152
-    assert "40GB" in why
+    assert tokens == 334848
+    assert "44GB" in why
     # PP=2 splits the layers -> half the per-rank cost -> double the tokens
     tokens2, _ = cards.derive_max_model_len(131072, 1000000, 24, 1, 2, 80)
-    assert tokens2 == 610304
+    assert tokens2 == 670720
     # native window is the hard ceiling — and the derivation says so
     capped, why3 = cards.derive_max_model_len(131072, 65536, 24, 1, 1, 80)
     assert capped == 65536
-    # an explicit utilization changes the claim (0.5 * 80 = 40GB -> 8GB budget)
+    # an explicit utilization changes the claim (0.5 * 80 = 40GB -> 12GB budget)
     lower, _ = cards.derive_max_model_len(131072, 1000000, 24, 1, 1, 80, util=0.5)
-    assert lower == 60416
+    assert lower == 91136
     # fp8 kv cache halves the per-token cost -> double the tokens
     fp8, _ = cards.derive_max_model_len(131072, 1000000, 24, 1, 1, 80, kv_dtype_factor=0.5)
-    assert fp8 == 610304
+    assert fp8 == 670720
 
 
 def test_derive_max_model_len_declines():
@@ -949,7 +949,7 @@ def test_derive_max_model_len_unified_agrees_with_util_derivation():
     # the util derivation's calibration point: 140GB over 4 ranks on a 128GB
     # pool claims 0.7 -> the ctx budget must be built on that SAME claim
     tokens, why = cards.derive_max_model_len(131072, 1000000, 140, 4, 1, 128, unified=True)
-    assert tokens == 354304
+    assert tokens == 385024
     # ...and where the util derivation refuses (2x70GB shards), the ctx
     # derivation must refuse too — deriving a context on top of a claim that
     # gets the rank OOM-killed would rebuild the field failure
@@ -964,9 +964,9 @@ def test_apply_derives_context_and_replaces_static_cap(tmp_path, monkeypatch):
     lines = cards.apply_to_args(a, shape=(4, 80, "x"))
     # exactly ONE --max-model-len: the derived value, the static 8192 stripped
     assert a.args.count("--max-model-len") == 1
-    assert a.args[a.args.index("--max-model-len") + 1] == "305152"
+    assert a.args[a.args.index("--max-model-len") + 1] == "334848"
     assert "8192" not in a.args
-    assert any(ln.startswith("max-model-len: 305152 (derived:") for ln in lines)
+    assert any(ln.startswith("max-model-len: 334848 (derived:") for ln in lines)
     # the card's only static arg was the cap, so no engine-args line remains
     assert not any(ln.startswith("engine args:") for ln in lines)
 
@@ -979,7 +979,7 @@ def test_apply_context_pair_precedes_derived_gpu_mem_pair(tmp_path, monkeypatch)
     # the long-standing contract: the derived gpu-mem pair stays LAST...
     assert a.args[-2:] == ["--gpu-memory-utilization", "0.79"]
     # ...and the derived ctx pair sits immediately before it
-    assert a.args[-4:-2] == ["--max-model-len", "530432"]
+    assert a.args[-4:-2] == ["--max-model-len", "561152"]
 
 
 def test_apply_context_user_max_model_len_still_wins(tmp_path, monkeypatch):
@@ -989,7 +989,7 @@ def test_apply_context_user_max_model_len_still_wins(tmp_path, monkeypatch):
     cards.apply_to_args(a, shape=(4, 80, "x"))
     # derived pair emitted, user pair appended after -> engine last-wins
     assert a.args[-2:] == ["--max-model-len", "4096"]
-    assert a.args[-4:-2] == ["--max-model-len", "305152"]
+    assert a.args[-4:-2] == ["--max-model-len", "334848"]
 
 
 def test_apply_context_honors_fp8_kv_cache_and_user_override(tmp_path, monkeypatch):
@@ -997,13 +997,13 @@ def test_apply_context_honors_fp8_kv_cache_and_user_override(tmp_path, monkeypat
     a = _args("acme/Ctx-Aware-24B-Instruct")
     a.args = None
     cards.apply_to_args(a, shape=(4, 80, "x"))
-    assert a.args[a.args.index("--max-model-len") + 1] == "610304"  # 2x: fp8 kv
+    assert a.args[a.args.index("--max-model-len") + 1] == "670720"  # 2x: fp8 kv
     # the user flipping the card's fp8 BACK to auto must restore the bf16 cost
     # (missing this would derive a context twice what the cache can hold)
     b = _args("acme/Ctx-Aware-24B-Instruct")
     b.args = ["--kv-cache-dtype", "auto"]
     cards.apply_to_args(b, shape=(4, 80, "x"))
-    assert b.args[b.args.index("--max-model-len") + 1] == "305152"
+    assert b.args[b.args.index("--max-model-len") + 1] == "334848"
 
 
 def test_apply_context_honors_user_pipeline_parallelism(tmp_path, monkeypatch):
@@ -1014,7 +1014,7 @@ def test_apply_context_honors_user_pipeline_parallelism(tmp_path, monkeypatch):
     a = _args("acme/Ctx-Aware-24B-Instruct")
     a.args = ["--pipeline-parallel-size", "2"]
     cards.apply_to_args(a, shape=(4, 80, "x"))
-    assert a.args[a.args.index("--max-model-len") + 1] == "610304"  # PP=2 halves cost
+    assert a.args[a.args.index("--max-model-len") + 1] == "670720"  # PP=2 halves cost
 
 
 def test_apply_context_declines_without_real_shape(tmp_path, monkeypatch):
@@ -1087,22 +1087,24 @@ def test_kimi_k3_card_carries_kv_fields():
 def test_kimi_k3_derives_past_static_cap_on_fat_metal():
     # the recipe's own MI325X shape (1 node x 8 x 256GB): the static 262144
     # fallback is REPLACED by the derived window — 230.4GB claim − 195GB shard
-    # − 8GB reserve = 27.4GB of KV at ~27.6KB/token = ~990K tokens, closing in
-    # on the full 1M native window with zero flags
+    # − 4GB reserve = 31.4GB of KV at ~27.6KB/token = ~1.14M tokens, clamped
+    # at the model's FULL 1M native window. Zero flags.
     a = _args("moonshotai/Kimi-K3")
     a.args = None
     lines = cards.apply_to_args(a, shape=(8, 256, "x"))
     assert a.args.count("--max-model-len") == 1
     derived = int(a.args[a.args.index("--max-model-len") + 1])
-    assert derived == 990208
+    assert derived == 1048576
     assert "262144" not in a.args
-    assert any(ln.startswith("max-model-len: 990208 (derived:") for ln in lines)
+    assert any(ln.startswith("max-model-len: 1048576 (derived:") for ln in lines)
+    assert any("FULL native window fits" in ln for ln in lines)
 
 
-# vLLM's own measured ground truth from the fielded 8-node MI300A serve — fill
-# from the log line 'GPU KV cache size: N tokens' and un-skip. This is the
+# vLLM's own measured ground truth from the fielded 8-node MI300A serve
+# (TP8xPP4, 128GB unified pools, 2026-08-22): 'Available KV cache memory:
+# 32.97 GiB' per rank, 'GPU KV cache size: 4,588,273 tokens'. This is the
 # calibration that pins _CTX_ACT_RESERVE_GB (tune the constant, not the test).
-MEASURED_K3_KV_TOKENS = None
+MEASURED_K3_KV_TOKENS = 4_588_273
 
 
 @pytest.mark.skipif(MEASURED_K3_KV_TOKENS is None,
@@ -1157,11 +1159,11 @@ def test_fit_geometry_grows_nodes_for_ctx_demand():
 
 
 def test_fit_geometry_ctx_widens_within_a_node_before_spilling():
-    # a 24GB model asking 400K tokens: 1 GPU gives a 40GB budget (~305K), but
-    # widening to 4 GPUs shrinks the shard and frees enough — no second node
+    # a 24GB model asking 400K tokens: 1 GPU gives a 44GB budget (~335K), but
+    # widening to 2 GPUs shrinks the shard and frees enough — no second node
     nodes, gpus, why = cards.fit_geometry(
         24, 4, 80, ctx_tokens=400_000, ctx_kv_bytes_per_token=131072.0)
-    assert (nodes, gpus) == (1, 4)
+    assert (nodes, gpus) == (1, 2)
     assert "widened" in why
     assert cards.fit_geometry(24, 4, 80)[:2] == (1, 1)
 

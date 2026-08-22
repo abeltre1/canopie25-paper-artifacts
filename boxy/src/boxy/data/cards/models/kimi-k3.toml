@@ -26,12 +26,13 @@ native_ctx = 1048576
 # KV bytes per token at bf16: KDA is a hybrid — the linear-attention majority
 # of the 93 layers carries CONSTANT state (zero per-token KV) and only the MLA
 # minority caches a compressed (kv_lora_rank 512 + qk_rope_head_dim 64) vector:
-# 576 x 2 bytes x 24 MLA layers (a 3:1 KDA:MLA schedule) = 27648. PROVISIONAL
-# pending verification against the staged config.json + the field-measured
-# 'GPU KV cache size' line (the golden calibration test); safe either way on
-# real K3 metal, where the derivation clamps at the native window long before
-# the budget runs out. This is what turns the old hand-passed
-# --max-model-len 131072 into a DERIVED near-native window.
+# 576 x 2 bytes x 24 MLA layers (a 3:1 KDA:MLA schedule) = 27648. FIELD-
+# VERIFIED within ~12%: vLLM measured 4,588,273 KV tokens from 32.97GiB/rank
+# at TP8xPP4 -> ~30.9KB/token effective, the delta being vLLM's own '3
+# padding layers, 4.35% waste' partition accounting. (Config.json schedule
+# cross-check still welcome.) The measurement also proves the point of the
+# field: 4.59M tokens of capacity on 8 nodes vs the 131072 that was being
+# hand-passed — the full 1M native window fits with a 4.4x margin.
 kv_bytes_per_token = 27648
 [model.args]
 trust_remote_code = true
