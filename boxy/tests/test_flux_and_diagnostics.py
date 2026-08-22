@@ -703,3 +703,68 @@ def test_vllm_env_disables_rays_userspace_oom_killer():
     # a user/box value still wins
     env2 = envs.build_env({"RAY_memory_monitor_refresh_ms": "250"}, "rocm", offline=False)
     assert env2["RAY_memory_monitor_refresh_ms"] == "250"
+
+
+# ---- distributed worker death (segfault / platform instability) ----------------------
+
+
+def test_diagnose_worker_segfault_names_rank_node_and_platform_cause():
+    """FIELD (2.8T MoE on 8x MI300A nodes): three consecutive multi-node runs
+    died on three different nodes at three different phases — profiling,
+    KV-init, first token. The one line that mattered ('Segfault encountered')
+    was buried under ~400 lines of Ray boilerplate and secondary tracebacks,
+    and RCCL's own 'Missing iommu=pt ... system instability' warning (a
+    compute-node BOOT ARG only admins can fix) went unnoticed for days."""
+    from boxy import diagnostics
+
+    log = (
+        '(RayWorkerProc pid=250, ip=10.0.0.7) !!!!!!! Segfault encountered !!!!!!!\n'
+        '(RayWorkerProc pid=250, ip=10.0.0.7) NCCL WARN Missing "iommu=pt" from kernel '
+        'command line which can lead to system instablity or hang!\n'
+        '(raylet) A worker died or was killed while executing a task by an unexpected '
+        'system error. Worker IP address: 10.0.0.7 Worker exit type: SYSTEM_ERROR '
+        'Worker exit detail: Worker unexpectedly exits with a connection error code 2. '
+        'End of file. Some common causes include: (1) the process was killed by the OOM '
+        'killer due to high memory usage, ... (3) the worker crashed unexpectedly due to '
+        'SIGSEGV or another unexpected error.\n'
+        'ERROR [ray_executor_v2.py:514] RayWorkerProc rank=[24] died unexpectedly, '
+        'shutting down executor.\n'
+        'RuntimeError: Engine core initialization failed. See root cause above.\n'
+    )
+    hint = diagnostics.diagnose(log)
+    assert hint is not None
+    assert "SEGFAULTED" in hint
+    assert "rank 24" in hint and "10.0.0.7" in hint
+    assert "iommu=pt" in hint and "admins" in hint
+    assert "TP = GPUs/node" in hint            # the keep-TP-inside-a-node remedy
+    # the generic engine-core rule must NOT have swallowed it
+    assert "a distributed worker died" in hint
+
+
+def test_diagnose_worker_death_without_segfault_points_at_dmesg():
+    from boxy import diagnostics
+
+    log = (
+        "(raylet) A worker died or was killed while executing a task by an unexpected "
+        "system error. Worker IP address: 10.0.0.9 Worker exit detail: Worker "
+        "unexpectedly exits with a connection error code 2. End of file.\n"
+        "ERROR [ray_executor_v2.py:514] RayWorkerProc rank=[12] died unexpectedly, "
+        "shutting down executor.\n"
+    )
+    hint = diagnostics.diagnose(log)
+    assert hint is not None
+    assert "rank 12" in hint and "10.0.0.9" in hint
+    assert "dmesg" in hint
+    assert "SEGFAULTED" not in hint
+
+
+def test_raylet_boilerplate_alone_is_not_a_segfault_diagnosis():
+    # the raylet message LISTS 'SIGSEGV' as a possible cause in every worker
+    # death — the segfault wording must key off the real banner, not the list
+    from boxy import diagnostics
+
+    log = ("Worker exit detail: ... (3) the worker crashed unexpectedly due to SIGSEGV "
+           "or another unexpected error.\n"
+           "RayWorkerProc rank=[3] died unexpectedly, shutting down executor.\n")
+    hint = diagnostics.diagnose(log)
+    assert hint is not None and "SEGFAULTED" not in hint

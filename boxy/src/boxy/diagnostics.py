@@ -318,6 +318,53 @@ def _nccl_shm_too_small(m: "re.Match[str]", log: str) -> str:
     )
 
 
+def _distributed_worker_died(m: "re.Match[str]", log: str) -> str:
+    """One rank of a multi-node engine died and took the whole executor down.
+    The raw log buries the one line that matters ('Segfault encountered') under
+    hundreds of lines of Ray boilerplate and secondary tracebacks — surface it,
+    plus the platform warnings that usually explain it."""
+    rank = re.search(r"RayWorkerProc rank=\[?(\d+)\]?\s+died", log)
+    node = re.search(r"Worker IP address:\s*([\d.]+)", log)
+    where = f"rank {rank.group(1)}" if rank else "a worker rank"
+    if node:
+        where += f" on {node.group(1)}"
+    segv = bool(re.search(r"!+\s*Segfault encountered|Fatal Python error: Segmentation fault",
+                          log))
+    iommu = bool(re.search(r'Missing "?iommu=pt"?', log))
+    stalled = bool(re.search(r"broker on \S+ \(rank \d+\) has been unresponsive", log))
+    body = ""
+    if segv:
+        body += (f"The worker ({where}) SEGFAULTED — a native crash in the GPU stack,\n"
+                 "not a Python error and not your configuration.\n")
+    else:
+        body += (f"The worker ({where}) exited abruptly ('connection error ... End of\n"
+                 "file'): either the kernel OOM-killed it (check dmesg on that node)\n"
+                 "or it crashed natively.\n")
+    if iommu:
+        body += ("\nRCCL warned: Missing \"iommu=pt\" from kernel command line — 'can lead\n"
+                 "to system instability or hang'. That is a COMPUTE-NODE BOOT ARGUMENT:\n"
+                 "only the cluster admins can set it, and without it GPU DMA is a known\n"
+                 "source of exactly these random segfaults and stalls. Report the RCCL\n"
+                 "warning line to them.\n")
+    if stalled:
+        body += ("\nScheduler brokers on several nodes went unresponsive at the same time —\n"
+                 "a node-wide stall (memory-pressure or DMA), not a software-only crash.\n")
+    body += (
+        "\nWhat to try, in order:\n"
+        "  1. Resubmit. These platform crashes are intermittent (field: three runs\n"
+        "     died on three DIFFERENT nodes at three different phases) and the\n"
+        "     scheduler will hand you a different node set.\n"
+        "  2. Keep tensor-parallel INSIDE a node (TP = GPUs/node, PP = nodes — the\n"
+        "     zero-flag default): TP that spans nodes routes every layer's\n"
+        "     all-reduce over the unstable path; PP crosses it far less often.\n"
+        "  3. If a claim was raised by hand, lower it (`-- --gpu-memory-utilization`)\n"
+        "     so the host keeps headroom on unified-memory parts.\n"
+        "  4. Persistent? Pin a known-good engine image tag instead of :latest, and\n"
+        "     escalate the platform warnings above to the admins."
+    )
+    return _fmt("a distributed worker died and took the engine with it", body)
+
+
 RULES: list[Rule] = [
     # only the DEFINITIVE signature: the 'has no vLLM implementation' warning alone
     # is benign (the Transformers fallback often works); this error is fatal.
@@ -421,6 +468,18 @@ RULES: list[Rule] = [
         re.compile(r"NCCL error: unhandled system error|ncclSystemError|"
                    r"Error while creating shared memory segment", re.IGNORECASE),
         _nccl_shm_too_small,
+    ),
+    Rule(
+        # One rank of a multi-node (Ray) engine died and the executor shut down.
+        # Matched on vLLM's own line (always present) or the segfault banner —
+        # NOT on the raylet boilerplate, which merely LISTS 'SIGSEGV'/'OOM
+        # killer' as possible causes in every worker death. Before the generic
+        # engine-core rule: that one would otherwise swallow this signature.
+        "distributed-worker-died",
+        re.compile(r"RayWorkerProc rank=\[?\d+\]? died unexpectedly|"
+                   r"!+\s*Segfault encountered|"
+                   r"Fatal Python error: Segmentation fault"),
+        _distributed_worker_died,
     ),
     # LAST: the generic vLLM wrapper. Only fires when nothing specific matched,
     # so a real signature above always wins.
