@@ -61,10 +61,19 @@ class PodmanBackend(RuntimeBackend):
     run_verb = "run"
 
     def network_args(self, box: Box, inner_cmd: list[str]) -> list[str]:
-        """Linux (HPC nodes): host networking + host IPC, per the paper's
-        prototype — --ipc=host also gives the container the host's /dev/shm,
-        which NCCL/RCCL need for multi-GPU communicators (podman's default
-        64MB is fatally small: 'NCCL error: unhandled system error').
+        """Linux (HPC nodes): host networking (Ray's ports must span nodes) +
+        a PRIVATE, sized /dev/shm. NCCL/RCCL communicators and vLLM's shm
+        broadcast need far more than podman's 64MB default ('NCCL error:
+        unhandled system error'); the first fix was --ipc=host, but vLLM's own
+        multi-node CI (.buildkite/scripts/run-multi-node-test.sh) prescribes
+        the opposite: '--shm-size=10.24gb is required. don't use --ipc=host'.
+        The reference is right for boxy's one-container-per-node layout:
+        nothing needs the HOST's IPC namespace, a fresh private shm cannot
+        collide with a crashed run's leaked segments in the host /dev/shm
+        (field: 'resource_tracker: 1 leaked shared_memory objects' across
+        relaunches), and the cap stops shm from eating unbounded host tmpfs —
+        which on unified-memory APUs is the same pool the GPUs and the
+        scheduler's own daemons live in.
         macOS: podman-machine/Docker Desktop run containers in a Linux VM,
         where --network=host binds inside the VM and is unreachable from the
         host — publish ports instead. (Field finding #11, 2026-07.)
@@ -75,7 +84,9 @@ class PodmanBackend(RuntimeBackend):
             for port in _serve_ports(box, inner_cmd):
                 args += ["-p", f"{port}:{port}"]
             return args
-        return ["--network=host", "--ipc=host"]
+        from boxy import config
+
+        return ["--network=host", f"--shm-size={config.get('network.shm_size')}"]
 
     def gpu_args(self, accelerator: str) -> list[str]:
         if accelerator == "cuda":
