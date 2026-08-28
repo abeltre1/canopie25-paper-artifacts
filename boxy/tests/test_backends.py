@@ -12,7 +12,9 @@ def test_podman_cuda(vllm_box, clustera):
     cmd = get_backend("podman").build_command(vllm_box, clustera, INNER, {}, MOUNTS, "cuda")
     assert cmd[:2] == ["podman", "run"]
     assert "--rm" in cmd and "--name=vllm" in cmd
-    assert "--network=host" in cmd and "--ipc=host" in cmd
+    assert "--network=host" in cmd and "--shm-size=10.24gb" in cmd
+    # vLLM's multi-node CI: '--shm-size=10.24gb is required. don't use --ipc=host'
+    assert "--ipc=host" not in cmd
     assert "--entrypoint=vllm" in cmd
     assert "--workdir=/vllm-workspace/models" in cmd
     assert "--volume=./models:/vllm-workspace/models" in cmd
@@ -84,3 +86,13 @@ def test_registry_prefix(vllm_box, clustera):
     clustera.registry = "registry.example.com/"
     cmd = get_backend("podman").build_command(vllm_box, clustera, INNER, {}, MOUNTS, "cuda")
     assert "registry.example.com/vllm/vllm-openai:v0.9.1" in cmd
+
+
+def test_shm_size_is_configurable(vllm_box, clustera, monkeypatch):
+    # sites with bigger inter-node fabrics (or tighter hosts) tune it; the
+    # default mirrors vLLM's own multi-node CI requirement
+    monkeypatch.setenv("BOXY_SHM_SIZE", "32g")
+    from boxy import config
+    config.reset()
+    cmd = get_backend("podman").build_command(vllm_box, clustera, INNER, {}, MOUNTS, "cuda")
+    assert "--shm-size=32g" in cmd

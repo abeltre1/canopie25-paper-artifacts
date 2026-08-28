@@ -308,11 +308,12 @@ def _nccl_shm_too_small(m: "re.Match[str]", log: str) -> str:
         "defaults to a 64MB /dev/shm that RCCL/NCCL cannot live in. Single-GPU runs\n"
         "never hit this (no communicator is created).\n"
         "  fix: re-deploy with an updated boxy — the container now runs with\n"
-        "  --ipc=host (the host's /dev/shm) on Linux compute nodes, including\n"
-        "  agentless scripts rendered on a Mac (the bug: the render followed the\n"
-        "  LAPTOP's platform and dropped --ipc=host).\n"
-        "  by hand: add --ipc=host (or --shm-size=8g) to the podman run line in the\n"
-        "  batch script and resubmit.\n"
+        "  --shm-size=10.24gb on Linux compute nodes (vLLM's own multi-node\n"
+        "  prescription; BOXY_SHM_SIZE overrides), including agentless scripts\n"
+        "  rendered on a Mac (the bug: the render followed the LAPTOP's platform\n"
+        "  and dropped the shm flag entirely).\n"
+        "  by hand: add --shm-size=10g (or --ipc=host) to the podman run line in\n"
+        "  the batch script and resubmit.\n"
         "  confirm: rerun with --env NCCL_DEBUG=INFO — the failing transport prints\n"
         "  'Error while creating shared memory segment'.",
     )

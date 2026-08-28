@@ -248,7 +248,7 @@ def test_render_multinode_needs_gpu_count(tmp_path):
 
 def test_render_from_mac_still_targets_linux(staged_gguf, tmp_path, monkeypatch):
     # FIELD (clusterb, Nemotron TP=2): rendered on a Mac laptop, the podman
-    # command took the darwin branch (-p publishing, NO --ipc=host) — so the
+    # command took the darwin branch (-p publishing, NO shm sizing) — so the
     # container ran on podman's 64MB /dev/shm and RCCL died at ncclCommInitRank
     # ('NCCL error: unhandled system error') as soon as a second GPU joined.
     # The agentless render must pin the TARGET platform (Linux), not follow
@@ -259,7 +259,8 @@ def test_render_from_mac_still_targets_linux(staged_gguf, tmp_path, monkeypatch)
     script = deploy.render_agentless_script(
         _box(staged_gguf), _loc(), "slurm", "boxy-al",
         str(tmp_path / "e.json"), str(tmp_path / "l-%j.log"), [], port=8090)
-    assert "--network=host" in script and "--ipc=host" in script
+    assert "--network=host" in script and "--shm-size=10.24gb" in script
+    assert "--ipc=host" not in script    # vLLM multi-node CI: don't use --ipc=host
     assert "-p 8090:8090" not in script                      # not the mac port-publish branch
     # and the pin does not leak: a plain local darwin build publishes ports again
     from boxy.backends.podman import PodmanBackend

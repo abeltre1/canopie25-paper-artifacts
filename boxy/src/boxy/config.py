@@ -58,6 +58,13 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in [
                  "set 127.0.0.1 only for a purely local, single-host serve."),
     Setting("network.ray_port", "BOXY_RAY_PORT", 6379, int,
             help="Ray head port for multi-node (distributed) vLLM serving."),
+    Setting("network.shm_size", "BOXY_SHM_SIZE", "10.24gb",
+            help="container /dev/shm size on Linux compute nodes (NCCL/RCCL communicators "
+                 "+ vLLM's shm broadcast live there; podman's 64MB default is fatally "
+                 "small). The default mirrors vLLM's own multi-node CI, which requires "
+                 "--shm-size=10.24gb and warns AGAINST --ipc=host: a private capped shm "
+                 "can't collide with a crashed run's leaked segments in the host's "
+                 "/dev/shm and can't eat unbounded host tmpfs on unified-memory parts."),
     Setting("network.ray_num_cpus", "BOXY_RAY_NUM_CPUS", 32, int,
             help="CPU count DECLARED to each node's `ray start` (never probed). Capped "
                  "low on purpose: Ray prestarts one worker process per declared CPU when "
