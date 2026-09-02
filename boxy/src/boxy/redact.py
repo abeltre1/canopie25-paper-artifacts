@@ -128,3 +128,15 @@ def redact_command(text: str, env: dict[str, str] | None = None) -> str:
 def redact_lines(text: str, env: dict[str, str] | None = None) -> list[str]:
     """redact_command() split into lines — the shape the CLI echoes scripts in."""
     return redact_command(text, env).splitlines()
+
+
+# A proxy URL can carry credentials inline (http://user:pass@host:port). Those
+# are secrets that no decision line, no rendered script echo, and no error
+# message may show — and they are NOT a KEY=VALUE assignment, so the
+# assignment-based masking above never saw them.
+_URL_CREDS = re.compile(r"(?P<scheme>[a-zA-Z][\w+.-]*://)(?P<user>[^/\s:@]+)(?::[^/\s@]*)?@")
+
+
+def redact_url_credentials(text: str) -> str:
+    """Mask `user:pass@` inside any URL, keeping the shape recognizable."""
+    return _URL_CREDS.sub(lambda m: f"{m.group('scheme')}{m.group('user')}:***@", text or "")
