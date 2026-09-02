@@ -239,3 +239,37 @@ def test_gen_matrix_refuses_to_write_a_leaking_doc(monkeypatch):
     assert "CLEAN-OK" in proc.stdout                      # clean text writes fine
     assert proc.returncode != 0                           # leaking text aborts
     assert "REFUSING to write" in (proc.stderr + proc.stdout)
+
+
+def test_proxy_credentials_are_never_printed():
+    """A proxy URL can carry credentials inline (http://user:pass@host). Those
+    are not a KEY=VALUE assignment, so the assignment masking never saw them —
+    and they were printed verbatim in decision lines and egress messages."""
+    from boxy import redact
+
+    assert redact.redact_url_credentials("http://bob:hunter2@proxy.example.gov:80") == \
+        "http://bob:***@proxy.example.gov:80"
+    # inside a longer line, and with the env-prefix spelling boxy renders
+    line = "  auto: proxy: forwarding env https_proxy=http://u:s3cr3t@x:3128 to the pull"
+    out = redact.redact_url_credentials(line)
+    assert "s3cr3t" not in out and "http://u:***@x:3128" in out
+    # a credential-free URL is untouched
+    assert redact.redact_url_credentials("http://proxy:80") == "http://proxy:80"
+
+
+def test_download_script_keeps_secrets_off_the_process_command_line():
+    """/proc/<pid>/cmdline is world-readable on a shared login node, and the
+    pull's curl runs for the length of a multi-GB download. Neither the HF
+    bearer token nor a proxy URL with inline credentials may appear in argv."""
+    from boxy import cli
+
+    script = cli._hf_curl_script("org/model", "/scratch/stage", "img:tag",
+                                 proxy="http://user:pw@proxy:80", token="hf_tok")
+    # argv-bearing spellings are gone
+    assert "-x http://user:pw@proxy:80" not in script
+    assert '-H "Authorization' not in script
+    # ...replaced by a 0600 config file that is cleaned up on every exit path
+    assert '-K "$CURLRC"' in script
+    assert 'chmod 600 "$CURLRC"' in script
+    assert "EOF_BOXY_CURLRC" in script          # heredoc: values stay off argv while WRITING it
+    assert "trap" in script

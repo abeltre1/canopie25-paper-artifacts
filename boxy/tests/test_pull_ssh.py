@@ -120,7 +120,12 @@ def test_blocked_egress_gives_curl_the_proxy_and_staged_ca(monkeypatch, capsys):
     assert cli._pull_agentless_ssh(_args(), TARGET) == 0
     assert "direct HF probe failed" in capsys.readouterr().out
     script = pushed[SCRIPT]
-    assert "-x http://site-proxy:80" in script
+    # the proxy reaches curl through the 0600 config file, NOT on argv, where
+    # inline credentials would be world-readable in /proc/<pid>/cmdline
+    assert "-x http://site-proxy:80" not in script
+    assert 'proxy = "$BOXY_PROXY_URL"' in script
+    assert "BOXY_PROXY_URL=http://site-proxy:80" in script
+    assert '-K "$CURLRC"' in script
     assert "--cacert /rdir/boxy-ca-merged.pem" in script
 
 
@@ -132,6 +137,12 @@ def test_hf_token_rides_as_an_auth_header_not_in_the_url(monkeypatch):
     assert "Authorization: Bearer $HF_TOKEN" in script and "hf_secret_token" in script
     launch = next(c for c in calls if "setsid" in c)
     assert "chmod 600" in launch, "the script carries the token; tighten it before running"
+    # ...and the token never reaches curl's ARGV: a shared login node lets any
+    # user read /proc/<pid>/cmdline for the whole multi-GB download
+    assert "-H \"Authorization" not in script
+    assert '-K "$CURLRC"' in script
+    assert 'chmod 600 "$CURLRC"' in script
+    assert 'trap ' in script and 'rm -f' in script       # removed on every exit path
 
 
 def test_launch_backgrounds_a_single_redirected_command(monkeypatch):
