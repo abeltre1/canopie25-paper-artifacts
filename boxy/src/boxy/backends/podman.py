@@ -117,6 +117,14 @@ class PodmanBackend(RuntimeBackend):
         # vLLM/llama.cpp thread pools scale with cores too. RamaLama lifts the
         # limit the same way.
         cmd = [self.name, self.run_verb, "--rm", "--pids-limit=-1", f"--name={box.name}"]
+        from boxy import deploy as _deploy
+
+        if getattr(_deploy, "_AIRGAP_RENDER", False):
+            # AIR-GAPPED: the image comes from the bundle's oci-archive, which a
+            # prelude `podman load`s. Without this, a load that did not happen
+            # degrades into a registry pull that CANNOT succeed inside the gap —
+            # after the queue wait. Fail in seconds, naming the real problem.
+            cmd += ["--pull=never"]
         cmd += self.network_args(box, inner_cmd)
         cmd += [f"--label=boxy.box={box.name}"]  # lets `boxy list` find boxy-launched containers
         if entrypoint:  # "" => keep the image's own ENTRYPOINT, pass args only
