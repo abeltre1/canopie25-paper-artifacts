@@ -179,3 +179,25 @@ class TestLiveDockerCycle:
 
         ps = subprocess.run(["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True)
         assert "llamacpp-demo" not in ps.stdout
+
+
+def test_dryrun_plans_without_the_ramalama_extra(monkeypatch, capsys):
+    """A --dryrun PRINTS A PLAN: it must never need the network, the store, or
+    an optional extra. It used to raise 'requires the ramalama package' before
+    even consulting dryrun — so the documented first command failed on the
+    documented first install (bare `pip install boxy-hpc`, whose README
+    examples are all --dryrun)."""
+    import sys
+
+    from boxy import ramalama_shim
+
+    # make the transport import fail exactly as it does without the extra
+    monkeypatch.setitem(sys.modules, "ramalama.transports.transport_factory", None)
+    path = ramalama_shim.pull_model("hf://Qwen/Qwen2.5-0.5B-Instruct", dryrun=True)
+    assert path.endswith("qwen-qwen2.5-0.5b-instruct")
+    out = capsys.readouterr().out
+    assert "would be pulled to" in out and "plan only" in out
+
+    # ...but a REAL pull still refuses, with the remedy
+    with pytest.raises(RuntimeError, match=r"boxy-hpc\[ramalama\]"):
+        ramalama_shim.pull_model("hf://Qwen/Qwen2.5-0.5B-Instruct", dryrun=False)
