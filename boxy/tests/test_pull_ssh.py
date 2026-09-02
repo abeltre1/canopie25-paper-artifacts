@@ -340,16 +340,22 @@ def test_listing_failure_names_the_cause_not_six_useless_words():
     both the body and the status, and the pipeline discarded curl's exit code
     on top."""
     script = cli._hf_curl_script("moonshotai/Kimi-K3", "/scratch/stage", "img:tag")
-    # the listing keeps the status instead of -f throwing it away
-    assert '-w "%{http_code}"' in script
-    assert "curl -sfL" not in script.split("case \"$code\"")[0].split("code=$(")[1]
+    # the listing keeps the status instead of -f throwing it away...
+    assert "%{http_code}" in script
+    # ...but STILL follows redirects: the Hub redirects some API paths, and a
+    # captive/intercepting proxy answers with a 3xx too (field: cronus returned
+    # 307 on /api/models and the download died on the body that came back)
+    assert "curl -sSL" in script
+    assert "captive portal" in script
     # ...and every status maps to the actual remedy
     assert "401|403)" in script and "GATED" in script and "HF_TOKEN" in script
     assert "404)" in script and "check the id for a typo" in script
     assert "429)" in script and "rate-limited" in script
     assert "000)" in script and "DNS/TLS/proxy, not the model" in script
-    # a 200 with an unexpected body is its own case, not silence
-    assert "listed no files" in script
+    # a reply that is not Hub JSON is its own case, and it NAMES where the
+    # request actually landed (field: cronus answered 307 on /api/models)
+    assert "did not come back as HuggingFace JSON" in script
+    assert "url_effective" in script and ".boxy-repo.url" in script
 
 
 def test_a_dead_pull_reports_FAILED_not_RUNNING(monkeypatch, capsys):
