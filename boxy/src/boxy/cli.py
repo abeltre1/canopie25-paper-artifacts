@@ -3406,6 +3406,23 @@ def _serve_agentless_ssh(args, target: str) -> int:
     #    submitter's ambient proxy env (or --proxy) is carried over — same as every
     #    other agentless render. Without this the isolated node can't reach the registry.
     pfx = "" if bundle else _proxy_prefix(args)
+    if pfx and not getattr(args, "proxy", ""):
+        # PROBE BEFORE INJECTING. Forwarding the SUBMITTER's ambient proxy into a
+        # cluster that reaches the registry directly does not add a fallback —
+        # it REPLACES a working path with one the cluster usually cannot even
+        # route (field: six rounds of in-container CERTIFICATE_VERIFY_FAILED on
+        # a cluster whose own curl answered 200 every time; the laptop's proxy
+        # had been injected by exactly this line). `boxy pull` already probes;
+        # serve must too. An explicit --proxy is never probed away.
+        reg = (args.image or box.image or "").split("/", 1)[0]
+        reg = reg if ("." in reg or reg == "localhost") else "docker.io"
+        rc_e, _ = remote.ssh_capture(
+            target, f"curl -sIf https://{reg}/ -o /dev/null --max-time 12", timeout=20)
+        if rc_e == 0:
+            pfx = ""
+            deploy.set_direct_egress(True)
+            print(f"  auto: egress: {reg} verifies directly from {host} — NOT injecting this "
+                  f"laptop's proxy (it would replace a working path; --proxy URL forces one)")
     if pfx:
         print(f"  auto: proxy: forwarding {pfx.strip()}to the compute-node image pull "
               f"(reach the registry behind the site proxy)")

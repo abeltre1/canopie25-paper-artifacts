@@ -918,6 +918,51 @@ def test_agentless_list_logs_stop_answer_from_laptop_records(ssh, capfd, monkeyp
     assert jobs.read_record("boxy-m") is None              # record reaped
 
 
+def test_serve_probes_egress_before_injecting_the_laptop_proxy(ssh, capfd, monkeypatch):
+    """FIELD: the laptop's ambient proxy was injected into a cluster that reaches
+    the registry DIRECTLY, replacing a working path with an unroutable one — six
+    rounds of in-container CERTIFICATE_VERIFY_FAILED while the cluster's own
+    curl answered 200 every time. `boxy pull` learned to probe first; serve must
+    too."""
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("https_proxy", "http://laptop-proxy.example.gov:80")
+    _shim(ssh["bin"], "curl", "#!/bin/bash\nexit 0\n")          # cluster reaches it directly
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "NOT injecting this laptop's proxy" in cap.out
+    assert "laptop-proxy.example.gov" not in cap.out              # nowhere: prefix OR container env
+
+
+def test_serve_still_forwards_the_proxy_when_egress_is_blocked(ssh, capfd, monkeypatch):
+    # the other half of the contract: a cluster that CANNOT reach the registry
+    # keeps the forwarded proxy (the ghcr 403 / Zscaler case this exists for)
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("https_proxy", "http://site-proxy.example.gov:80")
+    _shim(ssh["bin"], "curl", "#!/bin/bash\nexit 7\n")          # blocked
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "auto: proxy: forwarding" in cap.out
+    assert "site-proxy.example.gov" in cap.out
+
+
+def test_explicit_proxy_is_never_probed_away(ssh, capfd, monkeypatch):
+    # --proxy is the user naming a proxy they know they need: honor it even
+    # when the probe would have said 'direct'
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    _shim(ssh["bin"], "curl", "#!/bin/bash\nexit 0\n")          # direct would succeed
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera",
+               "--proxy", "http://chosen.example.gov:3128", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "chosen.example.gov" in cap.out
+    assert "NOT injecting" not in cap.out
+
+
 def test_agentless_curl_and_open_answer_from_laptop_records(ssh, capfd, monkeypatch, tmp_path):
     """FIELD: after the default agentless serve, `boxy curl --ssh` and `boxy open
     --ssh` delegated to a cluster boxy that DOES NOT EXIST (agentless installs
