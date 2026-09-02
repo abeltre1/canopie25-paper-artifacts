@@ -6360,11 +6360,142 @@ def _select_endpoint(name: str | None, verb: str = "curl") -> tuple[str, dict]:
     raise UsageError(f"several models are serving — pick one: boxy {verb} {' | '.join(sorted(endpoints))}")
 
 
+def _agentless_match(args, verb: str) -> dict | None:
+    """This machine's AGENTLESS record to act on, or None.
+
+    An agentless job runs on a cluster with NO boxy installed, and its endpoint
+    is a COMPUTE-node hostname that resolves only there. So curl/open must
+    answer from HERE over the SSH master; delegating `boxy <verb>` to the login
+    node exits 127 (field: the docs said to run `boxy open`, and it did exactly
+    that — `boxy attach` was the only command that worked). This is the rule
+    cmd_list and cmd_attach already follow.
+
+    With a --ssh target, records are narrowed to that cluster and win outright.
+    Without one, LOCAL endpoints keep priority (a laptop container the user is
+    more likely to mean) and agentless is the fallback."""
+    from boxy import jobs
+    from boxy import remote as _remote
+
+    name = getattr(args, "name", None)
+    ags = [r for r in _agentless_records() if r.get("target")]
+    tgt = _remote.resolve_target(args) or ""
+    if tgt:
+        thost = tgt.split("@")[-1]
+        ags = [r for r in ags if r["target"].split("@")[-1] == thost]
+    elif any(jobs.read_endpoint(n) for r in jobs.list_records()
+             for n in [r["name"], *r.get("replicas", [])]):
+        return None                      # something is serving HERE — that wins
+    if name:
+        ags = [r for r in ags if r["name"] == name]
+    if not ags:
+        return None
+    if len(ags) > 1:
+        raise UsageError(f"several agentless jobs — pick one: boxy {verb} "
+                         + " | ".join(sorted(r["name"] for r in ags)))
+    return ags[0]
+
+
+def _agentless_endpoint(rec: dict, verb: str) -> tuple[str, str]:
+    """(ssh target, base url) for an agentless record — or a UsageError naming
+    the job's state when the endpoint has not been published yet."""
+    from boxy import remote
+
+    target = rec["target"]
+    if remote.ensure_master(target) != 0:
+        raise RuntimeError(f"could not open an SSH session to {target}")
+    url = _agentless_url(rec)
+    if url == "-":
+        raise UsageError(f"{rec['name']}: no endpoint on {target} yet — the job may still be "
+                         f"pending (state: {_agentless_state(rec)}); see boxy list")
+    return target, url.removesuffix("/v1")
+
+
+def _curl_agentless(rec: dict, args) -> int:
+    """Send the chat request from the LOGIN NODE over the SSH master: only there
+    does the compute-node hostname resolve, and there is no cluster boxy to
+    delegate to."""
+    import json as _json
+
+    from boxy import remote
+
+    target, base = _agentless_endpoint(rec, "curl")
+    rc, out = remote.ssh_capture(
+        target, f"curl -sS --max-time 20 {shlex.quote(base + '/v1/models')}", timeout=60)
+    model = ""
+    if rc == 0 and "{" in out:
+        try:
+            model = ((_json.loads(out[out.index("{"):]).get("data") or [{}])[0]).get("id", "")
+        except (ValueError, IndexError, AttributeError):
+            model = ""
+    if not model:
+        raise RuntimeError(f"cannot reach {base} from {target} — is the job READY? "
+                           f"(state: {_agentless_state(rec)}; see boxy list / boxy logs "
+                           f"{rec['name']})")
+    payload = _json.dumps({"model": model, "max_tokens": args.max_tokens,
+                           "messages": [{"role": "user", "content": args.prompt}]})
+    rc, out = remote.ssh_capture(
+        target, f"curl -sS --max-time 300 -H 'Content-Type: application/json' "
+                f"-d {shlex.quote(payload)} {shlex.quote(base + '/v1/chat/completions')}",
+        timeout=360)
+    if rc != 0 or "{" not in out:
+        raise RuntimeError(f"the request failed on {target}: {out.strip()[-400:] or 'no output'}")
+    body = _json.loads(out[out.index("{"):])
+    if getattr(args, "json", False):
+        print(_json.dumps(body, indent=1))
+        return 0
+    reply = (body.get("choices") or [{}])[0].get("message", {}).get("content", "")
+    print(f"[{model} @ {base} — queried from {target}]")
+    print(reply.strip() or "(empty reply)")
+    return 0
+
+
+def _open_agentless(rec: dict, args) -> int:
+    """Forward the AGENTLESS job's compute-node endpoint to a local port from
+    here — the same tunnel `boxy attach` opens, plus --route/--share."""
+    import json as _json
+
+    from boxy import remote
+
+    target = rec["target"]
+    if remote.ensure_master(target) != 0:
+        print(f"boxy: could not open an SSH session to {target}", file=sys.stderr)
+        return 1
+    rc, epj = remote.ssh_capture(
+        target, f"cat {shlex.quote(rec.get('endpoint_remote', ''))} 2>/dev/null || true", timeout=15)
+    ep = None
+    if rc == 0 and epj.strip():
+        try:
+            ep = _json.loads(epj)
+        except ValueError:
+            ep = None
+    if not (ep and ep.get("host") and ep.get("port")):
+        raise UsageError(f"{rec['name']}: no endpoint on {target} yet — the job may still be "
+                         f"pending (state: {_agentless_state(rec)}); see boxy list")
+    _, lp = remote.ssh_capture(
+        target, f"ls -t {_agentless_log_glob(rec)} 2>/dev/null | head -1", timeout=15)
+    ok = remote.await_ready_and_tunnel(
+        target, ep["host"], int(ep["port"]), lp.strip(),
+        getattr(args, "local_port", None), getattr(args, "route", None) or "",
+        getattr(args, "share", "") or "", getattr(args, "exposer", None) or "relay", False,
+        timeout_s=_SCHED_READY_FLOOR,
+        still_alive=lambda: _agentless_state(rec) in ("RUNNING", "PENDING"))
+    if ok:
+        print(f"###   stop: boxy stop {rec['name']}")
+        return 0
+    print(f"boxy: job {rec['job']} is not serving yet; see: boxy logs {rec['name']}",
+          file=sys.stderr)
+    return 1
+
+
 def cmd_curl(args: argparse.Namespace) -> int:
     """Query a boxy-served model by NAME from wherever you are: resolve its
     endpoint from the job records, send one chat completion, print the reply.
     With --ssh (or BOXY_SSH_HOST) it runs ON the cluster, where the compute-node
     hostname resolves — so `boxy curl --ssh user@login` works from a laptop."""
+    if not getattr(args, "url", None):
+        rec = _agentless_match(args, "curl")
+        if rec is not None:                  # cluster has no boxy: query over the master
+            return _curl_agentless(rec, args)
     rc = _delegate_remote(args)
     if rc is not None:
         return rc
@@ -6404,6 +6535,9 @@ def cmd_open(args: argparse.Namespace) -> int:
     root path. Run ON the cluster (no --ssh) it prints the endpoint + the exact
     `ssh -L` a workstation needs. One step for the browser access that used to
     take a manual tunnel (field report, 2026-07)."""
+    rec = _agentless_match(args, "open")
+    if rec is not None:                      # cluster has no boxy: tunnel from here
+        return _open_agentless(rec, args)
     rc = _delegate_remote(args, tunnel_ready=True)
     if rc is not None:
         return rc
