@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from boxy import bench, cloud
+from tests.conftest import EXAMPLES
 from boxy.box import Box
 from boxy.cli import main
 from boxy.location import Location, Resources
@@ -140,3 +141,22 @@ def test_launch_cli_warns_on_hpc_scheduler(capsys):
     ])
     assert rc == 0
     assert "use `boxy serve` for Slurm/Flux" in capsys.readouterr().err
+
+
+def test_sky_task_carries_the_model_card(tmp_path, capfd):
+    """FIELD-shaped gap: the cloud path ignored model cards entirely, so a task
+    ran without --max-model-len (vLLM then profiles KV for the model's FULL
+    window and OOMs) and without any card-pinned engine knowledge. The manifest
+    and `boxy serve` must agree about what a model needs."""
+    from boxy.cli import main
+
+    box = tmp_path / "b.toml"
+    box.write_text('[box]\nname = "c"\nengine = "vllm"\nentrypoint = "vllm"\n'
+                   'model = "hf://meta-llama/Llama-3.1-8B-Instruct"\nports = [8000]\n')
+    out = tmp_path / "task.yaml"
+    rc = main(["generate", "sky", "--box", str(box), "--location",
+               str(EXAMPLES / "locations" / "cloud-gpu.toml"), "-o", str(out)])
+    assert rc == 0
+    text = out.read_text()
+    assert "--max-model-len=8192" in text          # the card's cap reached the cloud task
+    assert "vllm serve meta-llama/Llama-3.1-8B-Instruct" in text
