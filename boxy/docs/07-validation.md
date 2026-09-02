@@ -1,20 +1,23 @@
 # boxy validation report
 
 What was exercised this pass — every command, every deployment system, and the
-network scenarios — and the result. Run from `boxy/` on `claude/boxy-turnkey`.
+network scenarios — and the result. Run from `boxy/`.
 
 ## Test suites
 
 | Run | Command | Result |
 |---|---|---|
-| CI-equivalent (what GitHub Actions runs) | `ruff check src tests && pytest -q --ignore=tests/test_degraded_and_live.py` | **832 passed, 1 skipped, 0 failed** |
-| Full incl. air-gapped/live harness | `pytest -q` (all files) | **832 passed, 8 skipped, 0 failed** |
-| GitHub Actions `boxy-ci` (py 3.11 / 3.12 / 3.13 + package) | on every push to the branch | **green** (latest: `2fb3393`) |
+| CI-equivalent (what GitHub Actions runs) | `ruff check src tests && pytest -q --ignore=tests/test_degraded_and_live.py` | **1308 passed, 0 failed** |
+| Full suite | `pytest -q` (all files) | **1308 passed, 19 skipped, 0 failed** |
+| GitHub Actions `boxy-ci` (py 3.11 / 3.12 / 3.13 + package build) | on every push to a tracked branch | **green** |
 
-The 8 skips: the no-ramalama degradation harness needs ramalama *truly absent*
-(it's pip-installed here, so PYTHONPATH isolation can't hide it — CI excludes the
-file; the harness now SKIPS with a reason instead of failing), and the
-live-Docker end-to-end skips because this sandbox's Docker daemon isn't running.
+The skips are environmental, not gaps: suites whose optional extra is absent in
+this sandbox (`sky`, `boto3`, `matplotlib`), the no-ramalama degradation harness
+(it needs ramalama *truly* absent — CI runs it in its own job with a clean
+environment), and the live-Docker end-to-end (no daemon here).
+
+> Re-run this table before cutting a release; it is a point-in-time record, not
+> a contract. The standing contracts are in the suite itself.
 
 ## Commands (`boxy <cmd> --help`, all 22)
 

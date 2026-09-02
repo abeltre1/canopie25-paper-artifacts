@@ -16,6 +16,9 @@ Numbered in the order you'd test boxy end to end; reference material follows.
 | 10 | [Specification](10-spec.md) | the full design spec: goals, landscape, reuse map, CLI surface, roadmap (§8), known issues (§8b), agentless design (§8c) |
 | 11 | [Colocation (design draft)](11-colocation-design.md) | NOT implemented — bin-packing services onto shared nodes; open questions |
 | 12 | [Benchmark + plot](12-benchmark-and-plot.md) | real vLLM benchmarking of any served model (vllm-bench/container/CLI ladder), the results store, and `boxy plot` figures + gnuplot pipeline |
+| 13 | [Release runbook — air-gapped](13-runbook-airgapped.md) | connected build machine → transfer → serve inside the gap, with the pre-crossing checks that catch a bad bundle |
+| 14 | [Release runbook — cloud](14-runbook-cloud.md) | SkyPilot (cloud VMs) and OpenShift/Kubernetes, end to end, including teardown |
+| 15 | [Release runbook — networks](15-runbook-networks.md) | laptop → cluster across direct, proxied, and isolated-compute networks; reaching and sharing the endpoint |
 
-Start at [01](01-serve-gpu-model.md). The package front door is
+Start at [01](01-serve-gpu-model.md). Shipping into a specific environment? Jump to its release runbook: [13](13-runbook-airgapped.md) air-gapped, [14](14-runbook-cloud.md) cloud, [15](15-runbook-networks.md) networks. The package front door is
 [../README.md](../README.md).
