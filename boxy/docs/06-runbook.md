@@ -65,7 +65,7 @@ boxy serve $M --scheduler flux  --gpus 1
 boxy launch   --box examples/boxes/llama-3.2-1b.toml --location examples/locations/cloud-gpu.toml
 boxy generate sky --box examples/boxes/llama-3.2-1b.toml --location <loc> -o task.yaml   # then: sky launch task.yaml
 #    b. any on-prem site: write one location file and reuse every command above:
-boxy serve $M --location examples/locations/example.toml
+boxy serve $M --location examples/locations/local.toml
 ```
 All scale/serve flags (`--replicas`, `--nodes`, `--nodes-per-replica`, `--distributed`,
 `--router`, `boxy sweep`, `boxy bench`) compose on top of ANY row unchanged. For the
@@ -542,10 +542,10 @@ boxy pull --box examples/boxes/vllm-hf.toml
 # box (examples/boxes/vllm.toml + [location.staging] models_dir), per the paper.
 
 # 3.3 Eyeball the exact command before running anything:
-boxy serve --box examples/boxes/vllm-hf.toml --location examples/locations/clusterB.toml --dryrun
+boxy serve --box examples/boxes/vllm-hf.toml --location examples/locations/flux-podman-rocm.toml --dryrun
 # EXPECT: srun --nodes=.. --gpus-per-node=.. podman run ... --device nvidia.com/gpu=all
 #         ... vllm/vllm-openai:v0.24.0 serve <model> --host=0.0.0.0 --port=8000 ...
-# Adjust examples/locations/clusterB.toml (nodes/gpus/partition-specific tuning) to your site.
+# Adjust examples/locations/flux-podman-rocm.toml (nodes/gpus/partition-specific tuning) to your site.
 
 # 3.4 Single-node first (inside an allocation, scheduler wrap not needed):
 salloc -N1 --gpus-per-node=4
@@ -555,7 +555,7 @@ boxy serve --box examples/boxes/vllm-hf.toml --location my-clusterB-1node.toml
 curl -s http://localhost:8000/v1/models
 
 # 3.5 Then the scheduler-wrapped form from the login node (scheduler="slurm"):
-boxy serve --box examples/boxes/vllm-hf.toml --location examples/locations/clusterB.toml
+boxy serve --box examples/boxes/vllm-hf.toml --location examples/locations/flux-podman-rocm.toml
 
 # 3.6 Benchmark (paper's step 5; from a node that can reach the serving node):
 boxy bench --box examples/boxes/vllm-hf.toml --url http://<node>:8000 \
@@ -571,10 +571,10 @@ boxy list ; boxy stop --box examples/boxes/vllm-hf.toml
 ```bash
 boxy info                     # EXPECT: accelerator: rocm | apptainer | flux
 # 4.1 Pre-build the SIF once (large image; uses APPTAINER cache):
-boxy build --box examples/boxes/vllm.toml --location examples/locations/clusterA.toml
+boxy build --box examples/boxes/vllm.toml --location examples/locations/slurm-podman-cuda.toml
 # EXPECT: apptainer build --force vllm-rocm.sif docker://vllm/vllm-openai:v0.24.0
 # 4.2 Check the emitted command (module load rocm, --rocm, --fakeroot, tuning):
-boxy serve --box examples/boxes/vllm.toml --location examples/locations/clusterA.toml --dryrun
+boxy serve --box examples/boxes/vllm.toml --location examples/locations/slurm-podman-cuda.toml --dryrun
 # 4.3 Run inside a flux alloc (or let boxy wrap with flux run):
 flux alloc -N1
 boxy serve --box examples/boxes/vllm.toml --location my-clusterA-1node.toml

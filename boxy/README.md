@@ -390,8 +390,8 @@ boxy list
 boxy stop boxy-model-name         # name is printed in the READY banner
 
 # Everything still works profile-first too (the paper's pipeline):
-boxy serve --box examples/boxes/vllm.toml --location examples/locations/clusterA.toml --dryrun
-boxy build --box examples/boxes/vllm.toml --location examples/locations/clusterA.toml   # OCI -> SIF
+boxy serve --box examples/boxes/vllm.toml --location examples/locations/slurm-podman-cuda.toml --dryrun
+boxy build --box examples/boxes/vllm.toml --location examples/locations/slurm-podman-cuda.toml   # OCI -> SIF
 boxy bench --box examples/boxes/vllm.toml --batch-sizes 1,2,4,8 -o results.csv
 
 # Cloud: delegate the same box to SkyPilot (pip install 'boxy-hpc[cloud]'):
