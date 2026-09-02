@@ -470,6 +470,18 @@ def _propagate_ca_bundle(env: dict, mounts: list) -> None:
 
 
 _AIRGAP_RENDER = False
+_DIRECT_EGRESS = False
+
+
+def set_direct_egress(on: bool) -> None:
+    """Toggle 'the target verified DIRECT egress': suppresses proxy propagation
+    into the container plan. Injecting the SUBMITTER's proxy into a cluster that
+    reaches the internet directly does not add a fallback — it REPLACES a
+    working path with an unroutable one (field: six rounds of in-container TLS
+    failures on a cluster whose own curl answered 200 every time). Reset by the
+    caller / test conftest."""
+    global _DIRECT_EGRESS
+    _DIRECT_EGRESS = bool(on)
 
 
 def set_airgap(on: bool) -> None:
@@ -511,7 +523,8 @@ def _plan(
         # an air-gapped --bundle serve must carry ZERO network configuration —
         # no proxy, no CA (everything resolves from the bundle, offline).
         _propagate_ca_bundle(env, mounts)
-        _propagate_proxy(env)
+        if not _DIRECT_EGRESS:
+            _propagate_proxy(env)
     warnings: list[str] = []
     # Podman (unlike Docker) refuses to start when the workdir doesn't exist
     # in the image; a workdir no volume provides is usually a box bug.
