@@ -918,6 +918,56 @@ def test_agentless_list_logs_stop_answer_from_laptop_records(ssh, capfd, monkeyp
     assert jobs.read_record("boxy-m") is None              # record reaped
 
 
+def test_system_card_runtime_is_not_overwritten_with_podman(ssh, capfd, monkeypatch):
+    """A site card says what the site RUNS. The agentless path pinned
+    args.runtime to 'podman' BEFORE loading the location, so every Apptainer and
+    CharlieCloud card was silently rewritten and the rendered script ran
+    `podman run` on a cluster that may not have podman at all. Five shipped
+    cards are non-podman — including both rocm-cluster cards, the ones an AMD
+    site reaches for first."""
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--system", "rocm-cluster", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "podman run" not in cap.out              # the card said apptainer
+    assert "apptainer" in cap.out
+    # ...and an explicit --runtime still wins over the card
+    rc = main(["serve", MODEL, "--system", "rocm-cluster", "--ssh", "user@clustera",
+               "--runtime", "podman", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0 and "podman run" in cap.out
+
+
+def test_offline_site_card_does_not_forbid_the_engines_own_download(ssh, capfd, monkeypatch):
+    """Most system cards set offline = true (it stops the engine phoning home).
+    But when the ENGINE is what downloads the model, HF_HUB_OFFLINE=1 makes that
+    impossible and the job dies inside the container — after the queue wait.
+    Offline is correct only once the weights are local."""
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("BOXY_AGENTLESS_PRESTAGE", "never")   # the engine pulls on the node
+    rc = main(["serve", MODEL, "--system", "cuda-cluster", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "HF_HUB_OFFLINE=1" not in cap.out
+    assert "auto: offline: OFF for this serve" in cap.out
+
+
+def test_prestaged_serve_keeps_the_cards_offline_setting(ssh, capfd, monkeypatch):
+    # the other half: weights already on the shared FS -> offline STAYS on
+    from boxy import cli
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setattr(cli, "_pull_completed_stage", lambda t, s, m: "/scratch/staged/llama")
+    rc = main(["serve", MODEL, "--system", "cuda-cluster", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "HF_HUB_OFFLINE=1" in cap.out
+    assert "auto: offline: OFF" not in cap.out
+
+
 def test_serve_probes_egress_before_injecting_the_laptop_proxy(ssh, capfd, monkeypatch):
     """FIELD: the laptop's ambient proxy was injected into a cluster that reaches
     the registry DIRECTLY, replacing a working path with an unroutable one — six

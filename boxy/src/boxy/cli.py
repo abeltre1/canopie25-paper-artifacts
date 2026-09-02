@@ -3276,7 +3276,17 @@ def _serve_agentless_ssh(args, target: str) -> int:
                                     unified=_node_unified(host, cfacts, scheduler_name)):
         print(f"  auto: {line}")
 
-    # 3) box + location, accelerator/runtime PINNED so no local hardware probe runs
+    # 3) box + location, accelerator/runtime PINNED so no local hardware probe
+    #    runs. An explicit --runtime wins; otherwise the LOCATION / system
+    #    card's OWN runtime decides. Defaulting straight to podman silently
+    #    rewrote every Apptainer and CharlieCloud site card and rendered a
+    #    `podman run` script for a cluster that may not have podman at all —
+    #    the card said what the site uses and boxy overruled it.
+    if not args.runtime and getattr(args, "location", None):
+        try:
+            args.runtime = Location.from_toml(_packaged_profile(args.location)).runtime
+        except (OSError, ValueError):
+            pass
     args.runtime = args.runtime or "podman"
     try:
         box, location, _dec = _resolve_or_load(args)
@@ -3570,6 +3580,19 @@ def _serve_agentless_ssh(args, target: str) -> int:
             f"bundle path.' >&2; exit 9; }}")
         print(f"  auto: bundle: {bundle} (AIR-GAPPED — image from its oci-archive, model + "
               f"custom code from its HF cache, wheels offline; no proxy, no egress)")
+
+    # OFFLINE describes where the MODEL is, not the site. Most system cards set
+    # offline = true (it stops the engine phoning home on a cluster), but when
+    # the ENGINE is the thing that downloads the model, HF_HUB_OFFLINE=1 makes
+    # that download impossible and the job dies inside the container with
+    # "cannot find the requested files in the disk cache ... offline mode" —
+    # after the queue wait. Offline is correct once the weights are local:
+    # --prestage, a completed `boxy pull`, a by-path model, or --bundle.
+    if engine_pull and not bundle and location.offline:
+        location = dc_replace(location, offline=False)
+        print("  auto: offline: OFF for this serve — the engine downloads the model on the "
+              "compute node, which the site card's offline=true would forbid (use "
+              "--prestage or --bundle to keep the job fully offline)")
 
     deploy.set_agentless_ca(ca_remote)
     try:
