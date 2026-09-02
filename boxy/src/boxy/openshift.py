@@ -84,15 +84,34 @@ def _yaml_str(value: str) -> str:
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def serve_command(engine: str, model: str, port: int, engine_args=()) -> list[str]:
-    """The argv the container runs. Mirrors engines.py: `<entrypoint> serve
-    <model>`, vLLM-style `--key=value` flags appended after."""
-    entrypoint = "vllm" if engine == "vllm" else "llama-server"
-    if engine == "vllm":
-        cmd = [entrypoint, "serve", model, f"--port={port}", "--host=0.0.0.0"]
-    else:
-        cmd = [entrypoint, "--model", model, "--port", str(port), "--host", "0.0.0.0"]
-    return cmd + [str(a) for a in engine_args]
+def serve_command(engine: str, model: str, port: int, engine_args=(), *,
+                  gpus: int = 0, served_name: str = "") -> list[str]:
+    """The argv the container runs — built by the SAME engines.py builders the
+    HPC path uses, not hand-composed.
+
+    Hand-composing drifted from the real thing in ways that silently break a
+    manifest: no --tensor-parallel-size, so a Deployment requesting N GPUs
+    loaded the whole model onto GPU 0 and OOM'd; `llama-server` as an absolute
+    command, which does not exist on $PATH in the upstream image (its binary is
+    /app/llama-server, so the image's own ENTRYPOINT must be used); and no
+    --served-model-name, so a PVC-staged model answered to its mount path.
+    Going through the builders means every default the field taught boxy —
+    eager safetensors on network filesystems included — lands here too.
+
+    An empty FIRST element means "defer to the image's ENTRYPOINT" (llama.cpp);
+    the caller turns that into k8s `args:` with no `command:`."""
+    from boxy import engines
+    from boxy.box import Box
+    from boxy.location import Location, Resources, Staging
+
+    box = Box(name="serve", image="", engine=("vllm" if engine == "vllm" else "llama.cpp"),
+              entrypoint=("vllm" if engine == "vllm" else ""), ports=[port],
+              model=model, served_name=served_name)
+    loc = Location(name="openshift", scheduler="none", accelerator="cuda", runtime="podman",
+                   resources=Resources(nodes=1, gpus_per_node=max(1, int(gpus or 0))),
+                   staging=Staging(models_dir="."))
+    return engines.build_serve_cmd(box, loc, model, host="0.0.0.0", port=port,
+                                   extra_args=[str(a) for a in engine_args])
 
 
 def emit_serve_manifest(
@@ -108,6 +127,7 @@ def emit_serve_manifest(
     engine_args=(),
     model_pvc: str = "",
     model_mount: str = "/models",
+    served_name: str = "",
     hf_secret: str = "",
     replicas: int = 1,
     cpu: str = "",
@@ -142,8 +162,13 @@ def emit_serve_manifest(
     labels = f"{{app: {name}, boxy.serve: {name}}}"
 
     # --- container command -----------------------------------------------------
-    argv = serve_command(engine, model, port, engine_args)
-    cmd_yaml = "[" + ", ".join(_yaml_str(a) for a in argv) + "]"
+    argv = serve_command(engine, model, port, engine_args, gpus=gpus, served_name=served_name)
+    # An empty first element means the image's own ENTRYPOINT runs the server
+    # (the upstream llama.cpp image keeps its binary off $PATH at
+    # /app/llama-server, so naming it as `command:` makes the pod CrashLoop).
+    # k8s spells that as args-without-command.
+    _key = "command" if argv[0] else "args"
+    cmd_yaml = f"{_key}: [" + ", ".join(_yaml_str(a) for a in argv if a) + "]"
 
     # --- environment -----------------------------------------------------------
     env_lines = [f"            - {{name: {k}, value: {_yaml_str(v)}}}" for k, v in _CACHE_ENV.items()]
@@ -214,7 +239,7 @@ spec:
       containers:
         - name: server
           image: {image}
-          command: {cmd_yaml}
+          {cmd_yaml}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: {{drop: ["ALL"]}}

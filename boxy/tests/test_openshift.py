@@ -204,3 +204,38 @@ def test_cli_resolves_geometry_and_image_from_the_model_card(capsys):
 def test_cli_requires_a_model(capsys):
     assert main(["generate", "openshift"]) == 2
     assert "--model is required" in capsys.readouterr().err
+
+
+# ---- the manifest must agree with the engine builders, not hand-composed argv --------
+
+
+def test_openshift_vllm_manifest_shards_across_the_requested_gpus():
+    """A Deployment that REQUESTS n GPUs but serves without
+    --tensor-parallel-size loads the whole model onto GPU 0 and OOMs. The argv
+    now comes from engines.build_serve_cmd, so every default the HPC path has
+    (TP, eager safetensors on network storage) lands here too."""
+    y = openshift.emit_serve_manifest("m", "img", "/models/llama", engine="vllm", gpus=4,
+                                      model_pvc="pvc")
+    line = [ln for ln in y.splitlines() if "command:" in ln][0]
+    assert "--tensor-parallel-size=4" in line
+    assert "--safetensors-load-strategy=eager" in line
+    assert "--host=0.0.0.0" in line and "--port=8000" in line
+
+
+def test_openshift_llamacpp_defers_to_the_image_entrypoint():
+    """`command: ["llama-server", ...]` CrashLoops on the upstream image: the
+    binary is /app/llama-server, off $PATH. k8s spells 'use the image's own
+    ENTRYPOINT' as args-without-command."""
+    y = openshift.emit_serve_manifest("m", "ghcr.io/ggml-org/llama.cpp:server",
+                                      "/models/m.gguf", engine="llama.cpp", gpus=1)
+    body = [ln for ln in y.splitlines() if "command:" in ln or "args:" in ln]
+    assert len(body) == 1 and body[0].strip().startswith("args:")
+    assert "llama-server" not in body[0]
+    assert '"-m", "/models/m.gguf"' in body[0]
+
+
+def test_openshift_serves_a_staged_model_under_its_canonical_id():
+    y = openshift.emit_serve_manifest("m", "img", "/models/llama", engine="vllm", gpus=1,
+                                      model_pvc="pvc", served_name="meta-llama/Llama-3.3-70B")
+    line = [ln for ln in y.splitlines() if "command:" in ln][0]
+    assert "--served-model-name=meta-llama/Llama-3.3-70B" in line

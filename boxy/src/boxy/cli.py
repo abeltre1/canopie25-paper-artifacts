@@ -5543,6 +5543,15 @@ def cmd_generate(args: argparse.Namespace) -> int:
     from boxy.deploy import _apply_defaults
 
     box = _apply_defaults(box, location.resolve_accelerator())  # finding 41: empty image_id
+    # The model's CARD applies on the cloud path too: without it the task ran
+    # with none of the knowledge the HPC path has — no --max-model-len (vLLM
+    # then profiles KV for the full window and OOMs), no --trust-remote-code
+    # for custom-code repos, no card-pinned image. The manifest/task and
+    # `boxy serve` should agree about what a model needs, not drift apart.
+    box, _card_note = _ensure_card_args(box, getattr(box, "model", ""),
+                                        accel=location.resolve_accelerator())
+    if _card_note:
+        print(f"  auto: {_card_note}", file=sys.stderr)
     if location.scheduler != "none":
         print(
             f"warning: location {location.name!r} uses scheduler={location.scheduler!r}; the SkyPilot "
@@ -5635,6 +5644,17 @@ def _generate_openshift(args: argparse.Namespace) -> int:
         return 2
 
     accel = args.accelerator or "cuda"
+    # `vllm serve` wants the bare id, never the transport URI: hf://org/x made
+    # it look for a local directory called "hf:".
+    model_ref = cards.model_key(args.model)
+    served_name = ""
+    if model_ref.startswith("/") or model_ref.startswith("./"):
+        served_name = ""                       # a staged path has no canonical id here
+    elif args.model_pvc:
+        print(f"boxy generate openshift: NOTE: --model-pvc mounts the PVC, but --model "
+              f"{args.model!r} is a Hugging Face id — the pod will DOWNLOAD the weights "
+              f"instead of reading the PVC. To serve the staged copy, pass the path under "
+              f"the mount (e.g. --model /models/<dir>).", file=sys.stderr)
     resolved = argparse.Namespace(model=args.model, gpus=args.gpus, nodes=None,
                                   engine=args.engine, image=args.image,
                                   accelerator=accel, args=None)
@@ -5652,10 +5672,10 @@ def _generate_openshift(args: argparse.Namespace) -> int:
     try:
         text = openshift.emit_serve_manifest(
             args.name or openshift.k8s_name(args.model),
-            image, args.model, namespace=args.namespace or "", engine=engine, port=port,
+            image, model_ref, namespace=args.namespace or "", engine=engine, port=port,
             gpus=gpus, accelerator=accel, engine_args=resolved.args or [],
             model_pvc=args.model_pvc or "", hf_secret=args.hf_secret or "",
-            route_host=args.host or "")
+            served_name=served_name, route_host=args.host or "")
     except ValueError as e:
         print(f"boxy generate openshift: {e}", file=sys.stderr)
         return 2
@@ -7395,6 +7415,15 @@ def cmd_launch(args: argparse.Namespace) -> int:
     from boxy.deploy import _apply_defaults
 
     box = _apply_defaults(box, location.resolve_accelerator())
+    # The model's CARD applies on the cloud path too: without it the task ran
+    # with none of the knowledge the HPC path has — no --max-model-len (vLLM
+    # then profiles KV for the full window and OOMs), no --trust-remote-code
+    # for custom-code repos, no card-pinned image. The manifest/task and
+    # `boxy serve` should agree about what a model needs, not drift apart.
+    box, _card_note = _ensure_card_args(box, getattr(box, "model", ""),
+                                        accel=location.resolve_accelerator())
+    if _card_note:
+        print(f"  auto: {_card_note}", file=sys.stderr)
     if args.down:
         cmd = cloud.launch_command(box, "", serve=args.serve, down=True)
     else:
