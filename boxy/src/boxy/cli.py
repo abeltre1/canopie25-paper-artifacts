@@ -36,8 +36,37 @@ def _add_common(parser: argparse.ArgumentParser, location_required: bool = True)
     parser.add_argument("--dryrun", action="store_true", help="print the command instead of executing it")
 
 
+def _packaged_profile(path: str) -> str:
+    """Resolve a PACKAGED example profile when the given path is not on disk.
+
+    Every doc line spells these `examples/boxes/x.toml`, but the files ship
+    INSIDE the package (boxy/data/examples/...), so the documented commands
+    failed with 'No such file or directory' from a checkout AND from an
+    install — the first thing a new user copy-pastes. Fall back to the packaged
+    copy (by full relative path or bare filename) so the docs work verbatim
+    from any directory; a real file on disk always wins."""
+    if not path or os.path.exists(os.path.expanduser(path)):
+        return path
+    from importlib.resources import files
+
+    rel = path.replace("\\", "/").split("examples/", 1)[-1]
+    try:
+        root = files("boxy.data") / "examples"
+        cand = root / rel if "/" in rel else None
+        if cand is not None and cand.is_file():
+            return str(cand)
+        for kind in ("boxes", "locations"):
+            entry = root / kind / os.path.basename(rel)
+            if entry.is_file():
+                return str(entry)
+    except (FileNotFoundError, ModuleNotFoundError, NotADirectoryError, OSError):
+        pass
+    return path
+
+
 def _load(args: argparse.Namespace) -> tuple[Box, Location]:
-    return Box.from_toml(args.box), Location.from_toml(args.location)
+    return (Box.from_toml(_packaged_profile(args.box)),
+            Location.from_toml(_packaged_profile(args.location)))
 
 
 def _emit(deployment, dryrun: bool) -> int:
@@ -350,10 +379,10 @@ def _resolve_or_load(args: argparse.Namespace):
             f"(or: boxy {args.subcommand} --box box.toml [--location loc.toml])"
         )
 
-    profile = Location.from_toml(args.location) if args.location else None
+    profile = Location.from_toml(_packaged_profile(args.location)) if args.location else None
 
     if args.box:
-        box = Box.from_toml(args.box)
+        box = Box.from_toml(_packaged_profile(args.box))
         decisions: list[str] = []
         # explicit flags overlay the box profile
         for field_name, value in (("name", args.name), ("image", args.image), ("engine", args.engine)):
@@ -4870,7 +4899,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         scheduler_name = args.scheduler
         profile = None
         if args.location:
-            profile = Location.from_toml(args.location)
+            profile = Location.from_toml(_packaged_profile(args.location))
             if scheduler_name is None and profile.scheduler in ("slurm", "flux"):
                 scheduler_name = profile.scheduler
         # Turnkey on the login node itself (no --ssh, no --location scheduler):
@@ -5129,7 +5158,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
 
     model = args.model
     if not model and args.box:
-        box = Box.from_toml(args.box)
+        box = Box.from_toml(_packaged_profile(args.box))
         if not box.model:
             print(f"box {box.name}: no model set", file=sys.stderr)
             return 1
@@ -5198,7 +5227,7 @@ def cmd_stage(args: argparse.Namespace) -> int:
     models_dir = getattr(args, "models_dir", None) or "./models"
     endpoint = getattr(args, "s3_endpoint", None)
     if not model and getattr(args, "box", None):
-        box = Box.from_toml(args.box)
+        box = Box.from_toml(_packaged_profile(args.box))
         model = box.model
     if not model:
         # bare `boxy stage`: fall back entirely to the K8s-style env (bucket+path)
@@ -6038,7 +6067,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     # an AGENTLESS record is handled from HERE over the master — even with --ssh
     # (boxy's own output says `boxy stop NAME --ssh <target>`): the cluster's boxy
     # (if any) has no record of this job and would no-op/fail.
-    nm = args.name or (Box.from_toml(args.box).name if args.box else None)
+    nm = args.name or (Box.from_toml(_packaged_profile(args.box)).name if args.box else None)
     if nm:
         rec = _jobs.read_record(nm)
         if rec and rec.get("submitted_from") == "agentless-ssh" and rec.get("target"):
@@ -6053,7 +6082,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if args.name:
         target = args.name
     elif args.box:
-        target = Box.from_toml(args.box).name
+        target = Box.from_toml(_packaged_profile(args.box)).name
     else:
         raise UsageError("usage: boxy stop NAME   (names are printed at serve time and by `boxy list`)")
 
@@ -6070,7 +6099,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
             jobs.remove(target)
         return rc
 
-    location = Location.from_toml(args.location) if args.location else None
+    location = Location.from_toml(_packaged_profile(args.location)) if args.location else None
     runtime = args.runtime or _container_runtime(location)
     if not args.dryrun and _container_exists(runtime, target) and _container_label(runtime, target) != target:
         raise RuntimeError(
@@ -6153,7 +6182,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             state = ("LIVE" if relay_exposer.share_is_live(s)
                      else "DEAD (relay client gone — rerun with --share, or boxy unshare)")
             print(f"  {s['alias']}  {s['url']}/v1  {state}")
-    location = Location.from_toml(args.location) if args.location else None
+    location = Location.from_toml(_packaged_profile(args.location)) if args.location else None
     try:
         runtime = args.runtime or _container_runtime(location)
     except RuntimeError:
@@ -6649,7 +6678,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
     if args.url:
         url = args.url.rstrip("/").removesuffix("/v1")
     elif args.box:
-        box = Box.from_toml(args.box)
+        box = Box.from_toml(_packaged_profile(args.box))
         # the port precedence bench sees must match what serve binds (r2 audit):
         # [box.args] port > ports[0] > engine default
         args_port = box.args.get("port")
@@ -7313,7 +7342,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     axis, values = _sweep_axis(args)
     scheduler_name = args.scheduler
     rung_envelopes: list[dict] = []
-    profile = Location.from_toml(args.location) if args.location else None
+    profile = Location.from_toml(_packaged_profile(args.location)) if args.location else None
     if scheduler_name is None and profile and profile.scheduler in ("slurm", "flux"):
         scheduler_name = profile.scheduler
     if scheduler_name not in ("slurm", "flux"):
