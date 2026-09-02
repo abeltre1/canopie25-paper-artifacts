@@ -107,8 +107,9 @@ def _ramalama_accel() -> str:
 
 
 def detect_accel() -> str:
-    """GPU autodetect: ramalama.common.get_accel() first (probes nvidia-smi,
-    ROCm sysfs, ...), then boxy's own HPC ladder when that sees nothing.
+    """GPU autodetect: boxy's OWN probe (accel.detect_kind) first, then boxy's
+    HPC ladder when that sees nothing. No optional package takes part — a
+    headline capability must not vary with what happens to be installed.
 
     FIELD: on HPC nodes RamaLama's probes go blind — nvidia-smi lives behind
     `module load` (not on PATH), check_nvidia additionally demands a CDI
@@ -132,17 +133,20 @@ def detect_accel() -> str:
     if fallback:
         last_detect_note = why
         return fallback
-    if not ramalama_available():
-        import shutil
-        import sys
+    import shutil
+    import sys
 
-        if shutil.which("nvidia-smi") or shutil.which("rocm-smi"):
-            print(
-                "warning: a GPU tool is on PATH but the 'ramalama' package is not importable, "
-                "so boxy cannot autodetect the accelerator (a CPU image would be chosen). "
-                "Install boxy with the [ramalama] extra, or pass --accelerator explicitly.",
-                file=sys.stderr,
-            )
+    if shutil.which("nvidia-smi") or shutil.which("rocm-smi"):
+        # Detection is boxy's own, so the old advice here ("install the
+        # [ramalama] extra") was simply wrong: the extra plays no part in it.
+        # Say what actually helps instead.
+        print(
+            "warning: a GPU tool is on PATH but no accelerator could be detected, so a CPU "
+            "image would be chosen. On an HPC node the driver/devices usually appear only "
+            "inside the job — pass --accelerator cuda|rocm explicitly (or set it in the "
+            "location/system card), which is what the --ssh path does.",
+            file=sys.stderr,
+        )
     return "none"
 
 
@@ -422,6 +426,103 @@ def model_key_slug(model_uri: str) -> str:
     return re.sub(r"[^a-z0-9._-]+", "-", bare.lower()).strip("-") or "model"
 
 
+# ---- boxy's OWN hf:// download (no extra packages) ----------------------------------
+#
+# boxy already downloads models two other ways it wrote itself: plain `curl` on
+# the login node for `boxy pull --ssh`, and huggingface_hub for `boxy bundle`.
+# The LOCAL pull was the only path that reached for the optional 'ramalama'
+# extra — so a laptop had to carry an extra dependency closure (and an air-gap
+# transfer had to carry its wheels) to do something boxy can already do with
+# certifi, its ONE hard dependency, plus the stdlib.
+#
+# ramalama still wins when it IS installed: it owns its store layout and the
+# ollama:// / oci:// transports, which this does not implement.
+
+_HF_BASE = "https://huggingface.co"
+# the redundant PyTorch checkpoint (Llama ships both) and GGUFs: vLLM serves the
+# safetensors, and skipping these halves the download. Same list the --ssh
+# curl script uses, so both paths fetch the same set.
+_SKIP_SUFFIX = (".pth", ".gguf")
+_SKIP_PREFIX = ("original/", "consolidated")
+
+
+def store_slug(model_uri: str) -> str:
+    """Filesystem-safe directory name for a model in boxy's store."""
+    return model_key_slug(model_uri)
+
+
+def _hf_repo_files(repo: str, opener, token: str) -> list[str]:
+    import json as _json
+    import urllib.request
+
+    req = urllib.request.Request(f"{_HF_BASE}/api/models/{repo}",
+                                 headers={"User-Agent": "boxy"})
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    with opener.open(req, timeout=60) as r:
+        data = _json.loads(r.read().decode("utf-8"))
+    files = [str(s.get("rfilename", "")) for s in (data.get("siblings") or [])]
+    return [f for f in files
+            if f and not f.startswith(_SKIP_PREFIX) and not f.endswith(_SKIP_SUFFIX)]
+
+
+def _native_hf_pull(model_uri: str, *, force: bool = False, quiet: bool = False) -> str:
+    """Download an hf:// repo into boxy's store with the stdlib + certifi.
+
+    Resume shape mirrors the --ssh script: each file lands in <name>.part and is
+    renamed only when complete, so a rerun continues instead of restarting and a
+    half-written shard can never be mistaken for a finished one."""
+    import shutil as _shutil
+    import urllib.request
+
+    from boxy.cardgen import _opener            # proxy + CA aware, stdlib only
+
+    repo = model_uri.split("://", 1)[1].strip("/")
+    dest = os.path.join(DEFAULT_STORE, "models", store_slug(model_uri))
+    if force and os.path.isdir(dest):
+        _shutil.rmtree(dest, ignore_errors=True)
+    os.makedirs(dest, exist_ok=True)
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+    opener = _opener()
+    try:
+        files = _hf_repo_files(repo, opener, token)
+    except Exception as e:  # noqa: BLE001 — one actionable message beats a raw traceback
+        raise RuntimeError(
+            f"{repo}: could not list the repo on HuggingFace ({e}). For a GATED repo export "
+            f"HF_TOKEN; behind a TLS-intercepting proxy set SSL_CERT_FILE (or run "
+            f"`boxy trust huggingface.co`)."
+        ) from None
+    if not files:
+        raise RuntimeError(f"{repo}: the Hub listed no downloadable files for this repo")
+    for i, name in enumerate(files, 1):
+        target = os.path.join(dest, name)
+        if os.path.exists(target):
+            continue                                     # already complete
+        os.makedirs(os.path.dirname(target) or dest, exist_ok=True)
+        part = target + ".part"
+        have = os.path.getsize(part) if os.path.exists(part) else 0
+        req = urllib.request.Request(f"{_HF_BASE}/{repo}/resolve/main/{name}",
+                                     headers={"User-Agent": "boxy"})
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        if have:
+            req.add_header("Range", f"bytes={have}-")    # resume
+        if not quiet:
+            print(f"  pull: [{i}/{len(files)}] {name}" + (f" (resuming at {have} bytes)" if have else ""))
+        try:
+            with opener.open(req, timeout=120) as r, open(part, "ab" if have else "wb") as fh:
+                _shutil.copyfileobj(r, fh, 1024 * 1024)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                f"{repo}: download of {name} failed ({e}). Re-run `boxy pull` — it resumes "
+                f"from {os.path.getsize(part) if os.path.exists(part) else 0} bytes."
+            ) from None
+        os.replace(part, target)
+    if not quiet:
+        print(f"  pull: complete -> {dest}")
+    return dest
+
+
 def pull_model(model_uri: str, dryrun: bool = False, quiet: bool = False, force: bool = False) -> str:
     """Pull a model via RamaLama transports (hf://, ollama://, oci://, ...).
 
@@ -448,10 +549,16 @@ def pull_model(model_uri: str, dryrun: bool = False, quiet: bool = False, force:
             print(f"  auto: model: {model_uri} would be pulled to {placeholder} "
                   f"(plan only — the real pull needs `pip install 'boxy-hpc[ramalama]'`)")
             return placeholder
+        if model_uri.startswith(("hf://", "huggingface://")):
+            # boxy downloads hf:// itself — stdlib + certifi, the same repo
+            # listing and resume shape the --ssh path uses. No extra needed.
+            return _native_hf_pull(model_uri, force=force, quiet=quiet)
         raise RuntimeError(
-            "pulling transport URIs requires the 'ramalama' package "
-            "(pip install 'boxy-hpc[ramalama]'); for air-gapped sites set "
-            "box.model to a path on the shared filesystem instead"
+            f"{model_uri.split('://', 1)[0]}:// pulls need the 'ramalama' package "
+            f"(pip install 'boxy-hpc[ramalama]') — boxy downloads hf:// itself, but "
+            f"ollama:// and oci:// are ramalama transports. Alternatives: pull the image "
+            f"with podman/docker and serve it by path, or use hf:// if the model is on "
+            f"the Hub."
         ) from e
     from boxy import policy
 

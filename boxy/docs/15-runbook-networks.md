@@ -18,7 +18,8 @@ No egress anywhere → that is not this document: see
 ## Phase 0 — Laptop (5 min)
 
 ```bash
-pip install 'boxy-hpc[ramalama]'        # or: uv tool install boxy-hpc
+pip install boxy-hpc                    # or: uv tool install boxy-hpc
+                                        # certifi is the ONLY dependency
 boxy --version
 boxy doctor                             # local: runtime, TLS, tokens
 boxy doctor --ssh <user>@<login> --net  # the cluster: runtime, scheduler, registries

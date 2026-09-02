@@ -235,19 +235,19 @@ else degrades gracefully.
 
 ```bash
 pip install boxy-hpc            # the distribution is boxy-hpc; the command is `boxy`
-pip install "boxy-hpc[ramalama]"   # + model pulls / accelerator autodetect (recommended)
+pip install "boxy-hpc[ramalama]"   # + the ollama:// / oci:// transports (optional)
 pip install "boxy-hpc[cloud]"      # + SkyPilot cloud launch
 pip install "boxy-hpc[s3]"         # + boto3 for S3 model staging
 ```
 
 | Extra | Adds | For |
 |-------|------|-----|
-| `ramalama` | RamaLama | `hf://`/`ollama://` pulls, GPU autodetect |
+| `ramalama` | RamaLama | `ollama://` / `oci://` pulls — **not** needed for `hf://` or GPU autodetect, which are boxy's own |
 | `cloud` | SkyPilot | `boxy launch` on cloud VMs |
 | `s3` | boto3 | S3 model staging |
 
 Developing on boxy? Use an **editable** install so `git pull` takes effect
-without reinstalling: `pip install -e './boxy[ramalama,test]'`.
+without reinstalling: `pip install -e './boxy[test]'`.
 
 Building a wheel for an internal PyPI mirror? `make wheel` (or
 `make publish LOCAL_PYPI=<upload-url>`) from `boxy/` — see

@@ -19,7 +19,7 @@ in the cloud agrees with what runs on the cluster instead of drifting.
 ### A.1 Install
 
 ```bash
-pip install 'boxy-hpc[ramalama]' 'skypilot[aws]'   # or [gcp]/[azure]/[kubernetes]
+pip install boxy-hpc 'skypilot[aws]'               # or [gcp]/[azure]/[kubernetes]
 sky check                                          # credentials must be green
 boxy --version
 ```

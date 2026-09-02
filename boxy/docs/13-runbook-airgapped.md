@@ -114,7 +114,7 @@ read (`/projects/...`, not `$HOME` on a login-only volume).
 
 ```bash
 python3.12 -m venv boxy-env && . boxy-env/bin/activate
-pip install --no-index --find-links boxy-wheels/ 'boxy-hpc[ramalama,plot]'
+pip install --no-index --find-links boxy-wheels/ boxy-hpc
 boxy --version
 ```
 
