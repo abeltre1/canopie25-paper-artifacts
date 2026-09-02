@@ -918,6 +918,56 @@ def test_agentless_list_logs_stop_answer_from_laptop_records(ssh, capfd, monkeyp
     assert jobs.read_record("boxy-m") is None              # record reaped
 
 
+def test_agentless_curl_and_open_answer_from_laptop_records(ssh, capfd, monkeypatch, tmp_path):
+    """FIELD: after the default agentless serve, `boxy curl --ssh` and `boxy open
+    --ssh` delegated to a cluster boxy that DOES NOT EXIST (agentless installs
+    nothing) — so the two commands the docs point users at both failed, and
+    `boxy attach` was the only way back to a working endpoint. curl/open must
+    answer from THIS machine's records over the SSH master, exactly as list and
+    attach already do."""
+    from boxy import jobs, remote
+
+    rdir = tmp_path / "agentless"
+    rdir.mkdir()
+    (rdir / "boxy-m-777.log").write_text("Application startup complete.\n")
+    ep = rdir / "boxy-m.endpoint.json"
+    ep.write_text('{"name": "boxy-m", "host": "clustera9", "port": 8000, '
+                  '"url": "http://clustera9:8000"}')
+    jobs.write_record("boxy-m", {"name": "boxy-m", "scheduler": "slurm", "job": "777",
+                                 "model": "hf://x", "submitted_from": "agentless-ssh",
+                                 "target": "user@clustera", "endpoint_remote": str(ep),
+                                 "log": str(rdir / "boxy-m-%j.log")})
+    _shim(ssh["bin"], "squeue", "#!/bin/bash\necho RUNNING\n")
+    # the login node answers curl for the COMPUTE node's endpoint (only it resolves)
+    _shim(ssh["bin"], "curl", "#!/bin/bash\n"
+          "for a in \"$@\"; do case \"$a\" in\n"
+          "  */v1/models) echo '{\"data\": [{\"id\": \"org/Model-X\"}]}'; exit 0;;\n"
+          "  */v1/chat/completions) echo '{\"choices\": [{\"message\": "
+          "{\"content\": \"pong from the cluster\"}}]}'; exit 0;;\n"
+          "esac; done\nexit 1\n")
+
+    rc = main(["curl", "boxy-m", "--ssh", "user@clustera", "--prompt", "ping"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "pong from the cluster" in cap.out
+    assert "org/Model-X @ http://clustera9:8000" in cap.out
+    assert "### Remote" not in cap.out                    # never delegated to a cluster boxy
+
+    calls = {}
+
+    def fake_await(host, node, port, log_path, local_port, route, *a, **kw):
+        calls.update(host=host, node=node, port=port, route=route)
+        return True
+
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", fake_await)
+    rc = main(["open", "boxy-m", "--ssh", "user@clustera", "--route", "mymodel"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert calls["host"] == "user@clustera" and calls["node"] == "clustera9"
+    assert calls["port"] == 8000 and calls["route"] == "mymodel"
+    assert "### Remote" not in cap.out
+
+
 def test_boxy_attach_rejoins_agentless_serve(ssh, capfd, monkeypatch, tmp_path):
     # FIELD: the serve detached while vLLM was still loading and there was NO way
     # back to the tunnel/READY. `boxy attach` re-joins: reads the endpoint from
