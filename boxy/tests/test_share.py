@@ -451,3 +451,46 @@ def _reap_stray_clients(share_env):
                 os.kill(int(pid), 9)
         except (OSError, ValueError):
             pass
+
+
+def test_auto_share_alias_is_unique_per_user(monkeypatch):
+    """The auto team URL is PUBLIC on a shared relay. Derived from the model
+    alone, two people serving the same model on the same cluster both claim
+    <model>-boxy.apps.<cluster> — the second silently hijacks the first, so a
+    teammate's link starts answering from someone else's job."""
+    import argparse
+
+    from boxy import cli
+
+    from boxy import config
+
+    monkeypatch.setenv("BOXY_SHARE_ENABLED", "true")
+    monkeypatch.setenv("BOXY_AUTO_SHARE", "true")
+    config.reset()
+
+    def alias_for(user):
+        monkeypatch.setenv("USER", user)
+        monkeypatch.setenv("LOGNAME", user)
+        config.reset()
+        a = argparse.Namespace(model="hf://meta-llama/Llama-3.1-8B-Instruct", share=None,
+                               foreground=False, box=None, scheduler="slurm", name=None)
+        return cli._auto_share_name(a)
+
+    alice, alice_auto = alias_for("alice")
+    bob, _ = alias_for("bob")
+    assert alice_auto is True
+    assert alice != bob, "two users of the same model must not claim the same public URL"
+    assert alice.endswith("-alice") and bob.endswith("-bob")
+    assert "llama" in alice
+    assert len(alice) <= 40 and alias_is_dns_label(alice)
+    # an explicit --share is the user CHOOSING a name: taken verbatim
+    monkeypatch.setenv("USER", "alice")
+    a = argparse.Namespace(model="hf://x/y", share="team-demo", foreground=False, box=None,
+                           scheduler="slurm", name=None)
+    assert cli._auto_share_name(a) == ("team-demo", False)
+
+
+def alias_is_dns_label(name: str) -> bool:
+    import re
+
+    return bool(re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?", name))

@@ -285,3 +285,14 @@ def test_airgapped_run_never_falls_back_to_a_registry_pull():
     finally:
         deploy.set_airgap(False)
     assert "--pull=never" not in get_backend("podman").build_command(box, loc, inner, {}, [], "cuda")
+
+
+def test_bundle_without_ssh_refuses_instead_of_planning_an_online_serve(capsys):
+    """--bundle is read only by the agentless --ssh renderer. Ignoring it
+    planned an ONLINE serve — the worst outcome inside a gap, where the job then
+    dies trying to reach a registry after the queue wait."""
+    rc = main(["serve", "hf://org/model", "--bundle", "/projects/me/b", "--dryrun"])
+    err = capsys.readouterr().err
+    assert rc != 0
+    assert "--bundle /projects/me/b needs --ssh" in err
+    assert "from inside the gap the login node IS a valid --ssh target" in err

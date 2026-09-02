@@ -4680,7 +4680,17 @@ def _auto_share_name(args) -> tuple[str, bool]:
     except Exception:  # noqa: BLE001 — never block the serve on name resolution
         base = ""
     # relay hostnames are DNS labels: lowercase alnum + dashes, <= 40 chars.
-    alias = re.sub(r"[^a-z0-9-]+", "-", (base or "").removeprefix("boxy-").lower()).strip("-")[:40].strip("-")
+    alias = re.sub(r"[^a-z0-9-]+", "-", (base or "").removeprefix("boxy-").lower()).strip("-")
+    # AND THE USER, because this URL is PUBLIC on a shared relay. Derived from
+    # the model alone, two people serving the same model on the same cluster
+    # both claim <model>-boxy.apps.<cluster> — the second silently hijacks the
+    # first, so a teammate's link starts answering from someone else's job. An
+    # explicit --share still takes the name verbatim (that is the user choosing).
+    user = re.sub(r"[^a-z0-9-]+", "-",
+                  (os.environ.get("USER") or os.environ.get("LOGNAME") or "").lower()).strip("-")
+    if alias and user:
+        alias = f"{alias[:40 - len(user) - 1]}-{user}"
+    alias = alias[:40].strip("-")
     return (alias, True) if alias else ("", False)
 
 
@@ -4931,6 +4941,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
     rc = _delegate_remote(args, tunnel_ready=True)
     if rc is not None:
         return rc
+    # --bundle is read ONLY by the agentless --ssh renderer. Reaching here means
+    # it was silently ignored and the serve was planned ONLINE — the worst
+    # possible outcome inside a gap, where the job then dies trying to reach a
+    # registry. Refuse, and name the two ways to actually use the bundle.
+    if getattr(args, "bundle", None):
+        raise UsageError(
+            f"--bundle {args.bundle} needs --ssh: the air-gapped plan (podman load from the "
+            f"bundle's archive, its HF cache mounted offline, wheels installed --no-index) is "
+            f"rendered by the agentless path. Run it as "
+            f"`boxy serve <model> --bundle {args.bundle} --ssh <user>@<login>` — from inside "
+            f"the gap the login node IS a valid --ssh target. To inspect the plan first, add "
+            f"--dryrun.")
     _apply_bind_host_env(args)  # --bind-host wins over env/file/default for this serve
     if getattr(args, "share", None):
         raise UsageError("--share needs the laptop tunnel (`boxy serve ... --ssh user@login "
