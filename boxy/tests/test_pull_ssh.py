@@ -331,3 +331,45 @@ def test_local_pull_proceeds_when_space_is_fine(monkeypatch, capsys):
     monkeypatch.setattr(cli.ramalama_shim, "pull_model", lambda *a, **k: "/store/x")
     assert cli.cmd_pull(_args(ssh=None)) == 0
     assert "model available at: /store/x" in capsys.readouterr().out
+
+
+def test_listing_failure_names_the_cause_not_six_useless_words():
+    """FIELD (cronus, Kimi-K3): the pull died with 'boxy-pull: could not list
+    the repo files' — six words that fit a gated repo, a blocked API path, a
+    rate limit, a typo and a DNS failure equally well. `curl -sf` threw away
+    both the body and the status, and the pipeline discarded curl's exit code
+    on top."""
+    script = cli._hf_curl_script("moonshotai/Kimi-K3", "/scratch/stage", "img:tag")
+    # the listing keeps the status instead of -f throwing it away
+    assert '-w "%{http_code}"' in script
+    assert "curl -sfL" not in script.split("case \"$code\"")[0].split("code=$(")[1]
+    # ...and every status maps to the actual remedy
+    assert "401|403)" in script and "GATED" in script and "HF_TOKEN" in script
+    assert "404)" in script and "check the id for a typo" in script
+    assert "429)" in script and "rate-limited" in script
+    assert "000)" in script and "DNS/TLS/proxy, not the model" in script
+    # a 200 with an unexpected body is its own case, not silence
+    assert "listed no files" in script
+
+
+def test_a_dead_pull_reports_FAILED_not_RUNNING(monkeypatch, capsys):
+    """The status inferred liveness from the LOG'S MTIME, so a script that had
+    just crashed still reported 'pull RUNNING ... 0/96 shards' and sent the user
+    away to wait for a download that had already given up."""
+    calls, _pushed = _wire(monkeypatch)
+    orig = __import__("boxy.remote", fromlist=["ssh_capture"]).ssh_capture
+
+    def failed_probe(target, cmd, timeout=20):
+        if "STATE=" in cmd:
+            return 0, ("STATE=FAILED\nWHY=HuggingFace refused the repo listing (HTTP 403). "
+                       "moonshotai/Kimi-K3 is GATED\nGOT=1G\nSHARDS=0\n")
+        return orig(target, cmd, timeout)
+
+    monkeypatch.setattr("boxy.remote.ssh_capture", failed_probe)
+    rc = cli._pull_agentless_ssh(_args(), TARGET)
+    err = capsys.readouterr().err
+    assert rc == 1, "a failed pull must not exit 0"
+    assert "pull FAILED" in err
+    assert "GATED" in err                      # the cause travels back to the laptop
+    assert "tail -40" in err and "resumes" in err
+    assert "RUNNING" not in err
