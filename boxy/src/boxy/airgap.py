@@ -111,19 +111,20 @@ def _hf_download(repo: str, hf_home: str, token: str = "") -> None:
         env["HF_TOKEN"] = token
     try:
         from huggingface_hub import snapshot_download  # type: ignore
-
-        old = os.environ.get("HF_HOME")
-        os.environ["HF_HOME"] = hf_home
-        try:
-            snapshot_download(repo, token=token or None)
-        finally:
-            if old is None:
-                os.environ.pop("HF_HOME", None)
-            else:
-                os.environ["HF_HOME"] = old
-        return
     except ImportError:
         pass
+    else:
+        # NAME THE DESTINATION EXPLICITLY. huggingface_hub reads HF_HOME into
+        # huggingface_hub.constants.HF_HUB_CACHE at IMPORT time, so mutating
+        # os.environ here is too late: snapshot_download would fall back to the
+        # constant and write the model into the BUILD MACHINE's
+        # ~/.cache/huggingface while the bundle crossed the gap EMPTY — a
+        # failure that only surfaces on the far side of the transfer, where
+        # nothing can be re-downloaded. cache_dir is the HF hub root, i.e.
+        # <HF_HOME>/hub (the layout the container's mounted cache expects).
+        snapshot_download(repo, token=token or None,
+                          cache_dir=os.path.join(hf_home, "hub"))
+        return
     cli = shutil.which("huggingface-cli") or shutil.which("hf")
     if not cli:
         raise BundleError(

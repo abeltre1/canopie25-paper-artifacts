@@ -1326,7 +1326,16 @@ def cmd_bundle(args: argparse.Namespace) -> int:
     bare = cards.model_key(args.model)
     card = cards.find_card(bare)
     engine = (card.engine if card and card.engine else "vllm")
-    image = args.image or ramalama_shim.default_image(engine, args.accelerator or "cuda")
+    accel = args.accelerator or "cuda"
+    # The bundle must carry the image the SERVE will actually run. A card that
+    # pins [model.images] wins over the engine default exactly as it does at
+    # serve time — otherwise the archive holds one image, the podman run names
+    # another, and the mismatch only shows up air-gapped, where no pull can
+    # rescue it (field: the Kimi-K3 card pins a K3-specific tag).
+    pinned = ""
+    if card and card.images:
+        pinned = card.images.get(accel) or card.images.get("default", "")
+    image = args.image or pinned or ramalama_shim.default_image(engine, accel)
     pip_pkgs = cards.layered_pip(bare)
     aux = cards.layered_aux_repos(bare)
     out = args.output or (bare.rsplit("/", 1)[-1].lower() + "-bundle")
@@ -3229,6 +3238,11 @@ def _serve_agentless_ssh(args, target: str) -> int:
     #    over-one-node model becomes an N-node Ray instance — same bare
     #    `boxy serve MODEL --ssh HOST` command either way.
     shape = _facts_shape(cfacts, scheduler_name) or _node_shape(host)
+    # remember whether the IMAGE was the user's own choice: apply_to_args may
+    # set args.image from the model card, and --bundle has to tell the two
+    # apart (the bundle's archive outranks a card pin, but never an explicit
+    # --image).
+    user_image = getattr(args, "image", None)
     for line in cards.apply_to_args(args, shape=shape,
                                     unified=_node_unified(host, cfacts, scheduler_name)):
         print(f"  auto: {line}")
@@ -3464,7 +3478,14 @@ def _serve_agentless_ssh(args, target: str) -> int:
         from boxy.box import Volume
 
         man = {} if args.dryrun else airgap.read_remote_manifest(target, bundle)
-        if man.get("image") and not args.image:
+        # The archive in the bundle is the ONLY image that exists inside the
+        # gap, so it outranks a card's pin (which apply_to_args already wrote
+        # into args.image). An explicit --image still wins: that is the user
+        # naming an image they know is on the node.
+        if man.get("image") and not user_image:
+            if box.image and box.image != man["image"]:
+                print(f"  auto: bundle: image {man['image']} (from the bundle manifest — it "
+                      f"outranks the card's {box.image}, which is not inside the gap)")
             box = dc_replace(box, image=man["image"])
         location = dc_replace(location, offline=True)
         deploy.set_airgap(True)                          # no proxy/CA in the plan
@@ -3480,8 +3501,27 @@ def _serve_agentless_ssh(args, target: str) -> int:
             box = dc_replace(
                 box, pip_find_links="/opt/boxy-wheels",
                 volumes=[*box.volumes, Volume(source=f"{bundle}/wheels", target="/opt/boxy-wheels")])
-        prelude.append(f"podman load -i {shlex.quote(bundle + '/image.oci.tar')} "
-                       f">/dev/null 2>&1 || true")
+        # Load the archive into the podman store — on EVERY node of the
+        # allocation, not just the head: a multi-node (Ray) serve runs a worker
+        # container on each other node, and inside the gap those nodes cannot
+        # pull what was never loaded there. And never silence it: a failed load
+        # used to degrade into an impossible registry pull discovered only
+        # after the queue wait.
+        _load = f"podman load -i {shlex.quote(bundle + '/image.oci.tar')}"
+        _nodes_n = int(getattr(args, "nodes", None) or 1)
+        from boxy import distributed as _distmod
+
+        if _distmod.is_distributed(box.engine or "vllm", _nodes_n,
+                                   getattr(args, "distributed", None)):
+            _fan = (f"srun --ntasks={_nodes_n} --ntasks-per-node=1 bash -c {shlex.quote(_load)}"
+                    if scheduler_name == "slurm" else f"flux exec bash -c {shlex.quote(_load)}")
+            _load = _fan
+        prelude.append(
+            f"{_load} || {{ echo 'boxy: air-gap bundle: podman load failed for "
+            f"{bundle}/image.oci.tar — the image cannot be pulled inside the gap, so the "
+            f"job would die later with an impossible registry pull. Check the archive "
+            f"crossed intact (sha256sum) and that every allocated node can read the "
+            f"bundle path.' >&2; exit 9; }}")
         print(f"  auto: bundle: {bundle} (AIR-GAPPED — image from its oci-archive, model + "
               f"custom code from its HF cache, wheels offline; no proxy, no egress)")
 

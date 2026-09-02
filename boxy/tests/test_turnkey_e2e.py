@@ -1930,6 +1930,28 @@ def test_ssh_agentless_serve_from_bundle_is_fully_offline(ssh, capfd, monkeypatc
     assert "/projects/me/nemotron-bundle/wheels:/opt/boxy-wheels" in script
     assert "--trust-remote-code" in script                     # card args still ride
     assert "proxy.example.gov" not in script                    # zero egress config
+    # a failed load must ABORT: silencing it degraded into a registry pull that
+    # cannot succeed inside the gap, discovered only after the queue wait
+    assert "air-gap bundle: podman load failed" in script
+    assert "--pull=never" in script
+
+
+def test_ssh_agentless_bundle_multinode_loads_the_image_on_every_node(ssh, capfd, monkeypatch):
+    """AIR-GAP + MULTI-NODE: the head node ran `podman load`, but each OTHER
+    node runs a Ray worker container from the same image — and inside the gap a
+    node that never loaded the archive cannot pull it. The load must fan out
+    across the allocation exactly like the stale-container sweep does."""
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", "hf://nvidia/NVIDIA-Nemotron-Parse-v1.2", "--scheduler", "slurm",
+               "--accelerator", "cuda", "--ssh", "user@clustera", "--nodes", "4", "--gpus", "4",
+               "--bundle", "/projects/me/nemotron-bundle", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    script = cap.out[cap.out.index("### Batch script"):]
+    assert ("srun --ntasks=4 --ntasks-per-node=1 bash -c 'podman load -i "
+            "/projects/me/nemotron-bundle/image.oci.tar'") in script
+    assert "air-gap bundle: podman load failed" in script
 
 
 def test_ssh_geometry_from_system_card_zero_flags(ssh, capfd, monkeypatch, tmp_path):

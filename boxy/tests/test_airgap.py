@@ -4,6 +4,8 @@ stages monkeypatched; the serve side is asserted on the rendered agentless
 script — image loaded from the bundle, HF cache mounted offline, wheels
 installed with --no-index, and NO proxy anywhere."""
 
+import os
+
 import pytest
 
 from boxy import airgap, cards
@@ -211,3 +213,75 @@ def test_cmd_wheels_surfaces_build_errors(tmp_path, monkeypatch, capfd):
     monkeypatch.setattr(airgap, "build_wheelhouse", boom)
     rc = main(["wheels", "-o", str(tmp_path / "wh")])
     assert rc == 1 and "podman or docker" in capfd.readouterr().err
+
+
+# ---- the bundle must actually CONTAIN what it promises -------------------------------
+
+
+def test_hf_download_writes_into_the_bundle_not_the_build_hosts_cache(tmp_path, monkeypatch):
+    """THE air-gap trap: huggingface_hub reads HF_HOME into its constants at
+    IMPORT time, so setting os.environ afterwards is too late — the snapshot
+    landed in the BUILD MACHINE's ~/.cache/huggingface and the bundle crossed
+    the gap EMPTY, discovered only on the far side where nothing can be
+    re-downloaded. The destination must be named explicitly."""
+    seen = {}
+
+    def fake_snapshot(repo, token=None, cache_dir=None, **kw):
+        seen["repo"], seen["cache_dir"] = repo, cache_dir
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot)
+    monkeypatch.setenv("HF_HOME", "/somewhere/else/entirely")   # must NOT decide
+    hf_home = str(tmp_path / "nb" / "hfcache")
+    airgap._hf_download("nvidia/NVIDIA-Nemotron-Parse-v1.2", hf_home)
+    assert seen["repo"] == "nvidia/NVIDIA-Nemotron-Parse-v1.2"
+    # the hub root INSIDE the bundle — the layout the container's mount expects
+    assert seen["cache_dir"] == os.path.join(hf_home, "hub")
+
+
+def test_bundle_carries_the_card_pinned_image(tmp_path, monkeypatch, capfd):
+    """A card that pins [model.images] is what the SERVE will run, so it is what
+    the bundle must carry. Bundling the engine default instead put one image in
+    the archive and named another in the podman run — a mismatch that can only
+    be discovered inside the gap, where no pull can rescue it."""
+    import argparse
+
+    from boxy import cli
+
+    got = {}
+    monkeypatch.setattr(airgap, "build_bundle",
+                        lambda model, out, image, **kw: got.update(image=image, model=model) or "m")
+    rc = cli.cmd_bundle(argparse.Namespace(
+        model="hf://moonshotai/Kimi-K3", output=str(tmp_path / "b"), image=None,
+        accelerator="cuda", skip_image=True, bake=False))
+    assert rc == 0
+    assert got["image"] == "docker.io/vllm/vllm-openai:kimi-k3"   # the card's pin, not the default
+    # an explicit --image still wins over the card
+    got.clear()
+    cli.cmd_bundle(argparse.Namespace(
+        model="hf://moonshotai/Kimi-K3", output=str(tmp_path / "b2"), image="my/own:tag",
+        accelerator="cuda", skip_image=True, bake=False))
+    assert got["image"] == "my/own:tag"
+
+
+def test_airgapped_run_never_falls_back_to_a_registry_pull():
+    """Inside the gap a pull cannot succeed, so a missing image must fail in
+    seconds naming the real problem — not after the queue wait."""
+    from boxy import deploy
+    from boxy.backends import get_backend
+    from boxy.box import Box
+    from boxy.location import Location, Resources, Staging
+
+    box = Box(name="b", image="img:tag", engine="vllm", entrypoint="vllm", ports=[8000])
+    loc = Location(name="l", scheduler="none", accelerator="cuda", runtime="podman",
+                   resources=Resources(nodes=1, gpus_per_node=1),
+                   staging=Staging(models_dir="./models"))
+    inner = ["vllm", "serve", "/mnt/models/m"]
+    try:
+        deploy.set_airgap(True)
+        cmd = get_backend("podman").build_command(box, loc, inner, {}, [], "cuda")
+        assert "--pull=never" in cmd
+    finally:
+        deploy.set_airgap(False)
+    assert "--pull=never" not in get_backend("podman").build_command(box, loc, inner, {}, [], "cuda")
