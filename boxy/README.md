@@ -574,6 +574,12 @@ vs. verified-by-construction), and a troubleshooting table covering every
 failure observed in real-user testing (SSL/CA bundles, macOS podman prompts,
 amd64-on-ARM, Podman workdir strictness).
 
+**Shipping into a specific environment?** Each has an end-to-end release
+runbook: [air-gapped](docs/13-runbook-airgapped.md) (build → transfer → serve
+inside the gap), [cloud](docs/14-runbook-cloud.md) (SkyPilot and
+OpenShift/Kubernetes), and [networks](docs/15-runbook-networks.md) (laptop →
+cluster across direct, proxied, and isolated-compute networks).
+
 **`boxy doctor`** audits the environment for the known field issues (proxy/CA/
 token, container runtime, scheduler, accelerator, per-cluster state, OOM'd
 containers; `--net` also probes image-registry reachability) and prints

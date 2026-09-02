@@ -377,8 +377,19 @@ tunnel (`boxy open … --ssh <login>`).
 
 ## 1. Any machine — install & self-test (5 min)
 
+Most users need no checkout at all — install the published package:
+
 ```bash
-git clone -b claude/boxy-cli-hpc-spec-ojevsl <repo-url> && cd */boxy
+pip install 'boxy-hpc[ramalama]'         # or: uv tool install boxy-hpc
+boxy --version
+boxy info            # EXPECT: version, ramalama available, your runtimes/schedulers
+```
+
+From a checkout (to run the suite or use `boxy wheels`, which needs an
+editable install):
+
+```bash
+git clone <repo-url> && cd */boxy
 
 # with pip:
 python3 -m venv .boxy && source .boxy/bin/activate
@@ -387,9 +398,14 @@ pip install -e '.[ramalama,test]'
 uv venv .boxy && source .boxy/bin/activate
 uv pip install -e '.[ramalama,test]'
 
-pytest -q            # EXPECT: 113 passed (live Docker test skips if no Docker)
-boxy info            # EXPECT: version, ramalama available, your runtimes/schedulers
+pytest -q            # EXPECT: all green; suites needing an absent optional
+                     # extra (sky/boto3/matplotlib) or a live daemon SKIP
+boxy --version       # a checkout prints its git sha; an installed copy says so
 ```
+
+The `[ramalama]` extra is what pulls `hf://`/`ollama://`/`oci://` models.
+Without it boxy still serves a model **by path** — the air-gapped and
+pre-staged paths need nothing else.
 
 **uv users:** uv's standalone Pythons ship without system CA wiring — step 2.1
 (SSL_CERT_FILE) is *required* for you, not optional.
