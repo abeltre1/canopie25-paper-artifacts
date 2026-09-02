@@ -300,6 +300,19 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
         )
     else:
         podman = shlex.join(cmd)
+    # IMAGE CONVERSION. Runtimes that cannot run an OCI image directly (apptainer
+    # needs a .sif, charliecloud an unpacked dir) get a prepare step from their
+    # backend — and the agentless renderer used to DROP it, so the script exec'd
+    # a SIF filename nothing had ever built and the job died instantly with 'no
+    # such file or directory'. Every non-podman site card (both rocm-cluster
+    # cards, apptainer-only, charliecloud-cuda) was affected. Build it inside
+    # the job, where the runtime actually lives, and fail loudly if it cannot.
+    prepare_block = ""
+    for prep in getattr(deployment, "prepare_commands", []) or []:
+        line = shlex.join(prep)
+        prepare_block += (
+            f'echo "boxy: preparing the {runtime} image (this runs once per node/image) ..." >&2\n'
+            f'{line} || {{ echo "boxy: image preparation failed: {line}" >&2; exit 10; }}\n')
     # engine-pull: the model lands in the container's HF cache, which the caller
     # bind-mounts from the shared FS (download once, reuse every run) — create it
     # here so podman never fails on a missing bind source.
@@ -384,6 +397,7 @@ def render_agentless_script(box: Box, location: Location, scheduler_name: str, n
         f'_EP={shlex.quote(endpoint_file)}\n'
         f'{mk_cache}'
         f'{ca_block}'
+        f'{prepare_block}'
         f'{worker_block}'
         'cat > "${_EP}.tmp" <<EOF_BOXY_EP\n'
         f'{{"name": "{name}", "host": "${{_H}}", "port": {resolved_port}, '
@@ -557,8 +571,12 @@ def _plan(
     cmd = scheduler.with_modules(cmd, location)
     if wrap:  # distributed head/worker run directly / via their own srun — no launch-prefix wrap
         cmd = scheduler.wrap(cmd, location)
-    prepare = (backend.prepare(box, location, dryrun, accelerator=accelerator)
-               if backend.image_format == "sif" else [])
+    # ASK THE BACKEND, don't hard-code a format. Gating on image_format == "sif"
+    # meant CharlieCloud's fully-implemented prepare (ch-image pull, ch-convert,
+    # ch-fromhost --nvidia) was never called on ANY path, so `ch-run` was handed
+    # an image directory nothing had created. podman/docker inherit the base
+    # class's empty prepare, so they are unaffected.
+    prepare = backend.prepare(box, location, dryrun, accelerator=accelerator)
     return Deployment(
         box=box,
         location=location,

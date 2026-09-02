@@ -918,6 +918,54 @@ def test_agentless_list_logs_stop_answer_from_laptop_records(ssh, capfd, monkeyp
     assert jobs.read_record("boxy-m") is None              # record reaped
 
 
+def test_agentless_script_builds_the_image_its_runtime_needs(ssh, capfd, monkeypatch):
+    """Apptainer cannot run an OCI image: it needs a .sif built first. The
+    agentless renderer DROPPED the backend's prepare step, so the script exec'd
+    a SIF filename nothing had ever built and the job died instantly with 'no
+    such file or directory' — on every non-podman site card."""
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--system", "rocm-cluster", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    script = cap.out[cap.out.index("### Batch script"):]
+    assert "apptainer build" in script                  # built INSIDE the job...
+    assert "image preparation failed" in script         # ...and a failure aborts
+    sif = [w for w in script.split() if w.endswith(".sif")]
+    assert sif, "the run should still reference the SIF"
+    assert script.index("apptainer build") < script.index(sif[-1].strip("'\""))
+
+
+def test_podman_script_has_no_preparation_step(ssh, capfd, monkeypatch):
+    # podman/docker run the OCI image directly — nothing to build, no noise
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "image preparation failed" not in cap.out
+
+
+def test_charliecloud_prepare_is_actually_produced():
+    """CharlieCloud's prepare (ch-image pull / ch-convert / ch-fromhost --nvidia)
+    was gated behind `image_format == "sif"`, so it never ran on ANY path and
+    ch-run was handed an image directory nothing had created."""
+    from boxy import deploy
+    from boxy.box import Box
+    from boxy.location import Location, Resources, Staging
+
+    box = Box(name="cc", image="vllm/vllm-openai:latest", engine="vllm",
+              entrypoint="vllm", ports=[8000], model="/models/m")
+    loc = Location(name="cc", scheduler="slurm", accelerator="cuda", runtime="charliecloud",
+                   resources=Resources(nodes=1, gpus_per_node=1),
+                   staging=Staging(models_dir="./models"))
+    dep = deploy.plan_serve(box, loc, dryrun=True)
+    flat = [" ".join(c) for c in dep.prepare_commands]
+    assert any("ch-image pull" in c for c in flat)
+    assert any("ch-convert" in c for c in flat)
+    assert any("ch-fromhost --nvidia" in c for c in flat)   # cuda libs injected at build
+
+
 def test_system_card_runtime_is_not_overwritten_with_podman(ssh, capfd, monkeypatch):
     """A site card says what the site RUNS. The agentless path pinned
     args.runtime to 'podman' BEFORE loading the location, so every Apptainer and
