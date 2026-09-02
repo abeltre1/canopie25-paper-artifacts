@@ -198,6 +198,69 @@ def test_dryrun_plans_without_the_ramalama_extra(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "would be pulled to" in out and "plan only" in out
 
-    # ...but a REAL pull still refuses, with the remedy
-    with pytest.raises(RuntimeError, match=r"boxy-hpc\[ramalama\]"):
-        ramalama_shim.pull_model("hf://Qwen/Qwen2.5-0.5B-Instruct", dryrun=False)
+    # (a REAL hf:// pull no longer refuses either — boxy downloads it itself;
+    # see test_hf_pull_needs_no_optional_extra)
+
+
+def _fake_hub(monkeypatch, files, bodies):
+    """Serve a fake Hub through boxy's own opener seam (stdlib only)."""
+    import io
+    import json as _json
+
+    class _R(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            url = req.full_url
+            if "/api/models/" in url:
+                return _R(_json.dumps({"siblings": [{"rfilename": f} for f in files]}).encode())
+            return _R(bodies[url.split("/resolve/main/", 1)[1]])
+
+    from boxy import cardgen
+
+    monkeypatch.setattr(cardgen, "_opener", lambda: _Opener())
+
+
+def test_hf_pull_needs_no_optional_extra(monkeypatch, tmp_path, capsys):
+    """boxy already downloads models two ways it wrote itself (host curl over
+    --ssh, huggingface_hub for bundles). The LOCAL pull was the only path that
+    reached for the optional 'ramalama' extra — so a laptop had to carry an
+    extra dependency closure, and an air-gap transfer its wheels, to do
+    something boxy can do with certifi and the stdlib."""
+    import sys
+
+    from boxy import ramalama_shim
+
+    monkeypatch.setitem(sys.modules, "ramalama.transports.transport_factory", None)
+    monkeypatch.setenv("BOXY_STORE", str(tmp_path / "store"))
+    monkeypatch.setattr(ramalama_shim, "DEFAULT_STORE", str(tmp_path / "store"))
+    _fake_hub(monkeypatch,
+              ["config.json", "model.safetensors", "original/consolidated.pth", "w.gguf"],
+              {"config.json": b'{"a":1}', "model.safetensors": b"W" * 64})
+
+    path = ramalama_shim.pull_model("hf://acme/Demo-Model")
+    got = sorted(os.listdir(path))
+    assert got == ["config.json", "model.safetensors"]      # .pth/.gguf/original skipped
+    assert (Path(path) / "config.json").read_bytes() == b'{"a":1}'
+    assert path.endswith("acme-demo-model")
+    # a rerun is a no-op: complete files are skipped, nothing re-downloaded
+    assert ramalama_shim.pull_model("hf://acme/Demo-Model", quiet=True) == path
+
+
+def test_ollama_and_oci_still_name_the_extra(monkeypatch):
+    # those ARE ramalama transports; the message must say so without implying
+    # hf:// needs it too
+    import sys
+
+    from boxy import ramalama_shim
+
+    monkeypatch.setitem(sys.modules, "ramalama.transports.transport_factory", None)
+    with pytest.raises(RuntimeError) as e:
+        ramalama_shim.pull_model("ollama://llama3")
+    assert "boxy downloads hf:// itself" in str(e.value)
+    assert "ollama:// and oci:// are ramalama transports" in str(e.value)

@@ -43,7 +43,7 @@ Then on the target:
 
 ```bash
 python3.12 -m venv boxy-env && . boxy-env/bin/activate
-pip install --no-index --find-links boxy-wheels/ 'boxy-hpc[ramalama,plot]'
+pip install --no-index --find-links boxy-wheels/ boxy-hpc
 ```
 
 - **The set is platform+python pinned** — that is the point. `--platform

@@ -591,7 +591,8 @@ leverages both projects *behind seams*, absorbing neither.**
 
 - **RamaLama → library behind one file.** Pinned dependency, every import
   confined to `boxy/ramalama_shim.py` with lazy loading and graceful
-  degradation (no ramalama ⇒ no autodetect/no transport pulls, everything else
+  degradation (no ramalama ⇒ no ollama:///oci:// pulls; hf:// and autodetect are
+  boxy's own, everything else
   works). If its unstable internals ever break the pin, the worst case is
   vendoring ~300 lines of accelerator probes under MIT attribution.
 - **SkyPilot → optional cloud backend behind a subprocess/SDK boundary.**
