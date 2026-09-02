@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from types import SimpleNamespace
 
@@ -414,6 +415,13 @@ def verify_safetensors_complete(model_dir: str) -> list[str]:
     return []
 
 
+def model_key_slug(model_uri: str) -> str:
+    """Filesystem-safe slug for a transport URI — the shape boxy's store uses
+    ('hf://org/Name' -> 'org-name'). Used for dryrun plans and messages."""
+    bare = model_uri.split("://", 1)[-1]
+    return re.sub(r"[^a-z0-9._-]+", "-", bare.lower()).strip("-") or "model"
+
+
 def pull_model(model_uri: str, dryrun: bool = False, quiet: bool = False, force: bool = False) -> str:
     """Pull a model via RamaLama transports (hf://, ollama://, oci://, ...).
 
@@ -429,6 +437,17 @@ def pull_model(model_uri: str, dryrun: bool = False, quiet: bool = False, force:
         _silence_prompts()
         from ramalama.transports.transport_factory import New
     except Exception as e:
+        if dryrun:
+            # A --dryrun PRINTS A PLAN: it must never need the network, the
+            # store, or an optional extra. Refusing here made the documented
+            # first command fail on the documented first install (the bare
+            # `pip install boxy-hpc`, whose README examples are all --dryrun).
+            # Show the store path the pull WOULD resolve to, labelled, so the
+            # plan's mounts and argv are still inspectable.
+            placeholder = os.path.join(DEFAULT_STORE, "models", model_key_slug(model_uri))
+            print(f"  auto: model: {model_uri} would be pulled to {placeholder} "
+                  f"(plan only — the real pull needs `pip install 'boxy-hpc[ramalama]'`)")
+            return placeholder
         raise RuntimeError(
             "pulling transport URIs requires the 'ramalama' package "
             "(pip install 'boxy-hpc[ramalama]'); for air-gapped sites set "
