@@ -240,6 +240,28 @@ pip install "boxy-hpc[cloud]"      # + SkyPilot cloud launch
 pip install "boxy-hpc[s3]"         # + boto3 for S3 model staging
 ```
 
+### No index, no network, no build backend
+
+A ready-to-install wheel is tracked in the repo, beside the dependency wheels:
+
+```bash
+git pull
+uv pip install --no-deps wheels/boxy_hpc-*.whl     # or: pip install --no-deps ...
+```
+
+This is the install for a site whose package index terminates TLS with a private
+CA — where `pip install boxy-hpc` cannot reach an index and `pip install ./boxy`
+cannot fetch a build backend. A wheel needs neither. `--no-deps` because
+`certifi` is optional at runtime (boxy imports it inside a `try`); add it when
+your trust store is sorted.
+
+CI asserts the committed wheel matches `src/` on every push, so it cannot drift
+into shipping old code. After changing sources, refresh it with:
+
+```bash
+make -C boxy repo-wheel && git add wheels/
+```
+
 | Extra | Adds | For |
 |-------|------|-----|
 | `ramalama` | RamaLama | `ollama://` / `oci://` pulls — **not** needed for `hf://` or GPU autodetect, which are boxy's own |

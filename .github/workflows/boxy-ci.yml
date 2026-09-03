@@ -101,6 +101,13 @@ jobs:
           python -m boxy --version
           boxy config >/dev/null
           boxy examples >/dev/null
+      - name: The wheel committed at wheels/ must match src/
+        # A wheel is tracked in the repo so a site whose package index terminates
+        # TLS with a private CA can install with no index, no network and no
+        # build backend. A committed binary silently goes stale, though, and a
+        # stale wheel is worse than none — someone installs old code and cannot
+        # tell. This rebuilds from src/ and compares the package payload.
+        run: python3 boxy/hack/repo_wheel.py check
       - name: Upload the installable wheel (per-commit artifact)
         # Every push's Actions run carries the built wheel + sdist: download it
         # from the run page (or `gh run download`) and `pip install` anywhere —
