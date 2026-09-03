@@ -15,6 +15,7 @@ it never changes anything.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -392,9 +393,7 @@ def remote_checks(run) -> list[Result]:
                           "not installed — fine: `--ssh` delegation resolves the account laptop-side and "
                           "passes it as --account (no boxy needed on the cluster to serve turnkey)"))
     else:
-        out.append(Result("cluster boxy", OK,
-                          f"{ver} — a --ssh serve still injects --account laptop-side, so an older "
-                          "cluster boxy without turnkey is covered"))
+        out.append(_cluster_boxy_result(ver))
 
     _, jobs_ls = run("ls -d ~/.local/share/boxy/jobs/*/ 2>/dev/null | tr '\\n' ' '")
     if jobs_ls.strip():
@@ -403,6 +402,51 @@ def remote_checks(run) -> list[Result]:
         out.append(Result("boxy state", OK, "no jobs dir yet (nothing served here)"))
 
     return out
+
+
+def _parse_version(text: str) -> tuple[int, ...] | None:
+    """(1, 2, 3) from a `boxy 1.2.3 (git ...)` banner. None when unparseable —
+    an odd version string is not a reason to invent a problem."""
+    m = re.search(r"\b(\d+(?:\.\d+)*)\b", text or "")
+    if not m:
+        return None
+    try:
+        return tuple(int(part) for part in m.group(1).split("."))
+    except ValueError:
+        return None
+
+
+def _cluster_boxy_result(remote_banner: str) -> Result:
+    """Compare the CLUSTER's boxy against this one and say so.
+
+    `--ssh` runs the cluster's install, not the laptop's: `boxy list`, `logs`,
+    `stop` and `curl` all execute over there. This check used to read the remote
+    version and report OK unconditionally, reasoning that a --ssh serve injects
+    --account laptop-side so an older cluster boxy is "covered". That covers ONE
+    flag on ONE path. Field: a cluster running 0.1.0 from a feature branch
+    against a 0.2.0 laptop was reported as OK, and the user had no way to learn
+    they were driving two different tools.
+    """
+    from boxy import __version__
+
+    remote, local = _parse_version(remote_banner), _parse_version(__version__)
+    if remote is None or local is None or remote == local:
+        return Result("cluster boxy", OK,
+                      f"{remote_banner} — matches this machine"
+                      if remote == local else remote_banner)
+    if remote < local:
+        return Result(
+            "cluster boxy", WARN,
+            f"{remote_banner} — OLDER than this machine ({__version__}). `--ssh` runs the "
+            f"CLUSTER's boxy for list/logs/stop/curl, so you are driving two different tools",
+            fix="update it on the login node: `pip install --force-reinstall "
+                "'boxy-hpc @ git+<repo>#subdirectory=boxy'`, or `git pull` in its checkout "
+                "if the install is editable")
+    return Result(
+        "cluster boxy", WARN,
+        f"{remote_banner} — NEWER than this machine ({__version__}); update this laptop so the "
+        f"two agree",
+        fix="pip install --upgrade boxy-hpc (or `git pull` in this checkout)")
 
 
 def _check_bench_backend() -> Result:
