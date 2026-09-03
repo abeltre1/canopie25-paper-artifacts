@@ -1289,3 +1289,33 @@ def test_context_overshoot_clamps_to_native(tmp_path, monkeypatch, capsys):
     assert rc == 0
     assert "clamped" in out
     assert "--max-model-len 1000000" in out.replace("=", " ")
+
+
+def test_a_boxy_pulled_model_served_BY_PATH_still_finds_its_card():
+    """FIELD: `boxy pull` stages a model into a directory named by its SLUG —
+    hf://moonshotai/Kimi-K3 -> .../models/moonshotai-kimi-k3 — and serving that
+    path by hand matched NO card, silently dropping the pinned image, the engine
+    args, the geometry and the derived context. Exactly the failure the org/name
+    path handling was added for, missed for boxy's OWN layout."""
+    for path in ("/tscratch/u/boxy/models/moonshotai-kimi-k3",
+                 "/pscratch/u/boxy/models/moonshotai-kimi-k3",
+                 "~/boxy/models/moonshotai-kimi-k3"):
+        card = cards.find_card(path)
+        assert card is not None and card.card_name == "kimi-k3", path
+        assert card.images.get("cuda")          # the pin really rides along
+        assert card.native_ctx == 1048576       # ...and so does the context data
+    # an org whose NAME contains dashes resolves too (the split is ambiguous,
+    # so every dash is offered and the card's glob decides)
+    llama = cards.find_card("/scratch/u/boxy/models/meta-llama-llama-3.1-8b-instruct")
+    assert llama is not None and "llama-3.1-8b" in llama.card_name
+    # and an unrelated directory still matches nothing
+    assert cards.find_card("/data/some-unrelated-dir") is None
+
+
+def test_by_path_serve_gets_the_cards_geometry_and_context():
+    a = _args("/tscratch/u/boxy/models/moonshotai-kimi-k3")
+    a.args = None
+    lines = cards.apply_to_args(a, shape=(8, 256, "x"))
+    assert a.gpus == 8                                   # solved, not guessed
+    assert "--max-model-len" in a.args                   # context derived
+    assert any("image:" in ln and "kimi-k3" in ln for ln in lines)

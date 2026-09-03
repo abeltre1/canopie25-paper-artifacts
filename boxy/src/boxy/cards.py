@@ -130,11 +130,25 @@ def match_keys(model: str) -> list[str]:
             keys.append(f"{parts[-2]}/{parts[-1]}")
         if parts:
             keys.append(parts[-1])
+            # BOXY'S OWN STORE LAYOUT. A pulled model lands in a directory named
+            # by its slug — 'hf://moonshotai/Kimi-K3' -> 'moonshotai-kimi-k3' —
+            # so serving that path by hand matched NO card and silently dropped
+            # the image pin, the engine args, the geometry and the derived
+            # context. The org/name split is ambiguous once '/' became '-'
+            # (org names contain dashes), so offer EVERY split and let the
+            # card's own glob decide; matching is case-insensitive because the
+            # slug is lowercased.
+            base = parts[-1]
+            keys += [f"{base[:i]}/{base[i + 1:]}"
+                     for i, ch in enumerate(base) if ch == "-"]
     return keys
 
 
 def _hit(keys: list[str], pattern: str) -> bool:
-    return any(fnmatch.fnmatchcase(k, pattern) or k == pattern for k in keys)
+    # case-insensitive too: a store slug is lowercased ('moonshotai-kimi-k3'),
+    # while cards spell the Hub's canonical casing ('moonshotai/Kimi-K3*').
+    return any(fnmatch.fnmatchcase(k, pattern) or k == pattern
+               or fnmatch.fnmatchcase(k.lower(), pattern.lower()) for k in keys)
 
 
 def _user_dir() -> Path:
