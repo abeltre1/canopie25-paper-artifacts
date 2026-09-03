@@ -2438,6 +2438,15 @@ def _pick_partition(args, scheduler_name: str, need_gpu: bool, where: str = "") 
         print(f"  auto: partition: {pick} ({note})")
 
 
+def _sched_inspect_hint(scheduler_name: str, job_id: str) -> str:
+    """The scheduler's own command for 'what happened to this job', including
+    jobs that have already left the ACTIVE list — the case that produces an
+    unmapped state in the first place."""
+    if scheduler_name == "flux":
+        return f"flux jobs -a | grep {job_id}   (then: flux job attach {job_id})"
+    return f"sacct -j {job_id} --format=State,ExitCode,Elapsed"
+
+
 def _partition_unresolved_line(pwhy: str, scheduler_name: str) -> str:
     """The decision line when no partition could be ranked — SHARED by the
     agentless and non-agentless serve paths.
@@ -4322,6 +4331,15 @@ def _serve_submission(args, scheduler_name: str, profile, name_override: str | N
             endpoint_seen = endpoint_seen or bool(endpoint)
             if state != last_state:
                 print(f"###   [{_fmt_elapsed(time.time() - t_start)}] job {job_id}: {state}", flush=True)
+                if state == "UNKNOWN":
+                    # UNKNOWN is a dead end on its own: it means the scheduler
+                    # answered with a state boxy does not map, so the user cannot
+                    # tell "still queued" from "already died". Name the commands
+                    # that settle it (field: a Flux job went PENDING -> UNKNOWN
+                    # and the output offered nothing to run next).
+                    print(f"###   (boxy does not recognise that state — the job may have already "
+                          f"ended.  see: boxy logs {name}   |   {_sched_inspect_hint(scheduler_name, job_id)})",
+                          flush=True)
                 last_state = state
                 last_note = time.time()
             elif time.time() - last_note >= 10:
