@@ -2215,3 +2215,57 @@ def test_ssh_uncarded_model_autogenerates_card_deterministically(ssh, capfd, mon
     assert "auto: gpus: 1 per node" in cap.out            # bytes, not the 450B name
     assert "#SBATCH --gpus-per-node=1" in cap.out
     assert (tmp_path / "xdg" / "boxy" / "cards" / "models" / "acme-custom-dense-450b.toml").exists()
+
+
+def test_completed_pull_still_warms_the_image_under_prestage_auto(ssh, capfd, monkeypatch):
+    """FIELD (Kimi-K3 on clusterc, job died after the queue wait): the prestage
+    gate was `pmode != "never" and (engine_pull or pmode == "always")`. A
+    completed `boxy pull` clears engine_pull, so under the DEFAULT 'auto' the
+    whole block — including the login-node image warm — was skipped in exactly
+    the case that needs the image in $HOME's podman store most: a by-path serve
+    on an isolated node. The node was left retrying `Trying to pull <image>`
+    until the job died. Warming the IMAGE must not depend on engine_pull."""
+    from boxy import cli
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("BOXY_AGENTLESS_PRESTAGE", "auto")
+    staged = "/scratch/u/boxy/models/meta-llama-llama-3.1-8b-instruct"
+    monkeypatch.setattr(cli, "_pull_completed_stage", lambda t, s, m: staged)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "already fully staged by `boxy pull`" in cap.out      # model NOT re-downloaded
+    assert "prestage: would stage image " in cap.out             # ... image STILL warmed
+    assert "reuses $HOME's podman store" in cap.out
+
+
+def test_no_prestage_still_skips_the_image_warm(ssh, capfd, monkeypatch):
+    """The widened gate must not make --no-prestage do network work: 'never'
+    still means no login-node pull of anything."""
+    from boxy import cli
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    staged = "/scratch/u/boxy/models/meta-llama-llama-3.1-8b-instruct"
+    monkeypatch.setattr(cli, "_pull_completed_stage", lambda t, s, m: staged)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera",
+               "--no-prestage", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "prestage: would stage" not in cap.out
+
+
+def test_pull_script_records_a_failed_image_prepull(monkeypatch):
+    """The pre-pull is best-effort BY DESIGN (the download is plain host curl
+    and needs no container) — but `|| true` also threw the result away, so a
+    cold image looked identical to a warm one and only surfaced an allocation
+    later. It must leave a marker carrying the image ref and the real error."""
+    from boxy import cli
+
+    script = cli._hf_curl_script("org/model", "/stage", "quay.io/x/vllm:tag")
+    assert "|| true" not in script.split("podman pull")[1].split("\n")[0]
+    assert 'rm -f "$STAGE/.boxy-image-failed"' in script
+    assert '> "$STAGE/.boxy-image-failed"' in script
+    # the marker names the image, so the status probe can print the exact fix
+    assert 'printf "%s: " quay.io/x/vllm:tag' in script
