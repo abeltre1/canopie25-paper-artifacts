@@ -2903,7 +2903,17 @@ def _hf_curl_script(repo: str, stage: str, image: str, *, proxy: str = "", cacer
         # instead of inferring liveness from the log's mtime
         'rm -f "$STAGE/.boxy-pull-failed"',
         '_fail() { echo "boxy-pull: $1"; printf "%s\\n" "$1" > "$STAGE/.boxy-pull-failed"; exit 1; }',
-        f"podman pull {q(image)} >/dev/null 2>&1 || true",
+        # THE PRE-PULL MUST NOT FAIL THE DOWNLOAD — it is plain host curl and
+        # needs no container. But `|| true` also made a FAILED pre-pull
+        # INVISIBLE: `boxy pull` reported the model staged while the image was
+        # never warmed, and the gap surfaced an allocation later as a compute
+        # node retrying `Trying to pull <image>` until the job died. Record the
+        # outcome so the status probe can say so BEFORE a queue slot is spent.
+        'rm -f "$STAGE/.boxy-image-failed"',
+        (f'if podman pull {q(image)} >"$STAGE/.boxy-image.log" 2>&1; then :; else '
+         f'{{ printf "%s: " {q(image)}; '
+         'tr -d "\\r" < "$STAGE/.boxy-image.log" | tail -3 | tr "\\n" " "; } '
+         '> "$STAGE/.boxy-image-failed"; fi'),
         (f'code=$({list_curl} -o "$STAGE/.boxy-repo.json" '
          '-w "%{http_code} %{url_effective}" '   # NOT an f-string: single braces
          '"https://huggingface.co/api/models/$REPO" 2>"$STAGE/.boxy-repo.err" || true)'),
@@ -3041,15 +3051,18 @@ def _pull_agentless_ssh(args, target: str) -> int:
     # users away to wait for a download that had already given up (field: a
     # listing failure showed as 'pull RUNNING ... 0/96 shards').
     failed = f"{stage}/.boxy-pull-failed"
+    img_failed = f"{stage}/.boxy-image-failed"
     probe = (f"if [ -e {q(done)} ]; then echo STATE=DONE; "
              f"elif [ -s {q(failed)} ]; then echo STATE=FAILED; "
-             f"echo WHY=$(tr -d '\\n' < {q(failed)} 2>/dev/null | head -c 400); "
+             f"echo \"WHY=$(tr -d '\\n' < {q(failed)} 2>/dev/null | head -c 400)\"; "
              f"elif [ -s {q(pid_remote)} ] && kill -0 \"$(cat {q(pid_remote)})\" 2>/dev/null; "
              f"then echo STATE=RUNNING; "
              f"elif [ -n \"$(find {q(log_remote)} -mmin -5 2>/dev/null)\" ]; then echo STATE=RUNNING; "
              f"else echo STATE=IDLE; fi; "
              f"echo GOT=$(du -s -BG {q(stage)} 2>/dev/null | cut -f1); "
-             f"echo SHARDS=$(ls {q(stage)} 2>/dev/null | grep -c 'safetensors$')")
+             f"echo SHARDS=$(ls {q(stage)} 2>/dev/null | grep -c 'safetensors$'); "
+             # a staged model with a COLD image still dies on the node
+             f"echo \"IMG=$(tr -d '\\n' < {q(img_failed)} 2>/dev/null | head -c 300)\"")
     rc, out = remote.ssh_capture(target, probe, timeout=30)
     kv = dict(ln.strip().split("=", 1) for ln in out.splitlines() if "=" in ln) if rc == 0 else {}
     state = kv.get("STATE") or "IDLE"
@@ -3057,9 +3070,26 @@ def _pull_agentless_ssh(args, target: str) -> int:
     got_shards = kv.get("SHARDS") or "0"
     of_shards = f"/{shards}" if shards else ""
     of_gb = f" of ~{size_gb:.0f}GB" if size_gb else ""
+    img_err = (kv.get("IMG") or "").strip()
+
+    def _warn_cold_image() -> None:
+        """A fully staged model is still unservable if the serving image never
+        landed in $HOME's podman store: the compute node then has to reach the
+        registry itself, which an isolated node cannot do — and it finds out
+        AFTER the queue wait. Say it here, where it is still cheap to fix."""
+        if not img_err:
+            return
+        ref = img_err.split(": ", 1)[0]
+        print(f"  WARNING: the serving image was NOT warmed on {host} — {img_err}",
+              file=sys.stderr)
+        print("  the model is staged, but a compute node without registry egress cannot pull "
+              "the image either, and the job would die after the queue wait.", file=sys.stderr)
+        print(f"  warm it on the login node first:  ssh {target} podman pull {ref}",
+              file=sys.stderr)
 
     if state == "DONE" and not args.force:
         print(f"model staged at: {host}:{stage} ({got_shards}{of_shards} shards, {got_gb})")
+        _warn_cold_image()
         print(f"  serve it:  boxy serve {args.model} --ssh {target}")
         return 0
     if state == "FAILED" and not args.force:
@@ -3073,6 +3103,7 @@ def _pull_agentless_ssh(args, target: str) -> int:
         return 1
     if state == "RUNNING":
         print(f"pull RUNNING on {host}: {got_gb}{of_gb}, {got_shards}{of_shards} shards so far")
+        _warn_cold_image()
         print("  it survives this laptop disconnecting. Run the same command again for fresh progress,")
         print(f"  or watch live:  ssh {target} tail -f {log_remote}")
         return 0
@@ -3575,7 +3606,16 @@ def _serve_agentless_ssh(args, target: str) -> int:
             engine_pull = False
 
     pmode = "never" if bundle else _prestage_mode(args)
-    if pmode != "never" and (engine_pull or pmode == "always"):
+    # WARMING THE IMAGE IS NOT CONDITIONAL ON engine_pull. The old gate
+    # `(engine_pull or pmode == "always")` skipped this whole block under the
+    # default 'auto' as soon as the model was already staged — i.e. exactly the
+    # isolated-node PATH serve, the case that needs the image sitting in $HOME's
+    # podman store MOST. Field: a completed `boxy pull` (which only warms the
+    # image best-effort) followed by a serve that never warmed it at all left
+    # the compute node retrying `Trying to pull <image>` until the job died,
+    # after the whole queue wait. Staging the MODEL still requires engine_pull;
+    # warming the IMAGE only requires that prestage is not 'never'.
+    if pmode != "never":
         image = args.image or box.image or ramalama_shim.default_image(box.engine, accel)
         if args.dryrun:
             what = f"model {box.model} + image {image}" if engine_pull else f"image {image}"
