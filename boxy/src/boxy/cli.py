@@ -3570,13 +3570,39 @@ def _serve_agentless_ssh(args, target: str) -> int:
         # serve must too. An explicit --proxy is never probed away.
         reg = (args.image or box.image or "").split("/", 1)[0]
         reg = reg if ("." in reg or reg == "localhost") else "docker.io"
-        rc_e, _ = remote.ssh_capture(
-            target, f"curl -sIf https://{reg}/ -o /dev/null --max-time 12", timeout=20)
-        if rc_e == 0:
+        # THE PROBE MUST MEASURE **DIRECT** EGRESS, WITH THE PROXY STRIPPED.
+        # It used to run a bare `curl` through the login node's LOGIN SHELL,
+        # which sources the site profile and sets http(s)_proxy — so curl went
+        # THROUGH the proxy, answered 200, and boxy concluded "direct egress
+        # works, drop the proxy". The compute node, whose job env has no
+        # profile-set proxy, then went at the registry directly and got the
+        # site filter's block page:
+        #   pinging container registry registry-1.docker.io: StatusCode: 403,
+        #   "<html>... Zs..."      (field: clusterc, an SSO/egress filter)
+        # A proxied success can never be evidence that the proxy is redundant.
+        # Also probe the REGISTRY API (registry-1.docker.io/v2/), not the
+        # marketing domain: `docker.io` answers a redirect that `curl -f`
+        # without -L reports as SUCCESS, so the old probe passed on networks
+        # where no registry request could have completed. Per the registry v2
+        # spec the version check answers 200, or 401 when auth is required —
+        # both mean the registry itself is talking to us.
+        api = "registry-1.docker.io" if reg == "docker.io" else reg
+        probe = ("env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY "
+                 "-u all_proxy -u ALL_PROXY "
+                 "curl -s --noproxy '*' -o /dev/null "
+                 f"-w '%{{http_code}}' --max-time 12 https://{api}/v2/")
+        rc_e, code = remote.ssh_capture(target, probe, timeout=20)
+        code = code.strip().splitlines()[-1].strip() if code.strip() else ""
+        if rc_e == 0 and code in ("200", "401"):
             pfx = ""
             deploy.set_direct_egress(True)
-            print(f"  auto: egress: {reg} verifies directly from {host} — NOT injecting this "
-                  f"laptop's proxy (it would replace a working path; --proxy URL forces one)")
+            print(f"  auto: egress: {api} answers HTTP {code} with the proxy STRIPPED on {host} "
+                  f"— NOT injecting this laptop's proxy (it would replace a working path; "
+                  f"--proxy URL forces one)")
+        else:
+            print(f"  auto: egress: {api} is NOT reachable directly from {host} "
+                  f"({'HTTP ' + code if code else 'no response'}) — keeping the proxy for the "
+                  f"compute node's image pull")
     if pfx:
         print(f"  auto: proxy: forwarding {redact.redact_url_credentials(pfx.strip())}to the compute-node image pull "
               f"(reach the registry behind the site proxy)")

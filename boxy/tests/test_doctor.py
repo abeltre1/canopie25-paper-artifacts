@@ -239,3 +239,37 @@ def test_cmd_doctor_remote_audit_no_cluster_boxy(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "remote audit of user1@clustera.example.gov" in out and "no boxy required" in out
     assert "403" in out and rc == 1                 # ghcr 403 (+ no runtime) -> FAIL exit
+
+
+def test_doctor_flags_a_socks_all_proxy_on_an_http_proxy_port(monkeypatch):
+    """FIELD: a site profile exported ALL_PROXY=socks://proxy.site:80 alongside
+    http_proxy=http://proxy.site:80. curl prefers the scheme-specific vars so it
+    never showed locally, but boxy forwards all_proxy into the job env where
+    Python honours it — one port cannot be both an HTTP proxy and a SOCKS one."""
+    from boxy import config, doctor
+
+    for var in ("http_proxy", "https_proxy", "all_proxy",
+                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("http_proxy", "http://proxy.example.gov:80/")
+    monkeypatch.setenv("https_proxy", "http://proxy.example.gov:80/")
+    monkeypatch.setenv("all_proxy", "socks://proxy.example.gov:80/")
+    config.reset()
+    r = doctor._check_proxy()
+    assert r.status == doctor.WARN
+    assert "SOCKS" in r.detail and "HTTP proxy" in r.detail
+
+
+def test_doctor_accepts_a_real_socks_proxy_on_its_own_endpoint(monkeypatch):
+    """Only the SAME-ENDPOINT contradiction is a warning: a genuine SOCKS proxy
+    at a different host/port is a legitimate setup and must stay OK."""
+    from boxy import config, doctor
+
+    for var in ("http_proxy", "https_proxy", "all_proxy",
+                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("http_proxy", "http://proxy.example.gov:80/")
+    monkeypatch.setenv("https_proxy", "http://proxy.example.gov:80/")
+    monkeypatch.setenv("all_proxy", "socks5://socks.example.gov:1080/")
+    config.reset()
+    assert doctor._check_proxy().status == doctor.OK

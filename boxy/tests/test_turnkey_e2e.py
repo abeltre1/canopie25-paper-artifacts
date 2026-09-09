@@ -1025,7 +1025,9 @@ def test_serve_probes_egress_before_injecting_the_laptop_proxy(ssh, capfd, monke
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
     monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
     monkeypatch.setenv("https_proxy", "http://laptop-proxy.example.gov:80")
-    _shim(ssh["bin"], "curl", "#!/bin/bash\nexit 0\n")          # cluster reaches it directly
+    # the registry API answers 401 (auth required) even with the proxy stripped:
+    # that IS direct reachability, per the registry v2 version-check contract
+    _shim(ssh["bin"], "curl", "#!/bin/bash\nprintf 401\nexit 0\n")
     rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
     cap = capfd.readouterr()
     assert rc == 0
@@ -1039,7 +1041,7 @@ def test_serve_still_forwards_the_proxy_when_egress_is_blocked(ssh, capfd, monke
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
     monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
     monkeypatch.setenv("https_proxy", "http://site-proxy.example.gov:80")
-    _shim(ssh["bin"], "curl", "#!/bin/bash\nexit 7\n")          # blocked
+    _shim(ssh["bin"], "curl", "#!/bin/bash\nprintf 000\nexit 7\n")     # blocked
     rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
     cap = capfd.readouterr()
     assert rc == 0
@@ -1052,7 +1054,7 @@ def test_explicit_proxy_is_never_probed_away(ssh, capfd, monkeypatch):
     # when the probe would have said 'direct'
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
     monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
-    _shim(ssh["bin"], "curl", "#!/bin/bash\nexit 0\n")          # direct would succeed
+    _shim(ssh["bin"], "curl", "#!/bin/bash\nprintf 200\nexit 0\n")     # direct would succeed
     rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera",
                "--proxy", "http://chosen.example.gov:3128", "--dryrun"])
     cap = capfd.readouterr()
@@ -1484,6 +1486,7 @@ def test_proxy_self_heal_resubmits_without_proxy(ssh, capfd, monkeypatch):
     monkeypatch.delenv("BOXY_NO_PROXY_PROPAGATE", raising=False)      # opt in — forward the proxy
     monkeypatch.setattr(cli, "_remote_log_tail",
                         lambda *a, **k: "proxyconnect tcp: dial tcp 185.46.212.90:80: i/o timeout")
+    _shim(ssh["bin"], "curl", "#!/bin/bash\nprintf 000\nexit 7\n")   # no DIRECT egress
 
     calls = {"n": 0}
 
@@ -2269,3 +2272,48 @@ def test_pull_script_records_a_failed_image_prepull(monkeypatch):
     assert '> "$STAGE/.boxy-image-failed"' in script
     # the marker names the image, so the status probe can print the exact fix
     assert 'printf "%s: " quay.io/x/vllm:tag' in script
+
+
+def test_a_proxied_probe_success_is_not_evidence_of_direct_egress(ssh, capfd, monkeypatch):
+    """FIELD (clusterc): the compute node's podman pull came back
+
+        pinging container registry registry-1.docker.io: StatusCode: 403,
+        "<html>...Zs..."          (the site egress filter's block page)
+
+    because boxy had DROPPED the proxy. Its egress probe ran a bare curl through
+    the login node's LOGIN SHELL, which sources the site profile and exports
+    http(s)_proxy — so the probe went THROUGH the proxy, answered 200, and boxy
+    concluded the proxy was redundant. The compute node's job env has no such
+    profile, so it went direct and hit the filter.
+
+    A proxied success can never be evidence that the proxy is redundant: the
+    probe must strip the proxy before deciding."""
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("https_proxy", "http://site-proxy.example.gov:80")
+    # A LOGIN NODE BEHIND AN EGRESS FILTER: reachable through the proxy, 403 on
+    # the block page without it — exactly what the field cluster does.
+    _shim(ssh["bin"], "curl",
+          "#!/bin/bash\n"
+          'if [ -n "${https_proxy:-}${http_proxy:-}" ]; then printf 200; exit 0; fi\n'
+          "printf 403\nexit 0\n")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "NOT injecting" not in cap.out            # the old probe said this
+    assert "auto: proxy: forwarding" in cap.out      # ... the proxy must survive
+    assert "site-proxy.example.gov" in cap.out
+
+
+def test_default_images_are_fully_qualified(ssh):
+    """An unqualified ref is resolved against /etc/containers/registries.conf,
+    and on a RHEL node that list leads with the Red Hat registries — so the pull
+    reports 'Repo not found' from registry.access.redhat.com first and buries
+    the real cause third. Every default must name its registry."""
+    from boxy import ramalama_shim
+
+    for engine in ("vllm", "llama.cpp"):
+        for accel in ("cuda", "rocm", "intel", "vulkan", "none", "asahi", "musa", "ascend"):
+            ref = ramalama_shim.default_image(engine, accel)
+            registry = ref.split("/", 1)[0]
+            assert "." in registry or registry == "localhost", f"{engine}/{accel}: {ref}"

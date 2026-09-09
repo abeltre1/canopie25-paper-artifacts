@@ -85,6 +85,27 @@ def _check_proxy() -> Result:
         return Result("proxy", WARN, f"{shown} — http_proxy set but https_proxy is NOT",
                       "registries are all https and will BYPASS the proxy; if your profile does "
                       'https_proxy="${http_proxy}", it must come AFTER http_proxy is set')
+    # SAME ENDPOINT, TWO INCOMPATIBLE PROTOCOLS. A profile that sets
+    #   http_proxy=http://proxy.site:80   and   ALL_PROXY=socks://proxy.site:80
+    # is naming one HTTP proxy port as a SOCKS server. curl ignores ALL_PROXY
+    # when a scheme-specific proxy is set, so it looks harmless — but boxy
+    # PROPAGATES all_proxy into the job and container env, where Python's
+    # requests DOES honour it: the in-container model download then dies on
+    # "Missing dependencies for SOCKS support", or on a SOCKS handshake against
+    # a server that only speaks HTTP.
+    raw = ramalama_shim.raw_proxy_env()
+    allp = raw.get("all_proxy", "")
+    if allp.split("://", 1)[0].lower().startswith("socks"):
+        endpoint = allp.split("://", 1)[-1].rstrip("/")
+        others = {(raw.get(k) or "").split("://", 1)[-1].rstrip("/")
+                  for k in ("http_proxy", "https_proxy")}
+        if endpoint in others - {""}:
+            return Result("proxy", WARN,
+                          f"{shown} — all_proxy calls {endpoint} a SOCKS server, "
+                          f"but http/https_proxy call the same endpoint an HTTP proxy",
+                          "one port cannot be both. curl prefers the scheme-specific vars so this "
+                          "looks fine locally, but boxy forwards all_proxy into the job, where "
+                          "Python honours it and the download fails. Unset ALL_PROXY/all_proxy")
     return Result("proxy", OK, f"{shown}  (registry traffic follows these)")
 
 

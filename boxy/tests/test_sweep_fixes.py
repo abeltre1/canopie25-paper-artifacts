@@ -311,8 +311,8 @@ def test_default_image_does_not_depend_on_optional_packages():
     — different builds, different performance, invisible in the command line."""
     from boxy import ramalama_shim
 
-    assert ramalama_shim.default_image("vllm", "rocm") == "rocm/vllm:latest"
-    assert ramalama_shim.default_image("vllm", "cuda") == "vllm/vllm-openai:latest"
+    assert ramalama_shim.default_image("vllm", "rocm") == "docker.io/rocm/vllm:latest"
+    assert ramalama_shim.default_image("vllm", "cuda") == "docker.io/vllm/vllm-openai:latest"
 
 
 def test_llamacpp_rocm_image_is_static_not_vulkan():

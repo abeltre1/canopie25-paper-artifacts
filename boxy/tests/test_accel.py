@@ -154,8 +154,8 @@ def test_shim_delegates_to_boxy_detection(monkeypatch):
 
 
 @pytest.mark.parametrize("engine,acc,expected", [
-    ("vllm", "cuda", "vllm/vllm-openai:latest"),
-    ("vllm", "rocm", "rocm/vllm:latest"),
+    ("vllm", "cuda", "docker.io/vllm/vllm-openai:latest"),
+    ("vllm", "rocm", "docker.io/rocm/vllm:latest"),
     ("llama.cpp", "cuda", "ghcr.io/ggml-org/llama.cpp:server-cuda"),
     ("llama.cpp", "rocm", "quay.io/ramalama/rocm:latest"),
     ("llama.cpp", "none", "ghcr.io/ggml-org/llama.cpp:server"),
