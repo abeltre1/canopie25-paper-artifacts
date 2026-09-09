@@ -3902,6 +3902,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
     deadline = time.time() + 24 * 3600
     last_state = None
     proxy_healed = False
+    blocked_pull_healed = False
     trust_healed = False
     pip_healed = False
 
@@ -3950,6 +3951,38 @@ def _serve_agentless_ssh(args, target: str) -> int:
         if not _resubmit_current():
             return False
         print(f"### Resubmitted {scheduler_name} job {job_id} without the proxy (auto-recovered).")
+        return True
+
+    def _maybe_blocked_pull_heal(tail: str) -> bool:
+        """The MIRROR of _maybe_proxy_heal, and the half that was missing. The
+        node reached the registry with NO proxy and got the site egress filter's
+        block page:
+
+            pinging container registry registry-1.docker.io: StatusCode: 403,
+            "<html>... Zs..."
+
+        boxy had stripped the proxy because its login-node probe said direct
+        egress worked — but the login node is not the compute node, and no probe
+        run before the allocation can settle that. So recover the way the other
+        direction already does: if a proxy is KNOWN and was not forwarded,
+        resubmit ONCE with it. A wrongly-added proxy heals via
+        _maybe_proxy_heal; a wrongly-DROPPED one only printed advice and gave
+        up, one allocation later."""
+        nonlocal pfx, blocked_pull_healed
+        if blocked_pull_healed or pfx or not _looks_like_pull_block(tail):
+            return False
+        known = _proxy_prefix(args)
+        if not known:
+            return False                       # nothing to add — not our failure
+        blocked_pull_healed = True
+        print(f"boxy: the compute node was blocked reaching the registry with no proxy; "
+              f"resubmitting WITH {redact.redact_url_credentials(known.strip())} — the login "
+              f"node reached it directly, the compute node evidently cannot.", file=sys.stderr)
+        pfx = known
+        deploy.set_direct_egress(False)
+        if not _resubmit_current():
+            return False
+        print(f"### Resubmitted {scheduler_name} job {job_id} with the proxy (auto-recovered).")
         return True
 
     def _maybe_pip_heal(tail: str) -> bool:
@@ -4017,7 +4050,8 @@ def _serve_agentless_ssh(args, target: str) -> int:
                 pend_since = None
             if state == "DONE":
                 tail = _remote_log_tail(target, log_remote)
-                if _maybe_proxy_heal(tail) or _maybe_trust_heal(tail) or _maybe_pip_heal(tail):
+                if (_maybe_proxy_heal(tail) or _maybe_blocked_pull_heal(tail)
+                        or _maybe_trust_heal(tail) or _maybe_pip_heal(tail)):
                     time.sleep(5)
                     continue
                 print(f"boxy: job {job_id} ended before the server became ready; last log lines:",
@@ -4075,7 +4109,8 @@ def _serve_agentless_ssh(args, target: str) -> int:
                 # the wait extends while the job is alive, so reaching here means
                 # the job ENDED before the server answered — diagnose, don't shrug.
                 tail = _remote_log_tail(target, log_remote)
-                if _maybe_proxy_heal(tail) or _maybe_trust_heal(tail) or _maybe_pip_heal(tail):
+                if (_maybe_proxy_heal(tail) or _maybe_blocked_pull_heal(tail)
+                        or _maybe_trust_heal(tail) or _maybe_pip_heal(tail)):
                     time.sleep(5)
                     continue
                 print(f"boxy: {scheduler_name} job {job_id} ended before the server became ready; "

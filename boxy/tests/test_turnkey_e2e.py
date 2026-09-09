@@ -2317,3 +2317,40 @@ def test_default_images_are_fully_qualified(ssh):
             ref = ramalama_shim.default_image(engine, accel)
             registry = ref.split("/", 1)[0]
             assert "." in registry or registry == "localhost", f"{engine}/{accel}: {ref}"
+
+
+def test_blocked_pull_resubmits_WITH_the_proxy(ssh, capfd, monkeypatch):
+    """The mirror of the proxy self-heal, and the half that was missing. FIELD:
+    the login-node probe said direct egress worked, so boxy stripped the proxy;
+    the compute node then hit the site filter's block page
+
+        pinging container registry registry-1.docker.io: StatusCode: 403 "<html>...
+
+    and the job simply died. A wrongly-ADDED proxy already self-healed; a
+    wrongly-DROPPED one must too."""
+    from boxy import cli, remote
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("https_proxy", "http://site-proxy.example.gov:80")
+    monkeypatch.delenv("BOXY_NO_PROXY_PROPAGATE", raising=False)
+    # login node reaches the registry directly, so the first submit carries NO proxy
+    _shim(ssh["bin"], "curl", "#!/bin/bash\nprintf 401\nexit 0\n")
+    monkeypatch.setattr(
+        cli, "_remote_log_tail",
+        lambda *a, **k: ('Error: initializing source docker://vllm/vllm-openai:latest: '
+                         'pinging container registry registry-1.docker.io: StatusCode: 403, '
+                         '"<html>\\n<head>\\n<meta name=\\"description\\" content=\\"Zs..."'))
+    calls = {"n": 0}
+
+    def await_stub(host, node, port, *a, **k):
+        calls["n"] += 1
+        return calls["n"] > 1                       # die once (blocked), then ready
+
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", await_stub)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "gpu", "--ssh", "user@clusterb"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "blocked reaching the registry with no proxy" in cap.err
+    assert "Resubmitted slurm job" in cap.out and "with the proxy" in cap.out
+    assert ssh["sbatch_log"].read_text().count("--parsable") >= 2
