@@ -229,7 +229,9 @@ def test_hf_download_writes_into_the_bundle_not_the_build_hosts_cache(tmp_path, 
     def fake_snapshot(repo, token=None, cache_dir=None, **kw):
         seen["repo"], seen["cache_dir"] = repo, cache_dir
 
-    import huggingface_hub
+    # declared in the 'test' extra so CI really runs this; skip rather than
+    # error in a lean checkout that installed boxy without it
+    huggingface_hub = pytest.importorskip("huggingface_hub")
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot)
     monkeypatch.setenv("HF_HOME", "/somewhere/else/entirely")   # must NOT decide
