@@ -6,7 +6,7 @@
 # path, and Podman refuses workdirs that don't exist in the image.
 [box]
 name = "vllm-hf"
-image = "vllm/vllm-openai:v0.24.0"
+image = "docker.io/vllm/vllm-openai:v0.24.0"
 entrypoint = "vllm"
 model = "hf://Qwen/Qwen2.5-0.5B-Instruct"
 ports = [8000]

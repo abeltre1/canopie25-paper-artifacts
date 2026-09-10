@@ -2903,7 +2903,17 @@ def _hf_curl_script(repo: str, stage: str, image: str, *, proxy: str = "", cacer
         # instead of inferring liveness from the log's mtime
         'rm -f "$STAGE/.boxy-pull-failed"',
         '_fail() { echo "boxy-pull: $1"; printf "%s\\n" "$1" > "$STAGE/.boxy-pull-failed"; exit 1; }',
-        f"podman pull {q(image)} >/dev/null 2>&1 || true",
+        # THE PRE-PULL MUST NOT FAIL THE DOWNLOAD — it is plain host curl and
+        # needs no container. But `|| true` also made a FAILED pre-pull
+        # INVISIBLE: `boxy pull` reported the model staged while the image was
+        # never warmed, and the gap surfaced an allocation later as a compute
+        # node retrying `Trying to pull <image>` until the job died. Record the
+        # outcome so the status probe can say so BEFORE a queue slot is spent.
+        'rm -f "$STAGE/.boxy-image-failed"',
+        (f'if podman pull {q(image)} >"$STAGE/.boxy-image.log" 2>&1; then :; else '
+         f'{{ printf "%s: " {q(image)}; '
+         'tr -d "\\r" < "$STAGE/.boxy-image.log" | tail -3 | tr "\\n" " "; } '
+         '> "$STAGE/.boxy-image-failed"; fi'),
         (f'code=$({list_curl} -o "$STAGE/.boxy-repo.json" '
          '-w "%{http_code} %{url_effective}" '   # NOT an f-string: single braces
          '"https://huggingface.co/api/models/$REPO" 2>"$STAGE/.boxy-repo.err" || true)'),
@@ -3041,15 +3051,18 @@ def _pull_agentless_ssh(args, target: str) -> int:
     # users away to wait for a download that had already given up (field: a
     # listing failure showed as 'pull RUNNING ... 0/96 shards').
     failed = f"{stage}/.boxy-pull-failed"
+    img_failed = f"{stage}/.boxy-image-failed"
     probe = (f"if [ -e {q(done)} ]; then echo STATE=DONE; "
              f"elif [ -s {q(failed)} ]; then echo STATE=FAILED; "
-             f"echo WHY=$(tr -d '\\n' < {q(failed)} 2>/dev/null | head -c 400); "
+             f"echo \"WHY=$(tr -d '\\n' < {q(failed)} 2>/dev/null | head -c 400)\"; "
              f"elif [ -s {q(pid_remote)} ] && kill -0 \"$(cat {q(pid_remote)})\" 2>/dev/null; "
              f"then echo STATE=RUNNING; "
              f"elif [ -n \"$(find {q(log_remote)} -mmin -5 2>/dev/null)\" ]; then echo STATE=RUNNING; "
              f"else echo STATE=IDLE; fi; "
              f"echo GOT=$(du -s -BG {q(stage)} 2>/dev/null | cut -f1); "
-             f"echo SHARDS=$(ls {q(stage)} 2>/dev/null | grep -c 'safetensors$')")
+             f"echo SHARDS=$(ls {q(stage)} 2>/dev/null | grep -c 'safetensors$'); "
+             # a staged model with a COLD image still dies on the node
+             f"echo \"IMG=$(tr -d '\\n' < {q(img_failed)} 2>/dev/null | head -c 300)\"")
     rc, out = remote.ssh_capture(target, probe, timeout=30)
     kv = dict(ln.strip().split("=", 1) for ln in out.splitlines() if "=" in ln) if rc == 0 else {}
     state = kv.get("STATE") or "IDLE"
@@ -3057,9 +3070,26 @@ def _pull_agentless_ssh(args, target: str) -> int:
     got_shards = kv.get("SHARDS") or "0"
     of_shards = f"/{shards}" if shards else ""
     of_gb = f" of ~{size_gb:.0f}GB" if size_gb else ""
+    img_err = (kv.get("IMG") or "").strip()
+
+    def _warn_cold_image() -> None:
+        """A fully staged model is still unservable if the serving image never
+        landed in $HOME's podman store: the compute node then has to reach the
+        registry itself, which an isolated node cannot do — and it finds out
+        AFTER the queue wait. Say it here, where it is still cheap to fix."""
+        if not img_err:
+            return
+        ref = img_err.split(": ", 1)[0]
+        print(f"  WARNING: the serving image was NOT warmed on {host} — {img_err}",
+              file=sys.stderr)
+        print("  the model is staged, but a compute node without registry egress cannot pull "
+              "the image either, and the job would die after the queue wait.", file=sys.stderr)
+        print(f"  warm it on the login node first:  ssh {target} podman pull {ref}",
+              file=sys.stderr)
 
     if state == "DONE" and not args.force:
         print(f"model staged at: {host}:{stage} ({got_shards}{of_shards} shards, {got_gb})")
+        _warn_cold_image()
         print(f"  serve it:  boxy serve {args.model} --ssh {target}")
         return 0
     if state == "FAILED" and not args.force:
@@ -3073,6 +3103,7 @@ def _pull_agentless_ssh(args, target: str) -> int:
         return 1
     if state == "RUNNING":
         print(f"pull RUNNING on {host}: {got_gb}{of_gb}, {got_shards}{of_shards} shards so far")
+        _warn_cold_image()
         print("  it survives this laptop disconnecting. Run the same command again for fresh progress,")
         print(f"  or watch live:  ssh {target} tail -f {log_remote}")
         return 0
@@ -3539,13 +3570,39 @@ def _serve_agentless_ssh(args, target: str) -> int:
         # serve must too. An explicit --proxy is never probed away.
         reg = (args.image or box.image or "").split("/", 1)[0]
         reg = reg if ("." in reg or reg == "localhost") else "docker.io"
-        rc_e, _ = remote.ssh_capture(
-            target, f"curl -sIf https://{reg}/ -o /dev/null --max-time 12", timeout=20)
-        if rc_e == 0:
+        # THE PROBE MUST MEASURE **DIRECT** EGRESS, WITH THE PROXY STRIPPED.
+        # It used to run a bare `curl` through the login node's LOGIN SHELL,
+        # which sources the site profile and sets http(s)_proxy — so curl went
+        # THROUGH the proxy, answered 200, and boxy concluded "direct egress
+        # works, drop the proxy". The compute node, whose job env has no
+        # profile-set proxy, then went at the registry directly and got the
+        # site filter's block page:
+        #   pinging container registry registry-1.docker.io: StatusCode: 403,
+        #   "<html>... Zs..."      (field: clusterc, an SSO/egress filter)
+        # A proxied success can never be evidence that the proxy is redundant.
+        # Also probe the REGISTRY API (registry-1.docker.io/v2/), not the
+        # marketing domain: `docker.io` answers a redirect that `curl -f`
+        # without -L reports as SUCCESS, so the old probe passed on networks
+        # where no registry request could have completed. Per the registry v2
+        # spec the version check answers 200, or 401 when auth is required —
+        # both mean the registry itself is talking to us.
+        api = "registry-1.docker.io" if reg == "docker.io" else reg
+        probe = ("env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY "
+                 "-u all_proxy -u ALL_PROXY "
+                 "curl -s --noproxy '*' -o /dev/null "
+                 f"-w '%{{http_code}}' --max-time 12 https://{api}/v2/")
+        rc_e, code = remote.ssh_capture(target, probe, timeout=20)
+        code = code.strip().splitlines()[-1].strip() if code.strip() else ""
+        if rc_e == 0 and code in ("200", "401"):
             pfx = ""
             deploy.set_direct_egress(True)
-            print(f"  auto: egress: {reg} verifies directly from {host} — NOT injecting this "
-                  f"laptop's proxy (it would replace a working path; --proxy URL forces one)")
+            print(f"  auto: egress: {api} answers HTTP {code} with the proxy STRIPPED on {host} "
+                  f"— NOT injecting this laptop's proxy (it would replace a working path; "
+                  f"--proxy URL forces one)")
+        else:
+            print(f"  auto: egress: {api} is NOT reachable directly from {host} "
+                  f"({'HTTP ' + code if code else 'no response'}) — keeping the proxy for the "
+                  f"compute node's image pull")
     if pfx:
         print(f"  auto: proxy: forwarding {redact.redact_url_credentials(pfx.strip())}to the compute-node image pull "
               f"(reach the registry behind the site proxy)")
@@ -3575,7 +3632,16 @@ def _serve_agentless_ssh(args, target: str) -> int:
             engine_pull = False
 
     pmode = "never" if bundle else _prestage_mode(args)
-    if pmode != "never" and (engine_pull or pmode == "always"):
+    # WARMING THE IMAGE IS NOT CONDITIONAL ON engine_pull. The old gate
+    # `(engine_pull or pmode == "always")` skipped this whole block under the
+    # default 'auto' as soon as the model was already staged — i.e. exactly the
+    # isolated-node PATH serve, the case that needs the image sitting in $HOME's
+    # podman store MOST. Field: a completed `boxy pull` (which only warms the
+    # image best-effort) followed by a serve that never warmed it at all left
+    # the compute node retrying `Trying to pull <image>` until the job died,
+    # after the whole queue wait. Staging the MODEL still requires engine_pull;
+    # warming the IMAGE only requires that prestage is not 'never'.
+    if pmode != "never":
         image = args.image or box.image or ramalama_shim.default_image(box.engine, accel)
         if args.dryrun:
             what = f"model {box.model} + image {image}" if engine_pull else f"image {image}"
@@ -3836,6 +3902,7 @@ def _serve_agentless_ssh(args, target: str) -> int:
     deadline = time.time() + 24 * 3600
     last_state = None
     proxy_healed = False
+    blocked_pull_healed = False
     trust_healed = False
     pip_healed = False
 
@@ -3884,6 +3951,38 @@ def _serve_agentless_ssh(args, target: str) -> int:
         if not _resubmit_current():
             return False
         print(f"### Resubmitted {scheduler_name} job {job_id} without the proxy (auto-recovered).")
+        return True
+
+    def _maybe_blocked_pull_heal(tail: str) -> bool:
+        """The MIRROR of _maybe_proxy_heal, and the half that was missing. The
+        node reached the registry with NO proxy and got the site egress filter's
+        block page:
+
+            pinging container registry registry-1.docker.io: StatusCode: 403,
+            "<html>... Zs..."
+
+        boxy had stripped the proxy because its login-node probe said direct
+        egress worked — but the login node is not the compute node, and no probe
+        run before the allocation can settle that. So recover the way the other
+        direction already does: if a proxy is KNOWN and was not forwarded,
+        resubmit ONCE with it. A wrongly-added proxy heals via
+        _maybe_proxy_heal; a wrongly-DROPPED one only printed advice and gave
+        up, one allocation later."""
+        nonlocal pfx, blocked_pull_healed
+        if blocked_pull_healed or pfx or not _looks_like_pull_block(tail):
+            return False
+        known = _proxy_prefix(args)
+        if not known:
+            return False                       # nothing to add — not our failure
+        blocked_pull_healed = True
+        print(f"boxy: the compute node was blocked reaching the registry with no proxy; "
+              f"resubmitting WITH {redact.redact_url_credentials(known.strip())} — the login "
+              f"node reached it directly, the compute node evidently cannot.", file=sys.stderr)
+        pfx = known
+        deploy.set_direct_egress(False)
+        if not _resubmit_current():
+            return False
+        print(f"### Resubmitted {scheduler_name} job {job_id} with the proxy (auto-recovered).")
         return True
 
     def _maybe_pip_heal(tail: str) -> bool:
@@ -3951,7 +4050,8 @@ def _serve_agentless_ssh(args, target: str) -> int:
                 pend_since = None
             if state == "DONE":
                 tail = _remote_log_tail(target, log_remote)
-                if _maybe_proxy_heal(tail) or _maybe_trust_heal(tail) or _maybe_pip_heal(tail):
+                if (_maybe_proxy_heal(tail) or _maybe_blocked_pull_heal(tail)
+                        or _maybe_trust_heal(tail) or _maybe_pip_heal(tail)):
                     time.sleep(5)
                     continue
                 print(f"boxy: job {job_id} ended before the server became ready; last log lines:",
@@ -4009,7 +4109,8 @@ def _serve_agentless_ssh(args, target: str) -> int:
                 # the wait extends while the job is alive, so reaching here means
                 # the job ENDED before the server answered — diagnose, don't shrug.
                 tail = _remote_log_tail(target, log_remote)
-                if _maybe_proxy_heal(tail) or _maybe_trust_heal(tail) or _maybe_pip_heal(tail):
+                if (_maybe_proxy_heal(tail) or _maybe_blocked_pull_heal(tail)
+                        or _maybe_trust_heal(tail) or _maybe_pip_heal(tail)):
                     time.sleep(5)
                     continue
                 print(f"boxy: {scheduler_name} job {job_id} ended before the server became ready; "

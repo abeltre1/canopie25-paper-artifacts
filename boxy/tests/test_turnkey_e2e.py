@@ -1025,7 +1025,9 @@ def test_serve_probes_egress_before_injecting_the_laptop_proxy(ssh, capfd, monke
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
     monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
     monkeypatch.setenv("https_proxy", "http://laptop-proxy.example.gov:80")
-    _shim(ssh["bin"], "curl", "#!/bin/bash\nexit 0\n")          # cluster reaches it directly
+    # the registry API answers 401 (auth required) even with the proxy stripped:
+    # that IS direct reachability, per the registry v2 version-check contract
+    _shim(ssh["bin"], "curl", "#!/bin/bash\nprintf 401\nexit 0\n")
     rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
     cap = capfd.readouterr()
     assert rc == 0
@@ -1039,7 +1041,7 @@ def test_serve_still_forwards_the_proxy_when_egress_is_blocked(ssh, capfd, monke
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
     monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
     monkeypatch.setenv("https_proxy", "http://site-proxy.example.gov:80")
-    _shim(ssh["bin"], "curl", "#!/bin/bash\nexit 7\n")          # blocked
+    _shim(ssh["bin"], "curl", "#!/bin/bash\nprintf 000\nexit 7\n")     # blocked
     rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
     cap = capfd.readouterr()
     assert rc == 0
@@ -1052,7 +1054,7 @@ def test_explicit_proxy_is_never_probed_away(ssh, capfd, monkeypatch):
     # when the probe would have said 'direct'
     monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
     monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
-    _shim(ssh["bin"], "curl", "#!/bin/bash\nexit 0\n")          # direct would succeed
+    _shim(ssh["bin"], "curl", "#!/bin/bash\nprintf 200\nexit 0\n")     # direct would succeed
     rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera",
                "--proxy", "http://chosen.example.gov:3128", "--dryrun"])
     cap = capfd.readouterr()
@@ -1484,6 +1486,7 @@ def test_proxy_self_heal_resubmits_without_proxy(ssh, capfd, monkeypatch):
     monkeypatch.delenv("BOXY_NO_PROXY_PROPAGATE", raising=False)      # opt in — forward the proxy
     monkeypatch.setattr(cli, "_remote_log_tail",
                         lambda *a, **k: "proxyconnect tcp: dial tcp 185.46.212.90:80: i/o timeout")
+    _shim(ssh["bin"], "curl", "#!/bin/bash\nprintf 000\nexit 7\n")   # no DIRECT egress
 
     calls = {"n": 0}
 
@@ -2215,3 +2218,139 @@ def test_ssh_uncarded_model_autogenerates_card_deterministically(ssh, capfd, mon
     assert "auto: gpus: 1 per node" in cap.out            # bytes, not the 450B name
     assert "#SBATCH --gpus-per-node=1" in cap.out
     assert (tmp_path / "xdg" / "boxy" / "cards" / "models" / "acme-custom-dense-450b.toml").exists()
+
+
+def test_completed_pull_still_warms_the_image_under_prestage_auto(ssh, capfd, monkeypatch):
+    """FIELD (Kimi-K3 on clusterc, job died after the queue wait): the prestage
+    gate was `pmode != "never" and (engine_pull or pmode == "always")`. A
+    completed `boxy pull` clears engine_pull, so under the DEFAULT 'auto' the
+    whole block — including the login-node image warm — was skipped in exactly
+    the case that needs the image in $HOME's podman store most: a by-path serve
+    on an isolated node. The node was left retrying `Trying to pull <image>`
+    until the job died. Warming the IMAGE must not depend on engine_pull."""
+    from boxy import cli
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("BOXY_AGENTLESS_PRESTAGE", "auto")
+    staged = "/scratch/u/boxy/models/meta-llama-llama-3.1-8b-instruct"
+    monkeypatch.setattr(cli, "_pull_completed_stage", lambda t, s, m: staged)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "already fully staged by `boxy pull`" in cap.out      # model NOT re-downloaded
+    assert "prestage: would stage image " in cap.out             # ... image STILL warmed
+    assert "reuses $HOME's podman store" in cap.out
+
+
+def test_no_prestage_still_skips_the_image_warm(ssh, capfd, monkeypatch):
+    """The widened gate must not make --no-prestage do network work: 'never'
+    still means no login-node pull of anything."""
+    from boxy import cli
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    staged = "/scratch/u/boxy/models/meta-llama-llama-3.1-8b-instruct"
+    monkeypatch.setattr(cli, "_pull_completed_stage", lambda t, s, m: staged)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera",
+               "--no-prestage", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "prestage: would stage" not in cap.out
+
+
+def test_pull_script_records_a_failed_image_prepull(monkeypatch):
+    """The pre-pull is best-effort BY DESIGN (the download is plain host curl
+    and needs no container) — but `|| true` also threw the result away, so a
+    cold image looked identical to a warm one and only surfaced an allocation
+    later. It must leave a marker carrying the image ref and the real error."""
+    from boxy import cli
+
+    script = cli._hf_curl_script("org/model", "/stage", "quay.io/x/vllm:tag")
+    assert "|| true" not in script.split("podman pull")[1].split("\n")[0]
+    assert 'rm -f "$STAGE/.boxy-image-failed"' in script
+    assert '> "$STAGE/.boxy-image-failed"' in script
+    # the marker names the image, so the status probe can print the exact fix
+    assert 'printf "%s: " quay.io/x/vllm:tag' in script
+
+
+def test_a_proxied_probe_success_is_not_evidence_of_direct_egress(ssh, capfd, monkeypatch):
+    """FIELD (clusterc): the compute node's podman pull came back
+
+        pinging container registry registry-1.docker.io: StatusCode: 403,
+        "<html>...Zs..."          (the site egress filter's block page)
+
+    because boxy had DROPPED the proxy. Its egress probe ran a bare curl through
+    the login node's LOGIN SHELL, which sources the site profile and exports
+    http(s)_proxy — so the probe went THROUGH the proxy, answered 200, and boxy
+    concluded the proxy was redundant. The compute node's job env has no such
+    profile, so it went direct and hit the filter.
+
+    A proxied success can never be evidence that the proxy is redundant: the
+    probe must strip the proxy before deciding."""
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("https_proxy", "http://site-proxy.example.gov:80")
+    # A LOGIN NODE BEHIND AN EGRESS FILTER: reachable through the proxy, 403 on
+    # the block page without it — exactly what the field cluster does.
+    _shim(ssh["bin"], "curl",
+          "#!/bin/bash\n"
+          'if [ -n "${https_proxy:-}${http_proxy:-}" ]; then printf 200; exit 0; fi\n'
+          "printf 403\nexit 0\n")
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--ssh", "user@clustera", "--dryrun"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "NOT injecting" not in cap.out            # the old probe said this
+    assert "auto: proxy: forwarding" in cap.out      # ... the proxy must survive
+    assert "site-proxy.example.gov" in cap.out
+
+
+def test_default_images_are_fully_qualified(ssh):
+    """An unqualified ref is resolved against /etc/containers/registries.conf,
+    and on a RHEL node that list leads with the Red Hat registries — so the pull
+    reports 'Repo not found' from registry.access.redhat.com first and buries
+    the real cause third. Every default must name its registry."""
+    from boxy import ramalama_shim
+
+    for engine in ("vllm", "llama.cpp"):
+        for accel in ("cuda", "rocm", "intel", "vulkan", "none", "asahi", "musa", "ascend"):
+            ref = ramalama_shim.default_image(engine, accel)
+            registry = ref.split("/", 1)[0]
+            assert "." in registry or registry == "localhost", f"{engine}/{accel}: {ref}"
+
+
+def test_blocked_pull_resubmits_WITH_the_proxy(ssh, capfd, monkeypatch):
+    """The mirror of the proxy self-heal, and the half that was missing. FIELD:
+    the login-node probe said direct egress worked, so boxy stripped the proxy;
+    the compute node then hit the site filter's block page
+
+        pinging container registry registry-1.docker.io: StatusCode: 403 "<html>...
+
+    and the job simply died. A wrongly-ADDED proxy already self-healed; a
+    wrongly-DROPPED one must too."""
+    from boxy import cli, remote
+
+    monkeypatch.setenv("BOXY_AGENTLESS_SSH", "true")
+    monkeypatch.setenv("BOXY_ACCOUNT", "ab110003")
+    monkeypatch.setenv("https_proxy", "http://site-proxy.example.gov:80")
+    monkeypatch.delenv("BOXY_NO_PROXY_PROPAGATE", raising=False)
+    # login node reaches the registry directly, so the first submit carries NO proxy
+    _shim(ssh["bin"], "curl", "#!/bin/bash\nprintf 401\nexit 0\n")
+    monkeypatch.setattr(
+        cli, "_remote_log_tail",
+        lambda *a, **k: ('Error: initializing source docker://vllm/vllm-openai:latest: '
+                         'pinging container registry registry-1.docker.io: StatusCode: 403, '
+                         '"<html>\\n<head>\\n<meta name=\\"description\\" content=\\"Zs..."'))
+    calls = {"n": 0}
+
+    def await_stub(host, node, port, *a, **k):
+        calls["n"] += 1
+        return calls["n"] > 1                       # die once (blocked), then ready
+
+    monkeypatch.setattr(remote, "await_ready_and_tunnel", await_stub)
+    rc = main(["serve", MODEL, "--scheduler", "slurm", "--partition", "gpu", "--ssh", "user@clusterb"])
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "blocked reaching the registry with no proxy" in cap.err
+    assert "Resubmitted slurm job" in cap.out and "with the proxy" in cap.out
+    assert ssh["sbatch_log"].read_text().count("--parsable") >= 2

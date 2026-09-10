@@ -907,11 +907,18 @@ def vllm_image_for(accelerator: str) -> str:
     AMD's tuned rocm/vllm build rather than the upstream ROCm variant, and the
     choice must not depend on which optional packages happen to be installed
     (see default_image below). Overridable per model card or with --image."""
+    # FULLY QUALIFIED, ALWAYS. An unqualified `vllm/vllm-openai:latest` is
+    # resolved by podman against /etc/containers/registries.conf, and on a RHEL
+    # node that list starts with the Red Hat registries — so the pull first
+    # produced 'Repo not found' from registry.access.redhat.com and a 403 from
+    # registry.redhat.io, and the ACTUAL cause (the site filter blocking
+    # registry-1.docker.io) arrived third, inside a three-error wall. Every
+    # model card already pins docker.io/...; this fallback map must match.
     return {
-        "cuda": "vllm/vllm-openai:latest",
-        "rocm": "rocm/vllm:latest",
-        "intel": "intel/vllm:latest",
-    }.get(accelerator, "vllm/vllm-openai:latest")
+        "cuda": "docker.io/vllm/vllm-openai:latest",
+        "rocm": "docker.io/rocm/vllm:latest",
+        "intel": "docker.io/intel/vllm:latest",
+    }.get(accelerator, "docker.io/vllm/vllm-openai:latest")
 
 
 def default_entrypoint(engine: str, image: str) -> str:
