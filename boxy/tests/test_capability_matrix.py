@@ -245,7 +245,7 @@ def test_cli_generate_stdout_mode(capsys):
     rc = main(["generate", "sky", "--box", str(EXAMPLES / "boxes" / "vllm.toml"),
                "--location", str(EXAMPLES / "locations" / "cloud-gpu.toml")])
     assert rc == 0
-    assert "image_id: docker:vllm/vllm-openai:v0.24.0" in capsys.readouterr().out
+    assert "image_id: docker:docker.io/vllm/vllm-openai:v0.24.0" in capsys.readouterr().out
 
 
 def test_cli_pull_no_model_is_error(tmp_path, capsys):
@@ -280,3 +280,23 @@ def test_cli_launch_without_sky_is_helpful_error(monkeypatch, capsys):
                "--location", str(EXAMPLES / "locations" / "cloud-gpu.toml")])
     assert rc == 1
     assert "boxy-hpc[cloud]" in capsys.readouterr().err
+
+
+def test_packaged_example_boxes_name_their_registry():
+    """A packaged example is something a user copies verbatim, so an unqualified
+    ref there reproduces the same RHEL detour the default map had: podman walks
+    /etc/containers/registries.conf and reports 'Repo not found' from the Red
+    Hat registries before the real error. Locally-BUILT demo images are exempt:
+    they exist only in the user's own store, with no registry to name."""
+    import tomllib
+    from pathlib import Path
+
+    from boxy import data as _data
+
+    boxes = Path(_data.__file__).parent / "examples" / "boxes"
+    for toml_path in sorted(boxes.glob("*.toml")):
+        image = (tomllib.loads(toml_path.read_text()).get("box") or {}).get("image", "")
+        if not image or "://" in image or image.endswith(":local"):
+            continue
+        registry = image.split("/", 1)[0]
+        assert "." in registry or registry == "localhost", f"{toml_path.name}: {image}"

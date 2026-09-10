@@ -408,10 +408,10 @@ def test_finding8_prompts_hard_silenced_at_seam():
 
 def test_finding6_latest_vllm_and_mac_example():
     hf_box = Box.from_toml(EXAMPLES / "boxes" / "vllm-hf.toml")
-    assert hf_box.image == "vllm/vllm-openai:v0.24.0"   # registry-verified latest
+    assert hf_box.image == "docker.io/vllm/vllm-openai:v0.24.0"   # registry-verified latest
     assert not hf_box.workdir
     vllm_box = Box.from_toml(EXAMPLES / "boxes" / "vllm.toml")
-    assert vllm_box.image == "vllm/vllm-openai:v0.24.0"
+    assert vllm_box.image == "docker.io/vllm/vllm-openai:v0.24.0"
     gguf = Box.from_toml(EXAMPLES / "boxes" / "qwen-gguf.toml")
     assert gguf.engine == "llama.cpp"
     assert gguf.model.endswith(".gguf")   # single-file pull: no HF CLI needed
