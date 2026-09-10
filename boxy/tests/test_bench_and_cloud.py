@@ -16,7 +16,6 @@ from tests.conftest import EXAMPLES
 from boxy.box import Box
 from boxy.cli import main
 from boxy.location import Location, Resources
-from tests.conftest import EXAMPLES
 
 
 class _FakeOpenAI(BaseHTTPRequestHandler):

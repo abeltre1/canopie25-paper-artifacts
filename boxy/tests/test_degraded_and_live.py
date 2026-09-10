@@ -78,7 +78,30 @@ class TestDegradedWithoutRamalama:
         assert set(got["env"]) <= set(got["known_env"])
         assert all(node == f"/dev/{name}" for name, node in got["devices"].items())
 
-    def test_pull_transport_uri_gives_guidance(self):
+    def test_ramalama_transport_uri_gives_guidance(self):
+        """ollama:// and oci:// ARE ramalama transports, so without the package
+        they must name the extra rather than fail obscurely. Chosen over hf://
+        deliberately: this path raises before any network call, so the
+        assertion holds on an air-gapped runner too."""
+        p = _run_isolated(
+            "from boxy import ramalama_shim as s\n"
+            "try:\n"
+            "    s.pull_model('ollama://o/n')\n"
+            "except RuntimeError as e:\n"
+            "    print('OK:', e)\n"
+        )
+        assert p.returncode == 0
+        assert "OK:" in p.stdout and "boxy-hpc[ramalama]" in p.stdout
+
+    def test_hf_pull_does_not_demand_the_ramalama_extra(self):
+        """boxy downloads hf:// itself (stdlib + certifi), so this URI must NOT
+        route users to an optional package. The pull still fails here — 'o/n'
+        does not exist and the runner may have no egress — but it must fail as
+        a HUGGINGFACE problem, which is the whole point of the native path.
+
+        This assertion was the one CI caught and the default suite could not:
+        the file is excluded from `testpaths` and runs only in the degraded
+        job, so it kept asserting the pre-native contract for five merges."""
         p = _run_isolated(
             "from boxy import ramalama_shim as s\n"
             "try:\n"
@@ -87,7 +110,9 @@ class TestDegradedWithoutRamalama:
             "    print('OK:', e)\n"
         )
         assert p.returncode == 0
-        assert "OK:" in p.stdout and "boxy-hpc[ramalama]" in p.stdout
+        assert "OK:" in p.stdout
+        assert "huggingface" in p.stdout.lower()
+        assert "boxy-hpc[ramalama]" not in p.stdout
 
     def test_serve_dryrun_works_with_explicit_location(self):
         box = EXAMPLES / "boxes" / "vllm.toml"

@@ -3098,8 +3098,8 @@ def _pull_agentless_ssh(args, target: str) -> int:
               file=sys.stderr)
         print(f"  cause: {why}", file=sys.stderr)
         print(f"  log:   ssh {target} tail -40 {log_remote}", file=sys.stderr)
-        print(f"  retry: the same command resumes from what already landed "
-              f"(add --force to start clean)", file=sys.stderr)
+        print("  retry: the same command resumes from what already landed "
+              "(add --force to start clean)", file=sys.stderr)
         return 1
     if state == "RUNNING":
         print(f"pull RUNNING on {host}: {got_gb}{of_gb}, {got_shards}{of_shards} shards so far")
