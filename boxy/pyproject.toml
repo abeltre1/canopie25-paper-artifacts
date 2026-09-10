@@ -52,7 +52,12 @@ plot = ["matplotlib"]
 # pyyaml: tests PARSE the OpenShift manifests boxy emits rather than string-matching
 # them, so a malformed document fails loudly. boxy itself never imports it —
 # the emitters are pure string builders with no runtime YAML dependency.
-test = ["pytest", "pyyaml"]
+# huggingface_hub: the air-gap suite monkeypatches snapshot_download to prove the
+# bundle's HF download names its destination EXPLICITLY (hub reads HF_HOME at
+# import time, so a late os.environ leaves the bundle empty on the far side of
+# the gap). Without it declared here, that test errored in CI while passing on
+# any machine where ramalama had pulled the package in transitively.
+test = ["pytest", "pyyaml", "huggingface_hub"]
 
 [project.urls]
 Homepage = "https://github.com/abeltre1/canopie25-paper-artifacts/tree/main/boxy"
